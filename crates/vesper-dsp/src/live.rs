@@ -10,6 +10,12 @@ use std::sync::atomic::{AtomicPtr, Ordering};
 
 use crate::{Chain, ChainControl, FilterSpec};
 
+// Chains cross threads through raw pointers below: only sound if they are Send.
+const _: () = {
+    const fn send<T: Send>() {}
+    send::<Chain>()
+};
+
 /// The two slots between [`LiveControl`] and [`LiveChain`].
 #[derive(Default)]
 struct Exchange {

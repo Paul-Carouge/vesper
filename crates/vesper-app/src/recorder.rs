@@ -438,6 +438,11 @@ impl Pipeline {
     /// Recent peak of track `index`, linear 0..=1; 0 when it does not run.
     pub fn peak(&self, index: usize) -> f32 {
         let audio = lock(&self.audio);
+        // Ticked by the meters: frees a replaced filter chain soon after the
+        // audio thread hands it back, not at the next change.
+        if let Some((_, control)) = audio.filters.iter().find(|(i, _)| *i == index) {
+            control.collect();
+        }
         audio
             .running
             .iter()

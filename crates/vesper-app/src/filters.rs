@@ -5,6 +5,8 @@
 //! Like the tracks, the UI's filter rows are the truth. Edits change the
 //! track's filter model in place, so sliders and focus survive them.
 
+use std::cell::RefCell;
+use std::collections::BTreeSet;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -196,6 +198,9 @@ pub fn wire(ui: &AppWindow, rec: &Shared) {
 
     let (weak, r) = (ui.as_weak(), rec.clone());
     let timer = Rc::new(slint::Timer::default());
+    // Tracks with a structural change waiting for the slider to rest: one
+    // timer for all, so none is dropped when another track is touched.
+    let pending: Rc<RefCell<BTreeSet<i32>>> = Rc::default();
     ui.on_filter_param_changed(move |i, j, k, value| {
         let Some(ui) = weak.upgrade() else { return };
         let Some(model) = usize::try_from(i)
@@ -225,14 +230,16 @@ pub fn wire(ui: &AppWindow, rec: &Shared) {
             return;
         };
         edited(m);
-        if !structural {
+        if structural {
+            pending.borrow_mut().insert(i);
+        } else {
             apply(&ui, &r, i);
         }
-        let (weak, r) = (weak.clone(), r.clone());
+        let (weak, r, pending) = (weak.clone(), r.clone(), pending.clone());
         timer.start(slint::TimerMode::SingleShot, SAVE_DELAY, move || {
             if let Some(ui) = weak.upgrade() {
-                if structural {
-                    apply(&ui, &r, i);
+                for track in std::mem::take(&mut *pending.borrow_mut()) {
+                    apply(&ui, &r, track);
                 }
                 save(&ui);
             }
