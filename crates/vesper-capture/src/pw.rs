@@ -211,12 +211,14 @@ fn on_format<F: FnMut(Result<VideoFrame, Error>)>(
     state: &mut State<F>,
     pod: &Pod,
 ) {
+    // Until this format is accepted, no frame may go out with the old one.
+    state.format = None;
     let Some(info) = format::parse_format(pod.as_bytes()) else {
         warn!("ignoring a non raw-video format");
         return;
     };
-    let (Some(&spa_format), Some(size)) = (info.formats.first(), info.size) else {
-        warn!("ignoring a format without video format or size: {info:?}");
+    let Some(&spa_format) = info.formats.first() else {
+        warn!("ignoring a format without video format: {info:?}");
         return;
     };
     let Some(fourcc) = format::spa_to_drm(spa_format) else {
@@ -235,6 +237,10 @@ fn on_format<F: FnMut(Result<VideoFrame, Error>)>(
         update_params(stream, &pods);
         return;
     }
+    let Some(size) = info.size else {
+        warn!("ignoring a fixated format without size: {info:?}");
+        return;
+    };
     let Some(&modifier) = info.modifiers.first() else {
         return state.end(format!(
             "DMA-BUF negotiation failed: the server picked {spa_format:?} without a \
@@ -423,10 +429,12 @@ pub fn run<F>(
                 }
             })
             .param_changed(|stream, state, id, pod| {
-                if let Some(pod) = pod
-                    && id == ParamType::Format.as_raw()
-                {
-                    on_format(stream, state, pod);
+                if id != ParamType::Format.as_raw() {
+                    return;
+                }
+                match pod {
+                    Some(pod) => on_format(stream, state, pod),
+                    None => state.format = None,
                 }
             })
             .add_buffer(|_, state, buffer| {
