@@ -9,7 +9,9 @@
 //! clock (graph cycle time, minus the mic's capture delay or plus the desktop
 //! sink's playback delay, minus queued buffers); when the
 //! counter drifts from that by more than [`TOLERANCE`] (lost buffers, a
-//! suspended device, clock drift), silence is inserted or input dropped.
+//! suspended device), silence is inserted or input dropped. Slow device clock
+//! drift is followed instead: the low-pass filtered error is corrected by
+//! repeating or dropping single frames, at most one every 10 ms.
 
 mod pw;
 
@@ -40,6 +42,13 @@ const BIT_RATE: usize = 160_000;
 const PEAK_WINDOW: usize = 1_600;
 /// Timeline error allowed before inserting silence or dropping input.
 pub const TOLERANCE: Duration = Duration::from_millis(30);
+/// Filtered timeline error that triggers a one-frame drift correction.
+const DRIFT_THRESHOLD_NS: f64 = 1_000_000.0;
+/// Frames between two drift corrections at least (10 ms: up to 2000 ppm).
+const DRIFT_SPACING: usize = 480;
+/// Weight of each buffer's error in the drift filter (~0.6 s at 20 ms buffers).
+const DRIFT_ALPHA: f64 = 1.0 / 32.0;
+
 /// With no buffer for this long, the source is stalled: fill with silence.
 const STALL: Duration = Duration::from_millis(250);
 
@@ -187,24 +196,56 @@ struct Timeline {
     anchor: Duration,
     /// Frames placed so far.
     frames: usize,
+    /// Low-pass filtered `start - expected` of the recent buffers, in ns.
+    drift_ns: f64,
+    /// Frames placed since the last drift correction.
+    since_fix: usize,
 }
 
 impl Timeline {
+    fn new(anchor: Duration) -> Self {
+        Self {
+            anchor,
+            frames: 0,
+            drift_ns: 0.0,
+            since_fix: 0,
+        }
+    }
+
     /// Places `len` frames measured to start at `start`. Returns how many
-    /// silent frames to insert before them, and how many of them to drop.
-    // shortcut: drift is corrected by 30 ms jumps (silence or a cut, maybe a
-    // click every ~10 min at 50 ppm); resample instead if that is audible.
-    fn place(&mut self, start: Duration, len: usize) -> (usize, usize) {
+    /// silent frames to insert before them, how many of them to drop, and how
+    /// many times to repeat their first frame (drift correction, 0 or 1).
+    fn place(&mut self, start: Duration, len: usize) -> (usize, usize, usize) {
         let expected = self.anchor + frames_to_duration(self.frames);
-        let (pad, skip) = if start > expected + TOLERANCE {
-            (duration_to_frames(start - expected), 0)
+        let (pad, skip, repeat) = if start > expected + TOLERANCE {
+            self.drift_ns = 0.0;
+            (duration_to_frames(start - expected), 0, 0)
         } else if start + TOLERANCE < expected {
-            (0, duration_to_frames(expected - start).min(len))
+            self.drift_ns = 0.0;
+            (0, duration_to_frames(expected - start).min(len), 0)
+        } else if len == 0 {
+            (0, 0, 0)
         } else {
-            (0, 0)
+            let err_ns = (start.as_nanos() as i128 - expected.as_nanos() as i128) as f64;
+            self.drift_ns += (err_ns - self.drift_ns) * DRIFT_ALPHA;
+            self.since_fix += len;
+            if self.since_fix >= DRIFT_SPACING && self.drift_ns.abs() > DRIFT_THRESHOLD_NS {
+                self.since_fix = 0;
+                // The correction moves the error by one frame right away.
+                let frame_ns = 1e9 / f64::from(SAMPLE_RATE);
+                if self.drift_ns > 0.0 {
+                    self.drift_ns -= frame_ns;
+                    (0, 0, 1)
+                } else {
+                    self.drift_ns += frame_ns;
+                    (0, 1, 0)
+                }
+            } else {
+                (0, 0, 0)
+            }
         };
-        self.frames += pad + len - skip;
-        (pad, skip)
+        self.frames += pad + repeat + len - skip;
+        (pad, skip, repeat)
     }
 }
 
@@ -290,7 +331,7 @@ fn encode_loop(
     shared: &Shared,
     on_packet: impl FnMut(EncodedPacket),
 ) {
-    let mut timeline = Timeline { anchor, frames: 0 };
+    let mut timeline = Timeline::new(anchor);
     let mut enc = Encoder {
         encoder,
         frame: frame::Audio::new(Sample::F32(Type::Packed), FRAME, ChannelLayout::STEREO),
@@ -305,21 +346,24 @@ fn encode_loop(
     enc.frame.set_rate(SAMPLE_RATE);
     let ch = usize::from(CHANNELS);
     loop {
-        let (pad, skip, samples) = match rx.recv_timeout(STALL) {
+        let (pad, skip, repeat, samples) = match rx.recv_timeout(STALL) {
             Ok(chunk) => {
-                let (pad, skip) = timeline.place(chunk.start, chunk.samples.len() / ch);
-                (pad, skip, chunk.samples)
+                let (pad, skip, repeat) = timeline.place(chunk.start, chunk.samples.len() / ch);
+                (pad, skip, repeat, chunk.samples)
             }
             // Stalled source (no device, suspended): keep the track continuous.
             Err(RecvTimeoutError::Timeout) => {
-                let (pad, _) = timeline.place(monotonic_now().saturating_sub(STALL), 0);
-                (pad, 0, Vec::new())
+                let (pad, _, _) = timeline.place(monotonic_now().saturating_sub(STALL), 0);
+                (pad, 0, 0, Vec::new())
             }
             Err(RecvTimeoutError::Disconnected) => break,
         };
         if pad > 0 {
             warn!("audio timeline gap: {pad} frames of silence inserted");
             enc.push(&vec![0.0; pad * ch]);
+        }
+        for _ in 0..repeat {
+            enc.push(samples.get(..ch).unwrap_or_default());
         }
         enc.push(samples.get(skip * ch..).unwrap_or_default());
     }
@@ -333,24 +377,69 @@ mod tests {
     #[test]
     fn timeline_pads_gaps_and_drops_overlaps() {
         let anchor = Duration::from_secs(100);
-        let mut t = Timeline { anchor, frames: 0 };
+        let mut t = Timeline::new(anchor);
         // Within tolerance: taken as is.
-        assert_eq!(t.place(anchor + Duration::from_millis(10), 960), (0, 0));
+        assert_eq!(t.place(anchor + Duration::from_millis(10), 960), (0, 0, 0));
         assert_eq!(t.frames, 960);
         // 100 ms gap after the expected 20 ms: 4800 frames of silence.
         assert_eq!(
             t.place(anchor + Duration::from_millis(120), 960),
-            (4_800, 0)
+            (4_800, 0, 0)
         );
         assert_eq!(t.frames, 960 + 4_800 + 960);
         // Expected at 140 ms, buffer claims 90 ms: drop 50 ms of it.
         assert_eq!(
             t.place(anchor + Duration::from_millis(90), 4_800),
-            (0, 2_400)
+            (0, 2_400, 0)
         );
         assert_eq!(t.frames, 960 + 4_800 + 960 + 2_400);
         // Drops never exceed the buffer.
-        assert_eq!(t.place(anchor, 10), (0, 10));
+        assert_eq!(t.place(anchor, 10), (0, 10, 0));
+    }
+
+    /// Feeds 1 h of 20 ms buffers from a device clock `ppm` off the monotonic
+    /// clock, with ±1 ms of timestamp jitter. Returns the timeline, the end
+    /// time and the worst error of a buffer's pts, in ns.
+    fn run_drift(ppm: f64) -> (Timeline, f64, f64) {
+        let anchor = Duration::from_secs(1_000);
+        let mut t = Timeline::new(anchor);
+        let len = 960;
+        let frame_ns = 1e9 / f64::from(SAMPLE_RATE);
+        // A fast device clock fits 960 frames in less real time.
+        let buf_ns = len as f64 * frame_ns / (1.0 + ppm * 1e-6);
+        let mut worst = 0.0f64;
+        let mut true_start = anchor.as_nanos() as f64;
+        for i in 0..180_000u64 {
+            let jitter_ns = ((i * 7_919) % 2_001) as f64 * 1_000.0 - 1e6;
+            let start = Duration::from_nanos((true_start + jitter_ns) as u64);
+            let (pad, skip, repeat) = t.place(start, len);
+            assert_eq!(pad, 0, "jump at buffer {i}");
+            assert!(skip + repeat <= 1, "jump at buffer {i}");
+            // pts of the first kept frame against its true capture time.
+            let pts = anchor.as_nanos() as f64 + (t.frames - len + skip) as f64 * frame_ns;
+            let truth = true_start + skip as f64 * buf_ns / len as f64;
+            worst = worst.max((pts - truth).abs());
+            true_start += buf_ns;
+        }
+        (t, true_start, worst)
+    }
+
+    #[test]
+    fn timeline_follows_clock_drift_without_jumps() {
+        for ppm in [100.0, -100.0] {
+            let (_, _, worst) = run_drift(ppm);
+            assert!(worst < 5e6, "{ppm} ppm: worst error {} ms", worst / 1e6);
+        }
+    }
+
+    #[test]
+    fn timeline_still_pads_a_real_gap_after_drift() {
+        let (mut t, end, _) = run_drift(100.0);
+        let gap = Duration::from_nanos(end as u64) + Duration::from_millis(200);
+        let (pad, skip, repeat) = t.place(gap, 960);
+        assert_eq!((skip, repeat), (0, 0));
+        // 200 ms of silence, give or take the 1 ms tracking error.
+        assert!((9_550..=9_650).contains(&pad), "{pad} frames");
     }
 
     #[test]
