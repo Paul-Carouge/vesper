@@ -117,6 +117,8 @@ pub struct Encoder {
     /// Whether a frame reached the encoder (FFmpeg 9 vaapi crashes when
     /// flushing an encoder that never got one).
     started: bool,
+    /// Whether the next picture must be a keyframe ([`Encoder::force_keyframe`]).
+    force_key: bool,
 }
 
 // SAFETY: the FFmpeg/VA objects are owned by this struct and only used through
@@ -152,6 +154,7 @@ impl Encoder {
             imports: HashMap::new(),
             generation: None,
             started: false,
+            force_key: false,
         };
         // On error, `e` is dropped and frees whatever was created so far.
         unsafe {
@@ -441,7 +444,7 @@ impl Encoder {
                 return Err(Error(format!("vaSyncSurface failed: VA status {status}")));
             }
             drop(frame);
-            let ret = ff::avcodec_send_frame(self.enc, self.filtered.0);
+            let ret = self.send_filtered();
             // Keep the NV12 surface (not the producer's buffer) for `repeat`.
             ff::av_frame_unref(self.last.0);
             ff::av_frame_move_ref(self.last.0, self.filtered.0);
@@ -466,11 +469,33 @@ impl Encoder {
                 "ref last frame",
             )?;
             (*self.filtered.0).pts = pts;
-            let ret = ff::avcodec_send_frame(self.enc, self.filtered.0);
+            let ret = self.send_filtered();
             ff::av_frame_unref(self.filtered.0);
             check(ret, "send frame to encoder")?;
         }
         self.drain()
+    }
+
+    /// Makes the next picture given to [`Encoder::encode`] or
+    /// [`Encoder::repeat`] a keyframe (IDR), e.g. so a new file can start there.
+    pub fn force_keyframe(&mut self) {
+        self.force_key = true;
+    }
+
+    /// Sends `filtered` to the encoder, as a keyframe if one was forced.
+    unsafe fn send_filtered(&mut self) -> c_int {
+        unsafe {
+            let f = &mut *self.filtered.0;
+            if std::mem::take(&mut self.force_key) {
+                f.pict_type = ff::AVPictureType::AV_PICTURE_TYPE_I;
+                f.flags |= ff::AV_FRAME_FLAG_KEY as c_int;
+            }
+            let ret = ff::avcodec_send_frame(self.enc, f);
+            // `filtered` becomes `last`, which `repeat` copies: never force twice.
+            f.pict_type = ff::AVPictureType::AV_PICTURE_TYPE_NONE;
+            f.flags &= !(ff::AV_FRAME_FLAG_KEY as c_int);
+            ret
+        }
     }
 
     /// Flushes the encoder and returns the remaining packets. The encoder

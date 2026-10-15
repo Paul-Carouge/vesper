@@ -236,6 +236,8 @@ export component AppWindow inherits Window {
     in-out property <bool> replay-enabled;
     /// One of 30, 60, 120.
     in-out property <int> replay-seconds: 30;
+    /// RAM the buffer may take, e.g. "≈ 640 MB at 4K60 Quality".
+    in property <string> replay-memory;
 
     // ---- Audio --------------------------------------------------------
     in-out property <bool> desktop-muted;
@@ -523,7 +525,7 @@ export component AppWindow inherits Window {
                                 horizontal-stretch: 1;
                                 title: "Replay buffer";
                                 subtitle: root.replay-enabled
-                                    ? "Keeping the last \{root.replay-seconds < 60 ? root.replay-seconds + " s" : root.replay-seconds / 60 + " min"} in memory"
+                                    ? "Last \{root.replay-seconds < 60 ? root.replay-seconds + " s" : root.replay-seconds / 60 + " min"}, \{root.replay-memory}"
                                     : "Off. Turn on to save moments after they happen";
                             }
                             VerticalLayout {
