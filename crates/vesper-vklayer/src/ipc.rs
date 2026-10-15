@@ -186,6 +186,14 @@ enum Wake {
 
 /// An inotify fd watching `dir` for new entries. None if `dir` does not exist
 /// (Vesper never ran since boot) or inotify is unavailable.
+///
+/// Costs one inotify instance per process with a capturable swapchain (the
+/// IPC thread starts with the first one), counted against
+/// `fs.inotify.max_user_instances`
+/// (often 128 or 1024). Past that limit `inotify_init1` fails with `EMFILE`
+/// and that process falls back to trying to connect once per second, as
+/// before inotify; other apps' watches are not affected beyond sharing the
+/// limit.
 fn watch_dir(dir: &Path) -> Option<OwnedFd> {
     let fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC) };
     if fd < 0 {

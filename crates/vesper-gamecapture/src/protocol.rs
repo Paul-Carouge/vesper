@@ -275,8 +275,9 @@ pub struct Pacer {
     /// Next tick to serve.
     next: u64,
     last_present: u64,
-    /// Smoothed time between presents.
-    interval: u64,
+    /// Longest recent time between presents (rises at once, decays
+    /// slowly): irregular frame times must not fall through the window.
+    gap: u64,
     /// Time from a present to its copy being done on the GPU (rises at once,
     /// decays slowly).
     latency: u64,
@@ -289,7 +290,7 @@ impl Pacer {
             fps,
             next: 0,
             last_present: 0,
-            interval: 0,
+            gap: 0,
             latency: 0,
         }
     }
@@ -297,27 +298,25 @@ impl Pacer {
     /// Whether to copy the frame presented at `now_ns` (`CLOCK_MONOTONIC`).
     /// Call once per present; call [`Pacer::copied`] once it was sent.
     pub fn due(&mut self, now_ns: u64) -> bool {
-        if self.last_present != 0 {
-            let dt = now_ns.saturating_sub(self.last_present);
-            self.interval = if self.interval == 0 {
-                dt
-            } else {
-                (self.interval * 7 + dt) / 8
-            };
+        let period = tick_ns(1, self.fps);
+        let dt = now_ns.saturating_sub(self.last_present);
+        // A pause (alt-tab, loading) says nothing about the frame pacing.
+        if self.last_present != 0 && dt <= 4 * period {
+            self.gap = dt.max((self.gap * 15 + dt) / 16);
         }
         self.last_present = now_ns;
         if self.fps == 0 {
             return true;
         }
-        let period = tick_ns(1, self.fps);
         // Copy the first present in a window ending `lead` before the next
         // tick (time for the copy and its delivery: `latency` is seen at the
         // next present, so it overestimates) and wide enough to hold a
-        // present despite jitter. It must not reach back to the previous
-        // tick, or the copy would serve that one: a game too slow for such a
-        // window gets every frame copied.
+        // present: longer than the longest recent gap between presents. It
+        // must not reach back to the previous tick, or the copy would serve
+        // that one: a game too slow or irregular for such a window gets every
+        // frame copied.
         let lead = self.latency.max(period / 4);
-        let window = (self.interval + self.interval / 8).max(period / 8);
+        let window = (self.gap + self.gap / 16).max(period / 8);
         if lead + window > period {
             return true;
         }
@@ -333,6 +332,13 @@ impl Pacer {
 
     /// A copy was seen done `ns` after its present.
     pub fn latency(&mut self, ns: u64) {
+        let period = tick_ns(1, self.fps);
+        // Seen after a pause: not the copy's latency.
+        if ns > 4 * period {
+            return;
+        }
+        // A period or more means every frame is copied already.
+        let ns = ns.min(period);
         self.latency = ns.max((self.latency * 15 + ns) / 16);
     }
 }
@@ -555,10 +561,18 @@ pub fn is_dmabuf(fd: BorrowedFd) -> bool {
     }
 }
 
-/// Whether `fd` is a sync_file: only those answer `SYNC_IOC_FILE_INFO`.
-/// One ioctl, where reading its `/proc/self/fd` link costs a path walk and
-/// allocations on every frame.
+/// Whether `fd` is a sync_file: an anonymous inode that answers
+/// `SYNC_IOC_FILE_INFO`. Two syscalls, where reading its `/proc/self/fd`
+/// link costs a path walk and allocations on every frame.
 pub fn is_sync_file(fd: BorrowedFd) -> bool {
+    // Only anonymous inodes get the ioctl: on a FUSE file it could block.
+    const ANON_INODE_FS_MAGIC: libc::c_long = 0x0904_1934;
+    let mut st: libc::statfs = unsafe { zeroed() };
+    if unsafe { libc::fstatfs(fd.as_raw_fd(), &mut st) } != 0
+        || st.f_type as libc::c_long != ANON_INODE_FS_MAGIC
+    {
+        return false;
+    }
     /// `struct sync_file_info` from `linux/sync_file.h`.
     #[repr(C)]
     struct SyncFileInfo {
@@ -716,24 +730,41 @@ mod tests {
         assert!(Msg::decode(&no_planes).is_err());
     }
 
-    /// Presents at `game` fps (each up to `jitter` ns early or late) for 10 s,
-    /// paced to `pacer_fps`; each copy is done and reaches the recorder `lat`
-    /// ns later (seen done by the layer at the next present), and the
-    /// recorder ticks at `fps`. Returns (copies, ticks, ticks without a new
-    /// frame), after the first second.
-    fn pace(pacer_fps: u32, game: f64, jitter: u64, lat: u64, fps: u32, phase: u64) -> [u64; 3] {
+    /// Presents with frame times cycling through `frames` (ms, each up to
+    /// `jitter` ns early or late) for 10 s, with a 3 s pause after 4 s if
+    /// `pause`, paced to `pacer_fps`; each copy is done and reaches the
+    /// recorder `lat` ns later (seen done by the layer at the next present),
+    /// and the recorder ticks at `fps`. Returns (copies, ticks, ticks without
+    /// a new frame) over the last 2 s.
+    #[allow(clippy::too_many_arguments)]
+    fn pace(
+        pacer_fps: u32,
+        frames: &[f64],
+        jitter: u64,
+        lat: u64,
+        fps: u32,
+        phase: u64,
+        pause: bool,
+    ) -> [u64; 3] {
         let mut pacer = Pacer::new(pacer_fps);
         let start = 1_000_000_000_000 + phase;
         let end = start + 10_000_000_000;
         let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
         let mut arrivals = Vec::new();
         let mut in_flight = None;
+        let mut base = start as f64;
         for j in 0.. {
             seed = seed
                 .wrapping_mul(6_364_136_223_846_793_005)
                 .wrapping_add(1_442_695_040_888_963_407);
-            let t =
-                start + (j as f64 * 1e9 / game) as u64 + (seed >> 33) % (2 * jitter + 1) - jitter;
+            base += frames[j % frames.len()] * 1e6;
+            if pause
+                && (base as u64) > start + 4_000_000_000
+                && (base as u64) < start + 7_000_000_000
+            {
+                continue;
+            }
+            let t = base as u64 + (seed >> 33) % (2 * jitter + 1) - jitter;
             if t > end {
                 break;
             }
@@ -749,7 +780,7 @@ mod tests {
                 in_flight.get_or_insert(t);
             }
         }
-        let (first, last) = (tick_at(start + 1_000_000_000, fps), tick_at(end, fps));
+        let (first, last) = (tick_at(end - 2_000_000_000, fps), tick_at(end, fps));
         let (mut copies, mut repeats, mut a) = (0, 0, 0);
         while arrivals[a] <= tick_ns(first, fps) {
             a += 1;
@@ -777,50 +808,67 @@ mod tests {
 
     #[test]
     fn pacing_copies_one_frame_per_tick_without_repeats() {
-        // (game fps, jitter ms, recording fps)
+        // (frame times ms, cycled; jitter ms; recording fps)
+        let fps_of = |f: f64| vec![1000.0 / f];
         let cases = [
-            (60.0, 0.5, 60),
-            (60.0, 2.0, 60),
-            (57.0, 0.5, 60),
-            (62.0, 0.5, 60),
-            (70.0, 0.5, 60),
-            (90.0, 0.5, 60),
-            (120.0, 0.5, 60),
-            (144.0, 0.0, 60),
-            (144.0, 1.0, 60),
-            (240.0, 0.3, 60),
-            (1685.0, 0.1, 60),
-            (60.0, 0.5, 30),
-            (144.0, 0.3, 144),
-            (140.0, 0.3, 144),
-            (200.0, 0.3, 144),
-            (240.0, 0.3, 144),
-            (500.0, 0.1, 144),
+            (fps_of(60.0), 0.5, 60),
+            (fps_of(60.0), 2.0, 60),
+            (fps_of(57.0), 0.5, 60),
+            (fps_of(62.0), 0.5, 60),
+            (fps_of(70.0), 0.5, 60),
+            (fps_of(90.0), 0.5, 60),
+            (fps_of(120.0), 0.5, 60),
+            (fps_of(144.0), 0.0, 60),
+            (fps_of(144.0), 1.0, 60),
+            (fps_of(240.0), 0.3, 60),
+            (fps_of(1685.0), 0.1, 60),
+            (fps_of(60.0), 0.5, 30),
+            (fps_of(144.0), 0.3, 144),
+            (fps_of(140.0), 0.3, 144),
+            (fps_of(200.0), 0.3, 144),
+            (fps_of(240.0), 0.3, 144),
+            (fps_of(500.0), 0.1, 144),
+            // Irregular: bimodal (120 fps on average) and bursts.
+            (vec![3.0, 13.67], 0.2, 60),
+            (vec![1.0, 1.0, 1.0, 20.0], 0.2, 60),
+            (vec![2.0, 4.0], 0.2, 60),
+            (vec![0.5, 0.5, 0.5, 5.0], 0.1, 144),
         ];
-        for (game, jitter, fps) in cases {
+        for (frames, jitter, fps) in cases {
             let jitter = (jitter * 1e6) as u64;
+            let game = 1000.0 * frames.len() as f64 / frames.iter().sum::<f64>();
             for lat in [500_000, 1_000_000, 2_000_000, 5_000_000, 10_000_000] {
-                for phase in 0..16 {
-                    let phase = phase * 1_000_000_000 / 16 / u64::from(fps);
-                    let [all, ticks, all_repeats] = pace(0, game, jitter, lat, fps, phase);
-                    let [copies, _, repeats] = pace(fps, game, jitter, lat, fps, phase);
-                    let case =
-                        format!("game {game} jitter {jitter} lat {lat} rec {fps} phase {phase}");
-                    // Never more repeats than copying every present.
-                    assert!(
-                        repeats <= all_repeats,
-                        "{case}: {repeats} > {all_repeats} repeats"
-                    );
-                    if game <= f64::from(fps) {
-                        // At or below the recording rate every frame is copied.
-                        assert_eq!(copies, all, "{case}");
-                    } else if game > f64::from(fps) * 2.3 && lat < tick_ns(1, fps) / 4 {
-                        // Well above it, with a short copy: about one copy
-                        // per tick. Closer, or a slow copy, copies more.
-                        assert!(
-                            copies <= ticks + ticks / 50,
-                            "{case}: {copies} copies, {ticks} ticks"
+                for pause in [false, true] {
+                    for phase in 0..16 {
+                        let phase = phase * 1_000_000_000 / 16 / u64::from(fps);
+                        let [all, ticks, all_repeats] =
+                            pace(0, &frames, jitter, lat, fps, phase, pause);
+                        let [copies, _, repeats] =
+                            pace(fps, &frames, jitter, lat, fps, phase, pause);
+                        let case = format!(
+                            "frames {frames:?} jitter {jitter} lat {lat} rec {fps} phase {phase} pause {pause}"
                         );
+                        // Never more repeats than copying every present.
+                        assert!(
+                            repeats <= all_repeats,
+                            "{case}: {repeats} > {all_repeats} repeats"
+                        );
+                        if game <= f64::from(fps) {
+                            // At or below the recording rate every frame is copied.
+                            assert_eq!(copies, all, "{case}");
+                        } else if frames.len() == 1
+                            && jitter < 500_000
+                            && game > f64::from(fps) * 2.3
+                            && lat < tick_ns(1, fps) / 4
+                        {
+                            // Regular, well above it, with a short copy (also
+                            // soon after a pause): about one copy per tick.
+                            // Closer, irregular, or a slow copy, copies more.
+                            assert!(
+                                copies <= ticks + ticks / 50,
+                                "{case}: {copies} copies, {ticks} ticks"
+                            );
+                        }
                     }
                 }
             }
