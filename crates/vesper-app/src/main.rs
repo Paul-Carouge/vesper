@@ -755,7 +755,7 @@ fn settings(ui: &AppWindow, games: &Games) -> Settings {
         fps: ui.get_fps().max(1) as u32,
         quality: quality(ui.get_codec(), ui.get_quality()),
         max_bits_per_pixel: max_bits_per_pixel(ui.get_codec(), ui.get_quality()),
-        tracks: audio::tracks_from_ui(ui),
+        tracks: audio::recorded_tracks(ui),
         mix: ui.get_audio_mix(),
     }
 }
@@ -944,7 +944,12 @@ fn default_settings() -> Settings {
         fps: 60,
         quality: quality(VideoCodec::Hevc, QualityPreset::Balanced),
         max_bits_per_pixel: max_bits_per_pixel(VideoCodec::Hevc, QualityPreset::Balanced),
-        tracks: saved.tracks,
+        // On the devices chosen in the settings, as in the UI.
+        tracks: audio::resolve(
+            saved.tracks,
+            &audio::chosen_source(&prefs::Device::choice(saved.desktop_device.as_ref()), false),
+            &audio::chosen_source(&prefs::Device::choice(saved.mic_device.as_ref()), true),
+        ),
         mix: saved.audio_mix,
         game: None,
     }

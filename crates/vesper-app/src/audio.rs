@@ -1,8 +1,11 @@
 //! The Audio card: tracks shown in and read back from the UI, live mute and
-//! volume, the "Add track" source picker, and the level meters.
+//! volume, the source pickers ("Add track", a track's Source, the settings'
+//! audio devices), and the level meters.
 //!
 //! The UI's track list is the truth: the pipeline gets a copy on start, then
-//! live changes (mute, volume, name) or a new list (added, removed, enabled).
+//! live changes (mute, volume, name) or a new list (added, removed, enabled,
+//! another source or device). Desktop audio and Microphone tracks record the
+//! devices chosen in the settings: see [`recorded_tracks`].
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -12,9 +15,23 @@ use slint::{ComponentHandle, Model, ModelRc, VecModel};
 use vesper_audio::{MAX_DB, MIN_DB, Node, NodeWatch, Source};
 
 use crate::meter::{MeterState, visible_change};
-use crate::prefs::{self, Prefs};
+use crate::prefs::{self, Device, Prefs};
 use crate::recorder::{MAX_TRACKS, Pipeline, Track};
-use crate::{AppWindow, AudioTrack, METER_TICK, Shared, SourceOption, TrackKind};
+use crate::{AppWindow, AudioTrack, DeviceChoice, METER_TICK, Shared, SourceOption, TrackKind};
+
+/// Devices and applications, from a [`NodeWatch`] that runs while the UI
+/// shows a list of them, and once at startup for the tracks' device names.
+#[derive(Default)]
+struct Sources {
+    watch: Option<NodeWatch>,
+    /// The latest list; `None` until one came.
+    nodes: Option<Vec<Node>>,
+}
+
+thread_local! {
+    // UI thread only.
+    static SOURCES: RefCell<Sources> = RefCell::default();
+}
 
 /// Volume changes are saved once the slider rests this long.
 const SAVE_DELAY: Duration = Duration::from_millis(400);
@@ -29,10 +46,101 @@ fn kind(source: &Source) -> TrackKind {
     }
 }
 
-fn row(track: &Track) -> AudioTrack {
+/// The source a Desktop audio (`mic` false) or Microphone track records.
+pub fn chosen_source(choice: &DeviceChoice, mic: bool) -> Source {
+    match (choice.name.is_empty(), mic) {
+        (true, false) => Source::Desktop,
+        (true, true) => Source::Microphone,
+        (false, false) => Source::Output(choice.name.to_string()),
+        (false, true) => Source::Input(choice.name.to_string()),
+    }
+}
+
+/// `tracks` with the Desktop audio and Microphone ones on these sources.
+pub fn resolve(mut tracks: Vec<Track>, desktop: &Source, mic: &Source) -> Vec<Track> {
+    for track in &mut tracks {
+        match track.source {
+            Source::Desktop => track.source = desktop.clone(),
+            Source::Microphone => track.source = mic.clone(),
+            _ => {}
+        }
+    }
+    tracks
+}
+
+/// The tracks as they are recorded: Desktop audio and Microphone on the
+/// devices chosen in the settings.
+pub fn recorded_tracks(ui: &AppWindow) -> Vec<Track> {
+    resolve(
+        tracks_from_ui(ui),
+        &chosen_source(&ui.get_desktop_device(), false),
+        &chosen_source(&ui.get_mic_device(), true),
+    )
+}
+
+/// A device's label, and whether it is plugged in (true while unknown).
+fn device_label(source: &Source, fallback: &str, nodes: Option<&[Node]>) -> (String, bool) {
+    match nodes.map(|n| n.iter().find(|n| &n.source == source)) {
+        Some(Some(node)) => (node.label.clone(), true),
+        Some(None) => (fallback.to_owned(), false),
+        None => (fallback.to_owned(), true),
+    }
+}
+
+/// What a track's Source selector shows, and the device of its subtitle.
+fn track_labels(
+    source: &Source,
+    desktop: &DeviceChoice,
+    mic: &DeviceChoice,
+    nodes: Option<&[Node]>,
+) -> (String, String) {
+    let unplugged = |label: String, connected: bool| {
+        if connected {
+            label
+        } else {
+            format!("{label} (disconnected)")
+        }
+    };
+    let chosen = |choice: &DeviceChoice| {
+        if choice.name.is_empty() {
+            String::new()
+        } else {
+            unplugged(choice.label.to_string(), choice.connected)
+        }
+    };
+    match source {
+        Source::Desktop => ("Desktop audio".into(), chosen(desktop)),
+        Source::Microphone => ("Microphone".into(), chosen(mic)),
+        Source::Output(name) | Source::Input(name) => {
+            let (label, connected) = device_label(source, name, nodes);
+            let label = unplugged(label, connected);
+            // Unnamed until listed: the subtitle shows the kind meanwhile.
+            let device = if nodes.is_some() {
+                label.clone()
+            } else {
+                String::new()
+            };
+            (label, device)
+        }
+        Source::App(app) => (app.clone(), String::new()),
+    }
+}
+
+/// Track `track`'s row, its labels from the latest device list.
+fn row(ui: &AppWindow, track: &Track) -> AudioTrack {
+    let (source_label, device) = SOURCES.with(|s| {
+        track_labels(
+            &track.source,
+            &ui.get_desktop_device(),
+            &ui.get_mic_device(),
+            s.borrow().nodes.as_deref(),
+        )
+    });
     AudioTrack {
         name: track.name.as_str().into(),
         source: prefs::audio_source_id(&track.source).into(),
+        source_label: source_label.into(),
+        device: device.into(),
         kind: kind(&track.source),
         enabled: track.enabled,
         muted: track.muted,
@@ -59,7 +167,7 @@ pub fn tracks_from_ui(ui: &AppWindow) -> Vec<Track> {
 }
 
 pub fn show_tracks(ui: &AppWindow, tracks: &[Track]) {
-    let rows: Vec<_> = tracks.iter().map(row).collect();
+    let rows: Vec<_> = tracks.iter().map(|t| row(ui, t)).collect();
     ui.set_tracks(ModelRc::new(VecModel::from(rows)));
     ui.set_max_tracks(MAX_TRACKS as i32);
 }
@@ -81,54 +189,196 @@ fn snap_db(db: f32) -> f32 {
     ((db * 2.0).round() / 2.0).clamp(MIN_DB, MAX_DB)
 }
 
-/// The picker's choices: the defaults, then devices and playing apps.
-fn options(nodes: &[Node], tracks: &[Track]) -> Vec<SourceOption> {
-    let defaults = [
-        Node {
-            source: Source::Desktop,
-            label: "Desktop audio".into(),
-        },
-        Node {
-            source: Source::Microphone,
-            label: "Microphone".into(),
-        },
-    ];
+/// A name the settings can store (not one with a `|`, say).
+fn storable(source: &Source) -> bool {
+    prefs::audio_source_from_id(&prefs::audio_source_id(source)).is_some()
+}
+
+/// Options of a picker, each group headed by `heading`'s name for it.
+fn grouped<'a>(
+    nodes: impl Iterator<Item = (&'a Node, String)>,
+    heading: impl Fn(&Source) -> &'static str,
+    added: impl Fn(&Source) -> bool,
+) -> Vec<SourceOption> {
     let mut section = None;
-    defaults
-        .iter()
-        .chain(nodes)
-        // A name the settings cannot store (e.g. with a `|`) is left out.
-        .filter(|node| prefs::audio_source_from_id(&prefs::audio_source_id(&node.source)).is_some())
-        .map(|node| {
-            let heading = match node.source {
-                Source::Output(_) => "OUTPUT DEVICES",
-                Source::Input(_) => "INPUT DEVICES",
-                Source::App(_) => "APPLICATIONS",
-                _ => "ADD A TRACK",
-            };
+    nodes
+        .filter(|(node, _)| storable(&node.source))
+        .map(|(node, detail)| {
+            let heading = heading(&node.source);
             let first = section.replace(heading) != Some(heading);
             SourceOption {
                 label: node.label.as_str().into(),
                 source: prefs::audio_source_id(&node.source).into(),
                 kind: kind(&node.source),
                 section: if first { heading.into() } else { "".into() },
-                added: tracks.iter().any(|t| t.source == node.source),
+                added: added(&node.source),
+                detail: detail.into(),
             }
         })
         .collect()
 }
 
-fn show_options(ui: &AppWindow, nodes: &[Node]) {
-    let options = options(nodes, &tracks_from_ui(ui));
+fn node(source: Source, label: &str) -> Node {
+    Node {
+        source,
+        label: label.into(),
+        default: false,
+    }
+}
+
+/// "Default" for the system's default device.
+fn default_mark(node: &Node) -> String {
+    if node.default { "Default" } else { "" }.into()
+}
+
+/// The choices of "Add track" and of a track's Source: Desktop audio and
+/// Microphone (with the device they record), then devices and playing apps.
+fn options(
+    nodes: &[Node],
+    tracks: &[Track],
+    desktop: &DeviceChoice,
+    mic: &DeviceChoice,
+) -> Vec<SourceOption> {
+    let device = |choice: &DeviceChoice| match (choice.name.is_empty(), choice.connected) {
+        (true, _) => "System default".into(),
+        (false, true) => choice.label.to_string(),
+        (false, false) => format!("{} (disconnected)", choice.label),
+    };
+    let defaults = [
+        (node(Source::Desktop, "Desktop audio"), device(desktop)),
+        (node(Source::Microphone, "Microphone"), device(mic)),
+    ];
+    let heading = |source: &Source| match source {
+        Source::Output(_) => "OUTPUT DEVICES",
+        Source::Input(_) => "INPUT DEVICES",
+        Source::App(_) => "APPLICATIONS",
+        _ => "DESKTOP AND MICROPHONE",
+    };
+    let listed = nodes.iter().map(|n| (n, default_mark(n)));
+    grouped(
+        defaults.iter().map(|(n, d)| (n, d.clone())).chain(listed),
+        heading,
+        |source| tracks.iter().any(|t| &t.source == source),
+    )
+}
+
+/// The choices of the Desktop audio (`mic` false) or Microphone device: the
+/// system default, then the devices, the chosen one listed even unplugged.
+fn device_options(nodes: &[Node], mic: bool, choice: &DeviceChoice) -> Vec<SourceOption> {
+    let (default, heading) = if mic {
+        (Source::Microphone, "INPUT DEVICES")
+    } else {
+        (Source::Desktop, "OUTPUT DEVICES")
+    };
+    let chosen = chosen_source(choice, mic);
+    let devices = nodes.iter().filter(|n| {
+        matches!(
+            (&n.source, mic),
+            (Source::Output(_), false) | (Source::Input(_), true)
+        )
+    });
+    let missing = (chosen != default && !nodes.iter().any(|n| n.source == chosen))
+        .then(|| node(chosen.clone(), &choice.label));
+    let system = node(default, "System default");
+    let list = std::iter::once((&system, String::new()))
+        .chain(devices.map(|n| (n, default_mark(n))))
+        .chain(missing.iter().map(|n| (n, "Disconnected".into())));
+    grouped(
+        list,
+        |source| {
+            if matches!(source, Source::Desktop | Source::Microphone) {
+                ""
+            } else {
+                heading
+            }
+        },
+        |_| false,
+    )
+}
+
+/// Shows `nodes` in the pickers, the device selectors and the tracks.
+fn show_sources(ui: &AppWindow, nodes: &[Node]) {
+    let plugged = |mut choice: DeviceChoice, mic: bool| {
+        let source = chosen_source(&choice, mic);
+        choice.connected = choice.name.is_empty() || nodes.iter().any(|n| n.source == source);
+        choice
+    };
+    let desktop = plugged(ui.get_desktop_device(), false);
+    let mic = plugged(ui.get_mic_device(), true);
+    let model = |options: Vec<SourceOption>| ModelRc::new(VecModel::from(options));
+    let options = options(nodes, &tracks_from_ui(ui), &desktop, &mic);
     ui.set_apps_playing(options.iter().any(|o| o.kind == TrackKind::App));
-    ui.set_source_options(ModelRc::new(VecModel::from(options)));
+    ui.set_source_options(model(options));
+    ui.set_desktop_device_options(model(device_options(nodes, false, &desktop)));
+    ui.set_mic_device_options(model(device_options(nodes, true, &mic)));
+    ui.set_desktop_device(desktop);
+    ui.set_mic_device(mic);
+    refresh_rows(ui);
+}
+
+/// Shows the latest device list again (after a track or device change), or
+/// just the tracks before any list came.
+fn show_known_sources(ui: &AppWindow) {
+    match SOURCES.with(|s| s.borrow().nodes.clone()) {
+        Some(nodes) => show_sources(ui, &nodes),
+        None => refresh_rows(ui),
+    }
+}
+
+/// Updates the tracks' source labels in place: re-creating the rows would
+/// end a slider drag.
+fn refresh_rows(ui: &AppWindow) {
+    let model = ui.get_tracks();
+    for i in 0..model.row_count() {
+        let Some(mut old) = model.row_data(i) else {
+            continue;
+        };
+        let Some(source) = prefs::audio_source_from_id(&old.source) else {
+            continue;
+        };
+        let new = row(ui, &Track::new("", source));
+        if (&new.source_label, &new.device) != (&old.source_label, &old.device) {
+            (old.source_label, old.device) = (new.source_label, new.device);
+            model.set_row_data(i, old);
+        }
+    }
+}
+
+/// Starts (`on`) or stops watching devices and applications.
+fn watch_sources(ui: &AppWindow, on: bool) {
+    let running = SOURCES.with(|s| s.borrow().watch.is_some());
+    if !on {
+        // Dropped outside the borrow: it joins the watch thread.
+        let watch = SOURCES.with(|s| s.borrow_mut().watch.take());
+        drop(watch);
+        return;
+    }
+    if running {
+        return;
+    }
+    show_known_sources(ui);
+    let weak = ui.as_weak();
+    let started = NodeWatch::start(move |nodes| {
+        let _ = weak.upgrade_in_event_loop(move |ui| {
+            SOURCES.with(|s| s.borrow_mut().nodes = Some(nodes.clone()));
+            show_sources(&ui, &nodes);
+            // The startup listing: once is enough.
+            if !ui.get_watching_sources() {
+                watch_sources(&ui, false);
+            }
+        });
+    });
+    match started {
+        Ok(w) => SOURCES.with(|s| s.borrow_mut().watch = Some(w)),
+        Err(e) => log!("could not list audio devices: {e}"),
+    }
 }
 
 /// Hands a new track list to the running pipeline, if any. It restarts its
 /// audio once nothing records; a new pipeline reads the UI anyway.
 fn apply_tracks(ui: &AppWindow, rec: &Shared) {
     if let Some(p) = rec.borrow().as_ref() {
-        p.set_tracks(tracks_from_ui(ui), ui.get_audio_mix());
+        p.set_tracks(recorded_tracks(ui), ui.get_audio_mix());
     }
 }
 
@@ -243,25 +493,77 @@ pub fn wire(ui: &AppWindow, rec: &Shared) {
         apply_tracks(&ui, &r);
     });
 
-    // Devices and apps are only watched while the picker is open.
     let weak = ui.as_weak();
-    let watch: RefCell<Option<NodeWatch>> = RefCell::new(None);
-    ui.on_track_picker_changed(move |open| {
+    let r = rec.clone();
+    ui.on_track_source_changed(move |i, option| {
         let Some(ui) = weak.upgrade() else { return };
-        if !open {
-            drop(watch.borrow_mut().take());
+        let Some(source) = prefs::audio_source_from_id(&option.source) else {
+            return;
+        };
+        let mut tracks = tracks_from_ui(&ui);
+        let Some(i) = usize::try_from(i).ok().filter(|&i| i < tracks.len()) else {
+            return;
+        };
+        // One track per source, as "Add track" has it.
+        if tracks.iter().any(|t| t.source == source) {
             return;
         }
-        show_options(&ui, &[]);
-        let weak = weak.clone();
-        let started = NodeWatch::start(move |nodes| {
-            let _ = weak.upgrade_in_event_loop(move |ui| show_options(&ui, &nodes));
-        });
-        match started {
-            Ok(w) => *watch.borrow_mut() = Some(w),
-            Err(e) => log!("could not list audio devices: {e}"),
+        log!("track-source: {} ({})", tracks[i].name, option.source);
+        tracks[i].source = source;
+        show_tracks(&ui, &tracks);
+        show_known_sources(&ui);
+        Prefs::from_ui(&ui).save();
+        apply_tracks(&ui, &r);
+    });
+
+    let weak = ui.as_weak();
+    let r = rec.clone();
+    ui.on_device_chosen(move |mic, option| {
+        let Some(ui) = weak.upgrade() else { return };
+        let device = match prefs::audio_source_from_id(&option.source) {
+            Some(Source::Desktop) if !mic => None,
+            Some(Source::Microphone) if mic => None,
+            Some(Source::Output(name)) if !mic => Device::new(&name, &option.label),
+            Some(Source::Input(name)) if mic => Device::new(&name, &option.label),
+            _ => return,
+        };
+        let choice = Device::choice(device.as_ref());
+        let old = if mic {
+            ui.get_mic_device()
+        } else {
+            ui.get_desktop_device()
+        };
+        if choice.name == old.name {
+            return;
+        }
+        log!("device-chosen: {}", option.source);
+        if mic {
+            ui.set_mic_device(choice);
+        } else {
+            ui.set_desktop_device(choice);
+        }
+        show_known_sources(&ui);
+        Prefs::from_ui(&ui).save();
+        // Only the tracks on that device restart.
+        let follows = if mic {
+            Source::Microphone
+        } else {
+            Source::Desktop
+        };
+        if tracks_from_ui(&ui).iter().any(|t| t.source == follows) {
+            apply_tracks(&ui, &r);
         }
     });
+
+    // Devices and apps are watched while a list shows them, and once now
+    // for the tracks' device names.
+    let weak = ui.as_weak();
+    ui.on_sources_watch_changed(move |on| {
+        if let Some(ui) = weak.upgrade() {
+            watch_sources(&ui, on);
+        }
+    });
+    watch_sources(ui, true);
 }
 
 /// Feeds the meters from the pipeline's peaks at ~30 Hz. The timer stops
@@ -341,35 +643,163 @@ mod tests {
         assert_eq!(snap_db(20.0), MAX_DB);
     }
 
+    fn choice(name: &str, label: &str, connected: bool) -> DeviceChoice {
+        DeviceChoice {
+            name: name.into(),
+            label: label.into(),
+            connected,
+        }
+    }
+
+    fn nodes() -> Vec<Node> {
+        vec![
+            node(Source::Output("a".into()), "Headset"),
+            Node {
+                default: true,
+                ..node(Source::Output("b".into()), "Speakers")
+            },
+            node(Source::Input("m".into()), "USB Mic"),
+            node(Source::App("Firefox".into()), "Firefox"),
+            node(Source::App("a|b".into()), "a|b"),
+        ]
+    }
+
+    fn column<T>(options: &[SourceOption], f: impl Fn(&SourceOption) -> T) -> Vec<T> {
+        options.iter().map(f).collect()
+    }
+
     #[test]
     fn picker_groups_sources_and_marks_added_ones() {
-        let nodes = [
-            Node {
-                source: Source::Output("a".into()),
-                label: "Headset".into(),
-            },
-            Node {
-                source: Source::Output("b".into()),
-                label: "Speakers".into(),
-            },
-            Node {
-                source: Source::App("Firefox".into()),
-                label: "Firefox".into(),
-            },
-            Node {
-                source: Source::App("a|b".into()),
-                label: "a|b".into(),
-            },
-        ];
         let tracks = [Track::new("Desktop", Source::Desktop)];
-        let options = options(&nodes, &tracks);
-        let sections: Vec<_> = options.iter().map(|o| o.section.as_str()).collect();
+        let default = choice("", "", true);
+        let mic = choice("m", "USB Mic", true);
+        let options = options(&nodes(), &tracks, &default, &mic);
         assert_eq!(
-            sections,
-            ["ADD A TRACK", "", "OUTPUT DEVICES", "", "APPLICATIONS"]
+            column(&options, |o| o.section.to_string()),
+            [
+                "DESKTOP AND MICROPHONE",
+                "",
+                "OUTPUT DEVICES",
+                "",
+                "INPUT DEVICES",
+                "APPLICATIONS"
+            ]
         );
-        let added: Vec<_> = options.iter().map(|o| o.added).collect();
-        assert_eq!(added, [true, false, false, false, false]);
-        assert_eq!(options[4].source, "app:Firefox");
+        assert_eq!(
+            column(&options, |o| o.added),
+            [true, false, false, false, false, false]
+        );
+        // Desktop and Microphone name their device, the default is marked.
+        assert_eq!(
+            column(&options, |o| o.detail.to_string()),
+            ["System default", "USB Mic", "", "Default", "", ""]
+        );
+        assert_eq!(options[5].source, "app:Firefox");
+    }
+
+    #[test]
+    fn device_selectors_list_their_kind_and_keep_an_unplugged_choice() {
+        let desktop = device_options(&nodes(), false, &choice("", "", true));
+        assert_eq!(
+            column(&desktop, |o| o.label.to_string()),
+            ["System default", "Headset", "Speakers"]
+        );
+        assert_eq!(
+            column(&desktop, |o| o.section.to_string()),
+            ["", "OUTPUT DEVICES", ""]
+        );
+        assert_eq!(
+            column(&desktop, |o| o.detail.to_string()),
+            ["", "", "Default"]
+        );
+        assert_eq!(desktop[0].source, "desktop");
+
+        let gone = choice("usb", "USB Interface", false);
+        let mic = device_options(&nodes(), true, &gone);
+        assert_eq!(
+            column(&mic, |o| (
+                o.label.to_string(),
+                o.source.to_string(),
+                o.detail.to_string()
+            )),
+            [
+                ("System default".into(), "microphone".into(), "".into()),
+                ("USB Mic".into(), "input:m".into(), "".into()),
+                (
+                    "USB Interface".into(),
+                    "input:usb".into(),
+                    "Disconnected".into()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn desktop_and_microphone_tracks_record_the_chosen_devices() {
+        let tracks = vec![
+            Track::new("Desktop", Source::Desktop),
+            Track::new("Mic", Source::Microphone),
+            Track::new("Game", Source::App("game".into())),
+            Track::new("Headset", Source::Output("a".into())),
+        ];
+        let desktop = chosen_source(&choice("dac", "DAC", true), false);
+        let mic = chosen_source(&choice("", "", true), true);
+        let sources: Vec<_> = resolve(tracks.clone(), &desktop, &mic)
+            .into_iter()
+            .map(|t| t.source)
+            .collect();
+        assert_eq!(
+            sources,
+            [
+                Source::Output("dac".into()),
+                Source::Microphone,
+                Source::App("game".into()),
+                Source::Output("a".into()),
+            ]
+        );
+        // The defaults change nothing.
+        assert_eq!(
+            resolve(tracks.clone(), &Source::Desktop, &Source::Microphone),
+            tracks
+        );
+    }
+
+    #[test]
+    fn tracks_name_their_device() {
+        let dac = choice("dac", "Speakers (USB DAC)", true);
+        let none = choice("", "", true);
+        let list = nodes();
+        let labels = |source: Source, desktop: &DeviceChoice, nodes| {
+            track_labels(&source, desktop, &none, nodes)
+        };
+        let pair = |a: &str, b: &str| (a.to_owned(), b.to_owned());
+        assert_eq!(
+            labels(Source::Desktop, &dac, None),
+            pair("Desktop audio", "Speakers (USB DAC)")
+        );
+        assert_eq!(
+            labels(Source::Desktop, &none, None),
+            pair("Desktop audio", "")
+        );
+        let unplugged = choice("dac", "Speakers (USB DAC)", false);
+        assert_eq!(
+            labels(Source::Desktop, &unplugged, Some(&list)),
+            pair("Desktop audio", "Speakers (USB DAC) (disconnected)")
+        );
+        let headset = Source::Output("a".into());
+        assert_eq!(
+            labels(headset.clone(), &none, Some(&list)),
+            pair("Headset", "Headset")
+        );
+        // Not listed yet: the node name, no subtitle; listed and gone: disconnected.
+        assert_eq!(labels(headset, &none, None), pair("a", ""));
+        assert_eq!(
+            labels(Source::Input("x".into()), &none, Some(&list)),
+            pair("x (disconnected)", "x (disconnected)")
+        );
+        assert_eq!(
+            labels(Source::App("Firefox".into()), &none, Some(&list)),
+            pair("Firefox", "")
+        );
     }
 }

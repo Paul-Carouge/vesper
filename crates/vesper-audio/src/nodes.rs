@@ -1,7 +1,7 @@
 //! The devices and applications that can be recorded, from the PipeWire
 //! registry, kept up to date while a [`NodeWatch`] runs.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::sync::mpsc;
@@ -20,6 +20,8 @@ pub struct Node {
     pub source: Source,
     /// Human-readable name, e.g. "Arctis Nova 7 Analog Stereo" or "Firefox".
     pub label: String,
+    /// The system's default output or input device.
+    pub default: bool,
 }
 
 /// The name an application's playback streams are matched by: its
@@ -46,39 +48,76 @@ pub(crate) fn is_app_stream(app: &str, props: &DictRef) -> bool {
             ) == Some(app))
 }
 
+/// The node properties that matter here.
+#[derive(Default)]
+struct Props<'a> {
+    class: &'a str,
+    node_name: Option<&'a str>,
+    description: Option<&'a str>,
+    nick: Option<&'a str>,
+    app_name: Option<&'a str>,
+    binary: Option<&'a str>,
+}
+
 /// What a node offers to record, if anything.
-fn classify(
-    class: &str,
-    node_name: Option<&str>,
-    description: Option<&str>,
-    app_name: Option<&str>,
-    binary: Option<&str>,
-) -> Option<Node> {
-    if class == "Stream/Output/Audio" {
-        let key = app_key(app_name, binary, node_name)?;
+fn classify(p: &Props) -> Option<Node> {
+    if p.class == "Stream/Output/Audio" {
+        let key = app_key(p.app_name, p.binary, p.node_name)?;
         return Some(Node {
             source: Source::App(key.to_owned()),
             label: key.to_owned(),
+            default: false,
         });
     }
-    let name = node_name.filter(|n| !n.is_empty())?.to_owned();
-    let label = description
-        .filter(|d| !d.is_empty())
+    let name = p.node_name.filter(|n| !n.is_empty())?.to_owned();
+    // The friendliest name the device has.
+    let label = [p.description, p.nick]
+        .into_iter()
+        .flatten()
+        .find(|d| !d.is_empty())
         .unwrap_or(&name)
         .to_owned();
-    let source = if class == "Audio/Sink" {
+    let source = if p.class == "Audio/Sink" {
         Source::Output(name)
-    } else if class.starts_with("Audio/Source") {
+    } else if p.class.starts_with("Audio/Source") {
         Source::Input(name)
     } else {
         return None;
     };
-    Some(Node { source, label })
+    Some(Node {
+        source,
+        label,
+        default: false,
+    })
 }
 
-/// Sorted by kind then label, one entry per application.
-fn snapshot(nodes: &BTreeMap<u32, Node>) -> Vec<Node> {
+/// The `node.name` in a `default.audio.sink` or `default.audio.source`
+/// metadata value, `{"name":"alsa_output.x"}`.
+fn default_name(json: &str) -> Option<String> {
+    let rest = json.split_once("\"name\"")?.1.trim_start();
+    let rest = rest.strip_prefix(':')?.trim_start().strip_prefix('"')?;
+    let name = &rest[..rest.find('"')?];
+    // Node names are plain: an escaped one is not worth decoding.
+    (!name.is_empty() && !name.contains('\\')).then(|| name.to_owned())
+}
+
+/// The default output and input devices, by `node.name`.
+#[derive(Default)]
+struct Defaults {
+    sink: Option<String>,
+    source: Option<String>,
+}
+
+/// Sorted by kind then label, one entry per application, defaults marked.
+fn snapshot(nodes: &BTreeMap<u32, Node>, defaults: &Defaults) -> Vec<Node> {
     let mut list: Vec<Node> = nodes.values().cloned().collect();
+    for node in &mut list {
+        node.default = match &node.source {
+            Source::Output(name) => defaults.sink.as_ref() == Some(name),
+            Source::Input(name) => defaults.source.as_ref() == Some(name),
+            _ => false,
+        };
+    }
     let rank = |n: &Node| match n.source {
         Source::Output(_) => 0,
         Source::Input(_) => 1,
@@ -142,34 +181,51 @@ fn run(
         Err(e) => return drop(ready.send(Err(e))),
     };
     let nodes = Rc::new(RefCell::new(BTreeMap::new()));
+    let defaults = Rc::new(RefCell::new(Defaults::default()));
     // Quiet until the first sync: one call with the whole initial list.
     let synced = Rc::new(RefCell::new(false));
     let on_change = Rc::new(on_change);
     let notify = {
-        let (nodes, synced, on_change) = (nodes.clone(), synced.clone(), on_change.clone());
+        let (nodes, defaults, synced) = (nodes.clone(), defaults.clone(), synced.clone());
+        let on_change = on_change.clone();
         move || {
             if *synced.borrow() {
-                on_change(snapshot(&nodes.borrow()));
+                on_change(snapshot(&nodes.borrow(), &defaults.borrow()));
             }
         }
     };
-    let notify = Rc::new(notify);
+    let notify: Rc<dyn Fn()> = Rc::new(notify);
+    // The "default" metadata (the default devices) and its listener.
+    let metadata = Rc::new(RefCell::new(None));
     let _registry_listener = registry
         .add_listener_local()
         .global({
-            let (nodes, notify) = (nodes.clone(), notify.clone());
+            let (nodes, notify, metadata) = (nodes.clone(), notify.clone(), metadata.clone());
+            // Weak: the registry owns this closure.
+            let registry = registry.downgrade();
             move |global| {
+                let Some(props) = global.props else { return };
+                if global.type_ == ObjectType::Metadata
+                    && props.get("metadata.name") == Some("default")
+                    && let Some(registry) = registry.upgrade()
+                {
+                    match watch_defaults(&registry, global, defaults.clone(), notify.clone()) {
+                        Ok(m) => *metadata.borrow_mut() = Some(m),
+                        Err(e) => warn!("cannot watch the default devices: {e}"),
+                    }
+                    return;
+                }
                 if global.type_ != ObjectType::Node {
                     return;
                 }
-                let Some(props) = global.props else { return };
-                let node = classify(
-                    props.get(*pw::keys::MEDIA_CLASS).unwrap_or_default(),
-                    props.get(*pw::keys::NODE_NAME),
-                    props.get(*pw::keys::NODE_DESCRIPTION),
-                    props.get(*pw::keys::APP_NAME),
-                    props.get(*pw::keys::APP_PROCESS_BINARY),
-                );
+                let node = classify(&Props {
+                    class: props.get(*pw::keys::MEDIA_CLASS).unwrap_or_default(),
+                    node_name: props.get(*pw::keys::NODE_NAME),
+                    description: props.get(*pw::keys::NODE_DESCRIPTION),
+                    nick: props.get(*pw::keys::NODE_NICK),
+                    app_name: props.get(*pw::keys::APP_NAME),
+                    binary: props.get(*pw::keys::APP_PROCESS_BINARY),
+                });
                 if let Some(node) = node {
                     nodes.borrow_mut().insert(global.id, node);
                     notify();
@@ -190,13 +246,25 @@ fn run(
         Ok(seq) => seq,
         Err(e) => return drop(ready.send(Err(e.into()))),
     };
+    // The first sync has every global; a second one the default devices of
+    // the metadata bound meanwhile.
+    let (pending, first) = (Cell::new(pending), Cell::new(true));
+    // Weak: the core owns this closure.
+    let weak_core = core.downgrade();
     let _core_listener = core
         .add_listener_local()
         .done(move |id, seq| {
-            if id == pw::core::PW_ID_CORE && seq == pending {
-                *synced.borrow_mut() = true;
-                notify();
+            if id != pw::core::PW_ID_CORE || seq != pending.get() {
+                return;
             }
+            if first.replace(false)
+                && let Some(again) = weak_core.upgrade().and_then(|c| c.sync(0).ok())
+            {
+                pending.set(again);
+                return;
+            }
+            *synced.borrow_mut() = true;
+            notify();
         })
         .register();
     let _stop = stop.attach(mainloop.loop_(), {
@@ -205,6 +273,49 @@ fn run(
     });
     let _ = ready.send(Ok(()));
     mainloop.run();
+    // Before the core it was bound on.
+    drop(metadata.borrow_mut().take());
+}
+
+/// Follows the default devices in the "default" metadata.
+fn watch_defaults(
+    registry: &pw::registry::RegistryRc,
+    global: &pw::registry::GlobalObject<&DictRef>,
+    defaults: Rc<RefCell<Defaults>>,
+    notify: Rc<dyn Fn()>,
+) -> Result<(pw::metadata::Metadata, pw::metadata::MetadataListener)> {
+    let proxy: pw::metadata::Metadata = registry.bind(global)?;
+    let listener = proxy
+        .add_listener_local()
+        .property(move |subject, key, _, value| {
+            if subject != pw::core::PW_ID_CORE {
+                return 0;
+            }
+            let name = value.and_then(default_name);
+            let changed = {
+                let mut d = defaults.borrow_mut();
+                match key {
+                    Some("default.audio.sink") => {
+                        std::mem::replace(&mut d.sink, name.clone()) != name
+                    }
+                    Some("default.audio.source") => {
+                        std::mem::replace(&mut d.source, name.clone()) != name
+                    }
+                    Some(_) => false,
+                    // Every key removed.
+                    None => {
+                        let old = std::mem::take(&mut *d);
+                        old.sink.is_some() || old.source.is_some()
+                    }
+                }
+            };
+            if changed {
+                notify();
+            }
+            0
+        })
+        .register();
+    Ok((proxy, listener))
 }
 
 #[cfg(test)]
@@ -250,65 +361,94 @@ mod tests {
         assert!(is_app_stream("pw-play", bare.as_ref()));
     }
 
-    #[test]
-    fn nodes_are_classified_by_media_class() {
-        let sink = classify(
-            "Audio/Sink",
-            Some("alsa_output.x"),
-            Some("Headset"),
-            None,
-            None,
-        );
-        assert_eq!(
-            sink,
-            Some(Node {
-                source: Source::Output("alsa_output.x".into()),
-                label: "Headset".into()
-            })
-        );
-        let virt = classify("Audio/Source/Virtual", Some("ee_source"), None, None, None);
-        assert_eq!(virt.unwrap().source, Source::Input("ee_source".into()));
-        let app = classify(
-            "Stream/Output/Audio",
-            Some("n"),
-            None,
-            Some("Firefox"),
-            None,
-        );
-        assert_eq!(app.unwrap().source, Source::App("Firefox".into()));
-        assert_eq!(
-            classify("Video/Source", Some("cam"), None, None, None),
-            None
-        );
-        assert_eq!(
-            classify("Stream/Input/Audio", Some("rec"), None, None, None),
-            None
-        );
-        assert_eq!(classify("Audio/Sink", None, Some("x"), None, None), None);
+    fn device(
+        class: &'static str,
+        name: Option<&'static str>,
+        description: Option<&'static str>,
+    ) -> Option<Node> {
+        classify(&Props {
+            class,
+            node_name: name,
+            description,
+            ..Props::default()
+        })
+    }
+
+    fn app(name: &'static str) -> Node {
+        classify(&Props {
+            class: "Stream/Output/Audio",
+            app_name: Some(name),
+            ..Props::default()
+        })
+        .unwrap()
     }
 
     #[test]
-    fn snapshot_lists_each_app_once() {
+    fn nodes_are_classified_by_media_class() {
+        assert_eq!(
+            device("Audio/Sink", Some("alsa_output.x"), Some("Headset")),
+            Some(Node {
+                source: Source::Output("alsa_output.x".into()),
+                label: "Headset".into(),
+                default: false,
+            })
+        );
+        let virt = device("Audio/Source/Virtual", Some("ee_source"), None);
+        assert_eq!(virt.unwrap().source, Source::Input("ee_source".into()));
+        assert_eq!(app("Firefox").source, Source::App("Firefox".into()));
+        assert_eq!(device("Video/Source", Some("cam"), None), None);
+        assert_eq!(device("Stream/Input/Audio", Some("rec"), None), None);
+        assert_eq!(device("Audio/Sink", None, Some("x")), None);
+    }
+
+    #[test]
+    fn devices_get_their_friendliest_name() {
+        let label = |description, nick| {
+            classify(&Props {
+                class: "Audio/Sink",
+                node_name: Some("alsa_output.usb"),
+                description,
+                nick,
+                ..Props::default()
+            })
+            .unwrap()
+            .label
+        };
+        assert_eq!(label(Some("Speakers"), Some("DAC")), "Speakers");
+        assert_eq!(label(Some(""), Some("DAC")), "DAC");
+        assert_eq!(label(None, None), "alsa_output.usb");
+    }
+
+    #[test]
+    fn default_device_names_are_read_from_the_metadata() {
+        assert_eq!(
+            default_name(r#"{"name":"alsa_output.usb-DAC.analog-stereo"}"#).as_deref(),
+            Some("alsa_output.usb-DAC.analog-stereo")
+        );
+        assert_eq!(default_name(r#"{ "name" : "x" }"#).as_deref(), Some("x"));
+        assert_eq!(default_name(r#"{"name":""}"#), None);
+        assert_eq!(default_name(r#"{"name":"a\"b"}"#), None);
+        assert_eq!(default_name("garbage"), None);
+    }
+
+    #[test]
+    fn snapshot_lists_each_app_once_and_marks_defaults() {
         let nodes = BTreeMap::from([
-            (
-                5,
-                classify("Stream/Output/Audio", None, None, Some("Firefox"), None).unwrap(),
-            ),
-            (
-                6,
-                classify("Stream/Output/Audio", None, None, Some("Firefox"), None).unwrap(),
-            ),
-            (
-                7,
-                classify("Audio/Sink", Some("b"), Some("B"), None, None).unwrap(),
-            ),
-            (
-                8,
-                classify("Audio/Sink", Some("a"), Some("A"), None, None).unwrap(),
-            ),
+            (5, app("Firefox")),
+            (6, app("Firefox")),
+            (7, device("Audio/Sink", Some("b"), Some("B")).unwrap()),
+            (8, device("Audio/Sink", Some("a"), Some("A")).unwrap()),
+            (9, device("Audio/Source", Some("m"), Some("Mic")).unwrap()),
         ]);
-        let list = snapshot(&nodes);
-        let labels: Vec<_> = list.iter().map(|n| n.label.as_str()).collect();
-        assert_eq!(labels, ["A", "B", "Firefox"]);
+        let defaults = Defaults {
+            sink: Some("b".into()),
+            source: Some("m".into()),
+        };
+        let list = snapshot(&nodes, &defaults);
+        let labels: Vec<_> = list.iter().map(|n| (n.label.as_str(), n.default)).collect();
+        assert_eq!(
+            labels,
+            [("A", false), ("B", true), ("Mic", true), ("Firefox", false)]
+        );
     }
 }

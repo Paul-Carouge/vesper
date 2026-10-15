@@ -2,7 +2,7 @@
 // owns the truth and writes back the `in` properties.
 
 import { Theme, Icons } from "theme.slint";
-import { Icon, Card, Button, IconButton, Switch, Segmented, Meter, SectionLabel, FocusRing, Slider, TextField } from "components.slint";
+import { Icon, Card, Button, IconButton, Switch, Segmented, Meter, SectionLabel, FocusRing, Slider, TextField, SelectField } from "components.slint";
 
 export { Theme }
 
@@ -15,10 +15,17 @@ export struct FilterParam { index: int, label: string, unit: string, value: floa
 export struct FilterRow { kind: string, title: string, enabled: bool, meters: bool, main: [FilterParam], advanced: [FilterParam] }
 /// A filter the "Add filter" menu offers.
 export struct FilterKind { kind: string, title: string }
-/// One audio track. `source` is the backend's id of what it records.
-export struct AudioTrack { name: string, source: string, kind: TrackKind, enabled: bool, muted: bool, volume-db: float, filters: [FilterRow] }
-/// A source the "Add track" picker offers. `section` heads the first of a group.
-export struct SourceOption { label: string, source: string, kind: TrackKind, section: string, added: bool }
+/// One audio track. `source` is the backend's id of what it records;
+/// `source-label` names it ("Desktop audio", "Headset", "Firefox") and
+/// `device` is the device it records, if named ("Speakers (USB DAC)").
+export struct AudioTrack { name: string, source: string, source-label: string, device: string, kind: TrackKind, enabled: bool, muted: bool, volume-db: float, filters: [FilterRow] }
+/// A source a picker offers. `section` heads the first of a group; `added`:
+/// a track records it; `detail` is shown after the label ("Default",
+/// "Disconnected").
+export struct SourceOption { label: string, source: string, kind: TrackKind, section: string, added: bool, detail: string }
+/// A device chosen for the Desktop audio or Microphone tracks. `name` is its
+/// `node.name`, empty for the system default; `connected`: it is plugged in.
+export struct DeviceChoice { name: string, label: string, connected: bool }
 
 export enum SourceKind { none, screen, window, game }
 /// A game connected through the Vulkan layer that may be captured.
@@ -188,6 +195,17 @@ global TrackText {
             : kind == TrackKind.output ? "Output device"
             : kind == TrackKind.input ? "Input device" : "Application"
     }
+
+    // The device it records ("Speakers (USB DAC)"), else its kind. The icon
+    // and the name tell the kind: the narrow column keeps the device whole.
+    public pure function source(track: AudioTrack) -> string {
+        track.device == "" ? TrackText.kind(track.kind) : track.device
+    }
+
+    // What a device selector shows.
+    public pure function device(choice: DeviceChoice) -> string {
+        choice.name == "" ? "System default" : choice.connected ? choice.label : "\{choice.label} (disconnected)"
+    }
 }
 
 component AudioRow inherits HorizontalLayout {
@@ -230,7 +248,7 @@ component AudioRow inherits HorizontalLayout {
         Text {
             text: !root.track.enabled ? "Not recorded"
                 : root.track.muted ? "Muted"
-                : root.track.volume-db != 0 ? TrackText.volume(root.track.volume-db) : TrackText.kind(root.track.kind);
+                : root.track.volume-db != 0 ? TrackText.volume(root.track.volume-db) : TrackText.source(root.track);
             font-size: Theme.font-caption;
             font-weight: root.track.muted && root.track.enabled ? 600 : 400;
             color: root.track.muted && root.track.enabled ? Theme.rec : Theme.text-muted;
@@ -259,25 +277,42 @@ component AudioRow inherits HorizontalLayout {
     }
 }
 
-// A source in the "Add track" picker.
+// A source in a picker: "Add track" adds it, a selector (`choosing`)
+// picks it, `selected` being the current choice.
 component SourceRow inherits FocusScope {
     in property <SourceOption> option;
+    in property <bool> choosing;
+    in property <bool> selected;
     callback clicked;
+    // Escape: the list closes.
+    callback cancel;
+
+    // A source another track records cannot be picked again.
+    property <bool> taken: root.option.added && !root.selected;
+    property <string> spoken: root.option.detail != "" ? "\{root.option.label} (\{root.option.detail})" : root.option.label;
+    // Desktop audio and Microphone name their device under the label.
+    property <bool> below: root.option.detail != "" && (root.option.kind == TrackKind.desktop || root.option.kind == TrackKind.microphone);
 
     focus-on-click: false;
-    height: 36px;
-    accessible-role: button;
-    accessible-label: root.option.added ? "\{root.option.label} (already a track)" : "Add \{root.option.label}";
-    accessible-enabled: root.enabled && !root.option.added;
+    height: root.below ? 44px : 36px;
+    accessible-role: list-item;
+    accessible-label: root.taken ? "\{root.spoken} (already a track)" : root.choosing ? root.spoken : "Add \{root.spoken}";
+    accessible-item-selectable: root.choosing;
+    accessible-item-selected: root.selected;
+    accessible-enabled: root.enabled && !root.taken;
     accessible-action-default => {
-        if (root.enabled && !root.option.added) {
+        if (root.enabled && !root.taken) {
             root.clicked();
         }
     }
 
     key-pressed(event) => {
         if (event.text == Key.Space || event.text == Key.Return) {
-            if (root.enabled && !root.option.added) { root.clicked(); }
+            if (root.enabled && !root.taken) { root.clicked(); }
+            return accept;
+        }
+        if (event.text == Key.Escape) {
+            root.cancel();
             return accept;
         }
         reject
@@ -298,35 +333,144 @@ component SourceRow inherits FocusScope {
         padding-left: Theme.space-sm;
         padding-right: Theme.space-sm;
         spacing: Theme.space-sm;
-        opacity: root.option.added ? 0.45 : 1;
+        opacity: root.taken ? 0.45 : 1;
         Icon {
             y: (parent.height - self.height) / 2;
             width: 18px;
             height: 18px;
             data: TrackText.icon(root.option.kind, false);
-            tint: Theme.text-muted;
+            tint: root.selected ? Theme.accent : Theme.text-muted;
         }
-        Text {
+        VerticalLayout {
             horizontal-stretch: 1;
-            text: root.option.label;
+            alignment: center;
+            Text {
+                text: root.option.label;
+                font-size: Theme.font-body;
+                font-weight: root.selected ? 600 : 400;
+                color: Theme.text;
+                overflow: elide;
+            }
+            if root.below: Text {
+                text: root.option.detail;
+                font-size: Theme.font-caption;
+                color: Theme.text-muted;
+                overflow: elide;
+            }
+        }
+        // The label keeps most of the row: a long detail elides first.
+        if root.option.detail != "" && !root.below && !root.taken: Text {
+            max-width: 120px;
+            text: root.option.detail;
             vertical-alignment: center;
-            font-size: Theme.font-body;
-            color: Theme.text;
+            font-size: Theme.font-caption;
+            color: root.option.detail == "Disconnected" ? Theme.warn : Theme.text-muted;
             overflow: elide;
         }
-        if root.option.added: Text {
+        if root.taken: Text {
             text: "Added";
             vertical-alignment: center;
             font-size: Theme.font-caption;
             color: Theme.text-muted;
         }
+        if root.selected: Icon {
+            y: (parent.height - self.height) / 2;
+            width: 18px;
+            height: 18px;
+            data: Icons.check;
+            tint: Theme.accent;
+        }
     }
 
     touch := TouchArea {
-        enabled: root.enabled && !root.option.added;
+        enabled: root.enabled && !root.taken;
         mouse-cursor: self.enabled ? pointer : default;
         clicked => {
             root.clicked();
+        }
+    }
+}
+
+// The rows of a picker under their section headings. `current`: the
+// source a selector (`choosing`) has now.
+component SourceList inherits VerticalLayout {
+    in property <[SourceOption]> options;
+    in property <bool> choosing;
+    in property <string> current;
+    in property <string> label;
+    callback picked(SourceOption);
+    callback cancel;
+
+    spacing: 2px;
+    accessible-role: list;
+    accessible-label: root.label;
+    for option in root.options: VerticalLayout {
+        spacing: 2px;
+        if option.section != "": SectionLabel {
+            x: Theme.space-sm;
+            height: 24px;
+            vertical-alignment: bottom;
+            text: option.section;
+        }
+        SourceRow {
+            option: option;
+            choosing: root.choosing;
+            selected: root.choosing && option.source == root.current;
+            clicked => {
+                root.picked(option);
+            }
+            cancel => {
+                root.cancel();
+            }
+        }
+    }
+}
+
+// A device selector of the settings: its name, the choice, and the list of
+// devices while it is open.
+component DevicePicker inherits VerticalLayout {
+    in property <string> title;
+    in property <DeviceChoice> choice;
+    in property <[SourceOption]> options;
+    in property <bool> locked;
+    // The default entry's source id ("desktop", "microphone").
+    in property <string> default-source;
+    // Stateless: the parent owns `open` and updates it from `opened`.
+    in property <bool> open;
+    callback opened(bool);
+    callback chosen(SourceOption);
+
+    spacing: Theme.space-xs;
+    Text {
+        text: root.title;
+        font-size: Theme.font-small;
+        font-weight: 600;
+        color: Theme.text;
+    }
+    field := SelectField {
+        label: root.title;
+        text: TrackText.device(root.choice);
+        warn: !root.choice.connected;
+        expanded: root.open;
+        enabled: !root.locked;
+        description: root.locked ? "Locked while recording" : !root.choice.connected ? "Disconnected: recorded again once it is back" : "";
+        clicked => {
+            root.opened(!root.open);
+        }
+    }
+    if root.open: SourceList {
+        options: root.options;
+        choosing: true;
+        current: root.choice.name == "" ? root.default-source : (root.default-source == "desktop" ? "output:" : "input:") + root.choice.name;
+        label: root.title;
+        picked(option) => {
+            root.opened(false);
+            field.focus();
+            root.chosen(option);
+        }
+        cancel => {
+            root.opened(false);
+            field.focus();
         }
     }
 }
@@ -647,8 +791,15 @@ export component AppWindow inherits Window {
     /// Linear levels of each track, 0..1.
     in property <[float]> track-levels;
     in property <[float]> track-peaks;
-    /// What "Add track" offers, kept current while the picker is open.
+    /// What "Add track" and a track's Source offer, kept current while
+    /// `watching-sources`.
     in property <[SourceOption]> source-options;
+    /// Devices the Desktop audio and Microphone tracks record.
+    in property <DeviceChoice> desktop-device: { connected: true };
+    in property <DeviceChoice> mic-device: { connected: true };
+    /// What the device selectors offer, kept current while `watching-sources`.
+    in property <[SourceOption]> desktop-device-options;
+    in property <[SourceOption]> mic-device-options;
     /// `source-options` lists applications.
     in property <bool> apps-playing;
     in property <int> max-tracks: 8;
@@ -696,9 +847,14 @@ export component AppWindow inherits Window {
     callback track-renamed(int, string);
     callback track-enabled-changed(int, bool);
     callback track-removed(int);
-    /// The picker opened or closed: the backend watches sources meanwhile.
-    callback track-picker-changed(bool);
+    /// A list of sources or devices is shown (or none any more): the backend
+    /// watches them meanwhile.
+    callback sources-watch-changed(bool);
     callback track-added(SourceOption);
+    /// Track `i` records this source from now on.
+    callback track-source-changed(int, SourceOption);
+    /// The Microphone (true) or Desktop audio (false) device was chosen.
+    callback device-chosen(bool, SourceOption);
     callback filter-toggled(int, int, bool);
     callback filter-param-changed(int, int, int, float);
     /// Track, filter, then -1 (up) or 1 (down).
@@ -759,6 +915,15 @@ export component AppWindow inherits Window {
     // A name being typed in the open track's field, not committed yet.
     property <string> name-draft;
     property <int> name-draft-track: -1;
+    // The open track's Source list is shown.
+    property <bool> choosing-source;
+    // The settings' device list shown: 1 Desktop audio, 2 Microphone, 0 none.
+    property <int> device-list;
+    // A list of sources or devices is shown: the backend keeps them current.
+    out property <bool> watching-sources: root.picking || root.choosing-source || root.settings-open;
+    changed watching-sources => {
+        root.sources-watch-changed(self.watching-sources);
+    }
 
     // Closes the open track's settings; a name being typed is kept.
     function close-track() {
@@ -768,19 +933,35 @@ export component AppWindow inherits Window {
         }
         root.open-track = -1;
         root.adding-filter = false;
+        root.choosing-source = false;
         root.filter-focus = -1;
     }
 
     function set-picking(on: bool) {
         root.close-track();
         root.picking = on;
-        root.track-picker-changed(on);
     }
 
     public function open-track-settings(i: int) {
         root.close-track();
         root.picking = false;
         root.open-track = i;
+    }
+
+    // Opens the settings with a device list shown (see `device-list`).
+    public function open-device-list(list: int) {
+        root.settings-open = true;
+        if (!root.active) {
+            root.device-list = list;
+        }
+    }
+
+    // Opens track `i`'s settings with its Source list shown.
+    public function open-track-source(i: int) {
+        if (!root.active) {
+            root.open-track-settings(i);
+            root.choosing-source = true;
+        }
     }
 
     public function open-track-picker() {
@@ -793,6 +974,10 @@ export component AppWindow inherits Window {
     changed active => {
         if (root.active && root.picking) {
             root.set-picking(false);
+        }
+        if (root.active) {
+            root.choosing-source = false;
+            root.device-list = 0;
         }
     }
 
@@ -848,6 +1033,7 @@ export component AppWindow inherits Window {
 
     function close-settings() {
         root.settings-open = false;
+        root.device-list = 0;
         settings-button.focus();
     }
 
@@ -1294,6 +1480,51 @@ export component AppWindow inherits Window {
                                         root.name-draft-track = name != track.name ? i : -1;
                                     }
                                 }
+                                // What it records: same choices as "Add track".
+                                HorizontalLayout {
+                                    spacing: Theme.space-md;
+                                    Text {
+                                        width: 52px;
+                                        text: "Source";
+                                        vertical-alignment: center;
+                                        font-size: Theme.font-small;
+                                        color: Theme.text-muted;
+                                    }
+                                    source-field := SelectField {
+                                        horizontal-stretch: 1;
+                                        label: "Source of \{track.name}";
+                                        text: track.source-label;
+                                        icon: TrackText.icon(track.kind, false);
+                                        expanded: root.choosing-source;
+                                        enabled: !root.active;
+                                        description: root.active ? "Locked while recording" : "";
+                                        clicked => {
+                                            root.adding-filter = false;
+                                            root.choosing-source = !root.choosing-source;
+                                        }
+                                    }
+                                }
+                                if root.active: Text {
+                                    text: "Source, name and recording are locked while recording.";
+                                    font-size: Theme.font-small;
+                                    color: Theme.text-muted;
+                                    wrap: word-wrap;
+                                }
+                                if root.choosing-source: SourceList {
+                                    options: root.source-options;
+                                    choosing: true;
+                                    current: track.source;
+                                    label: "Sources for \{track.name}";
+                                    picked(option) => {
+                                        root.choosing-source = false;
+                                        source-field.focus();
+                                        root.track-source-changed(i, option);
+                                    }
+                                    cancel => {
+                                        root.choosing-source = false;
+                                        source-field.focus();
+                                    }
+                                }
                                 HorizontalLayout {
                                     spacing: Theme.space-md;
                                     Slider {
@@ -1432,22 +1663,15 @@ export component AppWindow inherits Window {
                             padding-left: Theme.card-padding - Theme.space-xs - Theme.space-sm;
                             padding-bottom: Theme.space-xs;
                             spacing: 2px;
-                            accessible-role: list;
-                            accessible-label: "Sources";
-                            for option in root.source-options: VerticalLayout {
-                                spacing: 2px;
-                                if option.section != "": SectionLabel {
-                                    x: Theme.space-sm;
-                                    height: 24px;
-                                    vertical-alignment: bottom;
-                                    text: option.section;
+                            SourceList {
+                                options: root.source-options;
+                                label: "Sources";
+                                picked(option) => {
+                                    root.set-picking(false);
+                                    root.track-added(option);
                                 }
-                                SourceRow {
-                                    option: option;
-                                    clicked => {
-                                        root.set-picking(false);
-                                        root.track-added(option);
-                                    }
+                                cancel => {
+                                    root.set-picking(false);
                                 }
                             }
                             if !root.apps-playing: HorizontalLayout {
@@ -1677,6 +1901,42 @@ export component AppWindow inherits Window {
                             changed(i) => {
                                 root.fps = root.fps-options[i];
                                 root.output-settings-changed();
+                            }
+                        }
+                    }
+
+                    SettingGroup {
+                        label: "AUDIO DEVICES";
+                        hint: "Recorded by the Desktop audio and Microphone tracks. An unplugged device is waited for, never replaced by another one.";
+                        VerticalLayout {
+                            spacing: Theme.space-md;
+                            DevicePicker {
+                                title: "Desktop audio";
+                                choice: root.desktop-device;
+                                options: root.desktop-device-options;
+                                default-source: "desktop";
+                                locked: root.active;
+                                open: root.device-list == 1;
+                                opened(on) => {
+                                    root.device-list = on ? 1 : 0;
+                                }
+                                chosen(option) => {
+                                    root.device-chosen(false, option);
+                                }
+                            }
+                            DevicePicker {
+                                title: "Microphone";
+                                choice: root.mic-device;
+                                options: root.mic-device-options;
+                                default-source: "microphone";
+                                locked: root.active;
+                                open: root.device-list == 2;
+                                opened(on) => {
+                                    root.device-list = on ? 2 : 0;
+                                }
+                                chosen(option) => {
+                                    root.device-chosen(true, option);
+                                }
                             }
                         }
                     }

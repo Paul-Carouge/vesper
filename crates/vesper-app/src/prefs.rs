@@ -35,6 +35,10 @@ pub struct Prefs {
     pub tracks: Vec<Track>,
     /// A mix of all tracks as the first audio track.
     pub audio_mix: bool,
+    /// Output device the Desktop audio tracks record; `None`: the default.
+    pub desktop_device: Option<Device>,
+    /// Input device the Microphone tracks record; `None`: the default.
+    pub mic_device: Option<Device>,
     pub output_folder: String,
     /// Record a game (Vulkan layer) instead of a portal source.
     pub game_source: bool,
@@ -52,6 +56,8 @@ impl Prefs {
             replay_seconds: ui.get_replay_seconds(),
             tracks: crate::audio::tracks_from_ui(ui),
             audio_mix: ui.get_audio_mix(),
+            desktop_device: Device::from_choice(&ui.get_desktop_device()),
+            mic_device: Device::from_choice(&ui.get_mic_device()),
             output_folder: ui.get_output_folder().into(),
             game_source: ui.get_source_kind() == SourceKind::Game,
             allowed_games: ALLOWED_GAMES.lock().unwrap().clone(),
@@ -65,6 +71,9 @@ impl Prefs {
         ui.set_fps(self.fps);
         ui.set_replay_enabled(self.replay_enabled);
         ui.set_replay_seconds(self.replay_seconds);
+        // Before the tracks, which show them.
+        ui.set_desktop_device(Device::choice(self.desktop_device.as_ref()));
+        ui.set_mic_device(Device::choice(self.mic_device.as_ref()));
         crate::audio::show_tracks(ui, &self.tracks);
         ui.set_audio_mix(self.audio_mix);
         ui.set_output_folder(self.output_folder.as_str().into());
@@ -127,6 +136,8 @@ impl Prefs {
                     }
                 }
                 "audio_mix" => set(&mut self.audio_mix, flag(value)),
+                "desktop_device" => set(&mut self.desktop_device, Device::parse(value)),
+                "mic_device" => set(&mut self.mic_device, Device::parse(value)),
                 "output_folder" if Path::new(value).is_absolute() => {
                     self.output_folder = value.to_owned();
                 }
@@ -180,6 +191,14 @@ impl Prefs {
             }
         }
         text += &format!("audio_mix={}\n", self.audio_mix);
+        // Empty: the default device.
+        for (key, device) in [
+            ("desktop_device", &self.desktop_device),
+            ("mic_device", &self.mic_device),
+        ] {
+            let value = device.as_ref().map_or(String::new(), Device::serialize);
+            text += &format!("{key}={value}\n");
+        }
         // A line break would split the line: keep the default folder instead.
         if self.output_folder != default_folder && !self.output_folder.contains(['\n', '\r']) {
             text += &format!("output_folder={}\n", self.output_folder);
@@ -251,7 +270,60 @@ pub fn default_tracks() -> Vec<Track> {
     ]
 }
 
-/// How a source is saved: `desktop`, `microphone`, `output:<node.name>`,
+/// A device chosen in the settings for the Desktop audio or Microphone
+/// tracks: its `node.name`, and its label to show while it is unplugged.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Device {
+    pub name: String,
+    pub label: String,
+}
+
+impl Device {
+    /// A device as the UI holds it; `None` for the default.
+    pub fn from_choice(choice: &crate::DeviceChoice) -> Option<Self> {
+        Self::new(&choice.name, &choice.label)
+    }
+
+    pub fn choice(device: Option<&Self>) -> crate::DeviceChoice {
+        crate::DeviceChoice {
+            name: device.map_or("", |d| &d.name).into(),
+            label: device.map_or("", |d| &d.label).into(),
+            connected: true,
+        }
+    }
+
+    /// `None` unless `name` is one the settings can store. The label is
+    /// kept to one line of at most 128 characters, else is the name.
+    pub fn new(name: &str, label: &str) -> Option<Self> {
+        audio_source_from_id(&format!("output:{name}"))?;
+        let label: String = label
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(128)
+            .collect();
+        let label = label.trim();
+        Some(Self {
+            name: name.to_owned(),
+            label: if label.is_empty() { name } else { label }.to_owned(),
+        })
+    }
+
+    /// `node.name|label`, the label last: it may hold a `|`.
+    fn serialize(&self) -> String {
+        format!("{}|{}", self.name, self.label)
+    }
+
+    /// `Some(None)` for an empty value (the default), `None` if invalid.
+    fn parse(value: &str) -> Option<Option<Self>> {
+        if value.is_empty() {
+            return Some(None);
+        }
+        let (name, label) = value.split_once('|').unwrap_or((value, value));
+        Self::new(name, label).map(Some)
+    }
+}
+
+/// How a source is saved:`desktop`, `microphone`, `output:<node.name>`,
 /// `input:<node.name>` or `app:<application>`.
 pub fn audio_source_id(source: &Source) -> String {
     match source {
@@ -472,6 +544,8 @@ mod tests {
             replay_seconds: 30,
             tracks: default_tracks(),
             audio_mix: true,
+            desktop_device: None,
+            mic_device: None,
             output_folder: DEFAULT.into(),
             game_source: false,
             allowed_games: Vec::new(),
@@ -521,6 +595,8 @@ mod tests {
                 },
             ],
             audio_mix: false,
+            desktop_device: Device::new("alsa_output.usb-DAC.analog-stereo", "Speakers | USB DAC"),
+            mic_device: Device::new("alsa_input.usb-mic", "USB Microphone"),
             output_folder: "/mnt/clips/my folder = 2".into(),
             game_source: true,
             allowed_games: vec!["Game.exe".into(), "a=b c".into()],
@@ -543,6 +619,38 @@ mod tests {
                 ..defaults()
             }
         );
+    }
+
+    #[test]
+    fn audio_devices_are_saved_and_bad_ones_ignored() {
+        let text = changed().serialize(DEFAULT);
+        assert!(
+            text.contains("desktop_device=alsa_output.usb-DAC.analog-stereo|Speakers | USB DAC\n")
+        );
+        // Settings from before device choices: the defaults.
+        let old = "codec=av1\ntracks=\ntrack=true|false|0|desktop|Desktop\n";
+        let prefs = changed().parse(old);
+        assert_eq!(
+            (prefs.desktop_device, prefs.mic_device),
+            (changed().desktop_device, changed().mic_device)
+        );
+        let prefs = defaults().parse(old);
+        assert_eq!((prefs.desktop_device, prefs.mic_device), (None, None));
+        // An empty value is the default; a bad one changes nothing.
+        let prefs = changed().parse("desktop_device=\nmic_device=a|b|c\n");
+        assert_eq!(prefs.desktop_device, None);
+        assert_eq!(prefs.mic_device, Device::new("a", "b|c"));
+        for bad in ["x\u{1}y", "|label"] {
+            let prefs = changed().parse(&format!("mic_device={bad}\n"));
+            assert_eq!(prefs.mic_device, changed().mic_device);
+        }
+        // A missing or unprintable label is the name.
+        assert_eq!(
+            defaults().parse("mic_device=m\n").mic_device,
+            Device::new("m", "m")
+        );
+        assert_eq!(Device::new("m", " \n ").unwrap().label, "m");
+        assert_eq!(Device::new("m", &"x".repeat(300)).unwrap().label.len(), 128);
     }
 
     #[test]

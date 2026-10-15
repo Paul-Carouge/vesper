@@ -8,6 +8,8 @@
 //!   Looks without a capture or a game, for screenshots: `screen-look`,
 //!   `game-look`, `consent-look`, `starting-look`, `stopping-look`, `layer-installed`, `layer-missing`,
 //!   `replay-on`, `replay-off`, `filters-look`; `scroll-end` scrolls the settings to the end.
+//!   `track-source` opens the first track's Source list, `desktop-devices` and
+//!   `mic-devices` a device list of the settings.
 //! - `VESPER_SNAPSHOT=<file.ppm>` saves the window as a PPM image once the
 //!   demo settled, then quits. Nothing outside the window is captured.
 //! - `VESPER_DEMO_DELAY=<ms>` runs `VESPER_DEMO` that long after launch
@@ -174,6 +176,9 @@ pub fn apply(ui: &AppWindow) {
                 "muted" => ui.invoke_track_mute_toggled(1),
                 "track-open" => ui.invoke_open_track_settings(0),
                 "track-picker" => ui.invoke_open_track_picker(),
+                "track-source" => ui.invoke_open_track_source(0),
+                "desktop-devices" => ui.invoke_open_device_list(1),
+                "mic-devices" => ui.invoke_open_device_list(2),
                 "tab" => press_key(&ui, Key::Tab.into(), false),
                 "esc" => press_key(&ui, Key::Escape.into(), false),
                 other => match other.strip_prefix("ctrl+") {
