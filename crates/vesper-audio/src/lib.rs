@@ -6,7 +6,8 @@
 //!
 //! Timestamps come from a sample counter anchored at the start time, so a
 //! track has no gaps. Each PipeWire buffer is also placed on the monotonic
-//! clock (graph cycle time minus device delay minus buffer length); when the
+//! clock (graph cycle time, minus the mic's capture delay or plus the desktop
+//! sink's playback delay, minus queued buffers); when the
 //! counter drifts from that by more than [`TOLERANCE`] (lost buffers, a
 //! suspended device, clock drift), silence is inserted or input dropped.
 
@@ -86,7 +87,8 @@ impl AudioCapture {
             std::slice::from_raw_parts((*ctx).extradata, (*ctx).extradata_size as usize).to_vec()
         };
         let shared = Arc::new(Shared::default());
-        let (chunk_tx, chunk_rx) = mpsc::channel();
+        // ~1 s of buffers at the default quantum.
+        let (chunk_tx, chunk_rx) = mpsc::sync_channel(50);
         let encode_thread = std::thread::Builder::new()
             .name("vesper-audio-enc".into())
             .spawn({
@@ -123,14 +125,6 @@ impl AudioCapture {
     /// `OpusHead` for the container's codec private data.
     pub fn extradata(&self) -> &[u8] {
         &self.extradata
-    }
-
-    pub fn sample_rate(&self) -> u32 {
-        SAMPLE_RATE
-    }
-
-    pub fn channels(&self) -> u16 {
-        CHANNELS
     }
 
     /// Stops the capture and flushes the encoder. Same as dropping it.
@@ -198,6 +192,8 @@ struct Timeline {
 impl Timeline {
     /// Places `len` frames measured to start at `start`. Returns how many
     /// silent frames to insert before them, and how many of them to drop.
+    // shortcut: drift is corrected by 30 ms jumps (silence or a cut, maybe a
+    // click every ~10 min at 50 ppm); resample instead if that is audible.
     fn place(&mut self, start: Duration, len: usize) -> (usize, usize) {
         let expected = self.anchor + frames_to_duration(self.frames);
         let (pad, skip) = if start > expected + TOLERANCE {
@@ -309,18 +305,15 @@ fn encode_loop(
     enc.frame.set_rate(SAMPLE_RATE);
     let ch = usize::from(CHANNELS);
     loop {
-        let (pad, samples) = match rx.recv_timeout(STALL) {
+        let (pad, skip, samples) = match rx.recv_timeout(STALL) {
             Ok(chunk) => {
                 let (pad, skip) = timeline.place(chunk.start, chunk.samples.len() / ch);
-                (
-                    pad,
-                    chunk.samples.get(skip * ch..).unwrap_or_default().to_vec(),
-                )
+                (pad, skip, chunk.samples)
             }
             // Stalled source (no device, suspended): keep the track continuous.
             Err(RecvTimeoutError::Timeout) => {
                 let (pad, _) = timeline.place(monotonic_now().saturating_sub(STALL), 0);
-                (pad, Vec::new())
+                (pad, 0, Vec::new())
             }
             Err(RecvTimeoutError::Disconnected) => break,
         };
@@ -328,7 +321,7 @@ fn encode_loop(
             warn!("audio timeline gap: {pad} frames of silence inserted");
             enc.push(&vec![0.0; pad * ch]);
         }
-        enc.push(&samples);
+        enc.push(samples.get(skip * ch..).unwrap_or_default());
     }
     enc.finish();
 }

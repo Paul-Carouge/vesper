@@ -90,7 +90,9 @@ pub struct Muxer {
     packet: *mut ff::AVPacket,
     start: Duration,
     frame_ns: i64,
-    audio_tracks: usize,
+    /// Opus pre-skip of each audio track: its first packet starts that
+    /// much before the audio it decodes to.
+    pre_skip: Vec<Duration>,
     /// Video is dropped until the first keyframe so the file starts decodable.
     got_keyframe: bool,
     /// Last written pts per stream, in its time base.
@@ -128,7 +130,15 @@ impl Muxer {
             packet: ptr::null_mut(),
             start,
             frame_ns: 1_000_000_000 / video.fps as i64,
-            audio_tracks: audio.len(),
+            pre_skip: audio
+                .iter()
+                .map(|a| {
+                    let samples = u16::from_le_bytes([a.extradata[10], a.extradata[11]]);
+                    Duration::from_nanos(
+                        u64::from(samples) * 1_000_000_000 / u64::from(a.sample_rate),
+                    )
+                })
+                .collect(),
             got_keyframe: false,
             last_pts: vec![i64::MIN; 1 + audio.len()],
         };
@@ -225,12 +235,13 @@ impl Muxer {
     }
 
     /// Writes one Opus packet to audio track `track` (index into the `audio`
-    /// slice given to [`Muxer::create`]). Packets before `start` are dropped.
+    /// slice given to [`Muxer::create`]). Packets ending their pre-skip before
+    /// `start` are dropped; the first Opus packet, `pre_skip` early, is kept.
     pub fn write_audio(&mut self, track: usize, packet: &EncodedPacket) -> Result<(), Error> {
-        if track >= self.audio_tracks {
+        let Some(&pre_skip) = self.pre_skip.get(track) else {
             return Err(Error(format!("no audio track {track}")));
-        }
-        if packet.pts < self.start {
+        };
+        if packet.pts + pre_skip < self.start {
             return Ok(());
         }
         self.write(1 + track, packet, 0)
@@ -242,7 +253,8 @@ impl Muxer {
         packet: &EncodedPacket,
         duration_ns: i64,
     ) -> Result<(), Error> {
-        let pts_ns = i64::try_from((packet.pts - self.start).as_nanos())
+        // Signed: an Opus packet may start up to its pre-skip before `start`.
+        let pts_ns = i64::try_from(packet.pts.as_nanos() as i128 - self.start.as_nanos() as i128)
             .map_err(|_| Error("pts overflow".into()))?;
         let size =
             c_int::try_from(packet.data.len()).map_err(|_| Error("packet too large".into()))?;

@@ -42,9 +42,12 @@ fn muxes_hevc_and_opus_readable_by_libavformat() {
     // Before the recording start: dropped.
     mux.write_audio(0, &opus_packet(start - OPUS_FRAME))
         .unwrap();
+    // The encoder's first packet starts pre-skip (312 samples) early: kept.
+    let pre_skip = Duration::from_nanos(312 * 1_000_000_000 / 48_000);
+    mux.write_audio(0, &opus_packet(start - pre_skip)).unwrap();
 
-    let mut audio_pts = start;
-    let mut audio_sent = 0;
+    let mut audio_pts = start - pre_skip + OPUS_FRAME;
+    let mut audio_sent = 1;
     for t in 0..FRAMES {
         let pts = start + Duration::from_millis(t as u64 * 33);
         let frame = unsafe { producer.frame(t as usize % POOL, t, 0, pts) };

@@ -6,7 +6,7 @@ use std::time::Duration;
 use pipewire as pw;
 use pw::spa;
 use pw::spa::pod::Pod;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::{CHANNELS, Error, SAMPLE_RATE, Source};
 
@@ -42,27 +42,43 @@ fn format_pod() -> Vec<u8> {
     .into_inner()
 }
 
-/// Capture time of the first frame of a buffer of `frames` frames.
+/// Capture time of the first frame of the oldest queued buffer, `frames` long.
 ///
-/// `now` is the start of the current graph cycle, when the driver handed over
-/// the last captured quantum; `delay` is how long samples took to travel from
-/// the device to us. The buffer's first frame is `frames` older than its last.
-fn buffer_start(now_ns: i64, delay: i64, rate: spa::utils::Fraction, frames: usize) -> Duration {
+/// `now` is the start of the last graph cycle and `queued_buffers` counts the
+/// buffers waiting for us, this one included (read before dequeuing): older
+/// ones are a quantum earlier each. `delay` (ticks of `rate`) excludes them.
+///
+/// - Microphone: the newest sample left the device `delay` before `now`.
+/// - Desktop (sink monitor): the newest buffer was mixed at `now` and is heard
+///   `delay` later. We stamp it when it is heard, as the video shows it.
+fn buffer_start(
+    source: Source,
+    now_ns: i64,
+    delay: i64,
+    rate: spa::utils::Fraction,
+    queued_buffers: u32,
+    frames: usize,
+) -> Duration {
     let delay_ns = if rate.denom == 0 {
         0
     } else {
         delay.max(0) as i128 * rate.num as i128 * 1_000_000_000 / rate.denom as i128
     };
     let len_ns = frames as i128 * 1_000_000_000 / SAMPLE_RATE as i128;
-    let start = now_ns as i128 - delay_ns - len_ns;
-    Duration::from_nanos(start.max(0) as u64)
+    // shortcut: assumes backlogged buffers are as long as this one; fine while the quantum is stable.
+    let backlog_ns = i128::from(queued_buffers.max(1) - 1) * len_ns;
+    let newest_start = match source {
+        Source::Microphone => now_ns as i128 - delay_ns - len_ns,
+        Source::Desktop => now_ns as i128 + delay_ns,
+    };
+    Duration::from_nanos((newest_start - backlog_ns).max(0) as u64)
 }
 
 /// Streams `source` into `tx` until `stop` fires. Reports setup success on
 /// `ready` before streaming.
 pub fn run(
     source: Source,
-    tx: mpsc::Sender<Chunk>,
+    tx: mpsc::SyncSender<Chunk>,
     stop: pw::channel::Receiver<()>,
     ready: mpsc::Sender<Result<(), Error>>,
 ) {
@@ -98,7 +114,7 @@ pub fn run(
                     error!("{name}: stream error: {e}");
                 }
             })
-            .process(|stream, tx| {
+            .process(move |stream, tx| {
                 let time = stream.time().ok();
                 let Some(mut buffer) = stream.dequeue_buffer() else {
                     return;
@@ -118,11 +134,20 @@ pub fn run(
                     .collect();
                 let frames = samples.len() / usize::from(CHANNELS);
                 let start = match time {
-                    Some(t) if t.now() > 0 => buffer_start(t.now(), t.delay(), t.rate(), frames),
+                    Some(t) if t.now() > 0 => buffer_start(
+                        source,
+                        t.now(),
+                        t.delay(),
+                        t.rate(),
+                        t.queued_buffers(),
+                        frames,
+                    ),
                     _ => crate::monotonic_now().saturating_sub(crate::frames_to_duration(frames)),
                 };
-                // Fails only while stopping: the encode thread is gone then.
-                let _ = tx.send(Chunk { start, samples });
+                // Never block the PipeWire loop: the timeline fills the hole.
+                if let Err(mpsc::TrySendError::Full(_)) = tx.try_send(Chunk { start, samples }) {
+                    warn!("{name}: encoder is behind, audio buffer dropped");
+                }
             })
             .register()?;
         let pod = format_pod();
@@ -156,19 +181,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn buffer_start_subtracts_delay_and_length() {
+    fn buffer_start_accounts_for_delay_backlog_and_direction() {
         let rate = spa::utils::Fraction {
             num: 1,
             denom: 48_000,
         };
-        // 10 s, 480 frames of delay (10 ms), 960 frames long (20 ms).
-        let start = buffer_start(10_000_000_000, 480, rate, 960);
-        assert_eq!(start, Duration::from_millis(9_970));
-        // A negative delay is ignored.
-        assert_eq!(
-            buffer_start(10_000_000_000, -5, rate, 0),
-            Duration::from_secs(10)
-        );
+        let now = 10_000_000_000;
+        // 480 ticks of delay (10 ms), 960-frame buffers (20 ms), none behind.
+        let mic = buffer_start(Source::Microphone, now, 480, rate, 1, 960);
+        assert_eq!(mic, Duration::from_millis(9_970));
+        let desktop = buffer_start(Source::Desktop, now, 480, rate, 1, 960);
+        assert_eq!(desktop, Duration::from_millis(10_010));
+        // Two newer buffers queued behind this one: it is 40 ms older.
+        let mic = buffer_start(Source::Microphone, now, 480, rate, 3, 960);
+        assert_eq!(mic, Duration::from_millis(9_930));
+        let desktop = buffer_start(Source::Desktop, now, 480, rate, 3, 960);
+        assert_eq!(desktop, Duration::from_millis(9_970));
+        // A negative delay and an empty queue count as zero and one.
+        let mic = buffer_start(Source::Microphone, now, -5, rate, 0, 0);
+        assert_eq!(mic, Duration::from_secs(10));
     }
 
     #[test]
