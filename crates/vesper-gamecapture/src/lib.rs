@@ -809,6 +809,9 @@ fn pollfd(fd: BorrowedFd) -> libc::pollfd {
 }
 
 #[cfg(test)]
+mod fuzz;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::mpsc;

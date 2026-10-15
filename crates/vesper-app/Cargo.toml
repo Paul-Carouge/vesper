@@ -24,5 +24,9 @@ vesper-mux.workspace = true
 vesper-audio.workspace = true
 vesper-gamecapture.workspace = true
 
+[dev-dependencies]
+# The GPU test-pattern producer of vesper-encode's tests, and reading files back.
+ffmpeg-next.workspace = true
+
 [build-dependencies]
 slint-build = "~1.18"
