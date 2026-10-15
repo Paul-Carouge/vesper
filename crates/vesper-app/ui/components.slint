@@ -59,7 +59,7 @@ export component Button inherits FocusScope {
     callback clicked;
 
     focus-on-click: false;
-    min-height: root.small ? 28px : Theme.control-height;
+    min-height: root.small ? Theme.control-height-sm : Theme.control-height;
     min-width: layout.min-width;
     horizontal-stretch: 0;
     accessible-role: button;
@@ -224,6 +224,8 @@ export component Switch inherits FocusScope {
 
     track := Rectangle {
         border-radius: self.height / 2;
+        // Same dimming as a disabled button: visibly not available.
+        opacity: root.enabled ? 1 : 0.4;
         background: root.checked ? Theme.accent : Theme.border-strong;
         animate background { duration: Theme.fast; }
 
@@ -251,6 +253,8 @@ export component Switch inherits FocusScope {
 }
 
 // Mutually exclusive options in a pill. Left/Right arrows move the selection.
+// Every option gets an equal cell, the thumb covers exactly one cell and each
+// label is centered in its cell, whatever the label lengths.
 export component Segmented inherits FocusScope {
     in property <[string]> options;
     in property <string> label;
@@ -258,8 +262,13 @@ export component Segmented inherits FocusScope {
     in property <int> selected;
     callback changed(int);
 
+    property <length> inset: 3px;
+    property <length> cell: (self.width - 2 * self.inset) / max(1, root.options.length);
+
     focus-on-click: false;
-    min-height: 36px;
+    min-height: Theme.segmented-height;
+    preferred-height: Theme.segmented-height;
+    vertical-stretch: 0;
     accessible-role: radio-group;
     accessible-enabled: root.enabled;
     accessible-label: root.label;
@@ -295,12 +304,11 @@ export component Segmented inherits FocusScope {
 
         // Sliding thumb under the selected option.
         Rectangle {
-            property <length> cell: (parent.width - 6px) / max(1, root.options.length);
-            x: 3px + self.cell * root.selected;
-            y: 3px;
-            width: self.cell;
-            height: parent.height - 6px;
-            border-radius: Theme.radius-md - 3px;
+            x: root.inset + root.cell * root.selected;
+            y: root.inset;
+            width: root.cell;
+            height: parent.height - 2 * root.inset;
+            border-radius: Theme.radius-md - root.inset;
             background: Theme.dark ? Theme.surface-pressed : Theme.surface;
             border-width: 1px;
             border-color: Theme.border-strong;
@@ -310,30 +318,33 @@ export component Segmented inherits FocusScope {
             animate x { duration: Theme.medium; easing: ease-out-quart; }
         }
 
-        HorizontalLayout {
-            padding: 3px;
-            for option[i] in root.options: TouchArea {
-                horizontal-stretch: 1;
-                enabled: root.enabled;
-                mouse-cursor: root.enabled ? pointer : default;
-                accessible-role: radio-button;
-                accessible-label: option;
-                accessible-checkable: true;
-                accessible-checked: i == root.selected;
-                accessible-action-default => {
-                    root.select(i);
-                }
-                clicked => {
-                    root.select(i);
-                }
-                Text {
-                    text: option;
-                    horizontal-alignment: center;
-                    vertical-alignment: center;
-                    font-size: Theme.font-small;
-                    font-weight: i == root.selected ? 600 : 500;
-                    color: i == root.selected ? Theme.text : parent.has-hover ? Theme.text : Theme.text-muted;
-                }
+        for option[i] in root.options: TouchArea {
+            x: root.inset + root.cell * i;
+            y: root.inset;
+            width: root.cell;
+            height: parent.height - 2 * root.inset;
+            enabled: root.enabled;
+            mouse-cursor: root.enabled ? pointer : default;
+            accessible-role: radio-button;
+            accessible-label: option;
+            accessible-checkable: true;
+            accessible-checked: i == root.selected;
+            accessible-action-default => {
+                root.select(i);
+            }
+            clicked => {
+                root.select(i);
+            }
+            Text {
+                x: Theme.space-xs;
+                width: parent.width - 2 * Theme.space-xs;
+                text: option;
+                overflow: elide;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                font-size: Theme.font-small;
+                font-weight: i == root.selected ? 600 : 500;
+                color: i == root.selected ? Theme.text : parent.has-hover ? Theme.text : Theme.text-muted;
             }
         }
     }

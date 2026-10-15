@@ -135,6 +135,8 @@ component RecordButton inherits FocusScope {
 component Labeled inherits VerticalLayout {
     in property <string> title;
     in property <string> subtitle;
+    /// Wraps a long subtitle instead of eliding it.
+    in property <bool> wrap-subtitle;
     alignment: center;
     spacing: 2px;
     Text {
@@ -148,6 +150,7 @@ component Labeled inherits VerticalLayout {
         text: root.subtitle;
         font-size: Theme.font-small;
         color: Theme.text-muted;
+        wrap: root.wrap-subtitle ? word-wrap : no-wrap;
         overflow: elide;
     }
 }
@@ -198,7 +201,6 @@ component AudioRow inherits HorizontalLayout {
     VerticalLayout {
         alignment: center;
         horizontal-stretch: 1;
-        padding-right: Theme.space-xs;
         Meter {
             level: root.level;
             peak: root.peak;
@@ -376,6 +378,12 @@ export component AppWindow inherits Window {
         }
     }
 
+    // From the source card in game mode: straight to the layer switch.
+    function open-game-settings() {
+        root.settings-open = true;
+        game-layer-switch.focus();
+    }
+
     function close-settings() {
         root.settings-open = false;
         settings-button.focus();
@@ -429,27 +437,24 @@ export component AppWindow inherits Window {
             main := VerticalLayout {
                 width: flick.width;
                 height: flick.content-height;
-                padding: 20px;
+                padding: Theme.page-padding;
                 padding-top: Theme.space-md;
                 // The status line's 28px row centers its text: 6px more below.
                 padding-bottom: Theme.space-sm;
-                spacing: Theme.space-lg;
+                spacing: Theme.section-gap;
 
                 // ---- Header ------------------------------------------------
+                // Outside the cards, edges line up with the cards' outer edges.
                 HorizontalLayout {
-                    spacing: Theme.space-sm;
+                    spacing: Theme.space-md;
                     alignment: stretch;
-                    Rectangle {
-                        width: 22px;
-                        VerticalLayout {
-                            alignment: center;
-                            Rectangle {
-                                width: 14px;
-                                height: 14px;
-                                x: 4px;
-                                border-radius: 7px;
-                                background: @linear-gradient(135deg, Theme.accent 0%, Theme.rec 100%);
-                            }
+                    VerticalLayout {
+                        alignment: center;
+                        Rectangle {
+                            width: 14px;
+                            height: 14px;
+                            border-radius: 7px;
+                            background: @linear-gradient(135deg, Theme.accent 0%, Theme.rec 100%);
                         }
                     }
                     Text {
@@ -478,7 +483,7 @@ export component AppWindow inherits Window {
                     accessible-role: groupbox;
                     accessible-label: "Allow Vesper to capture \{root.pending-game}?";
                     VerticalLayout {
-                        padding: Theme.space-md;
+                        padding: Theme.card-padding;
                         spacing: Theme.space-sm;
                         Text {
                             text: "Allow Vesper to capture \{root.pending-game}?";
@@ -519,16 +524,13 @@ export component AppWindow inherits Window {
                 // ---- Source ------------------------------------------------
                 Card {
                     VerticalLayout {
-                        padding-bottom: Theme.space-md;
-                        spacing: Theme.space-sm;
+                        padding: Theme.card-padding;
+                        spacing: Theme.space-md;
                         HorizontalLayout {
-                            padding: Theme.space-md;
-                            padding-bottom: 0px;
-                            padding-left: Theme.space-md;
                             spacing: Theme.space-md;
                             Rectangle {
-                                width: 40px;
-                                height: 40px;
+                                width: Theme.control-height;
+                                height: Theme.control-height;
                                 border-radius: Theme.radius-md;
                                 background: root.source-kind == SourceKind.none ? Theme.surface-raised : Theme.accent-soft;
                                 Icon {
@@ -544,7 +546,7 @@ export component AppWindow inherits Window {
                                 subtitle: root.game
                                     ? (root.source-name != ""
                                         ? "Game" + (root.source-detail != "" ? " · " + root.source-detail : "")
-                                        : root.game-layer-installed || root.pending-game != "" ? "Start a Vulkan game" : "Turn on game capture in settings")
+                                        : root.game-layer-installed || root.pending-game != "" ? "Start a Vulkan game" : root.game-layer-available ? "Turn on game capture in settings" : "Game capture layer not built")
                                     : root.source-kind == SourceKind.none
                                         ? "Pick a screen or a window to record"
                                         : root.source-detail != "" ? root.source-detail : root.source-kind == SourceKind.screen ? "Screen" : "Window";
@@ -555,36 +557,34 @@ export component AppWindow inherits Window {
                                         ? "No source selected"
                                         : "Source: " + self.title + ", " + self.subtitle;
                             }
-                            if !root.game: VerticalLayout {
+                            // In game mode without the layer: the way to set it up.
+                            if !root.game || !root.game-layer-installed: VerticalLayout {
                                 alignment: center;
                                 Button {
-                                    text: root.source-kind == SourceKind.none ? "Choose" : "Change";
-                                    kind: root.source-kind == SourceKind.none ? "primary" : "secondary";
+                                    text: root.game ? "Set up" : root.source-kind == SourceKind.none ? "Choose" : "Change";
+                                    kind: root.game || root.source-kind == SourceKind.none ? "primary" : "secondary";
                                     enabled: !root.active && !root.settings-open;
-                                    accessible-label: "Choose source";
+                                    accessible-label: root.game ? "Open the game capture settings" : "Choose source";
                                     clicked => {
-                                        root.pick-source();
+                                        if (root.game) {
+                                            root.open-game-settings();
+                                        } else {
+                                            root.pick-source();
+                                        }
                                     }
                                 }
                             }
                         }
-                        HorizontalLayout {
-                            padding-left: Theme.space-md;
-                            padding-right: Theme.space-md;
-                            Segmented {
-                                horizontal-stretch: 1;
-                                label: "Source type";
-                                enabled: !root.active && !root.settings-open;
-                                options: ["Screen or window", "Game"];
-                                selected: root.game ? 1 : 0;
-                                changed(i) => {
-                                    root.source-mode-changed(i == 1);
-                                }
+                        Segmented {
+                            label: "Source type";
+                            enabled: !root.active && !root.settings-open;
+                            options: ["Screen or window", "Game"];
+                            selected: root.game ? 1 : 0;
+                            changed(i) => {
+                                root.source-mode-changed(i == 1);
                             }
                         }
                         if root.game && root.other-games.length > 0: VerticalLayout {
-                            padding-left: Theme.space-md;
-                            padding-right: Theme.space-md;
                             spacing: Theme.space-xs;
                             Text {
                                 text: "Also running";
@@ -604,7 +604,7 @@ export component AppWindow inherits Window {
                                 }
                                 Button {
                                     text: "Capture";
-                                    kind: "ghost";
+                                    small: true;
                                     enabled: !root.settings-open;
                                     accessible-label: "Capture \{g.name}";
                                     clicked => {
@@ -745,14 +745,19 @@ export component AppWindow inherits Window {
 
                 // ---- Audio -------------------------------------------------
                 Card {
+                    // The mute glyphs line up with the label: their 40px hit
+                    // areas reach into the card padding.
                     VerticalLayout {
-                        padding: Theme.space-lg;
-                        padding-top: Theme.space-md;
+                        padding-top: Theme.card-padding;
                         padding-bottom: Theme.space-sm;
-                        spacing: 0px;
-                        SectionLabel {
-                            text: "AUDIO";
-                            height: 20px;
+                        padding-left: Theme.space-xs;
+                        padding-right: Theme.card-padding;
+                        spacing: Theme.space-xs;
+                        HorizontalLayout {
+                            padding-left: Theme.card-padding - Theme.space-xs;
+                            SectionLabel {
+                                text: "AUDIO";
+                            }
                         }
                         AudioRow {
                             interactive: !root.settings-open;
@@ -789,8 +794,6 @@ export component AppWindow inherits Window {
                 HorizontalLayout {
                     height: 28px;
                     spacing: Theme.space-sm;
-                    padding-left: Theme.space-xs;
-                    padding-right: root.notice-actions ? 0px : Theme.space-xs;
                     if !root.notice-actions: Text {
                         horizontal-stretch: 1;
                         // With a notice beside it, the fps goes first so elision spares it.
@@ -921,9 +924,9 @@ export component AppWindow inherits Window {
                 drawer-body := VerticalLayout {
                     width: drawer-flick.width;
                     height: drawer-flick.content-height;
-                    padding: 20px;
+                    padding: Theme.page-padding;
                     padding-top: Theme.space-md;
-                    spacing: 22px;
+                    spacing: Theme.space-xl;
 
                     HorizontalLayout {
                         Text {
@@ -1010,9 +1013,10 @@ export component AppWindow inherits Window {
                             Labeled {
                                 horizontal-stretch: 1;
                                 title: "Game capture (Vulkan layer)";
+                                wrap-subtitle: true;
                                 subtitle: root.game-layer-outdated
                                     ? "Update available"
-                                    : root.game-layer-installed ? "Installed for this user" : root.game-layer-available ? "Not installed" : "Layer not found next to Vesper";
+                                    : root.game-layer-installed ? "Installed for this user" : root.game-layer-available ? "Not installed" : "Layer not built: install the Vesper package or build the workspace";
                             }
                             if root.game-layer-outdated: VerticalLayout {
                                 alignment: center;
@@ -1026,7 +1030,7 @@ export component AppWindow inherits Window {
                             }
                             VerticalLayout {
                                 alignment: center;
-                                Switch {
+                                game-layer-switch := Switch {
                                     label: "Game capture (Vulkan layer)";
                                     enabled: root.game-layer-installed || root.game-layer-available;
                                     checked: root.game-layer-installed;
