@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+<defs>
+<linearGradient id="t" x1="0" y1="8" x2="0" y2="120" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#2B2C37"/><stop offset="1" stop-color="#0F1015"/></linearGradient>
+<linearGradient id="e" x1="0" y1="8" x2="0" y2="120" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#FFF" stop-opacity=".16"/><stop offset=".4" stop-color="#FFF" stop-opacity=".04"/><stop offset="1" stop-color="#FFF" stop-opacity=".02"/></linearGradient>
+<linearGradient id="g" x1="30" y1="30" x2="98" y2="98" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#A99CFF"/><stop offset=".55" stop-color="#C47DD6"/><stop offset="1" stop-color="#FF5C52"/></linearGradient>
+<radialGradient id="h" cx="88.042" cy="39.958" r="20" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#E9E4FF" stop-opacity=".5"/><stop offset=".35" stop-color="#B9ADFF" stop-opacity=".16"/><stop offset="1" stop-color="#9A8CFF" stop-opacity="0"/></radialGradient>
+<radialGradient id="s" cx="56.35" cy="55.5" r="22.1" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#FFF" stop-opacity=".38"/><stop offset="1" stop-color="#FFF" stop-opacity="0"/></radialGradient>
+</defs>
+<rect x="8" y="9" width="112" height="112" rx="28" fill="#000" fill-opacity=".10"/>
+<rect x="8" y="10" width="112" height="112" rx="28" fill="#000" fill-opacity=".08"/>
+<rect x="8" y="12" width="112" height="112" rx="28" fill="#000" fill-opacity=".05"/>
+<rect x="8" y="8" width="112" height="112" rx="28" fill="url(#t)"/>
+<rect x="8.75" y="8.75" width="110.5" height="110.5" rx="27.25" fill="none" stroke="url(#e)" stroke-width="1.5"/>
+<circle cx="88.042" cy="39.958" r="20" fill="url(#h)"/>
+<path d="M96.336 53.493A34 34 0 1 1 74.507 31.664" fill="none" stroke="url(#g)" stroke-width="8" stroke-linecap="round"/>
+<circle cx="64" cy="64" r="17" fill="url(#g)"/>
+<circle cx="64" cy="64" r="17" fill="url(#s)"/>
+<path d="M88.042 21.958Q90.642 37.358 106.042 39.958Q90.642 42.558 88.042 57.958Q85.442 42.558 70.042 39.958Q85.442 37.358 88.042 21.958Z" fill="#FFFFFF"/>
+</svg>
