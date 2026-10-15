@@ -304,6 +304,21 @@ export component AppWindow inherits Window {
     callback ignore-game();
     callback game-layer-changed(bool);
 
+    // Background: "Start with the session" (autostart entry), and whether a
+    // tray icon keeps Vesper running once the window is closed.
+    in-out property <bool> autostart;
+    in property <bool> tray-available;
+    callback autostart-changed(bool);
+    callback quit();
+    // The tray mirrors these.
+    callback tray-state-changed();
+    changed rec-state => {
+        root.tray-state-changed();
+    }
+    changed replay-enabled => {
+        root.tray-state-changed();
+    }
+
     property <string> codec-name: root.codec == VideoCodec.av1 ? "AV1" : root.codec == VideoCodec.hevc ? "HEVC" : "H.264";
     property <[int]> replay-options: [30, 60, 120];
     property <[int]> fps-options: [30, 60, 120, 144];
@@ -346,6 +361,12 @@ export component AppWindow inherits Window {
         }
     }
 
+    // The tray's Replay buffer item: same path as the switch.
+    public function toggle-replay() {
+        root.replay-enabled = !root.replay-enabled;
+        root.replay-changed(root.replay-enabled, root.replay-seconds);
+    }
+
     function open-settings() {
         root.settings-open = true;
         if (root.active) {
@@ -383,6 +404,10 @@ export component AppWindow inherits Window {
             }
             if (event.modifiers.control && (event.text == "s" || event.text == "S")) {
                 root.request-save-replay();
+                return accept;
+            }
+            if (event.modifiers.control && (event.text == "q" || event.text == "Q")) {
+                root.quit();
                 return accept;
             }
             if (event.modifiers.control && event.text == ",") {
@@ -1062,6 +1087,31 @@ export component AppWindow inherits Window {
                                 accessible-label: "Choose output folder";
                                 clicked => {
                                     root.pick-output-folder();
+                                }
+                            }
+                        }
+                    }
+
+                    SettingGroup {
+                        label: "BACKGROUND";
+                        hint: root.tray-available
+                            ? "Closing the window keeps Vesper in the tray, with the replay buffer running. Quit from the tray menu or with Ctrl+Q."
+                            : "No system tray found: closing the window quits Vesper.";
+                        HorizontalLayout {
+                            spacing: Theme.space-md;
+                            Labeled {
+                                horizontal-stretch: 1;
+                                title: "Start with the session";
+                                subtitle: "Starts hidden in the tray";
+                            }
+                            VerticalLayout {
+                                alignment: center;
+                                Switch {
+                                    label: "Start with the session";
+                                    checked: root.autostart;
+                                    toggled(on) => {
+                                        root.autostart-changed(on);
+                                    }
                                 }
                             }
                         }
