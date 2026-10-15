@@ -1382,6 +1382,17 @@ pub fn clear_restore_token() {
     }
 }
 
+/// vesper-encode's GPU test-pattern producer: synthetic game frames for the
+/// pipeline tests below (skipped without a VAAPI GPU).
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../../vesper-encode/tests/common/mod.rs"]
+mod producer;
+
+#[cfg(test)]
+#[path = "recorder_gpu_tests.rs"]
+mod gpu_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1572,5 +1583,140 @@ mod tests {
         let ts = local_timestamp();
         assert_eq!(ts.len(), 19, "{ts}");
         assert!(!ts.contains(':') && !ts.contains('/'), "{ts}");
+    }
+
+    // --- robustness (audit): the pipeline state machine without GPU or
+    // PipeWire (a game route nobody feeds, no audio tracks) ---
+
+    use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+
+    fn settings() -> Settings {
+        Settings {
+            codec: Codec::Hevc,
+            fps: 60,
+            quality: 28,
+            max_bits_per_pixel: 0.1,
+            tracks: Vec::new(),
+            mix: false,
+            game: Some(GameFrames::default()),
+        }
+    }
+
+    fn start(
+        replay: Option<Duration>,
+        record: Option<PathBuf>,
+        settings: Settings,
+    ) -> (Pipeline, Receiver<Event>) {
+        let (tx, rx) = mpsc::channel();
+        let p = Pipeline::start(settings, replay, record, move |e| drop(tx.send(e))).unwrap();
+        (p, rx)
+    }
+
+    /// Next event within `secs`, or a failure naming what hung.
+    fn next(rx: &Receiver<Event>, secs: u64) -> Event {
+        match rx.recv_timeout(Duration::from_secs(secs)) {
+            Ok(e) => e,
+            Err(RecvTimeoutError::Timeout) => panic!("no event within {secs} s: pipeline hung"),
+            Err(RecvTimeoutError::Disconnected) => panic!("pipeline ended without Stopped"),
+        }
+    }
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("vesper-rec-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn quitting_an_idle_pipeline_is_prompt_and_clean() {
+        let (p, rx) = start(Some(Duration::from_secs(30)), None, settings());
+        assert!(p.record(temp_dir("quit")), "pipeline accepts requests");
+        let t = std::time::Instant::now();
+        p.join();
+        assert!(
+            t.elapsed() < Duration::from_secs(2),
+            "join took {:?}",
+            t.elapsed()
+        );
+        // The pending recording request never started: no file, no Finished
+        // (it ends as "No frame was captured", which the UI ignores on quit).
+        assert!(matches!(next(&rx, 2), Event::Stopped(_)));
+    }
+
+    #[test]
+    fn a_dead_capture_ends_the_pipeline_and_refuses_new_requests() {
+        let s = settings();
+        let route = s.game.clone().unwrap();
+        let (p, rx) = start(Some(Duration::from_secs(30)), None, s);
+        // The game capture server died: its last event is an error.
+        std::thread::sleep(Duration::from_millis(100));
+        route.push(Err("boom".into()));
+        match next(&rx, 3) {
+            Event::Stopped(Some(e)) => assert!(e.contains("boom"), "{e}"),
+            other => panic!("{other:?}"),
+        }
+        // The UI must start a new pipeline: requests report the end.
+        assert!(!p.record(temp_dir("dead")));
+        assert!(!p.save_replay(temp_dir("dead")));
+        assert!(!p.set_replay(None));
+        p.join();
+    }
+
+    #[test]
+    fn a_recording_without_frames_fails_instead_of_waiting_forever() {
+        let dir = temp_dir("noframe");
+        let (p, rx) = start(None, Some(dir.clone()), settings());
+        match next(&rx, FIRST_FRAME_TIMEOUT.as_secs() + 3) {
+            Event::Finished(Err(e)) => assert!(e.contains("No frame"), "{e}"),
+            other => panic!("{other:?}"),
+        }
+        // Nothing runs any more: the pipeline ends on its own, cleanly.
+        assert!(matches!(next(&rx, 3), Event::Stopped(None)));
+        assert!(
+            !dir.exists(),
+            "no folder or file for a recording that never started"
+        );
+        p.join();
+    }
+
+    #[test]
+    fn saving_an_empty_replay_buffer_reports_it() {
+        let (p, rx) = start(Some(Duration::from_secs(30)), None, settings());
+        assert!(p.save_replay(temp_dir("empty")));
+        match next(&rx, 3) {
+            Event::ReplaySaved(Err(e)) => assert!(e.contains("empty"), "{e}"),
+            other => panic!("{other:?}"),
+        }
+        p.join();
+    }
+
+    #[test]
+    fn unusable_output_folders_are_reported_with_their_path() {
+        let video = VideoTrack {
+            codec: Codec::Hevc,
+            width: 64,
+            height: 64,
+            fps: 30,
+            extradata: Vec::new(),
+        };
+        // A file where the folder should be.
+        let base = temp_dir("badfolder");
+        std::fs::create_dir_all(&base).unwrap();
+        let file = base.join("not-a-folder");
+        std::fs::write(&file, b"x").unwrap();
+        let err = create_file(&file, "Vesper", Duration::ZERO, &video, &[])
+            .err()
+            .unwrap();
+        assert!(err.contains("not-a-folder"), "{err}");
+        // The header cannot be written (HEVC needs its parameter sets): the
+        // reserved, empty file must not stay behind.
+        let folder = base.join("clips");
+        let err = create_file(&folder, "Vesper", Duration::ZERO, &video, &[])
+            .err()
+            .unwrap();
+        assert!(err.contains("Could not create"), "{err}");
+        let left: Vec<_> = std::fs::read_dir(&folder).unwrap().collect();
+        assert!(left.is_empty(), "left behind: {left:?}");
+        std::fs::remove_dir_all(base).unwrap();
     }
 }

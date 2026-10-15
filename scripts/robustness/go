@@ -1,0 +1,9 @@
+#!/bin/bash
+# go <labname> <scenario.sh> [args...]  -- runs a scenario in its own namespace, prints filtered output
+LAB=$1
+shift
+S=$1
+shift
+export LAB
+D=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+timeout ${TMO:-110} $D/run.sh $D/$S "$@" 2>&1 | grep -v -E "inotify|portal|dbus-daemon|^$|ignoring unknown child"

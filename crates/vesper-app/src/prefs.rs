@@ -731,4 +731,116 @@ mod tests {
         assert!(!path.with_extension("tmp").exists());
         std::fs::remove_dir_all(dir).unwrap();
     }
+    // --- robustness (audit) ---
+
+    #[test]
+    fn hostile_files_never_panic_and_keep_defaults() {
+        let base = defaults();
+        let mut junk: Vec<String> = vec![
+            String::new(),
+            "\0\0\0".into(),
+            "=".into(),
+            "====\n====\n".into(),
+            "fps=\nreplay_seconds=\n".into(),
+            "track=|||||\ntrack=true|true|NaN|desktop|x\ntrack=true|true|inf|desktop|x\n".into(),
+            "track=true|true|-1e999|desktop|x\n".into(),
+            "output_folder=\n".into(),
+            "output_folder=relative/path\n".into(),
+            "allow_game=\nallow_game= \nallow_game=\u{0}\n".into(),
+            "\u{feff}fps=30\n".into(),
+        ];
+        // Binary garbage, as the lossy UTF-8 decoding in `load` would give it.
+        let mut x = 0x2545_F491_4F6C_DD1Du64;
+        for len in [1usize, 16, 4096, 1 << 20] {
+            let bytes: Vec<u8> = (0..len)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    x as u8
+                })
+                .collect();
+            junk.push(String::from_utf8_lossy(&bytes).into_owned());
+        }
+        for text in &junk {
+            let got = base.clone().parse(text);
+            // Out-of-range or non-finite values never get through.
+            assert!(FPS.contains(&got.fps));
+            assert!(REPLAY_SECONDS.contains(&got.replay_seconds));
+            assert!(got.tracks.len() <= MAX_TRACKS);
+            for t in &got.tracks {
+                assert!(t.volume_db.is_finite() && (MIN_DB..=MAX_DB).contains(&t.volume_db));
+            }
+            assert!(Path::new(&got.output_folder).is_absolute());
+        }
+    }
+
+    #[test]
+    #[ignore = "audit finding (low): parse is quadratic in the allow list"]
+    fn a_huge_allow_list_does_not_stall_startup() {
+        // 40k distinct names (a ~600 KB file) must parse in well under a second.
+        // `parse` checks every new name against the whole list (quadratic).
+        let text: String = (0..40_000).map(|i| format!("allow_game=g{i}\n")).collect();
+        let t = std::time::Instant::now();
+        let got = defaults().parse(&text);
+        let took = t.elapsed();
+        assert_eq!(got.allowed_games.len(), 40_000);
+        assert!(
+            took < std::time::Duration::from_secs(1),
+            "parse took {took:?}"
+        );
+    }
+
+    /// Settings are rewritten on every change from the UI thread, and a
+    /// second instance (no session bus: the guard is off) or a stray `--record`
+    /// can write at once. The shared `settings.tmp` makes a reader see a mix of
+    /// writers: truncated or interleaved content.
+    #[test]
+    #[ignore = "audit finding: write_atomically shares one temp name per target"]
+    fn concurrent_writers_never_tear_the_file() {
+        let dir = std::env::temp_dir().join(format!("vesper-prefs-race-{}", std::process::id()));
+        let path = dir.join("settings");
+        write_atomically(&path, &[b'0'; 64 * 1024]).unwrap();
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let torn = std::thread::scope(|s| {
+            for w in 1..=4u8 {
+                let (path, stop) = (&path, &stop);
+                s.spawn(move || {
+                    let payload = vec![b'0' + w; 64 * 1024];
+                    while !stop.load(Ordering::Relaxed) {
+                        let _ = write_atomically(path, &payload);
+                    }
+                });
+            }
+            let mut torn = None;
+            let end = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            while std::time::Instant::now() < end && torn.is_none() {
+                if let Ok(bytes) = std::fs::read(&path)
+                    && (bytes.len() != 64 * 1024 || bytes.iter().any(|b| *b != bytes[0]))
+                {
+                    torn = Some(bytes.len());
+                }
+            }
+            stop.store(true, Ordering::Relaxed);
+            torn
+        });
+        std::fs::remove_dir_all(dir).unwrap();
+        assert_eq!(torn, None, "a reader saw a torn settings file");
+    }
+
+    #[test]
+    fn unwritable_settings_dir_reports_an_error() {
+        // Not root-proof (root ignores modes): checks the error path only when it applies.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("vesper-prefs-ro-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let result = write_atomically(&dir.join("settings"), b"fps=30\n");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let denied = std::fs::File::create(dir.join("probe")).is_err();
+        std::fs::remove_dir_all(&dir).unwrap();
+        if denied {
+            assert!(result.is_err());
+        }
+    }
 }
