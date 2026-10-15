@@ -9,11 +9,13 @@ macro_rules! log {
     ($($arg:tt)*) => { eprintln!("[vesper] {}", format_args!($($arg)*)) };
 }
 
+mod desktop;
 #[cfg(debug_assertions)]
 mod dev;
 mod game;
 mod layer;
 mod meter;
+mod outputs;
 mod prefs;
 mod recorder;
 mod shortcuts;
@@ -21,14 +23,17 @@ mod shortcuts;
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use slint::ComponentHandle;
+use slint::winit_030::WinitWindowAccessor;
 use vesper_audio::Source;
 
 use game::GameSource;
 use meter::MeterState;
+use outputs::SourceLabel;
 use prefs::Prefs;
 use recorder::{Event, Pipeline, Settings};
 use shortcuts::Action;
@@ -45,6 +50,16 @@ static GENERATION: AtomicU64 = AtomicU64::new(0);
 
 /// The recording was stopped because the captured game closed.
 static GAME_CLOSED: AtomicBool = AtomicBool::new(false);
+
+/// The file the notice's Open and Play buttons act on.
+static NOTICE_FILE: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+/// Bumped by every notice, so an older notice's timer leaves a newer one.
+static NOTICE_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// How long a notice stays: plain ones, and ones with file actions.
+const NOTICE_TIME: Duration = Duration::from_millis(2500);
+const FILE_NOTICE_TIME: Duration = Duration::from_secs(8);
 
 /// Meter refresh period: ~30 Hz.
 const METER_TICK: Duration = Duration::from_millis(33);
@@ -95,6 +110,7 @@ fn main() -> Result<(), slint::PlatformError> {
     }
     ui.set_replay_enabled(true);
     Prefs::load(Prefs::from_ui(&ui)).apply(&ui);
+    show_output_folder(&ui);
     update_replay_memory(&ui);
     show_layer_state(&ui);
 
@@ -228,6 +244,7 @@ fn wire_callbacks(ui: &AppWindow, recording: &Shared, games: &Games) {
         // The portal has no "pick only" call: forget the source so the next
         // recording opens the picker.
         recorder::clear_restore_token();
+        prefs::clear_source();
         ui.set_source_kind(SourceKind::None);
         ui.set_source_name("".into());
         ui.set_source_detail("".into());
@@ -354,8 +371,44 @@ fn wire_callbacks(ui: &AppWindow, recording: &Shared, games: &Games) {
         Prefs::from_ui(&ui).save();
     });
 
-    ui.on_pick_output_folder(|| {
-        log!("pick-output-folder: would open the FileChooser portal");
+    // One dialog at a time: it may stay open for long.
+    static PICKING: AtomicBool = AtomicBool::new(false);
+    let weak = ui.as_weak();
+    ui.on_pick_output_folder(move || {
+        let Some(ui) = weak.upgrade() else { return };
+        if ui.get_rec_state() != RecState::Idle || PICKING.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        log!("pick-output-folder");
+        let weak = weak.clone();
+        let current = PathBuf::from(ui.get_output_folder().as_str());
+        desktop::pick_folder(current, move |result| {
+            PICKING.store(false, Ordering::Relaxed);
+            let _ = weak.upgrade_in_event_loop(move |ui| match result {
+                Ok(Some(folder)) => {
+                    log!("output folder: {}", folder.display());
+                    ui.set_output_folder(folder.to_string_lossy().as_ref().into());
+                    show_output_folder(&ui);
+                    Prefs::from_ui(&ui).save();
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    log!("folder picker: {e}");
+                    flash_notice(&ui, "Could not open the folder picker");
+                }
+            });
+        });
+    });
+
+    ui.on_open_notice_file(|| {
+        if let Some(file) = notice_file() {
+            desktop::show_in_folder(file);
+        }
+    });
+    ui.on_play_notice_file(|| {
+        if let Some(file) = notice_file() {
+            desktop::open(&file);
+        }
     });
 
     // Another source type needs another pipeline: end the replay buffer's,
@@ -479,11 +532,30 @@ fn set_source_mode(ui: &AppWindow, games: &Games, game: bool) {
         return;
     }
     if recorder::load_restore_token().is_some() {
-        ui.set_source_kind(SourceKind::Screen);
-        ui.set_source_name("Last picked source".into());
+        match prefs::load_source() {
+            Some(label) => show_source(ui, &label),
+            // Saved by an older version: named once its capture starts.
+            None => {
+                ui.set_source_kind(SourceKind::Screen);
+                ui.set_source_name("Saved source".into());
+                ui.set_source_detail("Screen or window".into());
+            }
+        }
     } else {
         ui.set_source_kind(SourceKind::None);
     }
+}
+
+/// Shows the picked portal source in the source card.
+fn show_source(ui: &AppWindow, label: &SourceLabel) {
+    let (name, detail) = label.lines();
+    ui.set_source_kind(if label.window {
+        SourceKind::Window
+    } else {
+        SourceKind::Screen
+    });
+    ui.set_source_name(name.into());
+    ui.set_source_detail(detail.into());
 }
 
 /// Global shortcuts take the same path as the in-window ones, minus the
@@ -566,16 +638,18 @@ fn start_pipeline(
 /// ended), except `Stopped(Some)`, which would reset the current one.
 fn on_recorder_event(ui: &AppWindow, generation: u64, event: Event) {
     match event {
+        // A late event of a portal pipeline must not rename a game.
+        Event::Source(label) if ui.get_source_kind() != SourceKind::Game => {
+            log!("source: {label:?}");
+            show_source(ui, &label);
+            prefs::save_source(&label);
+        }
+        Event::Source(_) => {}
         Event::Started => {
             ui.set_rec_state(RecState::Recording);
             ui.set_elapsed_seconds(0);
             ui.set_dropped_frames(0);
             ui.set_measured_fps(ui.get_fps() as f32);
-            if ui.get_source_kind() == SourceKind::None {
-                // shortcut: Capture exposes neither the source type nor its name; show them once it does.
-                ui.set_source_kind(SourceKind::Screen);
-                ui.set_source_name("Picked source".into());
-            }
         }
         Event::Stats {
             width,
@@ -588,8 +662,10 @@ fn on_recorder_event(ui: &AppWindow, generation: u64, event: Event) {
             ui.set_measured_fps(fps);
             ui.set_dropped_frames(dropped.min(i32::MAX as u64) as i32);
             ui.set_resolution(format!("{width}×{height}").into());
-            // Game mode shows the game's own size (the file keeps its first one).
-            if ui.get_source_kind() != SourceKind::Game {
+            // The portal gives a window's size in logical pixels: show the
+            // captured one. Game mode shows the game's own size (the file
+            // keeps its first one); a monitor's is known already.
+            if ui.get_source_kind() == SourceKind::Window {
                 ui.set_source_detail(format!("{width} × {height}").into());
             }
         }
@@ -599,27 +675,28 @@ fn on_recorder_event(ui: &AppWindow, generation: u64, event: Event) {
             match result {
                 Ok(path) => {
                     log!("saved {}", path.display());
-                    if GAME_CLOSED.swap(false, Ordering::Relaxed) {
-                        flash_notice(ui, "Game closed — recording saved");
+                    let title = if GAME_CLOSED.swap(false, Ordering::Relaxed) {
+                        "Game closed, recording saved"
                     } else {
-                        flash_notice(ui, "Recording saved");
-                    }
+                        "Recording saved"
+                    };
+                    announce_saved(ui, title, path);
                 }
                 Err(e) => {
                     GAME_CLOSED.store(false, Ordering::Relaxed);
                     log!("recording failed: {e}");
-                    flash_notice(ui, &e);
+                    announce_failure(ui, "Recording failed", &e);
                 }
             }
         }
         Event::ReplaySaved(result) => match result {
             Ok(path) => {
                 log!("saved replay {}", path.display());
-                flash_notice(ui, "Replay saved");
+                announce_saved(ui, "Replay saved", path);
             }
             Err(e) => {
                 log!("replay failed: {e}");
-                flash_notice(ui, &e);
+                announce_failure(ui, "Replay not saved", &e);
             }
         },
         // A clean stop always follows `Finished`: nothing to reset (a new
@@ -695,16 +772,96 @@ impl From<VideoCodec> for vesper_core::Codec {
 
 /// Shows a short confirmation in the status line.
 fn flash_notice(ui: &AppWindow, text: &str) {
+    show_notice(ui, text, None);
+}
+
+/// Shows a notice, with Open and Play buttons for `file`, then hides it.
+fn show_notice(ui: &AppWindow, text: &str, file: Option<PathBuf>) {
+    let generation = NOTICE_GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
     ui.set_notice(text.into());
+    ui.set_notice_has_file(file.is_some());
+    let time = if file.is_some() {
+        FILE_NOTICE_TIME
+    } else {
+        NOTICE_TIME
+    };
+    if file.is_some() {
+        *NOTICE_FILE.lock().unwrap_or_else(|e| e.into_inner()) = file;
+    }
     let weak = ui.as_weak();
-    let shown = text.to_owned();
-    slint::Timer::single_shot(Duration::from_millis(2500), move || {
+    slint::Timer::single_shot(time, move || {
         if let Some(ui) = weak.upgrade()
-            && ui.get_notice() == shown.as_str()
+            && NOTICE_GENERATION.load(Ordering::Relaxed) == generation
         {
             ui.set_notice("".into());
+            ui.set_notice_has_file(false);
         }
     });
+}
+
+fn notice_file() -> Option<PathBuf> {
+    NOTICE_FILE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+/// Whether the user is looking at the window. Unknown counts as not.
+fn window_focused(ui: &AppWindow) -> bool {
+    ui.window()
+        .with_winit_window(|w| w.has_focus())
+        .unwrap_or(false)
+}
+
+/// A saved recording or replay: a notice with Open and Play, and a desktop
+/// notification when the window is in the background (e.g. behind a game).
+fn announce_saved(ui: &AppWindow, title: &str, file: PathBuf) {
+    if !window_focused(ui) {
+        let name = file.file_name().map_or_else(
+            || file.display().to_string(),
+            |n| n.to_string_lossy().into_owned(),
+        );
+        desktop::notify(title.to_owned(), name, Some(file.clone()));
+    }
+    show_notice(ui, title, Some(file));
+}
+
+/// A failed save: the error as the notice, and a notification in the background.
+fn announce_failure(ui: &AppWindow, title: &str, error: &str) {
+    if !window_focused(ui) {
+        desktop::notify(title.to_owned(), error.to_owned(), None);
+    }
+    flash_notice(ui, error);
+}
+
+/// Shows the output folder's name, and its parent with the home folder as `~`.
+fn show_output_folder(ui: &AppWindow) {
+    let folder = PathBuf::from(ui.get_output_folder().as_str());
+    let name = folder
+        .file_name()
+        .map_or_else(|| folder.to_string_lossy(), |n| n.to_string_lossy());
+    let parent = folder.parent().map_or_else(String::new, |parent| {
+        let parent = parent.to_string_lossy();
+        dirs::home_dir()
+            .and_then(|home| home_relative(&parent, &home.to_string_lossy()))
+            .unwrap_or_else(|| parent.into_owned())
+    });
+    ui.set_output_folder_name(name.as_ref().into());
+    ui.set_output_folder_parent(parent.into());
+}
+
+/// `folder` as `~/...` when it is inside `home`.
+fn home_relative(folder: &str, home: &str) -> Option<String> {
+    let home = home.trim_end_matches('/');
+    if home.is_empty() {
+        return None;
+    }
+    let rest = folder.strip_prefix(home)?;
+    match rest {
+        "" => Some("~".into()),
+        _ if rest.starts_with('/') => Some(format!("~{rest}")),
+        _ => None,
+    }
 }
 
 /// `$XDG_VIDEOS_DIR/Vesper`, falling back to `$HOME/Videos/Vesper`.
@@ -743,6 +900,18 @@ mod tests {
             bits_per_pixel(VideoCodec::H264, QualityPreset::Balanced)
                 > bits_per_pixel(VideoCodec::Av1, QualityPreset::Balanced)
         );
+    }
+
+    #[test]
+    fn home_is_shown_as_tilde() {
+        let home = "/home/u";
+        assert_eq!(
+            home_relative("/home/u/Vidéos/Vesper", home).unwrap(),
+            "~/Vidéos/Vesper"
+        );
+        assert_eq!(home_relative("/home/u", "/home/u/").unwrap(), "~");
+        assert_eq!(home_relative("/home/user2/x", home), None);
+        assert_eq!(home_relative("/mnt/clips", home), None);
     }
 
     #[test]

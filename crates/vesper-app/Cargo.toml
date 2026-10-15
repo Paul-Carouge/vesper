@@ -8,11 +8,12 @@ name = "vesper"
 path = "src/main.rs"
 
 [dependencies]
-slint = "1.18"
+slint = { version = "1.18", features = ["unstable-winit-030"] }
 dirs = "7"
 libc = "0.2"
-ashpd = { version = "0.13", default-features = false, features = ["async-io", "global_shortcuts"] }
+ashpd = { version = "0.13", default-features = false, features = ["async-io", "global_shortcuts", "file_chooser", "notification"] }
 futures-lite = "2"
+wayland-client = "0.31"
 vesper-core.workspace = true
 vesper-capture.workspace = true
 vesper-encode.workspace = true

@@ -1,7 +1,9 @@
 //! Developer knobs for layout checks and screenshots (debug builds only):
 //! - `VESPER_WINDOW_SIZE=360x700` sets the initial logical window size.
-//! - `VESPER_DEMO=source,game,allow,ignore,recording,settings,muted,tab,esc,ctrl+<key>` replays
-//!   UI intents and key presses once the window is up (`ctrl+comma` for `,`).
+//! - `VESPER_DEMO=source,game,allow,ignore,recording,settings,muted,browse,saved,notify,tab,esc,ctrl+<key>`
+//!   replays UI intents and key presses once the window is up (`ctrl+comma`
+//!   for `,`). `saved` shows the saved-file notice and `notify` sends the
+//!   desktop notification, both for `VESPER_DEMO_FILE`.
 //! - `VESPER_DEMO_DELAY=<ms>` runs `VESPER_DEMO` that long after launch
 //!   (default 300), e.g. once a game asks for consent (`allow`, `ignore`).
 //! - `vesper --record <seconds>` records without the UI, from the saved
@@ -137,6 +139,13 @@ pub fn apply(ui: &AppWindow) {
                 "game" => ui.invoke_source_mode_changed(true),
                 "allow" => ui.invoke_allow_game(),
                 "ignore" => ui.invoke_ignore_game(),
+                "browse" => ui.invoke_pick_output_folder(),
+                "saved" => crate::show_notice(&ui, "Replay saved", Some(demo_file())),
+                "notify" => crate::desktop::notify(
+                    "Replay saved".into(),
+                    demo_file().display().to_string(),
+                    Some(demo_file()),
+                ),
                 "muted" => {
                     ui.set_mic_muted(true);
                     ui.invoke_mic_mute_changed(true);
@@ -151,6 +160,10 @@ pub fn apply(ui: &AppWindow) {
             }
         }
     });
+}
+
+fn demo_file() -> PathBuf {
+    std::env::var_os("VESPER_DEMO_FILE").map_or_else(|| folder().join("demo.mkv"), PathBuf::from)
 }
 
 fn press_key(ui: &AppWindow, text: slint::SharedString, control: bool) {

@@ -127,6 +127,8 @@ impl GameFrames {
 
 #[derive(Debug)]
 pub enum Event {
+    /// The portal capture started on this source.
+    Source(crate::outputs::SourceLabel),
     /// A recording started: its file exists.
     Started,
     /// Sent while recording.
@@ -513,6 +515,7 @@ fn run(
             {
                 log!("could not save the restore token: {e}");
             }
+            on_event(Event::Source(crate::outputs::describe(capture.source())));
             Some(capture)
         }
     };

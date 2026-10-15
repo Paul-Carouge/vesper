@@ -6,6 +6,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+use crate::outputs::SourceLabel;
 use crate::{AppWindow, QualityPreset, SourceKind, VideoCodec};
 
 /// Process names (`/proc/<pid>/comm`) the user allowed game capture for. Not
@@ -192,6 +193,62 @@ fn path() -> Option<PathBuf> {
     dirs::config_dir().map(|d| d.join("vesper").join("settings"))
 }
 
+/// `$XDG_CONFIG_HOME/vesper/source`: how to show the source of the saved
+/// restore token before its capture starts.
+fn source_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|d| d.join("vesper").join("source"))
+}
+
+fn parse_source(text: &str) -> SourceLabel {
+    let mut label = SourceLabel::default();
+    let (mut w, mut h) = (None, None);
+    for (key, value) in text.lines().filter_map(|l| l.split_once('=')) {
+        match key {
+            "window" => set(&mut label.window, flag(value)),
+            "name" if !value.is_empty() => label.name = Some(value.to_owned()),
+            "width" => w = value.parse().ok(),
+            "height" => h = value.parse().ok(),
+            _ => {}
+        }
+    }
+    label.size = w.zip(h);
+    label
+}
+
+fn serialize_source(label: &SourceLabel) -> String {
+    let mut text = format!("window={}\n", label.window);
+    if let Some(name) = label.name.as_ref().filter(|n| !n.contains(['\n', '\r'])) {
+        text += &format!("name={name}\n");
+    }
+    if let Some((w, h)) = label.size {
+        text += &format!("width={w}\nheight={h}\n");
+    }
+    text
+}
+
+/// The label saved with the restore token, if any.
+pub fn load_source() -> Option<SourceLabel> {
+    std::fs::read_to_string(source_path()?)
+        .ok()
+        .map(|text| parse_source(&text))
+}
+
+pub fn save_source(label: &SourceLabel) {
+    let Some(path) = source_path() else { return };
+    if let Err(e) = write_atomically(&path, serialize_source(label).as_bytes()) {
+        log!("could not save {}: {e}", path.display());
+    }
+}
+
+pub fn clear_source() {
+    if let Some(path) = source_path()
+        && let Err(e) = std::fs::remove_file(&path)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        log!("could not remove {}: {e}", path.display());
+    }
+}
+
 /// Writes a temporary file next to `path`, then renames it over `path`: a
 /// process crash leaves either the old or the new file, never half of one.
 /// No fsync: it would block the UI thread, and settings are cheap to lose.
@@ -317,6 +374,34 @@ mod tests {
             changed().output_folder
         );
         assert_eq!(defaults().parse(&prefs.serialize(DEFAULT)).fps, 60);
+    }
+
+    #[test]
+    fn source_label_round_trip() {
+        for label in [
+            SourceLabel::default(),
+            SourceLabel {
+                window: false,
+                name: Some("DP-1".into()),
+                size: Some((3840, 2160)),
+            },
+            SourceLabel {
+                window: true,
+                name: None,
+                size: Some((1280, 720)),
+            },
+        ] {
+            assert_eq!(parse_source(&serialize_source(&label)), label);
+        }
+        let broken = SourceLabel {
+            name: Some("a\nwindow=true".into()),
+            ..SourceLabel::default()
+        };
+        assert_eq!(
+            parse_source(&serialize_source(&broken)),
+            SourceLabel::default()
+        );
+        assert_eq!(parse_source("width=1\ngarbage"), SourceLabel::default());
     }
 
     #[test]
