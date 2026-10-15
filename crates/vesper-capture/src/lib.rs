@@ -44,8 +44,8 @@ pub struct Capture {
 impl Capture {
     /// Opens the portal picker (skipped when `restore_token` is still valid)
     /// and starts streaming, at most `max_fps` frames per second (the
-    /// compositor may send fewer: frames come on damage). `on_frame` runs on the PipeWire thread: keep it
-    /// short, e.g. send the frame to a channel. It gets one final `Err` when
+    /// compositor may send fewer: frames come on damage). `on_frame` runs on
+    /// the PipeWire thread: keep it short, e.g. send the frame to a channel. It gets one final `Err` when
     /// the capture ends on its own (source closed, stream error, no DMA-BUF);
     /// no frame follows. Dropping the `Capture` from `on_frame` is allowed,
     /// but blocks the PipeWire loop while the D-Bus session closes.

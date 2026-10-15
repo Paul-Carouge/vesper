@@ -49,7 +49,11 @@ const AUDIO_MARGIN: Duration = Duration::from_millis(100);
 
 /// A recording request waiting this long for a first frame fails (e.g. the
 /// game quit), so the UI does not stay in `starting`.
-const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(5);
+const FIRST_FRAME_TIMEOUT: Duration = if cfg!(test) {
+    Duration::from_millis(100)
+} else {
+    Duration::from_secs(5)
+};
 
 /// A new source size kept this long reopens the encoder at that size while
 /// nothing records (a launcher, then the game in fullscreen).
@@ -992,6 +996,9 @@ fn pump(
     let mut waiting_since: Option<Duration> = None;
     // Set by every encoded tick, read once `video` exists.
     let mut deadline = Duration::ZERO;
+    // Reads the requests before the first wait: a recording request must
+    // arm its first-frame timeout even if no frame ever comes.
+    slot.poke();
     let mut window = (monotonic_now(), 0u32);
     let mut error = None;
 
@@ -1059,6 +1066,9 @@ fn pump(
                     "the source"
                 };
                 on_event(Event::Finished(Err(format!("No frame from {what}"))));
+                // Without a replay buffer the pipeline ends: check again at
+                // once instead of waiting for a frame.
+                slot.poke();
             }
             (record, stop, c.replay, c.save.take())
         };
@@ -1429,6 +1439,47 @@ mod tests {
             ring.push_video(packet(ms, ms % 1000 == 0));
         }
         ring
+    }
+
+    #[test]
+    fn recording_without_any_frame_fails_after_the_timeout() {
+        let settings = Settings {
+            codec: Codec::Hevc,
+            fps: 60,
+            quality: 28,
+            max_bits_per_pixel: 0.1,
+            tracks: Vec::new(),
+            mix: false,
+            game: None,
+        };
+        let control = Mutex::new(Control {
+            record: Some(std::env::temp_dir()),
+            ..Control::default()
+        });
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let seen = events.clone();
+        let on_event: OnEvent = Arc::new(move |e| lock(&seen).push(format!("{e:?}")));
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        // No frame ever comes: the first wait must already know the deadline.
+        std::thread::spawn(move || {
+            let result = pump(
+                &settings,
+                &Mailbox::default(),
+                &control,
+                &SharedSinks::default(),
+                &AudioSources::default(),
+                &on_event,
+            );
+            let _ = done_tx.send(result);
+        });
+        let result = done_rx
+            .recv_timeout(FIRST_FRAME_TIMEOUT + Duration::from_secs(2))
+            .expect("the pipeline waits forever for a first frame");
+        assert_eq!(result, Ok(()));
+        assert_eq!(
+            *lock(&events),
+            [r#"Finished(Err("No frame from the source"))"#]
+        );
     }
 
     #[test]
