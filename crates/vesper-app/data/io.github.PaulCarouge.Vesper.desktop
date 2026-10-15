@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Vesper
+Comment=Record your screen and save replays
+Exec=vesper
+Icon=media-record
+Terminal=false
+Categories=AudioVideo;Video;Recorder;
+Keywords=screen;recorder;replay;capture;

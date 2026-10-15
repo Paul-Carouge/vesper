@@ -24,6 +24,21 @@ A fast, bloat-free screen recorder for desktop and gaming, written in Rust. An a
 - Replay buffer: ring buffer of encoded packets, save the last N seconds.
 - Slint UI + tray icon.
 
+## Install
+
+Global shortcuts need an app id, and the portal only accepts one with an installed desktop file whose `Exec` binary it can find:
+
+```sh
+cargo build --release
+install -Dm755 target/release/vesper ~/.local/bin/vesper
+install -Dm644 crates/vesper-app/data/io.github.PaulCarouge.Vesper.desktop \
+    ~/.local/share/applications/io.github.PaulCarouge.Vesper.desktop
+```
+
+If `~/.local/bin` is not in the session `PATH`, set `Exec=` to the full path. Default global shortcuts: Alt+F9 starts or stops recording, Alt+F10 saves the replay. KDE asks to confirm them on first launch; change them later in System Settings > Shortcuts.
+
+Settings are kept in `~/.config/vesper/settings`.
+
 ## Out of scope
 
 Scenes, source compositing, filters, browser sources, streaming, plugins.
