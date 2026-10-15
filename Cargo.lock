@@ -5109,6 +5109,7 @@ dependencies = [
  "vesper-mux",
  "vesper-vst",
  "wayland-client",
+ "zbus",
 ]
 
 [[package]]

@@ -181,6 +181,69 @@ fn scales_frames_of_other_sizes_to_the_encoder_size() {
     );
 }
 
+/// A scaled encoder (a live stream) follows its source's pictures, repeats
+/// and keyframes at its own size and rate control, also after the source
+/// rebuilt its graph for another input size.
+#[test]
+fn scaled_encoder_encodes_the_source_pictures_at_its_own_size() {
+    if !Path::new("/dev/dri/renderD128").exists() {
+        eprintln!("no GPU, skipping");
+        return;
+    }
+    let (w, h) = (640, 360);
+    let mut enc = Encoder::new(Codec::Hevc, w, h, 30, RateControl::ConstantQp(30)).unwrap();
+    // Opened on another thread, as the pipeline does.
+    let source = enc.scaled_source().unwrap();
+    let mut live = std::thread::spawn(move || {
+        source.open(
+            Codec::Hevc,
+            480,
+            270,
+            30,
+            RateControl::ConstantBitrate(1_000_000),
+        )
+    })
+    .join()
+    .unwrap()
+    .unwrap();
+    assert!(
+        live.encode_scaled(&enc, Duration::ZERO).is_err(),
+        "no picture yet"
+    );
+    let ms = |t: u64| Duration::from_millis(1_000 + t * 33);
+    let mut packets = Vec::new();
+    let mut t = 0;
+    for (generation, (pw, ph)) in [(640, 360), (1280, 720)].into_iter().enumerate() {
+        let producer = unsafe { Producer::new(pw, ph) };
+        for id in 0..3 {
+            let frame = unsafe { producer.frame(id, t as u32, generation as u32, ms(t)) };
+            enc.encode(frame).unwrap();
+            if t == 4 {
+                live.force_keyframe();
+            }
+            packets.extend(live.encode_scaled(&enc, ms(t)).unwrap());
+            t += 1;
+        }
+        enc.repeat(ms(t)).unwrap();
+        packets.extend(live.repeat(ms(t)).unwrap());
+        t += 1;
+    }
+    packets.extend(live.flush().unwrap());
+    let got: Vec<Duration> = packets.iter().map(|p| p.pts).collect();
+    assert_eq!(got, (0..t).map(ms).collect::<Vec<_>>());
+    let keys: Vec<_> = (0..packets.len())
+        .filter(|&i| packets[i].keyframe)
+        .collect();
+    assert_eq!(keys, [0, 4]);
+    let frames = unsafe { decode_luma(live.extradata(), &packets) };
+    assert_eq!(frames.len(), t as usize);
+    for f in &frames {
+        assert_eq!((f.w, f.h), (480, 270));
+        let mean = f.y.iter().map(|&v| f64::from(v)).sum::<f64>() / f.y.len() as f64;
+        assert!(mean > 30.0, "the pattern, not black: {mean}");
+    }
+}
+
 struct Luma {
     w: usize,
     h: usize,

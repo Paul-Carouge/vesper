@@ -18,6 +18,7 @@
 //! and per 480 frames (~2000 ppm ceiling up to 480-frame buffers, ~977 ppm at
 //! 1024, ~488 ppm at 2048).
 
+mod aac;
 mod mix;
 mod nodes;
 mod pw;
@@ -35,6 +36,7 @@ use ffmpeg_next as ffmpeg;
 use tracing::{error, warn};
 use vesper_core::EncodedPacket;
 
+pub use aac::Aac;
 pub use mix::{Mix, MixInput};
 pub use nodes::{Node, NodeWatch};
 
@@ -47,6 +49,11 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// silence when it shrinks), so the track and its pts stay on the timeline
 /// and the tracks of a mix stay aligned.
 pub type Process = Box<dyn FnMut(&mut [f32]) -> usize + Send>;
+
+/// Gets a track's samples as they are encoded: 20 ms blocks of interleaved
+/// stereo F32, each with the pts of its first sample. Runs on the track's
+/// encode thread (for a [`Mix`], whichever input thread completes a block).
+pub type Tap = Box<dyn FnMut(Duration, &[f32]) + Send>;
 
 /// Output sample rate of every track.
 pub const SAMPLE_RATE: u32 = 48_000;
@@ -396,6 +403,11 @@ struct Encoder<F> {
     gain: f32,
     process: Option<Process>,
     mix: Option<MixInput>,
+    /// Gets each block as encoded, with its pts (a live stream's audio).
+    tap: Option<Tap>,
+    /// Off: blocks go to `tap` only, nothing is encoded (a mix kept for a
+    /// stream while the files have none).
+    opus: bool,
     peak: f32,
     peak_samples: usize,
     on_packet: F,
@@ -420,6 +432,8 @@ impl<F: FnMut(EncodedPacket)> Encoder<F> {
             shared,
             process: None,
             mix: None,
+            tap: None,
+            opus: true,
             peak: 0.0,
             peak_samples: 0,
             on_packet,
@@ -450,6 +464,15 @@ impl<F: FnMut(EncodedPacket)> Encoder<F> {
         }
     }
 
+    /// Starts over at frame `at` of the timeline (a mix that was idle):
+    /// what waits is dropped, and so is the processing's delay of old audio.
+    fn restart_at(&mut self, at: u64) {
+        self.pending.clear();
+        self.ready.clear();
+        self.skip = self.delay;
+        self.sent = at as i64;
+    }
+
     /// Follows a change of the processing's delay. Output frame `n` must be
     /// input frame `n`: a longer delay drops output, a shorter one inserts
     /// silence where the old processing still held audio.
@@ -476,7 +499,17 @@ impl<F: FnMut(EncodedPacket)> Encoder<F> {
         apply_gain(&mut self.block, self.gain, gain);
         self.gain = gain;
         if let Some(mix) = &self.mix {
-            mix.push(&self.block);
+            mix.push(&self.block, self.sent as u64);
+        }
+        if let Some(tap) = &mut self.tap {
+            tap(
+                self.anchor + frames_to_duration(self.sent as usize),
+                &self.block,
+            );
+        }
+        if !self.opus {
+            self.sent += FRAME as i64;
+            return;
         }
         let out = self.frame.data_mut(0);
         for (dst, &s) in out.as_chunks_mut::<4>().0.iter_mut().zip(&self.block) {
@@ -524,10 +557,12 @@ impl<F: FnMut(EncodedPacket)> Encoder<F> {
             self.block.append(&mut self.ready);
             self.encode_block();
         }
-        if let Err(e) = self.encoder.send_eof() {
-            error!("opus flush failed: {e}");
+        if self.opus {
+            if let Err(e) = self.encoder.send_eof() {
+                error!("opus flush failed: {e}");
+            }
+            self.drain();
         }
-        self.drain();
         self.shared.peak.store(0, Ordering::Relaxed);
     }
 }

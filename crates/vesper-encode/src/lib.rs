@@ -72,6 +72,9 @@ pub enum RateControl {
     /// Constant quality capped at `max_bitrate` bits per second (VAAPI QVBR).
     /// `quality` is on the QP scale of [`RateControl::ConstantQp`]; lower is better.
     Quality { quality: u32, max_bitrate: u64 },
+    /// Constant bitrate in bits per second with a one-second buffer (VBV),
+    /// what streaming services ask for.
+    ConstantBitrate(u64),
 }
 
 #[derive(Debug)]
@@ -153,6 +156,9 @@ pub struct Encoder {
     started: bool,
     /// Whether the next picture must be a keyframe ([`Encoder::force_keyframe`]).
     force_key: bool,
+    /// Scaled encoders ([`Encoder::new_scaled`]): the frames context of the
+    /// source pictures their graph was built for.
+    scaled_from: *mut u8,
 }
 
 // SAFETY: the FFmpeg/VA objects are owned by this struct and only used through
@@ -189,6 +195,7 @@ impl Encoder {
             generation: None,
             started: false,
             force_key: false,
+            scaled_from: ptr::null_mut(),
         };
         // On error, `e` is dropped and frees whatever was created so far.
         unsafe {
@@ -207,16 +214,176 @@ impl Encoder {
             e.display = (*((*dev).hwctx as *mut ff::AVVAAPIDeviceContext)).display;
 
             e.set_import_size(width, height)?;
-            if let Err(err) = e.open_encoder(codec, fps, rate) {
+            e.open_with_fallback(codec, fps, rate)?;
+        }
+        Ok(e)
+    }
+
+    /// A second encoder fed with `self`'s pictures ([`Encoder::encode_scaled`]),
+    /// scaled on the GPU to `width`x`height`: e.g. a live stream at another
+    /// size, codec or rate control than the recording, without a second
+    /// import or colour conversion. Same device as `self`.
+    pub fn new_scaled(
+        &self,
+        codec: Codec,
+        width: u32,
+        height: u32,
+        fps: u32,
+        rate: RateControl,
+    ) -> Result<Self, Error> {
+        self.scaled_source()?.open(codec, width, height, fps, rate)
+    }
+
+    /// What [`ScaledSource::open`] needs from `self`, to open a scaled
+    /// encoder on another thread (opening one takes tens of milliseconds).
+    pub fn scaled_source(&self) -> Result<ScaledSource, Error> {
+        unsafe {
+            let mut source = ScaledSource {
+                device: not_null(ff::av_buffer_ref(self.device), "device ref")?,
+                frames: ptr::null_mut(),
+                display: self.display,
+                width: self.width,
+                height: self.height,
+            };
+            source.frames = not_null(
+                ff::av_buffer_ref(ff::av_buffersink_get_hw_frames_ctx(self.sink)),
+                "frames ref",
+            )?;
+            Ok(source)
+        }
+    }
+}
+
+/// References to an encoder's device and picture pool: enough to open a
+/// scaled encoder for it ([`Encoder::new_scaled`]) on any thread.
+pub struct ScaledSource {
+    device: *mut ff::AVBufferRef,
+    frames: *mut ff::AVBufferRef,
+    display: *mut c_void,
+    width: u32,
+    height: u32,
+}
+
+// SAFETY: reference-counted FFmpeg buffers (thread-safe counts) and a VA
+// display, which libva lets several threads use.
+unsafe impl Send for ScaledSource {}
+
+impl Drop for ScaledSource {
+    fn drop(&mut self) {
+        unsafe {
+            ff::av_buffer_unref(&mut self.frames);
+            ff::av_buffer_unref(&mut self.device);
+        }
+    }
+}
+
+impl ScaledSource {
+    /// Opens the scaled encoder; it then takes the source encoder's
+    /// pictures through [`Encoder::encode_scaled`].
+    pub fn open(
+        mut self,
+        codec: Codec,
+        width: u32,
+        height: u32,
+        fps: u32,
+        rate: RateControl,
+    ) -> Result<Encoder, Error> {
+        if width == 0 || height == 0 || fps == 0 {
+            return Err(Error("width, height and fps must be non-zero".into()));
+        }
+        let mut e = Encoder {
+            width,
+            height,
+            device: std::mem::replace(&mut self.device, ptr::null_mut()),
+            display: self.display,
+            import_frames: ptr::null_mut(),
+            graph: ptr::null_mut(),
+            src: ptr::null_mut(),
+            sink: ptr::null_mut(),
+            enc: ptr::null_mut(),
+            filtered: Frame::new()?,
+            last: Frame::new()?,
+            packet: ptr::null_mut(),
+            imports: HashMap::new(),
+            generation: None,
+            started: false,
+            force_key: false,
+            scaled_from: ptr::null_mut(),
+        };
+        // On error, `e` is dropped and frees whatever was created so far.
+        unsafe {
+            e.packet = not_null(ff::av_packet_alloc(), "av_packet_alloc")?;
+            e.build_scaled_graph(self.frames, self.width, self.height)?;
+            e.open_with_fallback(codec, fps, rate)?;
+        }
+        Ok(e)
+    }
+}
+
+impl Encoder {
+    unsafe fn open_with_fallback(
+        &mut self,
+        codec: Codec,
+        fps: u32,
+        rate: RateControl,
+    ) -> Result<(), Error> {
+        unsafe {
+            if let Err(err) = self.open_encoder(codec, fps, rate) {
                 let Some(fb) = fallback(rate) else {
                     return Err(err);
                 };
                 tracing::warn!("{rate:?} failed ({err}), falling back to {fb:?}");
-                ff::avcodec_free_context(&mut e.enc);
-                e.open_encoder(codec, fps, fb)?;
+                ff::avcodec_free_context(&mut self.enc);
+                self.open_encoder(codec, fps, fb)?;
             }
         }
-        Ok(e)
+        Ok(())
+    }
+
+    /// Builds `buffer` (`width`x`height` NV12 VA surfaces of `frames`) ->
+    /// `scale_vaapi` -> `buffersink` for a scaled encoder. On error the
+    /// previous graph stays.
+    unsafe fn build_scaled_graph(
+        &mut self,
+        frames: *mut ff::AVBufferRef,
+        width: u32,
+        height: u32,
+    ) -> Result<(), Error> {
+        let args = std::ffi::CString::new(format!(
+            "w={}:h={}:format=nv12:out_color_matrix=bt709:out_range=tv",
+            self.width, self.height
+        ))
+        .expect("no NUL");
+        unsafe {
+            if frames.is_null() {
+                return Err(Error("the source encoder has no frames context".into()));
+            }
+            let mut graph = not_null(ff::avfilter_graph_alloc(), "avfilter_graph_alloc")?;
+            let built = (|| {
+                let src = buffer_source(graph, frames, width, height, true)?;
+                let vpp = create_filter(graph, c"scale_vaapi", c"scale", args.as_ptr())?;
+                let sink = create_filter(graph, c"buffersink", c"out", ptr::null())?;
+                check(ff::avfilter_link(src, 0, vpp, 0), "link")?;
+                check(ff::avfilter_link(vpp, 0, sink, 0), "link")?;
+                check(
+                    ff::avfilter_graph_config(graph, ptr::null_mut()),
+                    "configure graph",
+                )?;
+                Ok((src, sink))
+            })();
+            match built {
+                Ok((src, sink)) => {
+                    ff::avfilter_graph_free(&mut self.graph);
+                    (self.graph, self.src, self.sink) = (graph, src, sink);
+                    self.scaled_from = (*frames).data;
+                    Ok(())
+                }
+                Err(e) => {
+                    ff::avfilter_graph_free(&mut graph);
+                    Err(e)
+                }
+            }
+        }
     }
 
     /// Makes the import frames context and the filter graph take
@@ -286,42 +453,9 @@ impl Encoder {
             std::ffi::CString::new(format!("w={w}:h={h}:x=(ow-iw)/2:y=(oh-ih)/2")).expect("no NUL");
         unsafe {
             *graph = not_null(ff::avfilter_graph_alloc(), "avfilter_graph_alloc")?;
-            let src = not_null(
-                ff::avfilter_graph_alloc_filter(
-                    *graph,
-                    ff::avfilter_get_by_name(c"buffer".as_ptr()),
-                    c"in".as_ptr(),
-                ),
-                "alloc buffer filter",
-            )?;
-            let par = not_null(ff::av_buffersrc_parameters_alloc(), "buffersrc params")?;
-            (*par).format = ff::AVPixelFormat::AV_PIX_FMT_VAAPI as c_int;
-            (*par).time_base = TIME_BASE;
-            (*par).width = width as c_int;
-            (*par).height = height as c_int;
-            (*par).hw_frames_ctx = frames;
-            let ret = ff::av_buffersrc_parameters_set(src, par);
-            ff::av_free(par.cast());
-            check(ret, "buffersrc params")?;
-            check(
-                ff::avfilter_init_dict(src, ptr::null_mut()),
-                "init buffersrc",
-            )?;
-
+            let src = buffer_source(*graph, frames, width, height, false)?;
             let create = |name: &CStr, label: &CStr, args: *const std::ffi::c_char| {
-                let mut f = ptr::null_mut();
-                check(
-                    ff::avfilter_graph_create_filter(
-                        &mut f,
-                        ff::avfilter_get_by_name(name.as_ptr()),
-                        label.as_ptr(),
-                        args,
-                        ptr::null_mut(),
-                        *graph,
-                    ),
-                    "create filter",
-                )
-                .map(|_| f)
+                create_filter(*graph, name, label, args)
             };
             let vpp = create(
                 c"scale_vaapi",
@@ -402,19 +536,30 @@ impl Encoder {
                     enc.global_quality = quality as c_int;
                     enc.bit_rate = max_bitrate as i64;
                     enc.rc_max_rate = max_bitrate as i64;
-                    let vendor = vaQueryVendorString(self.display);
-                    let vendor = if vendor.is_null() {
-                        ""
-                    } else {
-                        CStr::from_ptr(vendor).to_str().unwrap_or("")
-                    };
-                    let px_rate = u64::from(self.width) * u64::from(self.height) * u64::from(fps);
-                    if let Some(level) = quality_level(vendor, codec, px_rate) {
-                        enc.compression_level = level;
-                    }
                     c"QVBR"
                 }
+                RateControl::ConstantBitrate(bps) => {
+                    enc.bit_rate = bps as i64;
+                    enc.rc_max_rate = bps as i64;
+                    enc.rc_buffer_size = c_int::try_from(bps).unwrap_or(c_int::MAX);
+                    c"CBR"
+                }
             };
+            if matches!(
+                rate,
+                RateControl::Quality { .. } | RateControl::ConstantBitrate(_)
+            ) {
+                let vendor = vaQueryVendorString(self.display);
+                let vendor = if vendor.is_null() {
+                    ""
+                } else {
+                    CStr::from_ptr(vendor).to_str().unwrap_or("")
+                };
+                let px_rate = u64::from(self.width) * u64::from(self.height) * u64::from(fps);
+                if let Some(level) = quality_level(vendor, codec, px_rate) {
+                    enc.compression_level = level;
+                }
+            }
             check(
                 ff::av_opt_set(
                     self.enc.cast(),
@@ -583,6 +728,51 @@ impl Encoder {
         self.drain()
     }
 
+    /// Encodes the picture `source` last encoded or repeated, scaled to this
+    /// encoder's size, with `pts`. Only for encoders made by
+    /// [`Encoder::new_scaled`] from `source`; fails before `source`'s first
+    /// picture. For a picture already given here, [`Encoder::repeat`] is
+    /// cheaper (no VPP job).
+    pub fn encode_scaled(
+        &mut self,
+        source: &Encoder,
+        pts: Duration,
+    ) -> Result<Vec<EncodedPacket>, Error> {
+        let pts = i64::try_from(pts.as_nanos()).map_err(|_| Error("pts overflow".into()))?;
+        unsafe {
+            let picture = source.last.0;
+            if (*picture).buf[0].is_null() {
+                return Err(Error("no picture to scale".into()));
+            }
+            let frames = (*picture).hw_frames_ctx;
+            if frames.is_null() {
+                return Err(Error("the picture has no frames context".into()));
+            }
+            // `source` rebuilt its graph (its input size changed): new pool.
+            if (*frames).data != self.scaled_from {
+                self.build_scaled_graph(frames, source.width, source.height)?;
+            }
+            check(ff::av_frame_ref(self.filtered.0, picture), "ref picture")?;
+            (*self.filtered.0).pts = pts;
+            // Takes the reference and resets `filtered`.
+            let ret = ff::av_buffersrc_add_frame_flags(self.src, self.filtered.0, 0);
+            if ret < 0 {
+                ff::av_frame_unref(self.filtered.0);
+                check(ret, "feed VPP")?;
+            }
+            check(
+                ff::av_buffersink_get_frame(self.sink, self.filtered.0),
+                "run VPP",
+            )?;
+            let ret = self.send_filtered();
+            ff::av_frame_unref(self.last.0);
+            ff::av_frame_move_ref(self.last.0, self.filtered.0);
+            check(ret, "send frame to encoder")?;
+            self.started = true;
+        }
+        self.drain()
+    }
+
     /// Makes the next picture given to [`Encoder::encode`] or
     /// [`Encoder::repeat`] a keyframe (IDR), e.g. so a new file can start there.
     pub fn force_keyframe(&mut self) {
@@ -644,6 +834,68 @@ impl Encoder {
             }
         }
     }
+}
+
+/// A `buffer` source of `width`x`height` VA surfaces from `frames`; `yuv`:
+/// NV12 pictures of our own (BT.709, limited range), else RGB imports.
+unsafe fn buffer_source(
+    graph: *mut ff::AVFilterGraph,
+    frames: *mut ff::AVBufferRef,
+    width: u32,
+    height: u32,
+    yuv: bool,
+) -> Result<*mut ff::AVFilterContext, Error> {
+    unsafe {
+        let src = not_null(
+            ff::avfilter_graph_alloc_filter(
+                graph,
+                ff::avfilter_get_by_name(c"buffer".as_ptr()),
+                c"in".as_ptr(),
+            ),
+            "alloc buffer filter",
+        )?;
+        let par = not_null(ff::av_buffersrc_parameters_alloc(), "buffersrc params")?;
+        (*par).format = ff::AVPixelFormat::AV_PIX_FMT_VAAPI as c_int;
+        (*par).time_base = TIME_BASE;
+        (*par).width = width as c_int;
+        (*par).height = height as c_int;
+        (*par).hw_frames_ctx = frames;
+        if yuv {
+            (*par).color_space = ff::AVColorSpace::AVCOL_SPC_BT709;
+            (*par).color_range = ff::AVColorRange::AVCOL_RANGE_MPEG;
+        }
+        let ret = ff::av_buffersrc_parameters_set(src, par);
+        ff::av_free(par.cast());
+        check(ret, "buffersrc params")?;
+        check(
+            ff::avfilter_init_dict(src, ptr::null_mut()),
+            "init buffersrc",
+        )?;
+        Ok(src)
+    }
+}
+
+unsafe fn create_filter(
+    graph: *mut ff::AVFilterGraph,
+    name: &CStr,
+    label: &CStr,
+    args: *const std::ffi::c_char,
+) -> Result<*mut ff::AVFilterContext, Error> {
+    let mut f = ptr::null_mut();
+    unsafe {
+        check(
+            ff::avfilter_graph_create_filter(
+                &mut f,
+                ff::avfilter_get_by_name(name.as_ptr()),
+                label.as_ptr(),
+                args,
+                ptr::null_mut(),
+                graph,
+            ),
+            "create filter",
+        )?;
+    }
+    Ok(f)
 }
 
 impl Drop for Encoder {

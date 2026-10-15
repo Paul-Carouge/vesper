@@ -16,6 +16,7 @@ A fast, bloat-free screen recorder for desktop and gaming, written in Rust. An a
 3. **Encoding**: VAAPI hardware encode (AV1 / HEVC / H.264). Prototype with `cros-codecs`, fall back to `ffmpeg-next`.
 4. **Audio**: up to 8 PipeWire tracks (desktop, microphone, a device by node name, or an application's streams, followed as they come and go), each its own named Opus track, plus an optional mix of them all as the first track. Volume and mute per track, applied live. Built-in filters per track (`vesper-dsp`) run on the track's encode thread, never on PipeWire's real-time thread: parameter changes are lock-free, a new filter list is built off that thread and handed over without a lock or an allocation. A filter's delay (noise suppression 20 ms, limiter lookahead) is removed from the track's timeline, so tracks stay in sync with the video and with each other. The mix goes through a true-peak limiter (-1 dBTP). VST3 effects run in the same chains, each in its own host process (see *VST3 plugins*).
 5. **Container**: MKV (crash-safe), optional remux to MP4.
+6. **Live streaming**: FLV over RTMP/RTMPS or MPEG-TS over SRT (libavformat) from its own thread, next to the recording and the replay buffer. See [Live streaming](#live-streaming).
 
 ## Game capture layer: what it does when installed
 
@@ -42,6 +43,7 @@ Risks and limits: anti-cheats (EAC, BattlEye) may flag or reject unknown Vulkan 
 - Global hotkeys (GlobalShortcuts portal).
 - Replay buffer: ring buffer of encoded packets, save the last N seconds.
 - Slint UI, tray icon, start with the session.
+- Live streaming to Twitch, YouTube or any RTMP/RTMPS/SRT server, at the same time as a recording and the replay buffer.
 
 ## Install
 
@@ -66,7 +68,7 @@ install -Dm644 crates/vesper-app/data/io.github.PaulCarouge.Vesper.desktop -t ~/
 install -Dm644 crates/vesper-app/data/io.github.PaulCarouge.Vesper.svg -t ~/.local/share/icons/hicolor/scalable/apps/
 ```
 
-Vesper looks for the layer and the plugin host next to its binary, then in `../lib/vesper/`; the settings switch installs that copy (build with `cargo build --release` at the workspace root, not `-p vesper-app`, so the layer is built too). If `~/.local/bin` is not in the session `PATH`, set `Exec=` to the full path. Without the desktop file, global shortcuts and desktop notifications (sent when a recording or replay is saved, or fails, while the window is in the background) are off; the in-window shortcuts still work. The saved source is forgotten once after updating to this version, since it is now tied to the app id: pick it again. Default global shortcuts: Alt+F9 starts or stops recording, Alt+F10 saves the replay. KDE asks to confirm them on first launch; change them later in System Settings > Shortcuts.
+Vesper looks for the layer and the plugin host next to its binary, then in `../lib/vesper/`; the settings switch installs that copy (build with `cargo build --release` at the workspace root, not `-p vesper-app`, so the layer is built too). If `~/.local/bin` is not in the session `PATH`, set `Exec=` to the full path. Without the desktop file, global shortcuts and desktop notifications (sent when a recording or replay is saved, or fails, while the window is in the background) are off; the in-window shortcuts still work. The saved source is forgotten once after updating to this version, since it is now tied to the app id: pick it again. Default global shortcuts: Alt+F9 starts or stops recording, Alt+F10 saves the replay, Alt+F8 goes live or ends the stream. KDE asks to confirm them on first launch; change them later in System Settings > Shortcuts.
 
 Settings are kept in `~/.config/vesper/settings`.
 
@@ -85,9 +87,25 @@ Failure-injection lab (disk full, game crash, portal or PipeWire gone...): `scri
 
 The host uses the `vst3` crate (bindings generated from the VST3 SDK headers, MIT or Apache-2.0); the VST3 SDK itself is MIT-licensed since version 3.8.
 
+## Live streaming
+
+*Go live* (the Live stream card, Ctrl+L, the tray menu, or the global shortcut Alt+F8) streams what Vesper captures; recording and the replay buffer keep running beside it. The *Live stream* settings choose:
+
+- **Service**: Twitch goes to its automatic ingest, `rtmps://ingest.global-contribute.live-video.net/app` (the "Default" entry of `https://ingest.twitch.tv/ingests`, which replaced `live.twitch.tv`); YouTube to `rtmps://a.rtmps.youtube.com:443/live2` (`rtmp://a.rtmp.youtube.com/live2` in clear). Both over TLS, with the server's certificate and host name checked (`tls_verify=1`; a libavformat older than 62 is refused for `rtmps://`, and a TLS layer that does not take the option fails closed), so the key does not cross the network in clear. *Custom* takes an `rtmp://`, `rtmps://` or `srt://` URL: the key becomes the last path segment for RTMP, the `streamid` for SRT (or, written `streamid=...&passphrase=...`, both SRT parameters). The settings warn that `rtmp://` sends the key in clear and that `srt://` is encrypted only with a passphrase. A key pasted into the URL (an RTMP path below the application, an SRT `streamid` or `passphrase`) is moved to the key field and never written to the settings file. Only the network protocols a stream needs are allowed (`rtmp,rtmps,tls,tcp,srt`).
+- **Resolution** (native, or fit in 1080p or 720p, never upscaled), **frame rate** (30 or 60), **bitrate** (1 to 20 Mbit/s, constant bitrate with a 1 s buffer) and **encoder**. Twitch gets H.264: its HEVC/AV1 "Enhanced Broadcasting" is limited to OBS with NVIDIA GPUs. YouTube and custom servers can also take HEVC or AV1 (Enhanced RTMP over RTMP, plain MPEG-TS over SRT).
+- **Stream key**: kept by the Secret Service (`org.freedesktop.secrets`: KWallet on Plasma, GNOME Keyring, KeePassXC), encrypted at rest and unlocked with the session; Vesper never writes it to its settings file or its logs, and only shows where it is kept. The Secret portal is meant for sandboxed apps and would leave the encryption to Vesper, so it is not used. Only when the session has no Secret Service at all (or no default keyring) does the key go to `~/.config/vesper/stream-key`, written atomically with mode 0600 like the portal restore token: private to your account, but in clear on disk. A keyring that is there but stays locked (prompt dismissed) gets *The keyring stayed locked: key not saved*, never a copy in clear. The settings file itself is written with mode 0600.
+
+How it is encoded: the stream is a second VAAPI encode of the same NV12 picture, scaled on the GPU (VA-VPP), with its own codec, size, rate control and a keyframe every 2 s; nothing is captured or converted twice. When the stream asks for what the recording already makes (same codec, size and frame rate, and the recording's bitrate cap within the stream's bitrate), it sends the recording's packets instead, with no second encode. The stream's encoder is opened on a helper thread, never on the tick; if it cannot keep up (each stream frame taking longer than a frame for a second), the stream ends with *The GPU encoder is overloaded* so the recording stays smooth. When the recording's encode is shared, a keyframe is forced into the recording only when the stream (re)connects, never on congestion. Audio is the mix of the recorded tracks (the same mix and limiter as the mix track), encoded to AAC-LC at 160 kbit/s for the stream only; the Opus tracks of the files are untouched. When neither the files nor a stream use the mix, it is idle: its inputs drop their samples without taking its lock, and it lines them up again on the shared timeline when a stream starts. Without any audio track, the stream is silent and a notice says so. Measured on the RX 9070 with a 1440p60 game recorded in HEVC: recording alone 2.2 % of a CPU core and 42 % of the VCN encoder; with a 1080p60 6 Mbit/s H.264 stream 3.9 % and 64 %; sharing the recording's encode 3.7 % and 42 % (`scripts/robustness/t5_cost.sh`).
+
+The network never slows capture, encoding or the recording: the pipeline only queues packets for the `vesper-live` thread. When more than a second of video waits (the uplink is slower than the bitrate), the waiting video is dropped, and new video up to the next keyframe, which the stream encoder makes at once; the card shows the bitrate sent and the frames dropped. A lost connection is retried after 1, 2, 4... up to 30 s (*Reconnecting*), the recording going on meanwhile. A server that refuses the connection, rejects the stream, or closes it three times in a row right after it started ends the stream with what to check (server URL, stream key); an unreachable server (no network) is retried, an unknown host three times. Host names are resolved on a throwaway thread, so ending the stream never waits for DNS. An SRT server that does not answer is reported as unreachable, never as a wrong key.
+
+Limits: no adaptive bitrate (a slow uplink drops frames rather than lowering the quality); one stream at a time; a stream frame rate below the recording's sends the latest recorded picture of each stream frame; the stream keeps the size the recording's encoder opened at (a resized game is fitted with bars, as in a recording); whether the stream has audio is decided when it starts (tracks turned on or off later do not change it); a custom server URL is saved in the settings file as typed, so put the key in the key field, not in the URL.
+
+Tested without any real service, in the failure-injection lab (private network namespace, loopback only): `t1_stream.sh` (a game streamed to `ffmpeg -listen` while recording, checked with ffprobe: codec, size, frame rate, 2 s keyframes, AAC, audio and video spans; `PROTO=srt`, `CODEC=hevc|av1`, `H=0` for the shared encode), `t2_reconnect.sh` (the server killed mid-stream and back 6 s later), `t3_throttle.sh` (the loopback limited to 3 Mbit/s with `tc`), `t4_rejected.sh` (a server hanging up after the handshake, a wrong port, an unknown host), `t5_cost.sh`, `t6_shots.sh` (screenshots with demo data) and `t7_idle_mix.sh` (audio thread CPU with an idle mix). The TLS checks are unit tests against `openssl s_server` with a self-signed certificate, a trusted CA's certificate for another host, and one for the right host. `scripts/fake_secret_service.py` is an in-memory Secret Service for the keyring tests on a private bus (`DISMISS=1` refuses the unlock prompt).
+
 ## Background and tray
 
-Vesper shows an icon in the system tray (StatusNotifierItem, as on KDE Plasma). A left click shows or hides the window; its menu starts or stops a recording, saves the replay (while the replay buffer runs), turns the replay buffer on or off, and quits. A red dot marks a recording in progress.
+Vesper shows an icon in the system tray (StatusNotifierItem, as on KDE Plasma). A left click shows or hides the window; its menu starts or stops a recording, saves the replay (while the replay buffer runs), goes live or ends the stream, turns the replay buffer on or off, and quits. A red dot marks a recording in progress.
 
 With a tray, closing the window keeps Vesper running in the background, with the replay buffer and global shortcuts; the first time, a notification says so. Quit from the tray menu or with Ctrl+Q in the window (logging out, SIGTERM or SIGINT quit the same way): a recording in progress and replays being saved are finished first. Without a tray (no StatusNotifierWatcher on the session bus), closing the window quits, as before. Only one Vesper runs per session: launching it again shows the running one's window (it owns the D-Bus name `io.github.PaulCarouge.Vesper`). While the window is hidden, messages such as *No game to record yet* come as notifications.
 
@@ -100,8 +118,7 @@ Every feature below must keep recording quality, game performance and compatibil
 1. **VST3 plugin editors**: the plugins' own windows, next to the generic sliders.
 2. **Scenes and profiles**: sources composited on the GPU (VA-VPP / Vulkan) into the encoded picture, saved per profile.
 3. **Overlays**: images, text, webcam, and optional browser sources, on the same GPU compositor.
-4. **Streaming** to YouTube and Twitch (RTMP / SRT), sharing the recording's encode when settings match.
-5. **Game capture**: 32-bit Vulkan games, native OpenGL games.
+4. **Game capture**: 32-bit Vulkan games, native OpenGL games.
 
 Not planned: plugin APIs for the video pipeline itself.
 

@@ -4,6 +4,7 @@
 
 use std::collections::HashSet;
 use std::io::{Read, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -12,7 +13,8 @@ use vesper_audio::{MAX_DB, MIN_DB, Source};
 
 use crate::outputs::{Kind, SourceLabel};
 use crate::recorder::{MAX_FILTERS, MAX_TRACKS, Track, TrackFilter};
-use crate::{AppWindow, QualityPreset, SourceKind, VideoCodec};
+use crate::stream::{Service, StreamSettings};
+use crate::{AppWindow, LiveService, QualityPreset, SourceKind, VideoCodec};
 
 /// Process names (`/proc/<pid>/comm`) the user allowed game capture for. Not
 /// UI state, so kept here for `Prefs::from_ui`.
@@ -24,6 +26,10 @@ pub static TRAY_NOTICE_SHOWN: AtomicBool = AtomicBool::new(false);
 /// Choices offered by the UI; anything else in the file is ignored.
 const FPS: [i32; 4] = [30, 60, 120, 144];
 const REPLAY_SECONDS: [i32; 3] = [30, 60, 120];
+const LIVE_HEIGHTS: [i32; 3] = [0, 720, 1080];
+const LIVE_FPS: [i32; 2] = [30, 60];
+/// Stream bitrates offered, kbit/s: the slider's range and step.
+const LIVE_KBPS: (u64, u64, u64) = (1000, 20_000, 500);
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Prefs {
@@ -44,6 +50,8 @@ pub struct Prefs {
     pub game_source: bool,
     pub allowed_games: Vec<String>,
     pub tray_notice_shown: bool,
+    /// Live stream settings; the key is never here (see `secret`).
+    pub live: StreamSettings,
 }
 
 impl Prefs {
@@ -62,6 +70,7 @@ impl Prefs {
             game_source: ui.get_source_kind() == SourceKind::Game,
             allowed_games: ALLOWED_GAMES.lock().unwrap().clone(),
             tray_notice_shown: TRAY_NOTICE_SHOWN.load(Ordering::Relaxed),
+            live: crate::live::settings(ui),
         }
     }
 
@@ -85,6 +94,22 @@ impl Prefs {
             .unwrap()
             .clone_from(&self.allowed_games);
         TRAY_NOTICE_SHOWN.store(self.tray_notice_shown, Ordering::Relaxed);
+        let live = &self.live;
+        ui.set_live_service(match live.service {
+            Service::Twitch => LiveService::Twitch,
+            Service::YouTube => LiveService::Youtube,
+            Service::Custom => LiveService::Custom,
+        });
+        ui.set_live_url(live.custom_url.as_str().into());
+        ui.set_live_url_warning(crate::stream::cleartext_warning(&live.custom_url).into());
+        ui.set_live_height(live.height.map_or(0, |h| h as i32));
+        ui.set_live_fps(live.fps as i32);
+        ui.set_live_bitrate(live.bitrate as f32 / 1e6);
+        ui.set_live_codec(match live.codec {
+            vesper_core::Codec::Av1 => VideoCodec::Av1,
+            vesper_core::Codec::Hevc => VideoCodec::Hevc,
+            vesper_core::Codec::H264 => VideoCodec::H264,
+        });
     }
 
     /// `self` with the valid settings of `text` applied.
@@ -146,6 +171,26 @@ impl Prefs {
                     self.allowed_games.push(value.to_owned());
                 }
                 "tray_notice_shown" => set(&mut self.tray_notice_shown, flag(value)),
+                "live_service" => set(&mut self.live.service, service(value)),
+                "live_url" if one_line(value) => self.live.custom_url = value.trim().to_owned(),
+                "live_height" => {
+                    if let Some(h) = choice(value, &LIVE_HEIGHTS) {
+                        self.live.height = (h > 0).then_some(h as u32);
+                    }
+                }
+                "live_fps" => {
+                    if let Some(fps) = choice(value, &LIVE_FPS) {
+                        self.live.fps = fps as u32;
+                    }
+                }
+                "live_kbps" => {
+                    let (min, max, step) = LIVE_KBPS;
+                    let kbps = value.trim().parse::<u64>().ok();
+                    if let Some(kbps) = kbps.filter(|k| (min..=max).contains(k) && k % step == 0) {
+                        self.live.bitrate = kbps * 1000;
+                    }
+                }
+                "live_codec" => set(&mut self.live.codec, codec(value).map(Into::into)),
                 _ => {}
             }
         }
@@ -210,6 +255,28 @@ impl Prefs {
         for game in self.allowed_games.iter().filter(|g| valid_game(g)) {
             text += &format!("allow_game={game}\n");
         }
+        let live = &self.live;
+        let service = match live.service {
+            Service::Twitch => "twitch",
+            Service::YouTube => "youtube",
+            Service::Custom => "custom",
+        };
+        let codec = match live.codec {
+            vesper_core::Codec::Av1 => "av1",
+            vesper_core::Codec::Hevc => "hevc",
+            vesper_core::Codec::H264 => "h264",
+        };
+        text += &format!(
+            "live_service={service}\nlive_height={}\nlive_fps={}\nlive_kbps={}\nlive_codec={codec}\n",
+            live.height.unwrap_or(0),
+            live.fps,
+            live.bitrate / 1000
+        );
+        // Never a key pasted into the URL.
+        let (url, _) = crate::stream::split_secret(&live.custom_url);
+        if one_line(&url) {
+            text += &format!("live_url={url}\n");
+        }
         text
     }
 
@@ -251,6 +318,20 @@ fn codec(value: &str) -> Option<VideoCodec> {
         "h264" => Some(VideoCodec::H264),
         _ => None,
     }
+}
+
+fn service(value: &str) -> Option<Service> {
+    match value.trim() {
+        "twitch" => Some(Service::Twitch),
+        "youtube" => Some(Service::YouTube),
+        "custom" => Some(Service::Custom),
+        _ => None,
+    }
+}
+
+/// A value that stays on its line.
+fn one_line(value: &str) -> bool {
+    !value.chars().any(char::is_control)
 }
 
 fn quality(value: &str) -> Option<QualityPreset> {
@@ -516,9 +597,12 @@ pub fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         .subsec_nanos();
     let n = WRITES.fetch_add(1, Ordering::Relaxed);
     let tmp = path.with_extension(format!("tmp.{}.{n}.{nanos:x}", std::process::id()));
+    // Private (0600): the settings name devices and folders, and the
+    // stream key fallback goes through here too.
     let written = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
+        .mode(0o600)
         .open(&tmp)
         .and_then(|mut file| file.write_all(bytes))
         .and_then(|()| std::fs::rename(&tmp, path));
@@ -550,6 +634,7 @@ mod tests {
             game_source: false,
             allowed_games: Vec::new(),
             tray_notice_shown: false,
+            live: StreamSettings::default(),
         }
     }
 
@@ -601,6 +686,14 @@ mod tests {
             game_source: true,
             allowed_games: vec!["Game.exe".into(), "a=b c".into()],
             tray_notice_shown: true,
+            live: StreamSettings {
+                service: Service::Custom,
+                custom_url: "srt://host:9000?latency=200000".into(),
+                height: None,
+                fps: 30,
+                bitrate: 4_500_000,
+                codec: vesper_core::Codec::Av1,
+            },
         }
     }
 
@@ -651,6 +744,25 @@ mod tests {
         );
         assert_eq!(Device::new("m", " \n ").unwrap().label, "m");
         assert_eq!(Device::new("m", &"x".repeat(300)).unwrap().label.len(), 128);
+    }
+
+    #[test]
+    fn bad_live_settings_are_ignored() {
+        let text = "live_service=kick\nlive_height=1440\nlive_fps=144\nlive_kbps=6200\n\
+                    live_kbps=999999\nlive_codec=vp9\nlive_url=a\u{1}b\n";
+        assert_eq!(defaults().parse(text), defaults());
+        let prefs = Prefs {
+            live: StreamSettings {
+                custom_url: "rtmp://h/app/live_secret".into(),
+                ..StreamSettings::default()
+            },
+            ..defaults()
+        };
+        let text = prefs.serialize(DEFAULT);
+        assert!(text.contains("live_url=rtmp://h/app\n") && !text.contains("secret"));
+        let prefs = defaults().parse("live_height=0\nlive_kbps=8000\n");
+        assert_eq!(prefs.live.height, None);
+        assert_eq!(prefs.live.bitrate, 8_000_000);
     }
 
     #[test]

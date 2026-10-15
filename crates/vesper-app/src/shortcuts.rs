@@ -29,15 +29,17 @@ pub async fn register_app_id() -> ashpd::Result<()> {
 pub enum Action {
     ToggleRecording,
     SaveReplay,
+    ToggleLive,
 }
 
 impl Action {
-    const ALL: [Self; 2] = [Self::ToggleRecording, Self::SaveReplay];
+    const ALL: [Self; 3] = [Self::ToggleRecording, Self::SaveReplay, Self::ToggleLive];
 
     fn id(self) -> &'static str {
         match self {
             Self::ToggleRecording => "toggle-recording",
             Self::SaveReplay => "save-replay",
+            Self::ToggleLive => "toggle-live",
         }
     }
 
@@ -45,12 +47,13 @@ impl Action {
         Self::ALL.into_iter().find(|a| a.id() == id)
     }
 
-    /// ShadowPlay's keys; neither is bound by a default KDE Plasma 6 setup.
-    /// Format of the XDG shortcuts spec.
+    /// ShadowPlay's keys (Alt+F8 is its broadcast key); none is bound by a
+    /// default KDE Plasma 6 setup. Format of the XDG shortcuts spec.
     fn preferred_trigger(self) -> &'static str {
         match self {
             Self::ToggleRecording => "ALT+F9",
             Self::SaveReplay => "ALT+F10",
+            Self::ToggleLive => "ALT+F8",
         }
     }
 
@@ -58,6 +61,7 @@ impl Action {
         match self {
             Self::ToggleRecording => "Start/stop recording",
             Self::SaveReplay => "Save replay",
+            Self::ToggleLive => "Go live/end stream",
         }
     }
 }
