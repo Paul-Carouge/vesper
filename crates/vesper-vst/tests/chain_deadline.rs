@@ -21,6 +21,8 @@ fn stalled_plugins_share_the_block_deadline() {
     }
     let specs: Vec<_> = ids.iter().map(|&id| FilterSpec::Vst3 { id }).collect();
     let (mut chain, _control) = vesper_dsp::live(&specs, 2);
+    // The first block warms the chain up (allocations, RNNoise): not timed.
+    chain.process(&mut ramp(0, 960));
     let mut longest = Duration::ZERO;
     for _ in 0..5 {
         let mut buf = ramp(0, 960);
