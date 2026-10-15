@@ -246,10 +246,13 @@ impl Msg {
     }
 }
 
-/// `$XDG_RUNTIME_DIR/vesper/capture.sock`.
-pub fn socket_path() -> Option<PathBuf> {
-    let dir = std::env::var_os("XDG_RUNTIME_DIR").filter(|d| !d.is_empty())?;
-    Some(Path::new(&dir).join("vesper").join("capture.sock"))
+/// `/tmp/vesper-<uid>/capture.sock`. Not `$XDG_RUNTIME_DIR`: the Steam
+/// Linux Runtime container (pressure-vessel) replaces it with its own tmpfs
+/// but shares the host's `/tmp`. Flatpak apps get a private `/tmp`, so
+/// unlike an abstract socket they cannot reach it.
+pub fn socket_path() -> PathBuf {
+    let uid = unsafe { libc::getuid() };
+    PathBuf::from(format!("/tmp/vesper-{uid}/capture.sock"))
 }
 
 fn cvt(ret: libc::c_int) -> io::Result<libc::c_int> {
@@ -277,24 +280,32 @@ fn sockaddr(path: &Path) -> io::Result<(libc::sockaddr_un, libc::socklen_t)> {
     Ok((addr, len as libc::socklen_t))
 }
 
-fn seqpacket() -> io::Result<OwnedFd> {
-    let fd =
-        cvt(unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC, 0) })?;
+fn seqpacket(flags: libc::c_int) -> io::Result<OwnedFd> {
+    let fd = cvt(unsafe {
+        libc::socket(
+            libc::AF_UNIX,
+            libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC | flags,
+            0,
+        )
+    })?;
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
-/// Connects to the server (blocking socket; use `MSG_DONTWAIT` per call).
+/// Connects to the server and returns a blocking socket (use `MSG_DONTWAIT`
+/// per call). Never waits: a full backlog fails with `WouldBlock`.
 pub fn connect(path: &Path) -> io::Result<OwnedFd> {
     let (addr, len) = sockaddr(path)?;
-    let fd = seqpacket()?;
+    let fd = seqpacket(libc::SOCK_NONBLOCK)?;
     cvt(unsafe { libc::connect(fd.as_raw_fd(), (&raw const addr).cast(), len) })?;
+    let flags = cvt(unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) })?;
+    cvt(unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags & !libc::O_NONBLOCK) })?;
     Ok(fd)
 }
 
 /// Binds and listens on `path`. The caller removes stale sockets first.
 pub fn listen(path: &Path) -> io::Result<OwnedFd> {
     let (addr, len) = sockaddr(path)?;
-    let fd = seqpacket()?;
+    let fd = seqpacket(0)?;
     cvt(unsafe { libc::bind(fd.as_raw_fd(), (&raw const addr).cast(), len) })?;
     cvt(unsafe { libc::listen(fd.as_raw_fd(), 8) })?;
     Ok(fd)
@@ -458,7 +469,8 @@ pub fn is_sync_file(fd: BorrowedFd) -> bool {
 }
 
 /// Creates `dir` with mode 0700 if missing, then checks it is a real
-/// directory owned by this user with mode 0700 (not a symlink).
+/// directory owned by this user with mode 0700 (not a symlink). In `/tmp`
+/// another user can create it first: that only denies service.
 pub(crate) fn create_private_dir(dir: &Path) -> io::Result<()> {
     let c = CString::new(dir.as_os_str().as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "nul in path"))?;
@@ -476,7 +488,11 @@ pub(crate) fn create_private_dir(dir: &Path) -> io::Result<()> {
     {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            format!("{} is not a private directory of this user", dir.display()),
+            format!(
+                "{} is not a private directory of this user (owner, mode 0700, no symlink); \
+                 remove it to enable game capture",
+                dir.display()
+            ),
         ));
     }
     Ok(())
@@ -587,6 +603,50 @@ mod tests {
         no_planes.truncate(no_planes.len() - 12);
         no_planes.extend_from_slice(&0u32.to_le_bytes());
         assert!(Msg::decode(&no_planes).is_err());
+    }
+
+    #[test]
+    fn socket_dir_must_be_private() {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            socket_path(),
+            PathBuf::from(format!("/tmp/vesper-{}/capture.sock", unsafe {
+                libc::getuid()
+            }))
+        );
+        let base = std::env::temp_dir().join(format!("vesper-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir(&base).unwrap();
+        let dir = base.join("ok");
+        create_private_dir(&dir).unwrap();
+        create_private_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(create_private_dir(&dir).is_err());
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&dir, &link).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(create_private_dir(&link).is_err());
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn connect_never_waits_on_a_full_backlog() {
+        let path = std::env::temp_dir().join(format!("vesper-backlog-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let _listener = listen(&path).unwrap();
+        let mut held = Vec::new();
+        let err = loop {
+            match connect(&path) {
+                Ok(s) => held.push(s),
+                Err(e) => break e,
+            }
+            assert!(held.len() < 1000, "backlog never filled");
+        };
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+        // Connected sockets are blocking again.
+        let flags = unsafe { libc::fcntl(held[0].as_raw_fd(), libc::F_GETFL) };
+        assert_eq!(flags & libc::O_NONBLOCK, 0);
+        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]

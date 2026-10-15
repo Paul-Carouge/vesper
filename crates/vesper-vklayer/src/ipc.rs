@@ -105,9 +105,7 @@ fn pin_library() -> bool {
 }
 
 fn run() {
-    let Some(path) = protocol::socket_path() else {
-        return;
-    };
+    let path = protocol::socket_path();
     let hello = Msg::Hello {
         version: protocol::VERSION,
         pid: std::process::id(),

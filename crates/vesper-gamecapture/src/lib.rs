@@ -1,6 +1,7 @@
 //! Game capture through Vesper's own Vulkan layer (`vesper-vklayer`).
 //!
-//! [`GameCapture::start`] listens on `$XDG_RUNTIME_DIR/vesper/capture.sock`.
+//! [`GameCapture::start`] listens on `/tmp/vesper-<uid>/capture.sock`
+//! ([`protocol::socket_path`]), reachable from Steam Runtime containers.
 //! Every Vulkan process with the layer installed connects while the server
 //! runs and reports its swapchain size. The server captures one game at a
 //! time and only with consent: Steam games (`SteamAppId` in their
@@ -106,13 +107,21 @@ impl GameCapture {
     /// error: the server waits for the next one. It starts inactive: no
     /// game copies frames until [`GameCapture::set_active`].
     pub fn start(on_frame: impl FnMut(Result<VideoFrame>) + Send + 'static) -> Result<Self> {
-        let path = protocol::socket_path().ok_or("XDG_RUNTIME_DIR is not set")?;
+        Self::start_at(protocol::socket_path(), on_frame)
+    }
+
+    /// [`GameCapture::start`] on another socket path (tests).
+    fn start_at(
+        path: PathBuf,
+        on_frame: impl FnMut(Result<VideoFrame>) + Send + 'static,
+    ) -> Result<Self> {
         protocol::create_private_dir(path.parent().expect("socket path has a parent"))?;
         if path.exists() {
-            if protocol::connect(&path).is_ok() {
-                return Err("another Vesper instance is already capturing games".into());
+            match protocol::connect(&path) {
+                // A full backlog is a live server too.
+                Err(e) if e.kind() != io::ErrorKind::WouldBlock => std::fs::remove_file(&path)?,
+                _ => return Err("another Vesper instance is already capturing games".into()),
             }
-            std::fs::remove_file(&path)?;
         }
         let listener = protocol::listen(&path)?;
         let mut pipe = [0; 2];
@@ -271,6 +280,8 @@ struct Server {
     is_dmabuf: fn(BorrowedFd) -> bool,
     /// `alive`; replaced in tests, whose clients have made-up pids.
     alive: fn(u32) -> bool,
+    /// Uids already warned about.
+    refused_uids: Vec<u32>,
 }
 
 /// What selection needs to know about a client.
@@ -371,6 +382,7 @@ impl Server {
             is_sync_file: protocol::is_sync_file,
             is_dmabuf: protocol::is_dmabuf,
             alive,
+            refused_uids: Vec::new(),
         }
     }
 
@@ -448,7 +460,15 @@ impl Server {
         }
         let cred = match protocol::peer_cred(sock.as_fd()) {
             Ok(c) if c.uid == unsafe { libc::getuid() } => c,
-            _ => return warn!("refusing a connection from another user"),
+            other => {
+                // Once per uid: a peer must not flood the log.
+                let uid = other.map_or(u32::MAX, |c| c.uid);
+                if !self.refused_uids.contains(&uid) {
+                    self.refused_uids.push(uid);
+                    warn!("refusing connections from another user (uid {uid})");
+                }
+                return;
+            }
         };
         let pid = cred.pid.to_string();
         let exe = protocol::process_name_of(&pid);
@@ -851,6 +871,42 @@ mod tests {
     fn checks_process_liveness() {
         assert!(alive(std::process::id()));
         assert!(!alive(u32::MAX));
+    }
+
+    #[test]
+    fn games_connect_over_the_socket() {
+        let dir = std::env::temp_dir().join(format!("vesper-test-{}", std::process::id()));
+        let name = dir.join("capture.sock");
+        // A stale socket from a crashed instance is replaced.
+        protocol::create_private_dir(&dir).unwrap();
+        drop(protocol::listen(&name).unwrap());
+        let capture = GameCapture::start_at(name.clone(), |_| {}).unwrap();
+        let err = GameCapture::start_at(name.clone(), |_| {}).err().unwrap();
+        assert!(err.to_string().contains("another Vesper instance"), "{err}");
+
+        let sock = protocol::connect(&name).unwrap();
+        assert!(protocol::peer_is_same_user(sock.as_fd()));
+        let hello = Msg::Hello {
+            version: protocol::VERSION,
+            pid: 1,
+            exe: "lies".into(),
+        };
+        protocol::send(sock.as_fd(), &hello, None, false).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let games = loop {
+            let games = capture.games();
+            if !games.is_empty() || Instant::now() > deadline {
+                break games;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        // Identity comes from SO_PEERCRED, not from the hello.
+        assert_eq!(games.len(), 1);
+        assert_eq!(games[0].pid, std::process::id());
+
+        drop(capture);
+        assert!(!name.exists());
+        std::fs::remove_dir(&dir).unwrap();
     }
 
     #[test]
