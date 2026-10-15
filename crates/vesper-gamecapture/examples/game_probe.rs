@@ -1,8 +1,9 @@
 //! Waits for a game to present through the Vesper layer, then prints frame
 //! properties and fps every second. With `--encode PATH`, also encodes the
-//! frames to HEVC (Annex B) at PATH.
+//! frames to HEVC (Annex B) at PATH. Non-Steam games need `--allow EXE`
+//! (their process name); until then they are listed as pending consent.
 //!
-//! Usage: `cargo run -p vesper-gamecapture --example game_probe -- [SECONDS] [--encode PATH]`
+//! Usage: `cargo run -p vesper-gamecapture --example game_probe -- [SECONDS] [--encode PATH] [--allow EXE]...`
 //! (default 5 s of frames). Set `RUST_LOG=debug` for more logs.
 
 use std::sync::mpsc;
@@ -21,9 +22,11 @@ fn main() -> vesper_gamecapture::Result<()> {
     let mut args = std::env::args().skip(1);
     let mut seconds = 5;
     let mut out = None;
+    let mut allow = Vec::new();
     while let Some(a) = args.next() {
         match a.as_str() {
             "--encode" => out = Some(args.next().ok_or("--encode needs a path")?),
+            "--allow" => allow.push(args.next().ok_or("--allow needs a process name")?),
             s => seconds = s.parse()?,
         }
     }
@@ -34,7 +37,11 @@ fn main() -> vesper_gamecapture::Result<()> {
         Ok(frame) => drop(tx.try_send(Ok(frame))),
         Err(e) => drop(tx.send(Err(e))),
     })?;
+    for exe in &allow {
+        capture.allow(exe);
+    }
     println!("waiting for a game (VESPER_CAPTURE_DISABLE unset, layer installed)");
+    let mut listed = Vec::new();
 
     let mut end = None;
     let mut window = (Instant::now(), 0u32);
@@ -51,10 +58,17 @@ fn main() -> vesper_gamecapture::Result<()> {
                 println!("capture ended: {e}");
                 break;
             }
-            Err(_) => continue,
+            Err(_) => {
+                let games = capture.games();
+                if games != listed {
+                    println!("games: {games:?}");
+                    listed = games;
+                }
+                continue;
+            }
         };
         if end.is_none() {
-            println!("games: {:?}", capture.games());
+            println!("captured: {:?}", capture.captured());
             end = Some(Instant::now() + Duration::from_secs(seconds));
             window = (Instant::now(), 0);
         }

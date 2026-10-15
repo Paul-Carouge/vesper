@@ -8,45 +8,58 @@
 
 use std::ffi::{CStr, c_void};
 use std::os::fd::{AsFd, FromRawFd, OwnedFd};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ash::vk::{self, Handle};
-use vesper_gamecapture::protocol::{Msg, Plane};
+use vesper_gamecapture::protocol::{self, Msg, Plane};
 
 use crate::ipc::{self, IPC};
-use crate::{Instance, debug, device_for, guard, key, warn};
+use crate::{Instance, LockExt, debug, device_for, guard, key, warn};
 
 /// Images in the export ring. Three skipped frames at 160 fps with an
 /// encoder in the loop; four did not.
-const RING: usize = 4;
+const RING: usize = protocol::RING as usize;
+/// At most one ring (re)creation per swapchain in this time.
+const RING_RETRY: Duration = Duration::from_secs(1);
 /// Smallest swapchain worth capturing (skips launchers' splash windows,
 /// tooltips and the like).
 const MIN_SIZE: (u32, u32) = (640, 360);
 const DRM_FORMAT_MOD_LINEAR: u64 = 0;
 
-/// Swapchain the process currently offers to Vesper (raw handle, 0 = none).
-static OWNER: AtomicU64 = AtomicU64::new(0);
+/// Swapchain the process currently offers to Vesper: (device key, raw
+/// handle); (0, 0) = none. Handles are only unique per device.
+static OWNER: Mutex<(usize, u64)> = Mutex::new((0, 0));
+
+fn owner_is(dev: usize, sc: vk::SwapchainKHR) -> bool {
+    *OWNER.locked() == (dev, sc.as_raw())
+}
+
+/// Clears the owner if it is this swapchain; true if it was.
+fn release_owner(dev: usize, sc: vk::SwapchainKHR) -> bool {
+    let mut o = OWNER.locked();
+    let was = *o == (dev, sc.as_raw());
+    if was {
+        *o = (0, 0);
+    }
+    was
+}
 /// Ring generation, unique in the process.
 static GENERATION: AtomicU32 = AtomicU32::new(0);
-
-const fn fourcc(c: &[u8; 4]) -> u32 {
-    u32::from_le_bytes(*c)
-}
 
 /// Ring format for a swapchain format: (format, DRM fourcc, needs a blit).
 /// 8-bit formats are copied bit for bit (an sRGB swapchain's bytes are
 /// already what the encoder expects); others are blitted to 8-bit BGRA.
 fn ring_format(format: vk::Format) -> Option<(vk::Format, u32, bool)> {
     use vk::Format as F;
-    let xr24 = fourcc(b"XR24");
+    let xr24 = protocol::XR24;
     Some(match format {
         F::B8G8R8A8_UNORM | F::B8G8R8A8_SRGB => (F::B8G8R8A8_UNORM, xr24, false),
         F::R8G8B8A8_UNORM
         | F::R8G8B8A8_SRGB
         | F::A8B8G8R8_UNORM_PACK32
-        | F::A8B8G8R8_SRGB_PACK32 => (F::R8G8B8A8_UNORM, fourcc(b"XB24"), false),
+        | F::A8B8G8R8_SRGB_PACK32 => (F::R8G8B8A8_UNORM, protocol::XB24, false),
         F::A2B10G10R10_UNORM_PACK32 | F::A2R10G10B10_UNORM_PACK32 => {
             (F::B8G8R8A8_UNORM, xr24, true)
         }
@@ -112,12 +125,17 @@ struct Swapchain {
     /// Reused when the image is presented again, as apps do.
     present_sems: Vec<vk::Semaphore>,
     ring: Option<Ring>,
-    /// Presents to wait before retrying a ring Vesper could not take.
-    backoff: u32,
+    /// Earliest next ring (re)creation (rate limit, also after failures).
+    next_ring: Option<Instant>,
 }
 
 pub(crate) struct Device {
     handle: vk::Device,
+    /// Dispatch key, for `OWNER`.
+    key: usize,
+    /// Some swapchain may hold a ring: checked on the dormant path so a
+    /// ring never outlives the connection in VRAM.
+    pub has_ring: AtomicBool,
     gdpa: vk::PFN_vkGetDeviceProcAddr,
     pub fns: ash::Device,
     inst: Arc<Instance>,
@@ -170,6 +188,8 @@ impl Device {
         }
         Self {
             handle,
+            key: key(handle),
+            has_ring: AtomicBool::new(false),
             gdpa,
             fns: unsafe { ash::Device::load_with(load, handle) },
             swapchain: ash::khr::swapchain::DeviceFn::load(load),
@@ -193,12 +213,22 @@ impl Device {
 
     /// Frees every ring and semaphore (the device is being destroyed).
     pub fn destroy_all(&self) {
-        let swapchains = std::mem::take(&mut *self.swapchains.lock().unwrap());
+        let swapchains = std::mem::take(&mut *self.swapchains.locked());
         for mut sc in swapchains {
             self.forget(&mut sc);
         }
-        for s in self.spare_sems.lock().unwrap().drain(..) {
+        for s in self.spare_sems.locked().drain(..) {
             unsafe { self.fns.destroy_semaphore(s, None) };
+        }
+    }
+
+    /// Frees every ring (Vesper went away). Present semaphores stay.
+    pub fn drop_rings(&self) {
+        self.has_ring.store(false, Ordering::SeqCst);
+        for sc in self.swapchains.locked().iter_mut() {
+            if let Some(ring) = sc.ring.take() {
+                self.destroy_ring(ring);
+            }
         }
     }
 
@@ -206,14 +236,8 @@ impl Device {
         if let Some(ring) = sc.ring.take() {
             self.destroy_ring(ring);
         }
-        self.spare_sems
-            .lock()
-            .unwrap()
-            .extend(sc.present_sems.drain(..));
-        if OWNER
-            .compare_exchange(sc.handle.as_raw(), 0, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok()
-            && sc.announced == IPC.conn_id.load(Ordering::SeqCst)
+        self.spare_sems.locked().extend(sc.present_sems.drain(..));
+        if release_owner(self.key, sc.handle) && sc.announced == IPC.conn_id.load(Ordering::SeqCst)
         {
             ipc::send(
                 &Msg::Swapchain {
@@ -269,7 +293,7 @@ impl Device {
         }
         let handles = unsafe { std::slice::from_raw_parts(info.p_swapchains, n) };
         let indices = unsafe { std::slice::from_raw_parts(info.p_image_indices, n) };
-        let mut swapchains = self.swapchains.lock().unwrap();
+        let mut swapchains = self.swapchains.locked();
         for (h, &image) in handles.iter().zip(indices) {
             let Some(sc) = swapchains.iter_mut().find(|s| s.handle == *h) else {
                 continue;
@@ -278,7 +302,7 @@ impl Device {
                 continue;
             }
             // Also when the swapchain that held the slot went away.
-            if sc.announced != conn || OWNER.load(Ordering::SeqCst) == 0 {
+            if sc.announced != conn || *OWNER.locked() == (0, 0) {
                 let msg = Msg::Swapchain {
                     width: sc.extent.width,
                     height: sc.extent.height,
@@ -287,9 +311,13 @@ impl Device {
                     continue;
                 }
                 sc.announced = conn;
-                OWNER.store(h.as_raw(), Ordering::SeqCst);
+                *OWNER.locked() = (self.key, h.as_raw());
             }
-            if OWNER.load(Ordering::SeqCst) != h.as_raw() {
+            if !owner_is(self.key, *h) {
+                // Another swapchain took over: free this one's ring.
+                if let Some(ring) = sc.ring.take() {
+                    self.destroy_ring(ring);
+                }
                 continue;
             }
             if !capturing {
@@ -307,7 +335,7 @@ impl Device {
     /// Swaps a present semaphore that may still be signaled for a new one
     /// (the old one leaks: it may be signaled or awaited).
     fn replace_present_sem(&self, old: vk::Semaphore) {
-        let mut swapchains = self.swapchains.lock().unwrap();
+        let mut swapchains = self.swapchains.locked();
         for sc in swapchains.iter_mut() {
             if let Some(slot) = sc.present_sems.iter_mut().find(|s| **s == old) {
                 match unsafe {
@@ -325,10 +353,10 @@ impl Device {
     fn disable(&self, sc: &mut Swapchain, why: &str) {
         warn(&format!("capture off for this swapchain: {why}"));
         sc.capturable = false;
-        if OWNER
-            .compare_exchange(sc.handle.as_raw(), 0, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok()
-        {
+        if let Some(ring) = sc.ring.take() {
+            self.destroy_ring(ring);
+        }
+        if release_owner(self.key, sc.handle) {
             ipc::send(
                 &Msg::Swapchain {
                     width: 0,
@@ -349,16 +377,11 @@ impl Device {
     ) -> Option<vk::Semaphore> {
         let family = self
             .queues
-            .lock()
-            .unwrap()
+            .locked()
             .iter()
             .find(|(q, _)| *q == queue)
             .map(|(_, f)| *f)?;
         let src = *sc.images.get(image as usize)?;
-        if sc.backoff > 0 {
-            sc.backoff -= 1;
-            return None;
-        }
         if sc
             .ring
             .as_ref()
@@ -369,13 +392,18 @@ impl Device {
             self.destroy_ring(ring);
         }
         if sc.ring.is_none() {
+            let now = Instant::now();
+            if sc.next_ring.is_some_and(|t| now < t) {
+                return None;
+            }
+            sc.next_ring = Some(now + RING_RETRY);
             match self.create_ring(sc, family, start) {
-                Ok(Some(r)) => sc.ring = Some(r),
-                // Socket full: try again a second or so later.
-                Ok(None) => {
-                    sc.backoff = 120;
-                    return None;
+                Ok(Some(r)) => {
+                    sc.ring = Some(r);
+                    self.has_ring.store(true, Ordering::SeqCst);
                 }
+                // Socket full: try again later.
+                Ok(None) => return None,
                 Err(e) => {
                     self.disable(sc, &e);
                     return None;
@@ -384,7 +412,7 @@ impl Device {
         }
         if sc.present_sems.is_empty() {
             for _ in 0..sc.images.len() {
-                if let Some(s) = self.spare_sems.lock().unwrap().pop() {
+                if let Some(s) = self.spare_sems.locked().pop() {
                     sc.present_sems.push(s);
                     continue;
                 }
@@ -408,11 +436,11 @@ impl Device {
                 s.free = true;
             }
         }
-        let Some(slot) = ring
-            .slots
-            .iter()
-            .position(|s| s.free && unsafe { self.fns.get_fence_status(s.fence) } == Ok(true))
-        else {
+        let Some(slot) = ring.slots.iter().position(|s| {
+            s.free
+                && s.fence != vk::Fence::null()
+                && unsafe { self.fns.get_fence_status(s.fence) } == Ok(true)
+        }) else {
             debug("no free ring image: frame skipped");
             return None;
         };
@@ -456,7 +484,7 @@ impl Device {
     #[allow(clippy::too_many_arguments)]
     fn submit_copy(
         &self,
-        ring: &Ring,
+        ring: &mut Ring,
         slot: usize,
         queue: vk::Queue,
         info: &vk::PresentInfoKHR<'_>,
@@ -465,7 +493,9 @@ impl Device {
         present_sem: vk::Semaphore,
     ) -> Result<(), String> {
         let d = &self.fns;
-        let s = &ring.slots[slot];
+        let family = ring.family;
+        let blit = ring.blit;
+        let s = &mut ring.slots[slot];
         let ex = self.export.as_ref().expect("active device");
         let range = vk::ImageSubresourceRange::default()
             .aspect_mask(vk::ImageAspectFlags::COLOR)
@@ -486,12 +516,14 @@ impl Device {
                 .subresource_range(range)
         };
         use vk::{AccessFlags as A, ImageLayout as L, PipelineStageFlags as P};
+        // Chains on the semaphore wait (all stages) that covers the app's
+        // writes to `src`.
         let before = [
             barrier(
                 src,
                 L::PRESENT_SRC_KHR,
                 L::TRANSFER_SRC_OPTIMAL,
-                A::empty(),
+                A::MEMORY_WRITE,
                 A::TRANSFER_READ,
             ),
             barrier(
@@ -523,7 +555,7 @@ impl Device {
                 A::TRANSFER_WRITE,
                 A::empty(),
             )
-            .src_queue_family_index(ring.family)
+            .src_queue_family_index(family)
             .dst_queue_family_index(foreign),
         ];
         let size = vk::Offset3D {
@@ -546,14 +578,14 @@ impl Device {
             )?;
             d.cmd_pipeline_barrier(
                 s.cmd,
-                P::TRANSFER,
+                P::ALL_COMMANDS,
                 P::TRANSFER,
                 vk::DependencyFlags::empty(),
                 &[],
                 &[],
                 &before,
             );
-            if ring.blit {
+            if blit {
                 let region = vk::ImageBlit::default()
                     .src_subresource(layers)
                     .src_offsets([vk::Offset3D::default(), size])
@@ -605,7 +637,7 @@ impl Device {
                     info.wait_semaphore_count as usize,
                 )
             };
-            let stages = vec![P::TRANSFER; waits.len()];
+            let stages = vec![P::ALL_COMMANDS; waits.len()];
             let signals = [present_sem, s.sync];
             let cmds = [s.cmd];
             let submit = vk::SubmitInfo::default()
@@ -614,7 +646,17 @@ impl Device {
                 .command_buffers(&cmds)
                 .signal_semaphores(&signals);
             check(d.reset_fences(&[s.fence]), "reset fence")?;
-            check(d.queue_submit(queue, &[submit], s.fence), "submit copy")?;
+            if let Err(e) = d.queue_submit(queue, &[submit], s.fence) {
+                // The reset fence would never signal: replace it with a signaled one.
+                d.destroy_fence(s.fence, None);
+                s.fence = d
+                    .create_fence(
+                        &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
+                        None,
+                    )
+                    .unwrap_or(vk::Fence::null());
+                return Err(format!("submit copy: {e}"));
+            }
         }
         Ok(())
     }
@@ -698,6 +740,11 @@ impl Device {
             .get(family as usize)
             .ok_or("unknown queue family")?
             .queue_flags;
+        if !flags.intersects(
+            vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE | vk::QueueFlags::TRANSFER,
+        ) {
+            return Err("present queue cannot copy images".into());
+        }
         if blit {
             if !flags.contains(vk::QueueFlags::GRAPHICS) {
                 return Err("format conversion needs a graphics queue".into());
@@ -1014,7 +1061,7 @@ fn remember_queue(dev: &Device, queue: vk::Queue, family: u32) {
     if queue == vk::Queue::null() {
         return;
     }
-    let mut queues = dev.queues.lock().unwrap();
+    let mut queues = dev.queues.locked();
     if !queues.iter().any(|(q, _)| *q == queue) {
         queues.push((queue, family));
     }
@@ -1072,7 +1119,7 @@ pub(crate) unsafe extern "system" fn create_swapchain(
             ok = get(device, handle, &mut n, images.as_mut_ptr()) == vk::Result::SUCCESS;
             images.truncate(n as usize);
         }
-        dev.swapchains.lock().unwrap().push(Swapchain {
+        dev.swapchains.locked().push(Swapchain {
             handle,
             images,
             format: (*ci).image_format,
@@ -1081,7 +1128,7 @@ pub(crate) unsafe extern "system" fn create_swapchain(
             announced: 0,
             present_sems: Vec::new(),
             ring: None,
-            backoff: 0,
+            next_ring: None,
         });
         if wants && ok {
             ipc::ensure_thread();
@@ -1099,7 +1146,7 @@ pub(crate) unsafe extern "system" fn destroy_swapchain(
         return;
     };
     let sc = guard(None, || {
-        let mut list = dev.swapchains.lock().unwrap();
+        let mut list = dev.swapchains.locked();
         let i = list.iter().position(|s| s.handle == swapchain)?;
         let mut sc = list.swap_remove(i);
         if let Some(ring) = sc.ring.take() {
@@ -1123,6 +1170,9 @@ pub(crate) unsafe extern "system" fn queue_present(
     let next = dev.swapchain.queue_present_khr;
     // Dormant: Vesper is not running.
     if !IPC.connected.load(Ordering::Relaxed) {
+        if dev.has_ring.load(Ordering::Relaxed) {
+            guard((), || dev.drop_rings());
+        }
         return unsafe { next(queue, info) };
     }
     let wait = guard(None, || dev.before_present(queue, unsafe { &*info }));
@@ -1154,20 +1204,20 @@ mod tests {
             let (r, cc, blit) = ring_format(f).unwrap();
             (r.as_raw(), cc, blit)
         };
-        let xr24 = (vk::Format::B8G8R8A8_UNORM.as_raw(), fourcc(b"XR24"), false);
+        let xr24 = (vk::Format::B8G8R8A8_UNORM.as_raw(), protocol::XR24, false);
         assert_eq!(raw(vk::Format::B8G8R8A8_SRGB), xr24);
         assert_eq!(raw(vk::Format::B8G8R8A8_UNORM), xr24);
         assert_eq!(
             raw(vk::Format::A8B8G8R8_UNORM_PACK32),
-            (vk::Format::R8G8B8A8_UNORM.as_raw(), fourcc(b"XB24"), false)
+            (vk::Format::R8G8B8A8_UNORM.as_raw(), protocol::XB24, false)
         );
         assert_eq!(
             raw(vk::Format::A2B10G10R10_UNORM_PACK32),
-            (vk::Format::B8G8R8A8_UNORM.as_raw(), fourcc(b"XR24"), true)
+            (vk::Format::B8G8R8A8_UNORM.as_raw(), protocol::XR24, true)
         );
         assert_eq!(
             raw(vk::Format::R16G16B16A16_SFLOAT),
-            (vk::Format::B8G8R8A8_UNORM.as_raw(), fourcc(b"XR24"), true)
+            (vk::Format::B8G8R8A8_UNORM.as_raw(), protocol::XR24, true)
         );
         assert!(ring_format(vk::Format::R5G6B5_UNORM_PACK16).is_none());
     }

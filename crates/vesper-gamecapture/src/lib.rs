@@ -3,9 +3,14 @@
 //! [`GameCapture::start`] listens on `$XDG_RUNTIME_DIR/vesper/capture.sock`.
 //! Every Vulkan process with the layer installed connects while the server
 //! runs and reports its swapchain size. The server captures one game at a
-//! time: by default the one that most recently started presenting a
-//! swapchain, or the one picked with [`GameCapture::select`]. Other games
-//! stay dormant (pure pass-through).
+//! time and only with consent: Steam games (`SteamGameId`/`SteamAppId` in
+//! their environment) are allowed, others wait for [`GameCapture::allow`].
+//! Among allowed games it keeps the captured one until it exits, picks the
+//! newest otherwise, or follows [`GameCapture::select`]. Other games stay
+//! dormant (pure pass-through).
+//!
+//! Peers are identified by the kernel (`SO_PEERCRED`), never by what they
+//! claim: same user only, process name and environment read from `/proc`.
 //!
 //! The selected game copies each presented image into a small ring of
 //! exported DMA-BUFs. Frames arrive as [`VideoFrame`]s once their GPU copy
@@ -15,13 +20,15 @@
 pub mod protocol;
 
 use std::collections::HashMap;
-use std::io;
+use std::fs::File;
+use std::io::{self, Seek, SeekFrom};
+use std::mem::ManuallyDrop;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use protocol::{Msg, Plane};
 use tracing::{debug, info, warn};
@@ -34,14 +41,26 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// single-allocation layout the GPU can export; same-GPU VAAPI imports them.
 const MODIFIERS: &[u64] = &[];
 
-/// Bounds on what one (untrusted) client may make the server hold: ring
-/// images, and frames waiting for their sync_file.
-const MAX_BUFFERS: u32 = 16;
+/// Bounds on what untrusted clients may make the server hold.
+const MAX_CLIENTS: usize = 32;
 const MAX_PENDING: usize = 16;
+const MAX_SIZE: u32 = 16384;
+/// A client must say `Hello` within this time after connecting.
+const HELLO_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Whether a game may be captured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Consent {
+    /// A Steam game, or allowed with [`GameCapture::allow`].
+    Allowed,
+    /// Needs [`GameCapture::allow`] first (the app should ask the user).
+    Pending,
+}
 
 /// A game connected through the layer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Game {
+    /// From the kernel (`SO_PEERCRED`).
     pub pid: u32,
     /// Process name (`/proc/<pid>/comm`, at most 15 bytes; the `.exe` name
     /// under Proton).
@@ -49,6 +68,7 @@ pub struct Game {
     /// Size of its capturable swapchain, 0x0 when it has none.
     pub width: u32,
     pub height: u32,
+    pub consent: Consent,
     /// Whether this game is the one being captured.
     pub captured: bool,
 }
@@ -56,6 +76,7 @@ pub struct Game {
 struct Shared {
     games: Mutex<Vec<Game>>,
     select: Mutex<Option<u32>>,
+    allowed: Mutex<Vec<String>>,
     stop: AtomicBool,
 }
 
@@ -92,6 +113,7 @@ impl GameCapture {
         let shared = Arc::new(Shared {
             games: Mutex::new(Vec::new()),
             select: Mutex::new(None),
+            allowed: Mutex::new(Vec::new()),
             stop: AtomicBool::new(false),
         });
         let s = shared.clone();
@@ -114,15 +136,31 @@ impl GameCapture {
         })
     }
 
-    /// Games currently connected.
+    /// Games currently connected, with their consent state.
     pub fn games(&self) -> Vec<Game> {
         self.shared.games.lock().unwrap().clone()
     }
 
-    /// Captures the game with this pid, or picks automatically with `None`
-    /// (the game that most recently started presenting).
+    /// The game being captured, if any.
+    pub fn captured(&self) -> Option<Game> {
+        self.games().into_iter().find(|g| g.captured)
+    }
+
+    /// Captures the game with this pid (if allowed), or picks automatically
+    /// with `None`.
     pub fn select(&self, pid: Option<u32>) {
         *self.shared.select.lock().unwrap() = pid;
+        self.wake();
+    }
+
+    /// Allows capturing games with this process name ([`Game::exe`]). The
+    /// app persists its allow list and calls this at startup.
+    pub fn allow(&self, exe: &str) {
+        let mut allowed = self.shared.allowed.lock().unwrap();
+        if !allowed.iter().any(|e| e == exe) {
+            allowed.push(exe.to_owned());
+        }
+        drop(allowed);
         self.wake();
     }
 
@@ -158,13 +196,25 @@ struct Buffer {
     planes: Vec<Plane>,
 }
 
+struct Ring {
+    generation: u32,
+    buffers: HashMap<u32, Buffer>,
+}
+
 struct Client {
     sock: Arc<OwnedFd>,
-    game: Option<Game>,
-    /// Order of its last non-empty `Swapchain` message, for auto-selection.
+    pid: u32,
+    exe: String,
+    /// Steam/Proton game: allowed without asking.
+    steam: bool,
+    hello: bool,
+    since: Instant,
+    width: u32,
+    height: u32,
+    /// Order of its first non-empty `Swapchain` message, for auto-selection.
     announced: u64,
-    /// Ring announced by the layer while started: generation and buffers.
-    ring: Option<(u32, HashMap<u32, Buffer>)>,
+    /// Ring announced by the layer while started.
+    ring: Option<Ring>,
 }
 
 /// A frame waiting for its sync_file to signal.
@@ -189,27 +239,79 @@ struct Server {
     started: Option<Arc<OwnedFd>>,
     announce_seq: u64,
     pool_generation: u32,
+    /// `protocol::is_sync_file`; replaced in tests (no GPU to make one).
+    is_sync_file: fn(BorrowedFd) -> bool,
 }
 
-/// Picks the client to capture: the selected pid, else the most recent
-/// non-empty swapchain announcement.
-/// The current game stays eligible while it has no swapchain: games
-/// recreate theirs on resize or focus changes.
-fn choose(
-    clients: &[(Option<&Game>, u64)],
-    select: Option<u32>,
-    current: Option<usize>,
-) -> Option<usize> {
-    let eligible = |i: usize, g: &Game| (g.width > 0 && g.height > 0) || Some(i) == current;
-    let mut games = clients
-        .iter()
-        .enumerate()
-        .filter_map(|(i, (g, seq))| Some((i, (*g)?, *seq)))
-        .filter(|(i, g, _)| eligible(*i, g));
+/// What selection needs to know about a client.
+struct Candidate {
+    pid: u32,
+    allowed: bool,
+    /// Said hello and has a swapchain.
+    ready: bool,
+    seq: u64,
+}
+
+/// Picks the client to capture. Only allowed clients qualify. The current
+/// one is kept while it lives (games recreate their swapchain on resize or
+/// focus changes); otherwise the selected pid, or the newest ready client.
+fn choose(clients: &[Candidate], select: Option<u32>, current: Option<usize>) -> Option<usize> {
+    let ok = |i: usize| {
+        let c = &clients[i];
+        c.allowed && (c.ready || Some(i) == current)
+    };
     match select {
-        Some(pid) => games.find(|(_, g, _)| g.pid == pid).map(|(i, _, _)| i),
-        None => games.max_by_key(|(_, _, seq)| *seq).map(|(i, _, _)| i),
+        Some(pid) => (0..clients.len()).find(|&i| clients[i].pid == pid && ok(i)),
+        None => current.filter(|&i| ok(i)).or_else(|| {
+            (0..clients.len())
+                .filter(|&i| ok(i))
+                .max_by_key(|&i| clients[i].seq)
+        }),
     }
+}
+
+/// Size of a dma-buf (or any seekable fd), without taking ownership.
+fn fd_size(fd: BorrowedFd) -> io::Result<u64> {
+    let mut f = ManuallyDrop::new(unsafe { File::from_raw_fd(fd.as_raw_fd()) });
+    f.seek(SeekFrom::End(0))
+}
+
+/// Checks a `Buffer` against the client's announced swapchain and the
+/// dma-buf's real size.
+fn validate_buffer(
+    c: &Client,
+    index: u32,
+    width: u32,
+    height: u32,
+    fourcc: u32,
+    planes: &[Plane],
+    fd: BorrowedFd,
+) -> std::result::Result<(), String> {
+    if index >= protocol::RING {
+        return Err(format!("buffer index {index}"));
+    }
+    if !(1..=MAX_SIZE).contains(&width) || !(1..=MAX_SIZE).contains(&height) {
+        return Err(format!("buffer size {width}x{height}"));
+    }
+    if (width, height) != (c.width, c.height) {
+        return Err(format!(
+            "buffer {width}x{height} does not match swapchain {}x{}",
+            c.width, c.height
+        ));
+    }
+    if fourcc != protocol::XR24 && fourcc != protocol::XB24 {
+        return Err(format!("fourcc {fourcc:#x}"));
+    }
+    let size = fd_size(fd).map_err(|e| format!("dma-buf size: {e}"))?;
+    let first = planes.first().ok_or("no planes")?;
+    let rows_end = first.offset as u64 + first.stride as u64 * height as u64;
+    if (first.stride as u64) < width as u64 * 4 || rows_end > size {
+        return Err("plane 0 does not fit the dma-buf".into());
+    }
+    if planes.iter().any(|p| p.offset as u64 >= size) {
+        return Err("plane offset beyond the dma-buf".into());
+    }
+    Ok(())
 }
 
 impl Server {
@@ -224,6 +326,7 @@ impl Server {
             started: None,
             announce_seq: 0,
             pool_generation: 0,
+            is_sync_file: protocol::is_sync_file,
         }
     }
 
@@ -233,7 +336,15 @@ impl Server {
             let nc = self.clients.len();
             fds.extend(self.clients.iter().map(|c| pollfd(c.sock.as_fd())));
             fds.extend(self.pending.iter().map(|p| pollfd(p.sync.as_fd())));
-            if unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, -1) } < 0 {
+            // Wake up for the first client whose hello is overdue.
+            let timeout = self
+                .clients
+                .iter()
+                .filter(|c| !c.hello)
+                .map(|c| (c.since + HELLO_TIMEOUT).saturating_duration_since(Instant::now()))
+                .min()
+                .map_or(-1, |d| d.as_millis() as i32 + 1);
+            if unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, timeout) } < 0 {
                 let e = io::Error::last_os_error();
                 if e.kind() == io::ErrorKind::Interrupted {
                     continue;
@@ -266,20 +377,53 @@ impl Server {
                     self.remove_client(i);
                 }
             }
-            if fds[1].revents & libc::POLLIN != 0 {
-                match protocol::accept(self.listener.as_fd()) {
-                    Ok(sock) => self.clients.push(Client {
-                        sock: Arc::new(sock),
-                        game: None,
-                        announced: 0,
-                        ring: None,
-                    }),
-                    Err(e) => warn!("accepting a game connection failed: {e}"),
+            for i in (0..self.clients.len()).rev() {
+                let c = &self.clients[i];
+                if !c.hello && c.since.elapsed() >= HELLO_TIMEOUT {
+                    warn!("{} ({}) sent no hello, dropping it", c.exe, c.pid);
+                    self.remove_client(i);
                 }
+            }
+            if fds[1].revents & libc::POLLIN != 0 {
+                self.accept();
             }
             self.reselect();
             self.publish_games();
         }
+    }
+
+    fn accept(&mut self) {
+        let sock = match protocol::accept(self.listener.as_fd()) {
+            Ok(s) => s,
+            Err(e) => return warn!("accepting a game connection failed: {e}"),
+        };
+        if self.clients.len() >= MAX_CLIENTS {
+            return warn!("{MAX_CLIENTS} games connected already, refusing one more");
+        }
+        let cred = match protocol::peer_cred(sock.as_fd()) {
+            Ok(c) if c.uid == unsafe { libc::getuid() } => c,
+            _ => return warn!("refusing a connection from another user"),
+        };
+        let pid = cred.pid.to_string();
+        let exe = protocol::process_name_of(&pid);
+        let steam = std::fs::read(format!("/proc/{pid}/environ"))
+            .is_ok_and(|env| protocol::is_steam_game(&env));
+        self.add_client(sock, cred.pid as u32, exe, steam);
+    }
+
+    fn add_client(&mut self, sock: OwnedFd, pid: u32, exe: String, steam: bool) {
+        self.clients.push(Client {
+            sock: Arc::new(sock),
+            pid,
+            exe,
+            steam,
+            hello: false,
+            since: Instant::now(),
+            width: 0,
+            height: 0,
+            announced: 0,
+            ring: None,
+        });
     }
 
     /// Reads all queued messages. False when the client is gone or broken.
@@ -303,36 +447,29 @@ impl Server {
         }
     }
 
+    /// Handles one message. False drops the client (protocol violation).
     fn handle(&mut self, i: usize, msg: Msg, fd: Option<OwnedFd>) -> bool {
         let started = self
             .started
             .as_ref()
             .is_some_and(|s| Arc::ptr_eq(s, &self.clients[i].sock));
         let c = &mut self.clients[i];
+        if !c.hello && !matches!(msg, Msg::Hello { .. }) {
+            return false;
+        }
         match msg {
-            Msg::Hello { version, pid, exe } => {
-                if version != protocol::VERSION {
-                    warn!(
-                        "{exe} ({pid}) speaks protocol {version}, expected {}",
-                        protocol::VERSION
-                    );
+            // Identity comes from SO_PEERCRED, not from what the peer claims.
+            Msg::Hello { version, .. } => {
+                if c.hello || version != protocol::VERSION {
+                    warn!("{} ({}): bad hello (protocol {version})", c.exe, c.pid);
                     return false;
                 }
-                debug!("game connected: {exe} ({pid})");
-                c.game = Some(Game {
-                    pid,
-                    exe,
-                    width: 0,
-                    height: 0,
-                    captured: false,
-                });
+                c.hello = true;
+                debug!("game connected: {} ({})", c.exe, c.pid);
             }
             Msg::Swapchain { width, height } => {
-                let Some(game) = &mut c.game else {
-                    return false;
-                };
-                debug!("{} ({}) swapchain {width}x{height}", game.exe, game.pid);
-                (game.width, game.height) = (width, height);
+                debug!("{} ({}) swapchain {width}x{height}", c.exe, c.pid);
+                (c.width, c.height) = (width, height);
                 // Ranked by its first swapchain: recreating one is not a new game.
                 if width > 0 && height > 0 && c.announced == 0 {
                     self.announce_seq += 1;
@@ -351,22 +488,27 @@ impl Server {
                 let Some(fd) = fd else {
                     return false;
                 };
-                if index >= MAX_BUFFERS {
-                    warn!("game sent buffer index {index}, dropping it");
-                    return false;
-                }
                 if !started {
+                    // Our Stop got lost: say it again.
+                    let _ = protocol::send(c.sock.as_fd(), &Msg::Stop, None, true);
                     return true;
                 }
-                if c.ring.as_ref().is_none_or(|(g, _)| *g != generation) {
-                    c.ring = Some((generation, HashMap::new()));
-                    self.pool_generation = self.pool_generation.wrapping_add(1);
-                    if let Some(g) = &c.game {
-                        info!("capturing {} ({}): {width}x{height}", g.exe, g.pid);
-                    }
+                if let Err(e) =
+                    validate_buffer(c, index, width, height, fourcc, &planes, fd.as_fd())
+                {
+                    warn!("{} ({}): invalid buffer: {e}", c.exe, c.pid);
+                    return false;
                 }
-                let ring = &mut c.ring.as_mut().expect("ring set above").1;
-                ring.insert(
+                if c.ring.as_ref().is_none_or(|r| r.generation != generation) {
+                    c.ring = Some(Ring {
+                        generation,
+                        buffers: HashMap::new(),
+                    });
+                    self.pool_generation = self.pool_generation.wrapping_add(1);
+                    info!("capturing {} ({}): {width}x{height}", c.exe, c.pid);
+                }
+                let ring = c.ring.as_mut().expect("ring set above");
+                ring.buffers.insert(
                     index,
                     Buffer {
                         fd,
@@ -386,15 +528,24 @@ impl Server {
                 let known = c
                     .ring
                     .as_ref()
-                    .is_some_and(|(g, b)| *g == generation && b.contains_key(&index));
-                if !started || !known {
-                    // Not ours to keep: hand the buffer straight back.
-                    let _ = protocol::send(
-                        c.sock.as_fd(),
-                        &Msg::Release { generation, index },
-                        None,
-                        true,
-                    );
+                    .is_some_and(|r| r.generation == generation && r.buffers.contains_key(&index));
+                // A frame we cannot keep: hand the buffer straight back.
+                let release = |c: &Client| {
+                    let msg = Msg::Release { generation, index };
+                    let _ = protocol::send(c.sock.as_fd(), &msg, None, true);
+                };
+                if !started {
+                    release(c);
+                    let _ = protocol::send(c.sock.as_fd(), &Msg::Stop, None, true);
+                    return true;
+                }
+                if !known {
+                    release(c);
+                    return true;
+                }
+                if fd.as_ref().is_some_and(|f| !(self.is_sync_file)(f.as_fd())) {
+                    warn!("{} ({}): frame fence is not a sync_file", c.exe, c.pid);
+                    release(c);
                     return true;
                 }
                 let waiting = self
@@ -403,21 +554,19 @@ impl Server {
                     .filter(|p| Arc::ptr_eq(&p.sock, &c.sock))
                     .count();
                 if waiting >= MAX_PENDING {
-                    warn!("game has {waiting} frames that never complete, dropping it");
+                    warn!("{} ({}): frames never complete, dropping it", c.exe, c.pid);
                     return false;
                 }
+                let sock = c.sock.clone();
                 match fd {
                     Some(sync) => self.pending.push(Pending {
-                        sock: c.sock.clone(),
+                        sock,
                         generation,
                         index,
                         pts_ns,
                         sync,
                     }),
-                    None => {
-                        let sock = c.sock.clone();
-                        self.deliver(sock, generation, index, pts_ns);
-                    }
+                    None => self.deliver(sock, generation, index, pts_ns),
                 }
             }
             Msg::Start { .. } | Msg::Stop | Msg::Release { .. } => return false,
@@ -431,8 +580,8 @@ impl Server {
             .iter()
             .find(|c| Arc::ptr_eq(&c.sock, &sock))
             .and_then(|c| c.ring.as_ref())
-            .filter(|(g, _)| *g == generation)
-            .and_then(|(_, b)| b.get(&index));
+            .filter(|r| r.generation == generation)
+            .and_then(|r| r.buffers.get(&index));
         let release = move || {
             let msg = Msg::Release { generation, index };
             // shortcut: a lost Release costs the game one ring image until the next Start; retry from the server thread if this ever logs.
@@ -478,9 +627,7 @@ impl Server {
 
     fn remove_client(&mut self, i: usize) {
         let c = self.clients.remove(i);
-        if let Some(g) = &c.game {
-            debug!("game disconnected: {} ({})", g.exe, g.pid);
-        }
+        debug!("game disconnected: {} ({})", c.exe, c.pid);
         self.pending.retain(|p| !Arc::ptr_eq(&p.sock, &c.sock));
         if self
             .started
@@ -491,19 +638,28 @@ impl Server {
         }
     }
 
+    fn allowed(&self, c: &Client) -> bool {
+        c.steam || self.shared.allowed.lock().unwrap().contains(&c.exe)
+    }
+
     /// Starts the chosen game and stops the previous one.
     fn reselect(&mut self) {
         let select = *self.shared.select.lock().unwrap();
-        let view: Vec<_> = self
+        let candidates: Vec<_> = self
             .clients
             .iter()
-            .map(|c| (c.game.as_ref(), c.announced))
+            .map(|c| Candidate {
+                pid: c.pid,
+                allowed: c.hello && self.allowed(c),
+                ready: c.hello && c.width > 0 && c.height > 0,
+                seq: c.announced,
+            })
             .collect();
         let current = self
             .started
             .as_ref()
             .and_then(|s| self.clients.iter().position(|c| Arc::ptr_eq(&c.sock, s)));
-        let want = choose(&view, select, current);
+        let want = choose(&candidates, select, current);
         if want == current {
             return;
         }
@@ -534,13 +690,21 @@ impl Server {
         let games = self
             .clients
             .iter()
-            .filter_map(|c| {
-                let mut g = c.game.clone()?;
-                g.captured = self
+            .filter(|c| c.hello)
+            .map(|c| Game {
+                pid: c.pid,
+                exe: c.exe.clone(),
+                width: c.width,
+                height: c.height,
+                consent: if self.allowed(c) {
+                    Consent::Allowed
+                } else {
+                    Consent::Pending
+                },
+                captured: self
                     .started
                     .as_ref()
-                    .is_some_and(|s| Arc::ptr_eq(s, &c.sock));
-                Some(g)
+                    .is_some_and(|s| Arc::ptr_eq(s, &c.sock)),
             })
             .collect();
         *self.shared.games.lock().unwrap() = games;
@@ -558,32 +722,265 @@ fn pollfd(fd: BorrowedFd) -> libc::pollfd {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc;
 
-    fn game(pid: u32, w: u32) -> Game {
-        Game {
+    fn cand(pid: u32, allowed: bool, ready: bool, seq: u64) -> Candidate {
+        Candidate {
             pid,
-            exe: format!("g{pid}"),
-            width: w,
-            height: w,
-            captured: false,
+            allowed,
+            ready,
+            seq,
         }
     }
 
     #[test]
-    fn auto_selects_latest_announcement() {
-        let (a, b, c) = (game(1, 800), game(2, 800), game(3, 0));
-        let view = [(Some(&a), 5), (Some(&b), 7), (Some(&c), 9), (None, 10)];
+    fn selection_is_sticky_and_needs_consent() {
+        let view = [
+            cand(1, true, true, 5),
+            cand(2, true, true, 7),
+            cand(3, true, false, 9),
+            cand(4, false, true, 10),
+        ];
+        // Newest allowed game with a swapchain; never one without consent.
         assert_eq!(choose(&view, None, None), Some(1));
         assert_eq!(choose(&view, Some(1), None), Some(0));
-        // Selected game without a swapchain, or unknown pid: nothing.
+        assert_eq!(choose(&view, Some(4), None), None);
+        // Explicit pid without a swapchain, or unknown: nothing.
         assert_eq!(choose(&view, Some(3), None), None);
         assert_eq!(choose(&view, Some(9), None), None);
         assert_eq!(choose(&[], None, None), None);
-        // The captured game keeps its place while recreating its swapchain.
+        // The captured game stays, even while it has no swapchain and a
+        // newer game is ready.
+        assert_eq!(choose(&view, None, Some(0)), Some(0));
         assert_eq!(choose(&view, None, Some(2)), Some(2));
-        assert_eq!(choose(&view, Some(3), Some(2)), Some(2));
-        // A newer game still wins over an older one that lost its swapchain.
-        let view = [(Some(&c), 1), (Some(&b), 2)];
-        assert_eq!(choose(&view, None, Some(0)), Some(1));
+        // ...but an explicit selection moves it.
+        assert_eq!(choose(&view, Some(2), Some(0)), Some(1));
+    }
+
+    fn pair() -> (OwnedFd, OwnedFd) {
+        let mut fds = [0; 2];
+        let r = unsafe {
+            libc::socketpair(
+                libc::AF_UNIX,
+                libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+                0,
+                fds.as_mut_ptr(),
+            )
+        };
+        assert_eq!(r, 0);
+        unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) }
+    }
+
+    /// A memfd standing in for a dma-buf of `size` bytes.
+    fn memfd(size: u64) -> OwnedFd {
+        let fd = unsafe { libc::memfd_create(c"vesper-test".as_ptr(), libc::MFD_CLOEXEC) };
+        assert!(fd >= 0);
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        File::from(fd.try_clone().unwrap()).set_len(size).unwrap();
+        fd
+    }
+
+    fn server() -> (Server, mpsc::Receiver<VideoFrame>) {
+        let (listener, _) = pair();
+        let (wake, _) = pair();
+        let shared = Arc::new(Shared {
+            games: Mutex::new(Vec::new()),
+            select: Mutex::new(None),
+            allowed: Mutex::new(Vec::new()),
+            stop: AtomicBool::new(false),
+        });
+        let (tx, rx) = mpsc::channel();
+        let s = Server::new(
+            shared,
+            listener,
+            wake,
+            Box::new(move |f| drop(tx.send(f.unwrap()))),
+        );
+        (s, rx)
+    }
+
+    /// Connects a game and returns the layer's end of its socket.
+    fn connect(s: &mut Server, exe: &str, steam: bool) -> (usize, OwnedFd) {
+        let (ours, theirs) = pair();
+        s.add_client(ours, 100 + s.clients.len() as u32, exe.into(), steam);
+        let i = s.clients.len() - 1;
+        let hello = Msg::Hello {
+            version: protocol::VERSION,
+            pid: 1,
+            exe: "lies".into(),
+        };
+        assert!(s.handle(i, hello, None));
+        assert!(s.handle(
+            i,
+            Msg::Swapchain {
+                width: 64,
+                height: 32
+            },
+            None
+        ));
+        (i, theirs)
+    }
+
+    fn next(sock: &OwnedFd) -> Option<Msg> {
+        match protocol::recv(sock.as_fd(), true) {
+            Ok(Some((m, _))) => Some(m),
+            _ => None,
+        }
+    }
+
+    fn buffer(generation: u32, index: u32, width: u32) -> Msg {
+        Msg::Buffer {
+            generation,
+            index,
+            width,
+            height: 32,
+            fourcc: protocol::XR24,
+            modifier: 0,
+            planes: vec![Plane {
+                offset: 0,
+                stride: 256,
+            }],
+        }
+    }
+
+    #[test]
+    fn needs_hello_first_and_ignores_claimed_identity() {
+        let (mut s, _rx) = server();
+        let (ours, _theirs) = pair();
+        s.add_client(ours, 7, "real".into(), true);
+        assert!(!s.handle(
+            0,
+            Msg::Swapchain {
+                width: 1,
+                height: 1
+            },
+            None
+        ));
+        let (_, _t) = connect(&mut s, "real", true);
+        s.publish_games();
+        let games = s.shared.games.lock().unwrap().clone();
+        assert_eq!(games[0].exe, "real");
+        assert_ne!(games[0].pid, 1);
+    }
+
+    #[test]
+    fn starts_only_allowed_games() {
+        let (mut s, _rx) = server();
+        let (_, layer) = connect(&mut s, "native", false);
+        s.reselect();
+        assert!(s.started.is_none());
+        assert_eq!(next(&layer), None);
+        s.publish_games();
+        assert_eq!(s.shared.games.lock().unwrap()[0].consent, Consent::Pending);
+
+        s.shared.allowed.lock().unwrap().push("native".into());
+        s.reselect();
+        assert!(s.started.is_some());
+        assert!(matches!(next(&layer), Some(Msg::Start { .. })));
+
+        // A Steam game connecting later does not steal the capture.
+        let (_, steam) = connect(&mut s, "game.exe", true);
+        s.reselect();
+        assert_eq!(next(&steam), None);
+    }
+
+    #[test]
+    fn validates_buffers_and_delivers_frames() {
+        let (mut s, rx) = server();
+        let (i, layer) = connect(&mut s, "game.exe", true);
+        s.reselect();
+        assert!(matches!(next(&layer), Some(Msg::Start { .. })));
+
+        // Size not matching the swapchain, index out of the ring, short dma-buf.
+        assert!(!s.handle(i, buffer(1, 0, 128), Some(memfd(256 * 32))));
+        let (i, layer) = connect(&mut s, "game.exe", true);
+        s.started = Some(s.clients[i].sock.clone());
+        assert!(!s.handle(i, buffer(1, protocol::RING, 64), Some(memfd(256 * 32))));
+        let (i, layer2) = connect(&mut s, "game.exe", true);
+        s.started = Some(s.clients[i].sock.clone());
+        assert!(!s.handle(i, buffer(1, 0, 64), Some(memfd(100))));
+        drop((layer, layer2));
+
+        let (i, layer) = connect(&mut s, "game.exe", true);
+        s.started = Some(s.clients[i].sock.clone());
+        assert!(s.handle(i, buffer(1, 0, 64), Some(memfd(256 * 32))));
+        let gen1 = s.pool_generation;
+        let frame = |index| Msg::Frame {
+            generation: 1,
+            index,
+            pts_ns: 42,
+        };
+        assert!(s.handle(i, frame(0), None));
+        let f = rx.try_recv().unwrap();
+        assert_eq!((f.buffer_id, f.pool_generation, f.width), (0, gen1, 64));
+        assert_eq!(f.pts, Duration::from_nanos(42));
+        drop(f);
+        assert_eq!(
+            next(&layer),
+            Some(Msg::Release {
+                generation: 1,
+                index: 0
+            })
+        );
+
+        // Unknown buffer: released at once, nothing delivered.
+        assert!(s.handle(i, frame(2), None));
+        assert!(rx.try_recv().is_err());
+        assert_eq!(
+            next(&layer),
+            Some(Msg::Release {
+                generation: 1,
+                index: 2
+            })
+        );
+
+        // New ring generation: new pool generation.
+        assert!(s.handle(i, buffer(2, 0, 64), Some(memfd(256 * 32))));
+        assert_ne!(s.pool_generation, gen1);
+    }
+
+    #[test]
+    fn frames_from_a_stopped_game_are_returned() {
+        let (mut s, rx) = server();
+        let (i, layer) = connect(&mut s, "native", false);
+        let frame = Msg::Frame {
+            generation: 3,
+            index: 1,
+            pts_ns: 0,
+        };
+        assert!(s.handle(i, frame, None));
+        assert!(rx.try_recv().is_err());
+        assert_eq!(
+            next(&layer),
+            Some(Msg::Release {
+                generation: 3,
+                index: 1
+            })
+        );
+        assert_eq!(next(&layer), Some(Msg::Stop));
+    }
+
+    #[test]
+    fn caps_pending_frames() {
+        let (mut s, _rx) = server();
+        s.is_sync_file = |_| true;
+        let (i, _layer) = connect(&mut s, "game.exe", true);
+        s.reselect();
+        assert!(s.handle(i, buffer(1, 0, 64), Some(memfd(256 * 32))));
+        let frame = Msg::Frame {
+            generation: 1,
+            index: 0,
+            pts_ns: 0,
+        };
+        for _ in 0..MAX_PENDING {
+            assert!(s.handle(i, frame.clone(), Some(memfd(1))));
+        }
+        assert!(!s.handle(i, frame.clone(), Some(memfd(1))));
+
+        // Without the test override, a non-sync_file fence is refused.
+        s.is_sync_file = protocol::is_sync_file;
+        s.pending.clear();
+        assert!(s.handle(i, frame, Some(memfd(1))));
+        assert!(s.pending.is_empty());
     }
 }

@@ -26,6 +26,13 @@ pub const VERSION: u32 = 1;
 /// Largest encoded message. Every message is far smaller.
 pub const MAX_MSG: usize = 1024;
 
+/// DRM fourccs the layer sends: BGRA (`XR24`) and RGBA (`XB24`) byte order.
+pub const XR24: u32 = u32::from_le_bytes(*b"XR24");
+pub const XB24: u32 = u32::from_le_bytes(*b"XB24");
+
+/// Images in the layer's export ring; buffer indices are below this.
+pub const RING: u32 = 4;
+
 const MAX_PLANES: usize = 4;
 const MAX_MODIFIERS: usize = 64;
 const MAX_EXE: usize = 256;
@@ -385,9 +392,30 @@ pub fn recv(sock: BorrowedFd, nonblock: bool) -> io::Result<Option<(Msg, Option<
     Ok(Some((msg, fds.into_iter().next())))
 }
 
-/// Process name from `/proc/self/comm` (the Windows exe name under Wine).
-pub fn process_name() -> String {
-    std::fs::read(Path::new("/proc/self/comm"))
+/// Credentials of the peer of a connected Unix socket.
+pub fn peer_cred(sock: BorrowedFd) -> io::Result<libc::ucred> {
+    let mut cred: libc::ucred = unsafe { zeroed() };
+    let mut len = size_of::<libc::ucred>() as libc::socklen_t;
+    cvt(unsafe {
+        libc::getsockopt(
+            sock.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&raw mut cred).cast(),
+            &mut len,
+        )
+    })?;
+    Ok(cred)
+}
+
+/// Whether the peer runs as the same user as this process.
+pub fn peer_is_same_user(sock: BorrowedFd) -> bool {
+    peer_cred(sock).is_ok_and(|c| c.uid == unsafe { libc::getuid() })
+}
+
+/// Process name from `/proc/<pid>/comm` (the Windows exe name under Wine).
+pub fn process_name_of(pid: &str) -> String {
+    std::fs::read(Path::new("/proc").join(pid).join("comm"))
         .map(|b| {
             OsStr::from_bytes(b.trim_ascii_end())
                 .to_string_lossy()
@@ -396,7 +424,31 @@ pub fn process_name() -> String {
         .unwrap_or_default()
 }
 
-/// Creates `dir` with mode 0700 if missing.
+/// Process name of the calling process.
+pub fn process_name() -> String {
+    process_name_of("self")
+}
+
+/// Whether `environ` (NUL-separated `KEY=VALUE`) marks a Steam game:
+/// `SteamGameId` or `SteamAppId` set to something other than empty or 0.
+pub fn is_steam_game(environ: &[u8]) -> bool {
+    environ.split(|b| *b == 0).any(|kv| {
+        let Some(eq) = kv.iter().position(|b| *b == b'=') else {
+            return false;
+        };
+        let (k, v) = (&kv[..eq], &kv[eq + 1..]);
+        (k == b"SteamGameId" || k == b"SteamAppId") && !v.is_empty() && v != b"0"
+    })
+}
+
+/// Whether `fd` is a sync_file (an anonymous inode named `sync_file`).
+pub fn is_sync_file(fd: BorrowedFd) -> bool {
+    std::fs::read_link(format!("/proc/self/fd/{}", fd.as_raw_fd()))
+        .is_ok_and(|p| p.as_os_str().as_bytes() == b"anon_inode:sync_file")
+}
+
+/// Creates `dir` with mode 0700 if missing, then checks it is a real
+/// directory owned by this user with mode 0700 (not a symlink).
 pub(crate) fn create_private_dir(dir: &Path) -> io::Result<()> {
     let c = CString::new(dir.as_os_str().as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "nul in path"))?;
@@ -405,6 +457,17 @@ pub(crate) fn create_private_dir(dir: &Path) -> io::Result<()> {
         if e.kind() != io::ErrorKind::AlreadyExists {
             return Err(e);
         }
+    }
+    let mut st: libc::stat = unsafe { zeroed() };
+    cvt(unsafe { libc::lstat(c.as_ptr(), &mut st) })?;
+    if st.st_mode & libc::S_IFMT != libc::S_IFDIR
+        || st.st_uid != unsafe { libc::getuid() }
+        || st.st_mode & 0o777 != 0o700
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{} is not a private directory of this user", dir.display()),
+        ));
     }
     Ok(())
 }
@@ -458,6 +521,15 @@ mod tests {
                 index: 1,
             },
         ]
+    }
+
+    #[test]
+    fn detects_steam_games() {
+        assert!(is_steam_game(b"HOME=/h\0SteamGameId=1245620\0"));
+        assert!(is_steam_game(b"SteamAppId=570"));
+        assert!(!is_steam_game(b"SteamGameId=0\0SteamAppId=\0"));
+        assert!(!is_steam_game(b"XSteamGameId=5\0SteamGameIdX=5\0"));
+        assert!(!is_steam_game(b""));
     }
 
     #[test]

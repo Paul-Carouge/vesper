@@ -14,8 +14,17 @@ manifest="$data/vulkan/implicit_layer.d/vesper_capture.json"
 lib_dir="$data/vesper"
 lib="$lib_dir/libvesper_vklayer.so"
 
+# The path goes into JSON unescaped: accept only plain absolute paths.
+case "$lib" in
+/*) ;;
+*) echo "install path must be absolute: $lib" >&2; exit 1 ;;
+esac
+case "$lib" in
+*'"'* | *'\'*) echo "install path must not contain quotes or backslashes: $lib" >&2; exit 1 ;;
+esac
+
 if [ "${1:-}" = "--uninstall" ]; then
-    rm -f "$manifest" "$lib"
+    rm -f "$manifest" "$manifest.tmp" "$lib" "$lib.tmp"
     rmdir "$lib_dir" 2>/dev/null || true
     echo "removed $manifest"
     exit 0
@@ -32,7 +41,8 @@ mkdir -p "$lib_dir" "$(dirname "$manifest")"
 # Copy, then rename: running games keep the old file mapped.
 cp "$src" "$lib.tmp"
 mv -f "$lib.tmp" "$lib"
-cat >"$manifest" <<EOF
+# Written aside, then renamed: the loader never sees a partial manifest.
+cat >"$manifest.tmp" <<EOF
 {
     "file_format_version": "1.2.0",
     "layer": {
@@ -48,4 +58,5 @@ cat >"$manifest" <<EOF
     }
 }
 EOF
+mv -f "$manifest.tmp" "$manifest"
 echo "installed $manifest -> $lib"

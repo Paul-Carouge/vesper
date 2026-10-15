@@ -18,7 +18,7 @@ mod ipc;
 use std::ffi::{CStr, c_char, c_void};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 
 use ash::vk;
 
@@ -65,13 +65,43 @@ fn debug_enabled() -> bool {
     *ON
 }
 
+/// Writes a line to stderr only if that cannot block: these run on the
+/// game's render thread, and a full pipe must not stall it.
+fn log(msg: &str) {
+    let line = format!("[vesper layer] {msg}\n");
+    let mut pfd = libc::pollfd {
+        fd: 2,
+        events: libc::POLLOUT,
+        revents: 0,
+    };
+    // POLLOUT on a pipe means at least PIPE_BUF bytes free: a short line fits.
+    if line.len() <= libc::PIPE_BUF
+        && unsafe { libc::poll(&mut pfd, 1, 0) } == 1
+        && pfd.revents & libc::POLLOUT != 0
+    {
+        let _ = unsafe { libc::write(2, line.as_ptr().cast(), line.len()) };
+    }
+}
+
 pub(crate) fn warn(msg: &str) {
-    eprintln!("[vesper layer] {msg}");
+    log(msg);
 }
 
 pub(crate) fn debug(msg: &str) {
     if debug_enabled() {
-        eprintln!("[vesper layer] {msg}");
+        log(msg);
+    }
+}
+
+/// Locks, ignoring poisoning: a panic caught in one hook must not turn
+/// every later call (and the destroy paths) into panics.
+pub(crate) trait LockExt<T> {
+    fn locked(&self) -> MutexGuard<'_, T>;
+}
+
+impl<T> LockExt<T> for Mutex<T> {
+    fn locked(&self) -> MutexGuard<'_, T> {
+        self.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
@@ -189,8 +219,7 @@ static DEVICES: Mutex<Vec<(usize, Arc<capture::Device>)>> = Mutex::new(Vec::new(
 
 fn instance_for(k: usize) -> Option<Arc<Instance>> {
     INSTANCES
-        .lock()
-        .unwrap()
+        .locked()
         .iter()
         .find(|(i, _)| *i == k)
         .map(|(_, d)| d.clone())
@@ -198,8 +227,7 @@ fn instance_for(k: usize) -> Option<Arc<Instance>> {
 
 pub(crate) fn device_for(k: usize) -> Option<Arc<capture::Device>> {
     DEVICES
-        .lock()
-        .unwrap()
+        .locked()
         .iter()
         .find(|(i, _)| *i == k)
         .map(|(_, d)| d.clone())
@@ -301,10 +329,7 @@ unsafe extern "system" fn create_instance(
             c"vkGetPhysicalDeviceImageFormatProperties2KHR",
         ]);
         inst.surface_capabilities = inst.load(&[c"vkGetPhysicalDeviceSurfaceCapabilitiesKHR"]);
-        INSTANCES
-            .lock()
-            .unwrap()
-            .push((key(handle), Arc::new(inst)));
+        INSTANCES.locked().push((key(handle), Arc::new(inst)));
         vk::Result::SUCCESS
     })
 }
@@ -313,20 +338,19 @@ unsafe extern "system" fn destroy_instance(
     instance: vk::Instance,
     alloc: *const vk::AllocationCallbacks<'_>,
 ) {
-    guard((), || unsafe {
-        if instance == vk::Instance::null() {
-            return;
-        }
+    if instance == vk::Instance::null() {
+        return;
+    }
+    let inst = guard(None, || {
         let k = key(instance);
-        let inst = {
-            let mut list = INSTANCES.lock().unwrap();
-            let i = list.iter().position(|(i, _)| *i == k);
-            i.map(|i| list.swap_remove(i).1)
-        };
-        if let Some(inst) = inst {
-            (inst.fns.fp_v1_0().destroy_instance)(instance, alloc);
-        }
-    })
+        let mut list = INSTANCES.locked();
+        let i = list.iter().position(|(i, _)| *i == k);
+        i.map(|i| list.swap_remove(i).1)
+    });
+    // Outside the guard: the next layer's destroy must run exactly once.
+    if let Some(inst) = inst {
+        unsafe { (inst.fns.fp_v1_0().destroy_instance)(instance, alloc) };
+    }
 }
 
 // --- Devices ---
@@ -343,7 +367,6 @@ const DEVICE_EXTENSIONS: &[&CStr] = &[
     c"VK_KHR_dedicated_allocation",
     c"VK_KHR_bind_memory2",
     c"VK_KHR_sampler_ycbcr_conversion",
-    c"VK_KHR_maintenance1",
     c"VK_KHR_image_format_list",
     c"VK_EXT_image_drm_format_modifier",
     c"VK_EXT_queue_family_foreign",
@@ -419,10 +442,7 @@ unsafe extern "system" fn create_device(
 
         let handle = *out;
         let device = capture::Device::new(inst, physical, handle, gdpa, &enabled, *PASSIVE);
-        DEVICES
-            .lock()
-            .unwrap()
-            .push((key(handle), Arc::new(device)));
+        DEVICES.locked().push((key(handle), Arc::new(device)));
         vk::Result::SUCCESS
     })
 }
@@ -431,21 +451,19 @@ unsafe extern "system" fn destroy_device(
     device: vk::Device,
     alloc: *const vk::AllocationCallbacks<'_>,
 ) {
-    guard((), || unsafe {
-        if device == vk::Device::null() {
-            return;
-        }
+    if device == vk::Device::null() {
+        return;
+    }
+    let dev = guard(None, || {
         let k = key(device);
-        let dev = {
-            let mut list = DEVICES.lock().unwrap();
-            let i = list.iter().position(|(i, _)| *i == k);
-            i.map(|i| list.swap_remove(i).1)
-        };
-        if let Some(dev) = dev {
-            dev.destroy_all();
-            (dev.fns.fp_v1_0().destroy_device)(device, alloc);
-        }
-    })
+        let mut list = DEVICES.locked();
+        let i = list.iter().position(|(i, _)| *i == k);
+        i.map(|i| list.swap_remove(i).1)
+    });
+    if let Some(dev) = dev {
+        guard((), || dev.destroy_all());
+        unsafe { (dev.fns.fp_v1_0().destroy_device)(device, alloc) };
+    }
 }
 
 // --- Proc addr ---
