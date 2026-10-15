@@ -531,6 +531,10 @@ pub fn wire(ui: &AppWindow, rec: &Shared) {
         let Some(ui) = weak.upgrade() else { return };
         let mut tracks = tracks_from_ui(&ui);
         if usize::try_from(i).is_ok_and(|i| i < tracks.len()) {
+            // Its plugins' hosts stop and their settings files go.
+            if let Some(track) = ui.get_tracks().row_data(i as usize) {
+                crate::filters::forget_plugins(track.filters.iter());
+            }
             tracks.remove(i as usize);
             show_tracks(&ui, &tracks);
             Prefs::from_ui(&ui).save();

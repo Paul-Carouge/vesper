@@ -16,6 +16,9 @@
 //! lookahead change, which changes the latency) needs a new [`Chain`]: build
 //! it off the audio thread, hand it over, and drop the old one off the audio
 //! thread too: [`live`] does both, with a lock-free handover.
+//!
+//! [`FilterSpec::Vst3`] filters are built by another crate (they talk to a
+//! plugin host process): it registers its builder with [`set_external`].
 
 mod biquad;
 mod denoise;
@@ -24,8 +27,10 @@ mod limiter;
 mod live;
 mod spec;
 
-use std::sync::Arc;
+use std::cell::Cell;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 
 pub use live::{LiveChain, LiveControl, live};
 pub use spec::{FilterSpec, MAX_PARAMS, ParseError};
@@ -42,7 +47,9 @@ pub trait Filter {
     /// Clears the state (delay lines, envelopes) between two streams. Not
     /// meant for the audio callback: it may allocate.
     fn reset(&mut self);
-    /// Delay added to the signal, in frames.
+    /// Delay added to the signal, in frames. Built-in filters keep it for
+    /// their lifetime; a hosted plugin may change it between two blocks, so
+    /// it is read again after every block.
     fn latency(&self) -> usize;
     /// Sets parameter `index` (in [`FilterSpec::param_names`] order). The
     /// filter glides to it over a few ms. Real-time safe; parameters that
@@ -53,6 +60,49 @@ pub trait Filter {
     fn reduction_db(&self) -> f32 {
         0.0
     }
+}
+
+/// Builds the filter of a [`FilterSpec::Vst3`]: its id and channel count.
+/// None: a pass-through instead.
+pub type ExternalBuilder = fn(u32, usize) -> Option<Box<dyn Filter + Send>>;
+
+static EXTERNAL: OnceLock<ExternalBuilder> = OnceLock::new();
+
+/// Sets the builder of [`FilterSpec::Vst3`] filters, once per process.
+/// Returns false if one was already set. Without one, they pass the audio
+/// through unchanged.
+pub fn set_external(build: ExternalBuilder) -> bool {
+    EXTERNAL.set(build).is_ok()
+}
+
+fn external(id: u32, channels: usize) -> Box<dyn Filter + Send> {
+    EXTERNAL
+        .get()
+        .and_then(|build| build(id, channels))
+        .unwrap_or_else(|| Box::new(PassThrough))
+}
+
+thread_local! {
+    static BLOCK_START: Cell<Option<Instant>> = const { Cell::new(None) };
+}
+
+/// When the [`Chain`] block running on this thread started; None outside
+/// [`Chain::process`]. Lets hosted plugins share one time budget per block
+/// instead of each taking its own.
+pub fn block_start() -> Option<Instant> {
+    BLOCK_START.with(Cell::get)
+}
+
+/// A filter that changes nothing.
+struct PassThrough;
+
+impl Filter for PassThrough {
+    fn process(&mut self, _: &mut [f32]) {}
+    fn reset(&mut self) {}
+    fn latency(&self) -> usize {
+        0
+    }
+    fn set_param(&mut self, _: usize, _: f32) {}
 }
 
 /// Parameter values published by a [`ChainControl`] for one filter.
@@ -94,6 +144,7 @@ impl Chain {
     /// Non-finite input samples become 0: a NaN would stick in the filters'
     /// states until a reset.
     pub fn process(&mut self, buf: &mut [f32]) {
+        let outer = BLOCK_START.replace(Some(Instant::now()));
         for s in buf.iter_mut().filter(|s| !s.is_finite()) {
             *s = 0.0;
         }
@@ -112,6 +163,7 @@ impl Chain {
                 .reduction
                 .store(reduction.to_bits(), Ordering::Relaxed);
         }
+        BLOCK_START.set(outer);
     }
 
     /// Prepares the calling thread to run the chain: call it once on the
@@ -160,7 +212,10 @@ impl ChainControl {
         let new = spec.clamped();
         let (before, after) = (old.values(), new.values());
         let changed = |i: &usize| before[*i] != after[*i];
-        if old.name() != new.name()
+        // Another plugin instance is another filter.
+        let other_plugin = matches!(old, FilterSpec::Vst3 { .. }) && *old != new;
+        if other_plugin
+            || old.name() != new.name()
             || (0..MAX_PARAMS)
                 .filter(changed)
                 .any(|i| old.is_structural(i))
@@ -373,6 +428,18 @@ mod tests {
             lookahead_ms: 2.0,
         };
         assert!(control.set(0, slower));
+    }
+
+    #[test]
+    fn plugins_without_a_builder_pass_through() {
+        let a = FilterSpec::Vst3 { id: 1 };
+        let (mut chain, mut control) = Chain::new(&[a, FilterSpec::Gain { db: 0.0 }], 2);
+        let mut buf = vec![0.25; 960 * 2];
+        chain.process(&mut buf);
+        assert!(buf.iter().all(|&s| s == 0.25));
+        assert_eq!(chain.latency(), 0);
+        assert!(control.set(0, a));
+        assert!(!control.set(0, FilterSpec::Vst3 { id: 2 }));
     }
 
     #[test]

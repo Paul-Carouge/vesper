@@ -20,10 +20,15 @@ macro_rules! specs {
             $( $(#[doc = $fdoc:literal])* $field:ident: $default:literal in $min:literal..=$max:literal, )+
         }
     )+) => {
-        /// Parameters of a built-in filter. Defaults suit a voice.
+        /// Parameters of a filter. Defaults suit a voice.
         #[derive(Debug, Clone, Copy, PartialEq)]
         pub enum FilterSpec {
             $( $(#[doc = $doc])* $variant { $( $(#[doc = $fdoc])* $field: f32, )+ }, )+
+            /// A plugin hosted out of process, built by the builder given to
+            /// [`crate::set_external`]. `id` names its settings (plugin,
+            /// state), kept outside the filter list. No parameter here: the
+            /// plugin's own are set through its host.
+            Vst3 { id: u32 },
         }
 
         impl FilterSpec {
@@ -32,17 +37,17 @@ macro_rules! specs {
 
             /// Name in the text form.
             pub fn name(&self) -> &'static str {
-                match self { $( Self::$variant { .. } => $name, )+ }
+                match self { $( Self::$variant { .. } => $name, )+ Self::Vst3 { .. } => "vst3" }
             }
 
             /// Parameter names, in [`Filter::set_param`] order.
             pub fn param_names(&self) -> &'static [&'static str] {
-                match self { $( Self::$variant { .. } => &[$( stringify!($field), )+], )+ }
+                match self { $( Self::$variant { .. } => &[$( stringify!($field), )+], )+ Self::Vst3 { .. } => &[] }
             }
 
             /// Valid `(min, max)` of each parameter, in [`Self::param_names`] order.
             pub fn ranges(&self) -> &'static [(f32, f32)] {
-                match self { $( Self::$variant { .. } => &[$( ($min, $max), )+], )+ }
+                match self { $( Self::$variant { .. } => &[$( ($min, $max), )+], )+ Self::Vst3 { .. } => &[] }
             }
 
             /// Parameter values in [`Self::param_names`] order, then zeros.
@@ -53,6 +58,7 @@ macro_rules! specs {
                         let v = [$( $field, )+];
                         out[..v.len()].copy_from_slice(&v);
                     } )+
+                    Self::Vst3 { .. } => {}
                 }
                 out
             }
@@ -60,6 +66,7 @@ macro_rules! specs {
             fn value_mut(&mut self, i: usize) -> &mut f32 {
                 let value = match self {
                     $( Self::$variant { $( $field, )+ } => [$( $field, )+].into_iter().nth(i), )+
+                    Self::Vst3 { .. } => None,
                 };
                 value.expect("parameter index")
             }
@@ -144,9 +151,8 @@ impl FilterSpec {
 
     /// The same filter with every value in its range (NaN: the default).
     pub fn clamped(mut self) -> Self {
-        let defaults = Self::default_for(self.name())
-            .expect("known filter")
-            .values();
+        // A plugin has no parameter here: nothing to clamp.
+        let defaults = Self::default_for(self.name()).map_or([0.0; MAX_PARAMS], |d| d.values());
         for (i, &(lo, hi)) in self.ranges().iter().enumerate() {
             let v = self.value_mut(i);
             *v = if v.is_nan() {
@@ -221,6 +227,7 @@ impl FilterSpec {
             } => Box::new(Limiter::new(channels, ceiling_db, release_ms, lookahead_ms)),
             Self::HighPass { freq_hz } => Box::new(HighPass::new(channels, freq_hz)),
             Self::Gain { db } => Box::new(Gain::new(channels, db)),
+            Self::Vst3 { id } => crate::external(id, channels),
         }
     }
 }
@@ -228,6 +235,9 @@ impl FilterSpec {
 /// `name:key=value,key=value`, every parameter written.
 impl fmt::Display for FilterSpec {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Self::Vst3 { id } = self {
+            return write!(f, "vst3:id={id}");
+        }
         write!(f, "{}:", self.name())?;
         for (i, (name, value)) in self.param_names().iter().zip(self.values()).enumerate() {
             let sep = if i == 0 { "" } else { "," };
@@ -245,6 +255,15 @@ impl FromStr for FilterSpec {
     fn from_str(s: &str) -> Result<Self, ParseError> {
         let err = |what: String| ParseError(format!("{what} in filter `{s}`"));
         let (name, params) = s.split_once(':').unwrap_or((s, ""));
+        if name.trim() == "vst3" {
+            let id = params
+                .trim()
+                .strip_prefix("id")
+                .and_then(|v| v.trim_start().strip_prefix('='))
+                .and_then(|v| v.trim().parse().ok())
+                .ok_or_else(|| err("bad id".to_owned()))?;
+            return Ok(Self::Vst3 { id });
+        }
         let mut spec = Self::default_for(name.trim())
             .ok_or_else(|| err(format!("unknown filter `{}`", name.trim())))?;
         for param in params.split(',').map(str::trim).filter(|p| !p.is_empty()) {
@@ -301,6 +320,13 @@ mod tests {
         };
         assert_eq!(odd.to_string().parse::<FilterSpec>(), Ok(odd));
         assert_eq!(FilterSpec::Gain { db: -3.5 }.to_string(), "gain:db=-3.5");
+        let plugin = FilterSpec::Vst3 { id: 42 };
+        assert_eq!(plugin.to_string(), "vst3:id=42");
+        assert_eq!(" vst3 : id = 42 ".parse(), Ok(plugin));
+        assert_eq!(plugin.clamped(), plugin);
+        assert_eq!(plugin.with(0, 1.0), plugin);
+        assert!(plugin.param_names().is_empty() && !plugin.is_structural(0));
+        assert_eq!(FilterSpec::default_for("vst3"), None);
     }
 
     #[test]
@@ -337,6 +363,9 @@ mod tests {
             "gain:db",
             "gain:db=loud",
             "gain:db=inf",
+            "vst3",
+            "vst3:id=-1",
+            "vst3:id=x",
         ] {
             assert!(bad.parse::<FilterSpec>().is_err(), "{bad}");
         }

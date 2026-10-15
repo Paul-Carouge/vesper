@@ -4,14 +4,22 @@
 //!
 //! Like the tracks, the UI's filter rows are the truth. Edits change the
 //! track's filter model in place, so sliders and focus survive them.
+//!
+//! VST3 plugins (`vesper-vst`) are rows too: kind `vst3:id=<id>`, their
+//! parameters as generic sliders (0-100 %, the first ones shown, the rest
+//! behind "More settings"), their state saved beside the settings. Their
+//! title says when a plugin is bypassed (host crashed, restarting) or failed.
 
 use std::cell::RefCell;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::rc::Rc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use slint::{ComponentHandle, Model, ModelRc, VecModel};
 use vesper_dsp::FilterSpec;
+use vesper_vst::{PluginInfo, Status};
 
 use crate::prefs::Prefs;
 use crate::recorder::{MAX_FILTERS, TrackFilter};
@@ -21,6 +29,31 @@ use crate::{AppWindow, FilterKind, FilterParam, FilterRow, Shared};
 /// that needs a new chain (it resets the filters' state, a short dropout) is
 /// also applied only then, not at every step of a drag.
 const SAVE_DELAY: Duration = Duration::from_millis(400);
+
+/// How often plugin rows check their plugin's status.
+const PLUGIN_TICK: Duration = Duration::from_millis(500);
+
+/// Plugin parameters shown before "More settings".
+const PLUGIN_MAIN_PARAMS: usize = 8;
+
+/// "Add filter" kinds of the scanned plugins: this prefix, then the index
+/// in `PLUGINS`.
+const PLUGIN_KIND: &str = "vst3-plugin:";
+
+/// The installed VST3 effects, once scanned.
+static PLUGINS: Mutex<Vec<PluginInfo>> = Mutex::new(Vec::new());
+
+/// Makes the tracks' chains able to run VST3 plugins (settings in
+/// `~/.config/vesper/vst3/`, hosts from `vesper-vst-host` next to Vesper).
+pub fn install_plugins() {
+    if let Some(dir) = dirs::config_dir() {
+        let dir = dir.join("vesper").join("vst3");
+        vesper_vst::install(vesper_vst::Registry::new(
+            dir,
+            vesper_vst::HostCommand::installed(),
+        ));
+    }
+}
 
 /// Title shown for a filter.
 fn title(kind: &str) -> &'static str {
@@ -68,8 +101,64 @@ fn advanced(spec: &FilterSpec, name: &str) -> bool {
     }
 }
 
+/// The id of a plugin row's instance.
+fn plugin_id(kind: &str) -> Option<u32> {
+    match kind.parse() {
+        Ok(FilterSpec::Vst3 { id }) => Some(id),
+        _ => None,
+    }
+}
+
+/// A plugin's row: its parameters as 0-100 % sliders.
+fn plugin_row(enabled: bool, id: u32) -> FilterRow {
+    let view = vesper_vst::global()
+        .and_then(|r| r.instance(id).ok())
+        .map(|i| i.view());
+    let (title, params) = match view {
+        Some(v) => {
+            let title = match v.status {
+                Status::Running => v.name,
+                Status::Starting => format!("{} (starting)", v.name),
+                Status::Restarting(why) => format!("{} (bypassed: {why}; restarting)", v.name),
+                Status::Failed(why) => format!("{} (bypassed: {why})", v.name),
+            };
+            (title, v.params)
+        }
+        None => ("VST3 plugin (unavailable)".to_owned(), Vec::new()),
+    };
+    let params: Vec<_> = params
+        .iter()
+        .enumerate()
+        .map(|(i, p)| FilterParam {
+            index: i as i32,
+            label: p.title.as_str().into(),
+            unit: "%".into(),
+            value: (p.value * 100.0) as f32,
+            minimum: 0.0,
+            maximum: 100.0,
+            step: if p.steps > 0 {
+                100.0 / p.steps as f32
+            } else {
+                0.1
+            },
+        })
+        .collect();
+    let split = params.len().min(PLUGIN_MAIN_PARAMS);
+    FilterRow {
+        kind: FilterSpec::Vst3 { id }.to_string().into(),
+        title: title.into(),
+        enabled,
+        meters: false,
+        main: ModelRc::new(VecModel::from(params[..split].to_vec())),
+        advanced: ModelRc::new(VecModel::from(params[split..].to_vec())),
+    }
+}
+
 fn row(filter: &TrackFilter) -> FilterRow {
     let spec = filter.spec;
+    if let FilterSpec::Vst3 { id } = spec {
+        return plugin_row(filter.enabled, id);
+    }
     let (mut main, mut more) = (Vec::new(), Vec::new());
     let params = spec
         .param_names()
@@ -117,7 +206,7 @@ pub fn rows(filters: &[TrackFilter]) -> ModelRc<FilterRow> {
 pub fn from_rows(rows: &ModelRc<FilterRow>) -> Vec<TrackFilter> {
     rows.iter()
         .filter_map(|r| {
-            let mut spec = FilterSpec::default_for(&r.kind)?;
+            let mut spec: FilterSpec = r.kind.parse().ok()?;
             for p in r.main.iter().chain(r.advanced.iter()) {
                 spec = spec.with(usize::try_from(p.index).ok()?, p.value);
             }
@@ -129,14 +218,19 @@ pub fn from_rows(rows: &ModelRc<FilterRow>) -> Vec<TrackFilter> {
         .collect()
 }
 
-/// What "Add filter" offers.
+/// What "Add filter" offers: the built-in filters, then the scanned plugins.
 pub fn show_kinds(ui: &AppWindow) {
+    let plugins = PLUGINS.lock().unwrap_or_else(|e| e.into_inner());
     let kinds: Vec<_> = FilterSpec::DEFAULTS
         .iter()
         .map(|s| FilterKind {
             kind: s.name().into(),
             title: title(s.name()).into(),
         })
+        .chain(plugins.iter().enumerate().map(|(i, p)| FilterKind {
+            kind: format!("{PLUGIN_KIND}{i}").into(),
+            title: format!("VST3: {}", p.name).into(),
+        }))
         .collect();
     ui.set_filter_kinds(ModelRc::new(VecModel::from(kinds)));
     ui.set_max_filters(MAX_FILTERS as i32);
@@ -176,10 +270,90 @@ fn apply(ui: &AppWindow, rec: &Shared, track: i32) {
 
 fn save(ui: &AppWindow) {
     Prefs::from_ui(ui).save();
+    if let Some(r) = vesper_vst::global() {
+        r.persist_all();
+    }
+}
+
+/// Forgets the plugin instances of `rows` (their settings file goes too).
+pub(crate) fn forget_plugins(rows: impl IntoIterator<Item = FilterRow>) {
+    if let Some(r) = vesper_vst::global() {
+        rows.into_iter()
+            .filter_map(|row| plugin_id(&row.kind))
+            .for_each(|id| r.remove(id));
+    }
+}
+
+/// A plugin scan is running.
+static SCANNING: AtomicBool = AtomicBool::new(false);
+
+/// Lists the installed plugins in the background, then offers them. Run
+/// when "Add filter" opens (unchanged bundles come from the cache), not at
+/// startup: no plugin code runs unless plugins are wanted.
+fn scan_plugins(ui: &AppWindow) {
+    let Some(registry) = vesper_vst::global() else {
+        return;
+    };
+    if SCANNING.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let weak = ui.as_weak();
+    let scan = std::thread::Builder::new()
+        .name("vst3-scan".into())
+        .spawn(move || {
+            let found = registry.scan();
+            *PLUGINS.lock().unwrap_or_else(|e| e.into_inner()) = found;
+            SCANNING.store(false, Ordering::Release);
+            let _ = weak.upgrade_in_event_loop(|ui| show_kinds(&ui));
+        });
+    if let Err(e) = scan {
+        SCANNING.store(false, Ordering::Release);
+        log!("cannot scan the VST3 plugins: {e}");
+    }
+}
+
+/// Refreshes plugin rows whose plugin changed (loaded, bypassed, back).
+fn refresh_plugins(ui: &AppWindow, seen: &mut HashMap<u32, u64>) {
+    let Some(registry) = vesper_vst::global() else {
+        return;
+    };
+    for track in ui.get_tracks().iter() {
+        let Some(model) = track.filters.as_any().downcast_ref::<VecModel<FilterRow>>() else {
+            continue;
+        };
+        for (j, r) in model.iter().enumerate() {
+            let Some(id) = plugin_id(&r.kind) else {
+                continue;
+            };
+            let Ok(instance) = registry.instance(id) else {
+                continue;
+            };
+            let generation = instance.generation();
+            if seen.insert(id, generation) != Some(generation) {
+                model.set_row_data(j, plugin_row(r.enabled, id));
+            }
+        }
+    }
 }
 
 pub fn wire(ui: &AppWindow, rec: &Shared) {
     show_kinds(ui);
+    let weak = ui.as_weak();
+    ui.on_filter_menu_opened(move || {
+        if let Some(ui) = weak.upgrade() {
+            scan_plugins(&ui);
+        }
+    });
+    let weak = ui.as_weak();
+    let seen = RefCell::new(HashMap::new());
+    let plugin_timer = slint::Timer::default();
+    plugin_timer.start(slint::TimerMode::Repeated, PLUGIN_TICK, move || {
+        if let Some(ui) = weak.upgrade() {
+            refresh_plugins(&ui, &mut seen.borrow_mut());
+        }
+    });
+    // Ticks as long as the app runs.
+    std::mem::forget(plugin_timer);
 
     let (weak, r) = (ui.as_weak(), rec.clone());
     ui.on_filter_toggled(move |i, j, on| {
@@ -210,6 +384,9 @@ pub fn wire(ui: &AppWindow, rec: &Shared) {
         else {
             return;
         };
+        let plugin = model
+            .row_data(j as usize)
+            .and_then(|row| plugin_id(&row.kind));
         let structural = model.row_data(j as usize).is_some_and(|row| {
             FilterSpec::default_for(&row.kind).is_some_and(|s| s.is_structural(k as usize))
         });
@@ -230,7 +407,22 @@ pub fn wire(ui: &AppWindow, rec: &Shared) {
             return;
         };
         edited(m);
-        if structural {
+        if let Some(id) = plugin {
+            // Straight to the plugin's host: its chain does not change.
+            let instance = vesper_vst::global().and_then(|r| r.instance(id).ok());
+            let value = model
+                .row_data(j as usize)
+                .and_then(|row| {
+                    row.main
+                        .iter()
+                        .chain(row.advanced.iter())
+                        .find(|p| p.index == k)
+                })
+                .map_or(value, |p| p.value);
+            if let (Some(instance), Ok(k)) = (instance, usize::try_from(k)) {
+                instance.set_param(k, f64::from(value) / 100.0);
+            }
+        } else if structural {
             pending.borrow_mut().insert(i);
         } else {
             apply(&ui, &r, i);
@@ -264,11 +456,13 @@ pub fn wire(ui: &AppWindow, rec: &Shared) {
     let (weak, r) = (ui.as_weak(), rec.clone());
     ui.on_filter_removed(move |i, j| {
         let Some(ui) = weak.upgrade() else { return };
+        let mut removed = None;
         let done = edit(&ui, &r, i, |m| {
             if usize::try_from(j).is_ok_and(|j| j < m.row_count()) {
-                m.remove(j as usize);
+                removed = Some(m.remove(j as usize));
             }
         });
+        forget_plugins(removed);
         if done.is_some() {
             save(&ui);
         }
@@ -277,17 +471,24 @@ pub fn wire(ui: &AppWindow, rec: &Shared) {
     let (weak, r) = (ui.as_weak(), rec.clone());
     ui.on_filter_added(move |i, kind| {
         let Some(ui) = weak.upgrade() else { return };
-        let Some(spec) = FilterSpec::default_for(&kind) else {
+        let Some(spec) = new_filter(&kind) else {
             return;
         };
+        let mut added = false;
         let done = edit(&ui, &r, i, |m| {
             if m.row_count() < MAX_FILTERS {
                 m.push(row(&TrackFilter {
                     enabled: true,
                     spec,
                 }));
+                added = true;
             }
         });
+        if let (false, FilterSpec::Vst3 { id }) = (added, spec)
+            && let Some(r) = vesper_vst::global()
+        {
+            r.remove(id);
+        }
         if done.is_some() {
             save(&ui);
         }
@@ -305,10 +506,36 @@ pub fn wire(ui: &AppWindow, rec: &Shared) {
                 })
             })
             .collect();
-        if edit(&ui, &r, i, |m| m.set_vec(voice)).is_some() {
+        let mut old = Vec::new();
+        let done = edit(&ui, &r, i, |m| {
+            old = m.iter().collect();
+            m.set_vec(voice);
+        });
+        forget_plugins(old);
+        if done.is_some() {
             save(&ui);
         }
     });
+}
+
+/// The filter "Add filter" makes of `kind`: a built-in one, or a new
+/// instance of a scanned plugin.
+fn new_filter(kind: &str) -> Option<FilterSpec> {
+    let Some(index) = kind.strip_prefix(PLUGIN_KIND) else {
+        return FilterSpec::default_for(kind);
+    };
+    let plugin = PLUGINS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(index.parse::<usize>().ok()?)?
+        .clone();
+    match vesper_vst::global()?.add(&plugin) {
+        Ok(id) => Some(FilterSpec::Vst3 { id }),
+        Err(e) => {
+            log!("cannot add VST3 plugin {:?}: {e}", plugin.name);
+            None
+        }
+    }
 }
 
 /// Gain reduction of the open track's filters, from the pipeline, into
@@ -369,6 +596,59 @@ mod tests {
                 assert_ne!(p.label, "Value", "{}", f.spec.name());
             }
         }
+    }
+
+    #[test]
+    fn plugin_rows_round_trip() {
+        let filters = vec![
+            TrackFilter {
+                enabled: false,
+                spec: FilterSpec::Vst3 { id: 5 },
+            },
+            TrackFilter {
+                enabled: true,
+                spec: FilterSpec::Gain { db: 1.0 },
+            },
+        ];
+        let rows = rows(&filters);
+        assert_eq!(rows.row_data(0).unwrap().kind, "vst3:id=5");
+        assert_eq!(plugin_id("vst3:id=5"), Some(5));
+        assert_eq!(plugin_id("gain"), None);
+        assert_eq!(from_rows(&rows), filters);
+        assert_eq!(new_filter("gain"), FilterSpec::default_for("gain"));
+        assert_eq!(new_filter("vst3-plugin:99"), None);
+    }
+
+    #[test]
+    fn forgetting_plugin_rows_deletes_only_their_settings() {
+        let dir = std::env::temp_dir().join(format!("vesper-app-vst-{}", std::process::id()));
+        let reg = vesper_vst::install(vesper_vst::Registry::new(
+            &dir,
+            vesper_vst::HostCommand::new("/nonexistent/vesper-vst-host"),
+        ))
+        .unwrap();
+        let plugin = PluginInfo {
+            path: "/nowhere/A.vst3".into(),
+            cid: [1; 16],
+            name: "A".into(),
+            vendor: String::new(),
+            category: "Fx".into(),
+        };
+        let (a, b) = (reg.add(&plugin).unwrap(), reg.add(&plugin).unwrap());
+        let track_rows = rows(&[
+            TrackFilter {
+                enabled: true,
+                spec: FilterSpec::Vst3 { id: a },
+            },
+            TrackFilter {
+                enabled: true,
+                spec: FilterSpec::Gain { db: 0.0 },
+            },
+        ]);
+        forget_plugins(track_rows.iter());
+        assert!(!vesper_vst::sidecar::file(&dir, a).exists());
+        assert!(vesper_vst::sidecar::file(&dir, b).exists());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
