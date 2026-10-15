@@ -4,33 +4,88 @@
 //!   UI intents and key presses once the window is up (`ctrl+comma` for `,`).
 //! - `vesper --record <seconds>` records without the UI, from the saved
 //!   source or `VESPER_RESTORE_TOKEN`, with `default_settings()`.
+//! - `vesper --replay <buffer_s> <wait_s>` runs the replay buffer for
+//!   `wait_s`, recording during the second half, then saves the replay.
 
 use std::time::Duration;
 
 use slint::ComponentHandle;
 use slint::platform::{Key, WindowEvent};
 
+use std::path::PathBuf;
+use std::sync::mpsc::Receiver;
+
 use crate::AppWindow;
-use crate::recorder::{Event, Recorder, Settings};
+use crate::recorder::{Event, Pipeline, Settings};
 
 pub fn record_seconds() -> Option<u64> {
     let mut args = std::env::args().skip(1);
     (args.next()? == "--record").then(|| args.next()?.parse().ok())?
 }
 
-pub fn record(seconds: u64, settings: Settings) {
-    let (tx, rx) = std::sync::mpsc::channel();
-    let rec = Recorder::start(settings, move |event| drop(tx.send(event))).expect("spawn");
-    for event in &rx {
+pub fn replay_seconds() -> Option<(u64, u64)> {
+    let mut args = std::env::args().skip(1);
+    if args.next()? != "--replay" {
+        return None;
+    }
+    Some((args.next()?.parse().ok()?, args.next()?.parse().ok()?))
+}
+
+fn folder() -> PathBuf {
+    crate::default_output_folder().unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// Logs events until `want` matches one; false if the pipeline stopped first.
+fn wait_for(rx: &Receiver<Event>, want: impl Fn(&Event) -> bool) -> bool {
+    for event in rx {
         log!("{event:?}");
-        match event {
-            Event::Started => break,
-            Event::Finished(_) => return,
-            _ => {}
+        if want(&event) {
+            return true;
+        }
+        if matches!(event, Event::Stopped(_)) {
+            return false;
         }
     }
+    false
+}
+
+pub fn record(seconds: u64, settings: Settings) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let p = Pipeline::start(settings, None, Some(folder()), move |event| {
+        drop(tx.send(event))
+    })
+    .expect("spawn");
+    if !wait_for(&rx, |e| matches!(e, Event::Started)) {
+        return;
+    }
     std::thread::sleep(Duration::from_secs(seconds));
-    rec.join();
+    p.join();
+    for event in rx {
+        log!("{event:?}");
+    }
+}
+
+pub fn replay(buffer: u64, wait: u64, settings: Settings) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let span = Some(Duration::from_secs(buffer));
+    let p =
+        Pipeline::start(settings, span, None, move |event| drop(tx.send(event))).expect("spawn");
+    std::thread::sleep(Duration::from_secs(wait / 2));
+    if !p.record(folder()) || !wait_for(&rx, |e| matches!(e, Event::Started)) {
+        return;
+    }
+    std::thread::sleep(Duration::from_secs(wait - wait / 2));
+    p.stop_recording();
+    p.save_replay(folder());
+    // Both the recording and the replay, in either order.
+    for _ in 0..2 {
+        if !wait_for(&rx, |e| {
+            matches!(e, Event::Finished(_) | Event::ReplaySaved(_))
+        }) {
+            return;
+        }
+    }
+    p.join();
     for event in rx {
         log!("{event:?}");
     }

@@ -1,7 +1,8 @@
 //! Vesper desktop app: the Slint UI and the video recording backend.
 //!
-//! Recording (video + desktop and microphone audio) lives in `recorder`.
-//! Audio sources only run while recording, so the meters rest at 0 when idle.
+//! Recording and the replay buffer (video + desktop and microphone audio)
+//! live in `recorder`. Audio sources only run while one of them does, so the
+//! meters rest at 0 otherwise.
 
 /// Minimal stderr logger, enough until a real backend brings `tracing`.
 macro_rules! log {
@@ -22,9 +23,10 @@ use slint::ComponentHandle;
 use vesper_audio::Source;
 
 use meter::MeterState;
-use recorder::{Event, Recorder, Settings};
+use recorder::{Event, Pipeline, Settings};
 
-type Recording = Rc<RefCell<Option<Recorder>>>;
+/// The last started pipeline; it may have ended since.
+type Shared = Rc<RefCell<Option<Pipeline>>>;
 
 /// Meter refresh period: ~30 Hz.
 const METER_TICK: Duration = Duration::from_millis(33);
@@ -35,6 +37,11 @@ fn main() -> Result<(), slint::PlatformError> {
     #[cfg(debug_assertions)]
     if let Some(seconds) = dev::record_seconds() {
         dev::record(seconds, default_settings());
+        return Ok(());
+    }
+    #[cfg(debug_assertions)]
+    if let Some((buffer, wait)) = dev::replay_seconds() {
+        dev::replay(buffer, wait, default_settings());
         return Ok(());
     }
 
@@ -60,8 +67,14 @@ fn main() -> Result<(), slint::PlatformError> {
         ui.set_source_name("Last picked source".into());
     }
 
-    let recording = Recording::default();
+    let recording = Shared::default();
     wire_callbacks(&ui, &recording);
+    // The replay buffer runs from launch (may open the picker once).
+    if ui.get_replay_enabled()
+        && let Err(e) = start_pipeline(&ui, &recording, None)
+    {
+        flash_notice(&ui, &e);
+    }
 
     let tick = slint::Timer::default();
     let weak = ui.as_weak();
@@ -84,6 +97,7 @@ fn main() -> Result<(), slint::PlatformError> {
     let result = ui.run();
     // Closing the window mid-recording still finalizes the file. Before the
     // capture started, the thread may wait on the portal picker: exit without it.
+    // Replays being saved are cut short.
     if let Some(rec) = recording.take()
         && rec.started()
     {
@@ -101,7 +115,7 @@ fn main() -> Result<(), slint::PlatformError> {
 /// `idle -> starting -> recording -> stopping -> idle`, or `starting -> idle`
 /// when the picker is cancelled or the pipeline fails to start; the UI ignores
 /// record intents while it is `starting` or `stopping`.
-fn wire_callbacks(ui: &AppWindow, recording: &Recording) {
+fn wire_callbacks(ui: &AppWindow, recording: &Shared) {
     let weak = ui.as_weak();
     ui.on_pick_source(move || {
         let Some(ui) = weak.upgrade() else { return };
@@ -125,26 +139,17 @@ fn wire_callbacks(ui: &AppWindow, recording: &Recording) {
             flash_notice(&ui, "Choose an output folder first");
             return;
         }
-        let settings = Settings {
-            codec: ui.get_codec().into(),
-            fps: ui.get_fps().max(1) as u32,
-            bits_per_pixel: bits_per_pixel(ui.get_codec(), ui.get_quality()),
-            folder: PathBuf::from(ui.get_output_folder().as_str()),
-            desktop_muted: ui.get_desktop_muted(),
-            mic_muted: ui.get_mic_muted(),
-        };
-        log!("start-recording: {settings:?}");
+        let folder = PathBuf::from(ui.get_output_folder().as_str());
+        log!("start-recording: {}", folder.display());
         ui.set_rec_state(RecState::Starting);
-        let weak = ui.as_weak();
-        let started = Recorder::start(settings, move |event| {
-            let _ = weak.upgrade_in_event_loop(move |ui| on_recorder_event(&ui, event));
-        });
-        match started {
-            Ok(r) => *rec.borrow_mut() = Some(r),
-            Err(e) => {
-                ui.set_rec_state(RecState::Idle);
-                flash_notice(&ui, &format!("Could not start: {e}"));
-            }
+        // Joins the running pipeline (replay buffer), or starts one.
+        let joined = rec
+            .borrow()
+            .as_ref()
+            .is_some_and(|p| p.record(folder.clone()));
+        if !joined && let Err(e) = start_pipeline(&ui, &rec, Some(folder)) {
+            ui.set_rec_state(RecState::Idle);
+            flash_notice(&ui, &e);
         }
     });
 
@@ -158,19 +163,39 @@ fn wire_callbacks(ui: &AppWindow, recording: &Recording) {
         log!("stop-recording");
         ui.set_rec_state(RecState::Stopping);
         if let Some(r) = rec.borrow().as_ref() {
-            r.stop();
+            r.stop_recording();
         }
     });
 
     let weak = ui.as_weak();
+    let rec = recording.clone();
     ui.on_save_replay(move || {
         let Some(ui) = weak.upgrade() else { return };
         log!("save-replay: last {} s", ui.get_replay_seconds());
-        flash_notice(&ui, "Replay saved");
+        let folder = PathBuf::from(ui.get_output_folder().as_str());
+        let saving =
+            ui.get_replay_enabled() && rec.borrow().as_ref().is_some_and(|p| p.save_replay(folder));
+        if !saving {
+            flash_notice(&ui, "The replay buffer is not running");
+        }
     });
 
-    ui.on_replay_changed(|enabled, seconds| {
+    let weak = ui.as_weak();
+    let rec = recording.clone();
+    ui.on_replay_changed(move |enabled, seconds| {
+        let Some(ui) = weak.upgrade() else { return };
         log!("replay-changed: enabled={enabled} seconds={seconds}");
+        let applied = rec
+            .borrow()
+            .as_ref()
+            .is_some_and(|p| p.set_replay(replay_span(&ui)));
+        if !applied
+            && enabled
+            && let Err(e) = start_pipeline(&ui, &rec, None)
+        {
+            ui.set_replay_enabled(false);
+            flash_notice(&ui, &e);
+        }
     });
 
     // Applied live while recording; the next recording reads the UI state.
@@ -204,7 +229,39 @@ fn wire_callbacks(ui: &AppWindow, recording: &Recording) {
     });
 }
 
-/// Applies a recorder event on the UI thread.
+/// Encoder settings from the UI.
+fn settings(ui: &AppWindow) -> Settings {
+    Settings {
+        codec: ui.get_codec().into(),
+        fps: ui.get_fps().max(1) as u32,
+        bits_per_pixel: bits_per_pixel(ui.get_codec(), ui.get_quality()),
+        desktop_muted: ui.get_desktop_muted(),
+        mic_muted: ui.get_mic_muted(),
+    }
+}
+
+/// The replay buffer length, `None` when it is off.
+fn replay_span(ui: &AppWindow) -> Option<Duration> {
+    ui.get_replay_enabled()
+        .then(|| Duration::from_secs(ui.get_replay_seconds().max(1) as u64))
+}
+
+/// Starts a pipeline with the UI's settings and replay buffer, recording into
+/// `record` if set. It replaces the previous, ended one: that thread ends on
+/// its own.
+fn start_pipeline(ui: &AppWindow, shared: &Shared, record: Option<PathBuf>) -> Result<(), String> {
+    let settings = settings(ui);
+    log!("start-pipeline: {settings:?}");
+    let weak = ui.as_weak();
+    let pipeline = Pipeline::start(settings, replay_span(ui), record, move |event| {
+        let _ = weak.upgrade_in_event_loop(move |ui| on_recorder_event(&ui, event));
+    })
+    .map_err(|e| format!("Could not start: {e}"))?;
+    *shared.borrow_mut() = Some(pipeline);
+    Ok(())
+}
+
+/// Applies a pipeline event on the UI thread.
 fn on_recorder_event(ui: &AppWindow, event: Event) {
     match event {
         Event::Started => {
@@ -245,6 +302,27 @@ fn on_recorder_event(ui: &AppWindow, event: Event) {
                 }
             }
         }
+        Event::ReplaySaved(result) => match result {
+            Ok(path) => {
+                log!("saved replay {}", path.display());
+                flash_notice(ui, "Replay saved");
+            }
+            Err(e) => {
+                log!("replay failed: {e}");
+                flash_notice(ui, &e);
+            }
+        },
+        // A clean stop always follows `Finished`: nothing to reset (a new
+        // pipeline may already be starting).
+        Event::Stopped(None) => log!("pipeline stopped"),
+        Event::Stopped(Some(e)) => {
+            log!("pipeline stopped: {e}");
+            // Neither a recording nor the replay buffer runs any more.
+            ui.set_rec_state(RecState::Idle);
+            ui.set_elapsed_seconds(0);
+            ui.set_replay_enabled(false);
+            flash_notice(ui, &e);
+        }
     }
 }
 
@@ -270,7 +348,6 @@ fn default_settings() -> Settings {
         codec: vesper_core::Codec::Hevc,
         fps: 60,
         bits_per_pixel: bits_per_pixel(VideoCodec::Hevc, QualityPreset::Balanced),
-        folder: default_output_folder().unwrap_or_else(|| PathBuf::from(".")),
         desktop_muted: false,
         mic_muted: false,
     }

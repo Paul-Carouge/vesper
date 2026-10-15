@@ -76,3 +76,41 @@ fn repeat_reencodes_last_picture_with_new_pts() {
     assert_eq!(got, want);
     assert!(packets[0].keyframe);
 }
+
+#[test]
+fn force_keyframe_makes_only_the_next_picture_a_keyframe() {
+    if !Path::new("/dev/dri/renderD128").exists() {
+        eprintln!("no GPU, skipping");
+        return;
+    }
+    let (w, h) = (640, 360);
+    let producer = unsafe { Producer::new(w, h) };
+    // GOP of 2 s: no natural keyframe in these 20 pictures but the first.
+    let mut enc = Encoder::new(Codec::Hevc, w, h, 30, RateControl::ConstantQp(30)).unwrap();
+    let ms = |t: u64| Duration::from_millis(1_000 + t * 33);
+    let mut packets = Vec::new();
+    packets.extend(
+        enc.encode(unsafe { producer.frame(0, 0, 0, ms(0)) })
+            .unwrap(),
+    );
+    for t in 1..10 {
+        packets.extend(enc.repeat(ms(t)).unwrap());
+    }
+    enc.force_keyframe();
+    for t in 10..15 {
+        packets.extend(enc.repeat(ms(t)).unwrap());
+    }
+    enc.force_keyframe();
+    packets.extend(
+        enc.encode(unsafe { producer.frame(1, 15, 0, ms(15)) })
+            .unwrap(),
+    );
+    for t in 16..20 {
+        packets.extend(enc.repeat(ms(t)).unwrap());
+    }
+    packets.extend(enc.flush().unwrap());
+
+    assert_eq!(packets.len(), 20);
+    let keys: Vec<usize> = (0..20).filter(|&i| packets[i].keyframe).collect();
+    assert_eq!(keys, [0, 10, 15]);
+}
