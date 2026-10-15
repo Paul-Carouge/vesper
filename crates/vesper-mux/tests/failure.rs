@@ -147,10 +147,9 @@ fn a_killed_recording_is_playable_to_the_last_second() {
 }
 
 /// A recording whose folder is deleted while it runs keeps writing to an
-/// unlinked file: every write succeeds, `finish()` says Ok, and the app shows
-/// "Recording saved" for a path that no longer exists.
+/// unlinked file: every write succeeds, so `finish()` must say the file is
+/// gone instead of letting the app show "Recording saved".
 #[test]
-#[ignore = "audit finding: finish() succeeds on a file nobody can open any more"]
 fn finish_reports_a_deleted_output() {
     let path = temp("unlinked");
     let start = Duration::from_secs(1_000);
@@ -159,9 +158,10 @@ fn finish_reports_a_deleted_output() {
     std::fs::remove_file(&path).unwrap();
     let (errors, _) = record(&mut mux, start + Duration::from_secs(3), 60, 3000);
     assert_eq!(errors, 0, "writes to an unlinked file succeed");
+    let finished = mux.finish();
     assert!(
-        mux.finish().is_err(),
-        "finish() returned Ok but {} is gone",
+        finished.as_ref().is_err_and(vesper_mux::Error::is_deleted),
+        "finish() returned {finished:?} but {} is gone",
         path.display()
     );
 }

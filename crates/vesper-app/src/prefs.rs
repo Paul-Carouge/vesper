@@ -2,10 +2,11 @@
 //! as `key=value` lines. Unknown keys, missing keys and bad values are
 //! ignored: those settings keep their defaults. Written atomically.
 
-use std::io::Write;
+use std::collections::HashSet;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use vesper_audio::{MAX_DB, MIN_DB, Source};
 
@@ -87,6 +88,8 @@ impl Prefs {
         // The track the next `filter` lines belong to: the last one read, if valid.
         let mut last_track: Option<usize> = None;
         let (mut desktop_muted, mut mic_muted) = (None, None);
+        // Duplicate check in O(1): a huge allow list must not stall startup.
+        let mut allowed: HashSet<String> = self.allowed_games.iter().cloned().collect();
         for line in text.lines() {
             let Some((key, value)) = line.split_once('=') else {
                 continue;
@@ -128,9 +131,7 @@ impl Prefs {
                     self.output_folder = value.to_owned();
                 }
                 "game_source" => set(&mut self.game_source, flag(value)),
-                "allow_game"
-                    if valid_game(value) && !self.allowed_games.iter().any(|g| g == value) =>
-                {
+                "allow_game" if valid_game(value) && allowed.insert(value.to_owned()) => {
                     self.allowed_games.push(value.to_owned());
                 }
                 "tray_notice_shown" => set(&mut self.tray_notice_shown, flag(value)),
@@ -197,7 +198,7 @@ impl Prefs {
     /// file keeps the defaults.
     pub fn load(defaults: Self) -> Self {
         let Some(path) = path() else { return defaults };
-        match std::fs::read(&path) {
+        match read_capped(&path) {
             Ok(bytes) => defaults.parse(&String::from_utf8_lossy(&bytes)),
             Err(e) => {
                 if e.kind() != std::io::ErrorKind::NotFound {
@@ -406,16 +407,53 @@ pub fn clear_source() {
     }
 }
 
+/// Most of the settings file read; the rest is ignored. Real files are a few
+/// KB: this only bounds a corrupt or hostile one.
+const MAX_SETTINGS_SIZE: u64 = 1 << 20;
+
+/// `path`'s first [`MAX_SETTINGS_SIZE`] bytes, cut after the last full line.
+fn read_capped(path: &Path) -> std::io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)?
+        .take(MAX_SETTINGS_SIZE + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_SETTINGS_SIZE {
+        log!(
+            "{} is larger than {MAX_SETTINGS_SIZE} bytes: the rest is ignored",
+            path.display()
+        );
+        bytes.truncate(MAX_SETTINGS_SIZE as usize);
+        let end = bytes.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+        bytes.truncate(end);
+    }
+    Ok(bytes)
+}
+
 /// Writes a temporary file next to `path`, then renames it over `path`: a
 /// process crash leaves either the old or the new file, never half of one.
 /// No fsync: it would block the UI thread, and settings are cheap to lose.
 pub fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    static WRITES: AtomicU64 = AtomicU64::new(0);
     let dir = path.parent().ok_or(std::io::ErrorKind::NotFound)?;
     std::fs::create_dir_all(dir)?;
-    let tmp = path.with_extension("tmp");
-    let mut file = std::fs::File::create(&tmp)?;
-    file.write_all(bytes)?;
-    std::fs::rename(&tmp, path)
+    // One temporary file per writer (threads, a second instance), so a
+    // writer never renames another one's half-written file.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos();
+    let n = WRITES.fetch_add(1, Ordering::Relaxed);
+    let tmp = path.with_extension(format!("tmp.{}.{n}.{nanos:x}", std::process::id()));
+    let written = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .and_then(|mut file| file.write_all(bytes))
+        .and_then(|()| std::fs::rename(&tmp, path));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written
 }
 
 #[cfg(test)]
@@ -776,7 +814,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "audit finding (low): parse is quadratic in the allow list"]
     fn a_huge_allow_list_does_not_stall_startup() {
         // 40k distinct names (a ~600 KB file) must parse in well under a second.
         // `parse` checks every new name against the whole list (quadratic).
@@ -793,10 +830,9 @@ mod tests {
 
     /// Settings are rewritten on every change from the UI thread, and a
     /// second instance (no session bus: the guard is off) or a stray `--record`
-    /// can write at once. The shared `settings.tmp` makes a reader see a mix of
-    /// writers: truncated or interleaved content.
+    /// can write at once. A temporary file shared by the writers would make
+    /// a reader see a mix of them: truncated or interleaved content.
     #[test]
-    #[ignore = "audit finding: write_atomically shares one temp name per target"]
     fn concurrent_writers_never_tear_the_file() {
         let dir = std::env::temp_dir().join(format!("vesper-prefs-race-{}", std::process::id()));
         let path = dir.join("settings");
@@ -826,6 +862,21 @@ mod tests {
         });
         std::fs::remove_dir_all(dir).unwrap();
         assert_eq!(torn, None, "a reader saw a torn settings file");
+    }
+
+    #[test]
+    fn a_huge_settings_file_is_read_up_to_the_cap() {
+        let dir = std::env::temp_dir().join(format!("vesper-prefs-big-{}", std::process::id()));
+        let path = dir.join("settings");
+        let line = "allow_game=some_game\n";
+        let text = line.repeat(2 * MAX_SETTINGS_SIZE as usize / line.len());
+        write_atomically(&path, format!("fps=30\n{text}").as_bytes()).unwrap();
+        let bytes = read_capped(&path).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+        assert!(bytes.len() as u64 <= MAX_SETTINGS_SIZE);
+        // Cut after a full line: every line read is whole.
+        assert!(bytes.ends_with(b"\n"));
+        assert_eq!(defaults().parse(&String::from_utf8_lossy(&bytes)).fps, 30);
     }
 
     #[test]

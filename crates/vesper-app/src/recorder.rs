@@ -47,6 +47,10 @@ const STATS_PERIOD: Duration = Duration::from_millis(500);
 /// the packet whose pre-skip covers the start.
 const AUDIO_MARGIN: Duration = Duration::from_millis(100);
 
+/// Audio kept in the replay buffer past its last video packet (desktop
+/// audio is stamped ahead of real time by its playback delay).
+const AUDIO_LEAD: Duration = Duration::from_secs(1);
+
 /// A recording request waiting this long for a first frame fails (e.g. the
 /// game quit), so the UI does not stay in `starting`.
 const FIRST_FRAME_TIMEOUT: Duration = if cfg!(test) {
@@ -111,6 +115,13 @@ impl GameFrames {
         }
     }
 
+    /// Whether the game being captured disconnected (quit or crashed) and
+    /// none replaced it yet. A paused game stays connected: not gone.
+    fn gone(&self) -> bool {
+        let capture = self.0.capture.get().and_then(Weak::upgrade);
+        capture.is_some_and(|c| c.captured().is_none())
+    }
+
     /// Never called under the slot lock: dropping the upgraded capture may
     /// join the server thread, which takes that lock in `push`.
     fn set_active(&self, fps: Option<u32>) {
@@ -166,6 +177,9 @@ pub enum Event {
     ReplaySaved(Result<PathBuf, String>),
     /// The audio track of this name lost its source, or has it back.
     AudioTrack(String, TrackState),
+    /// Some audio tracks or the mix could not start: what is left out, for
+    /// a notice.
+    AudioMissing(String),
     /// The pipeline ended, with the error that ended it if any. A recording
     /// still running then is lost only if the pipeline crashed.
     Stopped(Option<String>),
@@ -176,6 +190,9 @@ pub const MAX_TRACKS: usize = 8;
 
 /// Most filters a track has.
 pub const MAX_FILTERS: usize = 16;
+
+/// A recording whose file (or folder) was deleted: nothing was saved.
+const DELETED: &str = "The recording file was deleted while recording";
 
 /// Name of the mix in the files.
 const MIX_NAME: &str = "Mix";
@@ -564,8 +581,11 @@ struct Recording {
 
 impl Recording {
     fn finish(self, error: Option<String>) -> Result<PathBuf, String> {
-        let finished = self.mux.finish().map_err(|e| e.to_string());
-        match error.or(finished.err()) {
+        let finished = self.mux.finish();
+        if finished.as_ref().is_err_and(vesper_mux::Error::is_deleted) {
+            return Err(DELETED.into());
+        }
+        match error.or(finished.err().map(|e| e.to_string())) {
             None => Ok(self.path),
             Some(e) => Err(format!("{e} (saved up to there: {})", self.path.display())),
         }
@@ -645,7 +665,10 @@ impl Ring {
     }
 
     fn push_audio(&mut self, track: usize, p: EncodedPacket) {
-        if !self.video.is_empty()
+        // Bounded while no video comes (the game is gone): only the
+        // audio that goes with the video kept.
+        let latest = self.video.back().map(|v| v.pts + AUDIO_LEAD);
+        if latest.is_some_and(|t| p.pts <= t)
             && let Some(t) = self.audio.get_mut(track)
         {
             t.push_back(p);
@@ -714,11 +737,15 @@ fn start_audio(sources: &AudioSources, sinks: &SharedSinks, on_event: &OnEvent) 
     // One clock for every track, so the mix lines their samples up.
     let anchor = monotonic_now();
     let mut mixer = None;
+    let mut mix_failed = false;
     if mix && enabled.len() >= 2 {
         let sinks = sinks.clone();
         match Mix::start(anchor, move |packet| write_audio(&sinks, 0, packet)) {
             Ok(m) => mixer = Some(m),
-            Err(e) => log!("recording without the mix: {e}"),
+            Err(e) => {
+                log!("recording without the mix: {e}");
+                mix_failed = true;
+            }
         }
     }
     // Every input exists before any track runs.
@@ -730,6 +757,7 @@ fn start_audio(sources: &AudioSources, sinks: &SharedSinks, on_event: &OnEvent) 
     let first = Arc::new(AtomicUsize::new(usize::from(mixer.is_some())));
     let mut running = Vec::new();
     let mut controls = Vec::new();
+    let mut failed = Vec::new();
     for (input, &i) in inputs.iter_mut().zip(&enabled) {
         let track = &tracks[i];
         let (index, sinks) = (StreamIndex::new(&first, running.len()), sinks.clone());
@@ -757,13 +785,30 @@ fn start_audio(sources: &AudioSources, sinks: &SharedSinks, on_event: &OnEvent) 
                 running.push((i, capture));
                 controls.push((i, control));
             }
-            Err(e) => log!("running without the {:?} track: {e}", track.name),
+            Err(e) => {
+                log!("running without the {:?} track: {e}", track.name);
+                failed.push(track.name.as_str());
+            }
         }
     }
     // A mix of one track would be a copy of it.
-    if running.len() < 2 && mixer.take().is_some() {
+    let dropped = running.len() < 2 && mixer.take().is_some();
+    if dropped {
         // The tracks move up one stream: before any file or replay uses them.
         first.store(0, Ordering::Relaxed);
+    }
+    // One notice for everything left out.
+    let missing = match (failed.as_slice(), mix_failed || dropped) {
+        ([], false) => None,
+        ([], true) => Some("Recording without the mix track".to_owned()),
+        ([one], _) => Some(format!("Recording without the audio track {one}")),
+        (many, _) => Some(format!(
+            "Recording without the audio tracks {}",
+            many.join(", ")
+        )),
+    };
+    if let Some(text) = missing {
+        on_event(Event::AudioMissing(text));
     }
     // Started outside the lock (it blocks until PipeWire is ready); the
     // latest mute and volume applied under it, so no change is missed.
@@ -833,7 +878,6 @@ fn run(
     let sinks = SharedSinks::default();
     started.store(true, Ordering::Relaxed);
     let result = pump(settings, slot, control, &sinks, sources, on_event);
-    drop(capture);
     if let Some(game) = &settings.game {
         game.detach(slot);
     }
@@ -844,6 +888,8 @@ fn run(
     if let Some(r) = rec {
         on_event(Event::Finished(r.finish(result.clone().err())));
     }
+    // Last: closing the portal session may hang, the file is safe by now.
+    drop(capture);
     result
 }
 
@@ -1187,6 +1233,14 @@ fn pump(
             Some(mut frame) => {
                 frame.pts = pts;
                 v.enc.encode(frame)
+            }
+            // The game quit or crashed: no frozen picture, so the replay
+            // buffer keeps the seconds before it. A recording keeps its
+            // frame rate until the UI stops it (its stop needs a packet).
+            None if lock(sinks).rec.is_none()
+                && settings.game.as_ref().is_some_and(GameFrames::gone) =>
+            {
+                Ok(Vec::new())
             }
             None => v.enc.repeat(pts),
         };
@@ -1547,6 +1601,25 @@ mod tests {
         ring.span = Duration::from_secs(2);
         ring.push_video(packet(10_400, false));
         assert_eq!(ring.video[0].pts, Duration::from_millis(8000));
+    }
+
+    #[test]
+    fn ring_keeps_its_content_while_video_stops() {
+        // The game crashed at 4 s: audio goes on, video does not.
+        let mut ring = filled(3, 4000);
+        let before = (ring.video.clone(), ring.audio[0].len());
+        for ms in (4100..60_000).step_by(100) {
+            ring.push_audio(0, packet(ms, false));
+        }
+        assert!(
+            ring.video
+                .iter()
+                .map(|p| p.pts)
+                .eq(before.0.iter().map(|p| p.pts))
+        );
+        let last = ring.audio[0].back().unwrap().pts;
+        assert_eq!(last, Duration::from_millis(4000) + AUDIO_LEAD);
+        assert_eq!(ring.audio[0].len(), before.1 + 10);
     }
 
     #[test]

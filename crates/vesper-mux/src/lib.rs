@@ -14,7 +14,9 @@
 
 use std::ffi::{CString, c_int};
 use std::fmt;
+use std::fs::File;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::ptr;
 use std::time::Duration;
@@ -61,6 +63,15 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+const DELETED: &str = "the file was deleted while it was written";
+
+impl Error {
+    /// The file was deleted (or its folder) before `finish`: nothing was saved.
+    pub fn is_deleted(&self) -> bool {
+        self.0 == DELETED
+    }
+}
+
 fn check(ret: c_int, what: &str) -> Result<c_int, Error> {
     if ret < 0 {
         Err(Error(format!("{what}: {}", ffmpeg_next::Error::from(ret))))
@@ -99,6 +110,9 @@ pub struct Muxer {
     got_keyframe: bool,
     /// Last written pts per stream, in its time base.
     last_pts: Vec<i64>,
+    /// The output file, opened again to notice it being deleted: writes to
+    /// an unlinked file succeed, and `finish` would claim it was saved.
+    file: Option<File>,
 }
 
 // SAFETY: the FFmpeg objects are owned by this struct and only used through
@@ -143,6 +157,7 @@ impl Muxer {
                 .collect(),
             got_keyframe: false,
             last_pts: vec![i64::MIN; 1 + audio.len()],
+            file: None,
         };
         // On error, `m` is dropped and frees whatever was created so far.
         unsafe {
@@ -201,6 +216,7 @@ impl Muxer {
                 ff::avio_open(&mut (*m.ctx).pb, cpath.as_ptr(), ff::AVIO_FLAG_WRITE),
                 "open output file",
             )?;
+            m.file = File::open(path).ok();
             // Hand each closed cluster to the OS at once: a kill loses at most ~1 s.
             (*m.ctx).flush_packets = 1;
             // A stalled track must not make libavformat hold more than a
@@ -317,6 +333,13 @@ impl Muxer {
             ff::avformat_free_context(self.ctx);
             self.ctx = ptr::null_mut();
             check(ret, "write MKV trailer")?;
+        }
+        let file = self.file.take();
+        if file
+            .and_then(|f| f.metadata().ok())
+            .is_some_and(|m| m.nlink() == 0)
+        {
+            return Err(Error(DELETED.into()));
         }
         Ok(())
     }
