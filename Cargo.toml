@@ -10,6 +10,7 @@ edition = "2024"
 vesper-core = { path = "crates/vesper-core" }
 vesper-capture = { path = "crates/vesper-capture" }
 vesper-encode = { path = "crates/vesper-encode" }
+vesper-mux = { path = "crates/vesper-mux" }
 ffmpeg-next = { version = "9.0.0", default-features = false, features = ["codec", "format", "filter"] }
 
 [profile.release]

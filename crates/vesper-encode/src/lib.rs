@@ -269,6 +269,8 @@ impl Encoder {
             enc.gop_size = (fps * 2) as c_int;
             // No B-frames: decode order == presentation order (vesper-core contract).
             enc.max_b_frames = 0;
+            // Parameter sets go to `extradata` for containers (see `extradata()`).
+            enc.flags |= ff::AV_CODEC_FLAG_GLOBAL_HEADER as c_int;
             enc.color_range = ff::AVColorRange::AVCOL_RANGE_MPEG;
             enc.colorspace = ff::AVColorSpace::AVCOL_SPC_BT709;
             enc.color_primaries = ff::AVColorPrimaries::AVCOL_PRI_BT709;
@@ -309,6 +311,20 @@ impl Encoder {
             )?;
         }
         Ok(())
+    }
+
+    /// Codec-level header (FFmpeg `extradata`) a muxer needs to declare the
+    /// stream: Annex-B VPS/SPS/PPS for HEVC, SPS/PPS for H.264, the sequence
+    /// header OBU for AV1. Empty if the encoder exposes none.
+    pub fn extradata(&self) -> &[u8] {
+        unsafe {
+            let e = &*self.enc;
+            if e.extradata.is_null() || e.extradata_size <= 0 {
+                &[]
+            } else {
+                std::slice::from_raw_parts(e.extradata, e.extradata_size as usize)
+            }
+        }
     }
 
     /// Imports `frame`'s DMA-BUF as a VA surface (no copy).

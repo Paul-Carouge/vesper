@@ -7,6 +7,7 @@ Fast, bloat-free screen recorder in Rust. See README.md for goals, architecture 
 - `crates/vesper-core`: shared types (`VideoFrame`, `EncodedPacket`, `Codec`). Change only with care: every crate depends on it.
 - `crates/vesper-capture`: xdg-desktop-portal ScreenCast + PipeWire, DMA-BUF frames.
 - `crates/vesper-encode`: VAAPI hardware encoding.
+- `crates/vesper-mux`: Matroska (MKV) muxing of encoded video and Opus audio.
 - `crates/vesper-app`: the `vesper` binary and the Slint UI.
 
 ## Target machine
