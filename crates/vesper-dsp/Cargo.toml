@@ -1,0 +1,9 @@
+[package]
+name = "vesper-dsp"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+# Pure-Rust RNNoise port (BSD-3-Clause). Without default features it skips
+# the CLI dependencies (clap, hound, dasp).
+nnnoiseless = { version = "0.5.2", default-features = false }
