@@ -37,7 +37,7 @@ use vesper_capture::Capture;
 use vesper_core::{Codec, EncodedPacket, VideoFrame};
 use vesper_dsp::{FilterSpec, LiveControl};
 use vesper_encode::{Encoder, RateControl};
-use vesper_gamecapture::GameCapture;
+use vesper_gamecapture::{GameCapture, protocol};
 use vesper_mux::{AudioTrack, Muxer, VideoTrack};
 
 /// How often `Event::Stats` is sent.
@@ -84,7 +84,8 @@ pub struct GameFrames(Arc<GameRoute>);
 
 #[derive(Debug, Default)]
 struct GameRoute {
-    slot: Mutex<Option<Arc<Mailbox>>>,
+    /// The attached pipeline's slot and recording rate.
+    slot: Mutex<Option<(Arc<Mailbox>, u32)>>,
     /// Weak: the capture's frame callback holds this route.
     capture: OnceLock<Weak<GameCapture>>,
 }
@@ -93,13 +94,17 @@ impl GameFrames {
     /// Ties the route to its capture, inactive until a pipeline attaches.
     pub fn bind(&self, capture: &Arc<GameCapture>) {
         let _ = self.0.capture.set(Arc::downgrade(capture));
-        let attached = lock(&self.0.slot).is_some();
-        capture.set_active(attached);
+        capture.set_active(self.fps());
+    }
+
+    /// Recording rate of the attached pipeline.
+    fn fps(&self) -> Option<u32> {
+        lock(&self.0.slot).as_ref().map(|(_, fps)| *fps)
     }
 
     /// Hands a frame (or the capture's final error) to the pipeline.
     pub fn push(&self, event: Result<VideoFrame, String>) {
-        let slot = lock(&self.0.slot).clone();
+        let slot = lock(&self.0.slot).as_ref().map(|(s, _)| s.clone());
         match slot {
             Some(slot) => slot.park(event),
             None => drop(event),
@@ -108,29 +113,28 @@ impl GameFrames {
 
     /// Never called under the slot lock: dropping the upgraded capture may
     /// join the server thread, which takes that lock in `push`.
-    fn set_active(&self, active: bool) {
+    fn set_active(&self, fps: Option<u32>) {
         if let Some(capture) = self.0.capture.get().and_then(Weak::upgrade) {
-            capture.set_active(active);
+            capture.set_active(fps);
         }
     }
 
-    fn attach(&self, slot: &Arc<Mailbox>) {
-        let old = lock(&self.0.slot).replace(slot.clone());
+    fn attach(&self, slot: &Arc<Mailbox>, fps: u32) {
+        let old = lock(&self.0.slot).replace((slot.clone(), fps));
         drop(old);
-        self.set_active(true);
+        self.set_active(Some(fps));
     }
 
     /// Detaches `slot`, unless a newer pipeline replaced it already.
     fn detach(&self, slot: &Arc<Mailbox>) {
         let mut current = lock(&self.0.slot);
-        if current.as_ref().is_some_and(|s| Arc::ptr_eq(s, slot)) {
+        if current.as_ref().is_some_and(|(s, _)| Arc::ptr_eq(s, slot)) {
             *current = None;
             drop(current);
-            self.set_active(false);
+            self.set_active(None);
             // A newer pipeline attached meanwhile: keep it fed.
-            let attached = lock(&self.0.slot).is_some();
-            if attached {
-                self.set_active(true);
+            if let Some(fps) = self.fps() {
+                self.set_active(Some(fps));
             }
         }
     }
@@ -804,7 +808,7 @@ fn run(
 ) -> Result<(), String> {
     let capture = match &settings.game {
         Some(game) => {
-            game.attach(slot);
+            game.attach(slot, settings.fps);
             None
         }
         None => {
@@ -881,11 +885,12 @@ impl Video {
         );
         // The grid starts now, not at the frame's own pts: opening the encoder
         // takes a while, and a producer clock off by seconds must not stall
-        // or burst the ticks. The first frame gets this pts.
+        // or burst the ticks. The first frame gets this pts. Rounded up to
+        // the tick grid the game layer paces its copies to.
         Ok(Self {
             enc,
             track,
-            start: monotonic_now(),
+            start: next_tick(monotonic_now(), fps),
         })
     }
 }
@@ -1281,6 +1286,18 @@ fn frame_offset(k: u64, fps: u32) -> Duration {
     Duration::from_nanos(k * 1_000_000_000 / u64::from(fps))
 }
 
+/// First tick of the shared grid ([`protocol::tick_ns`]) at or after `t`.
+fn next_tick(t: Duration, fps: u32) -> Duration {
+    let t = t.as_nanos() as u64;
+    let n = protocol::tick_at(t, fps);
+    let n = if protocol::tick_ns(n, fps) < t {
+        n + 1
+    } else {
+        n
+    };
+    Duration::from_nanos(protocol::tick_ns(n, fps))
+}
+
 fn monotonic_now() -> Duration {
     let mut ts = libc::timespec {
         tv_sec: 0,
@@ -1399,6 +1416,16 @@ mod tests {
         mailbox.park(Err("gone".into()));
         mailbox.wait(None);
         assert_eq!(mailbox.take().1.as_deref(), Some("gone"));
+    }
+
+    #[test]
+    fn ticks_start_on_the_shared_grid() {
+        let t = Duration::from_nanos(1_000_000_000_007);
+        let s = next_tick(t, 144);
+        assert!(s >= t && s - t < frame_offset(1, 144));
+        let n = protocol::tick_at(s.as_nanos() as u64, 144);
+        assert_eq!(protocol::tick_ns(n, 144), s.as_nanos() as u64);
+        assert_eq!(next_tick(s, 144), s);
     }
 
     #[test]

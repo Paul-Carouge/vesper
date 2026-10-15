@@ -1,12 +1,17 @@
 //! Connection to Vesper, one per process.
 //!
-//! A background thread tries to connect once per second, so the present path
-//! only reads atomics while Vesper is not running. Once connected, the thread
-//! blocks on the socket and records `Start`/`Stop`/`Release` from the server.
-//! The render thread sends its own messages with non-blocking writes.
+//! A background thread connects when Vesper's socket appears (inotify on its
+//! directory; once per second while that directory does not exist), so the
+//! present path only reads atomics while Vesper is not running. Once
+//! connected, the thread blocks on the socket and records
+//! `Start`/`Stop`/`Release` from the server. The render thread sends its own
+//! messages with non-blocking writes.
 
+use std::ffi::CString;
 use std::io;
-use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Once};
 use std::time::Duration;
@@ -24,6 +29,8 @@ pub struct Ipc {
     pub conn_id: AtomicU64,
     /// Bumped on every `Start`, so the export ring is announced again.
     pub start_id: AtomicU64,
+    /// Recording rate of the last `Start`: copies are paced to it.
+    pub fps: AtomicU32,
     /// Process that started the thread: a forked child has no thread, and
     /// its copies of the mutexes may be held by threads that do not exist.
     pid: AtomicU32,
@@ -37,6 +44,7 @@ pub static IPC: Ipc = Ipc {
     capturing: AtomicBool::new(false),
     conn_id: AtomicU64::new(0),
     start_id: AtomicU64::new(0),
+    fps: AtomicU32::new(0),
     pid: AtomicU32::new(0),
     sock: Mutex::new(None),
     modifiers: Mutex::new(Vec::new()),
@@ -104,38 +112,160 @@ fn pin_library() -> bool {
     }
 }
 
+/// Quick retries after the socket appears: the server binds, then listens.
+const FAST_RETRIES: u32 = 5;
+const FAST_RETRY_MS: i32 = 20;
+
 fn run() {
     let path = protocol::socket_path();
+    let dir = path.parent().expect("socket path has a parent");
     let hello = Msg::Hello {
         version: protocol::VERSION,
         pid: std::process::id(),
         exe: protocol::process_name(),
     };
+    let mut watch = None;
+    let mut fast = 0;
     loop {
-        if let Ok(sock) = protocol::connect(&path)
-            // Only talk to a server of our own user.
-            && protocol::peer_is_same_user(sock.as_fd())
-            && protocol::send(sock.as_fd(), &hello, None, false).is_ok()
-        {
-            let sock = Arc::new(sock);
-            *IPC.sock.locked() = Some(sock.clone());
-            IPC.conn_id.fetch_add(1, Ordering::SeqCst);
-            IPC.connected.store(true, Ordering::SeqCst);
-            serve(sock.as_fd());
-            IPC.connected.store(false, Ordering::SeqCst);
-            IPC.capturing.store(false, Ordering::SeqCst);
-            *IPC.sock.locked() = None;
-            IPC.releases.locked().clear();
+        // Watch before connecting, so a socket created in between wakes us.
+        if watch.is_none() {
+            watch = watch_dir(dir);
         }
-        std::thread::sleep(Duration::from_secs(1));
+        // After a connection ends: once per second, as the server may have
+        // dropped us while staying up.
+        let mut timeout = 1000;
+        match protocol::connect(&path) {
+            Ok(sock) => {
+                // Only talk to a server of our own user.
+                if protocol::peer_is_same_user(sock.as_fd())
+                    && protocol::send(sock.as_fd(), &hello, None, false).is_ok()
+                {
+                    let sock = Arc::new(sock);
+                    *IPC.sock.locked() = Some(sock.clone());
+                    IPC.conn_id.fetch_add(1, Ordering::SeqCst);
+                    IPC.connected.store(true, Ordering::SeqCst);
+                    serve(sock.as_fd());
+                    IPC.connected.store(false, Ordering::SeqCst);
+                    IPC.capturing.store(false, Ordering::SeqCst);
+                    *IPC.sock.locked() = None;
+                    IPC.releases.locked().clear();
+                }
+                fast = 0;
+            }
+            // No server: sleep until its socket appears.
+            Err(e)
+                if watch.is_some()
+                    && matches!(
+                        e.kind(),
+                        io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                    ) =>
+            {
+                timeout = -1
+            }
+            Err(_) => {}
+        }
+        if fast > 0 {
+            fast -= 1;
+            timeout = FAST_RETRY_MS;
+        }
+        match wait_dir(watch.as_ref(), timeout) {
+            Wake::Created => fast = FAST_RETRIES,
+            Wake::Timeout => {}
+            Wake::Lost => watch = None,
+        }
+    }
+}
+
+enum Wake {
+    /// Something was created in the directory.
+    Created,
+    Timeout,
+    /// The watch is gone (directory removed): watch again.
+    Lost,
+}
+
+/// An inotify fd watching `dir` for new entries. None if `dir` does not exist
+/// (Vesper never ran since boot) or inotify is unavailable.
+///
+/// Costs one inotify instance per process with a capturable swapchain (the
+/// IPC thread starts with the first one), counted against
+/// `fs.inotify.max_user_instances`
+/// (often 128 or 1024). Past that limit `inotify_init1` fails with `EMFILE`
+/// and that process falls back to trying to connect once per second, as
+/// before inotify; other apps' watches are not affected beyond sharing the
+/// limit.
+fn watch_dir(dir: &Path) -> Option<OwnedFd> {
+    let fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC) };
+    if fd < 0 {
+        return None;
+    }
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    let c = CString::new(dir.as_os_str().as_bytes()).ok()?;
+    let mask = libc::IN_CREATE | libc::IN_MOVED_TO | libc::IN_DELETE_SELF | libc::IN_MOVE_SELF;
+    (unsafe { libc::inotify_add_watch(fd.as_raw_fd(), c.as_ptr(), mask) } >= 0).then_some(fd)
+}
+
+/// Waits up to `timeout_ms` (-1: forever) for an entry to appear in the
+/// watched directory; sleeps the timeout (or a second) without a watch.
+fn wait_dir(watch: Option<&OwnedFd>, timeout_ms: i32) -> Wake {
+    let Some(fd) = watch else {
+        let ms = if timeout_ms < 0 { 1000 } else { timeout_ms };
+        std::thread::sleep(Duration::from_millis(ms as u64));
+        return Wake::Timeout;
+    };
+    let mut pfd = libc::pollfd {
+        fd: fd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let n = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+    if n < 0 {
+        return if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+            Wake::Timeout
+        } else {
+            Wake::Lost
+        };
+    }
+    if n == 0 {
+        return Wake::Timeout;
+    }
+    // u64 storage keeps the buffer aligned for inotify_event.
+    let mut buf = [0u64; 512];
+    let len = unsafe { libc::read(fd.as_raw_fd(), buf.as_mut_ptr().cast(), size_of_val(&buf)) };
+    if len <= 0 {
+        return Wake::Lost;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), len as usize) };
+    let (mut created, mut lost, mut at) = (false, false, 0);
+    while at + size_of::<libc::inotify_event>() <= bytes.len() {
+        let ev = unsafe {
+            bytes
+                .as_ptr()
+                .add(at)
+                .cast::<libc::inotify_event>()
+                .read_unaligned()
+        };
+        if ev.mask & (libc::IN_CREATE | libc::IN_MOVED_TO) != 0 {
+            created = true;
+        }
+        if ev.mask & (libc::IN_DELETE_SELF | libc::IN_MOVE_SELF | libc::IN_IGNORED) != 0 {
+            lost = true;
+        }
+        at += size_of::<libc::inotify_event>() + ev.len as usize;
+    }
+    match (lost, created) {
+        (true, _) => Wake::Lost,
+        (false, true) => Wake::Created,
+        (false, false) => Wake::Timeout,
     }
 }
 
 fn serve(sock: BorrowedFd) {
     loop {
         match protocol::recv(sock, false) {
-            Ok(Some((Msg::Start { modifiers }, _))) => {
+            Ok(Some((Msg::Start { modifiers, fps }, _))) => {
                 *IPC.modifiers.locked() = modifiers;
+                IPC.fps.store(fps, Ordering::SeqCst);
                 IPC.releases.locked().clear();
                 IPC.start_id.fetch_add(1, Ordering::SeqCst);
                 IPC.capturing.store(true, Ordering::SeqCst);
@@ -166,10 +296,33 @@ pub fn send(msg: &Msg, fd: Option<BorrowedFd>) -> bool {
     sock.is_some_and(|s| protocol::send(s.as_fd(), msg, fd, true).is_ok())
 }
 
+pub fn fps() -> u32 {
+    IPC.fps.load(Ordering::SeqCst)
+}
+
 pub fn modifiers() -> Vec<u64> {
     IPC.modifiers.locked().clone()
 }
 
 pub fn take_releases() -> Vec<(u32, u32)> {
     std::mem::take(&mut *IPC.releases.locked())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wakes_when_the_socket_appears() {
+        let dir = std::env::temp_dir().join(format!("vesper-watch-{}", std::process::id()));
+        assert!(watch_dir(&dir).is_none());
+        std::fs::create_dir(&dir).unwrap();
+        let watch = watch_dir(&dir).unwrap();
+        assert!(matches!(wait_dir(Some(&watch), 0), Wake::Timeout));
+        std::fs::write(dir.join("capture.sock"), b"").unwrap();
+        assert!(matches!(wait_dir(Some(&watch), 1000), Wake::Created));
+        std::fs::remove_file(dir.join("capture.sock")).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
+        assert!(matches!(wait_dir(Some(&watch), 1000), Wake::Lost));
+    }
 }
