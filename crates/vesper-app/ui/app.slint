@@ -35,6 +35,10 @@ export enum QualityPreset { performance, balanced, quality }
 /// Recording lifecycle, owned by the backend. `starting` covers the portal
 /// picker and encoder setup, `stopping` the encoder flush and muxer close.
 export enum RecState { idle, starting, recording, stopping }
+// Where the live stream goes.
+export enum LiveService { twitch, youtube, custom }
+// `off -> connecting -> live (<-> reconnecting) -> ending -> off`.
+export enum LiveState { off, connecting, live, reconnecting, ending }
 
 // Elapsed time with fixed-width digit cells, so the clock does not jitter.
 component Clock inherits HorizontalLayout {
@@ -755,6 +759,18 @@ component MenuRow inherits FocusScope {
     }
 }
 
+// A titled control inside a setting group.
+component Field inherits VerticalLayout {
+    in property <string> title;
+    spacing: Theme.space-xs;
+    Text {
+        text: root.title;
+        font-size: Theme.font-small;
+        color: Theme.text-muted;
+    }
+    @children
+}
+
 component SettingGroup inherits VerticalLayout {
     in property <string> label;
     in property <string> hint;
@@ -890,6 +906,30 @@ export component AppWindow inherits Window {
     callback ignore-game();
     callback game-layer-changed(bool);
 
+    // ---- Live stream ---------------------------------------------------
+    in-out property <LiveService> live-service: LiveService.twitch;
+    // Server URL of a custom service.
+    in-out property <string> live-url;
+    // Fit in a 16:9 box of this height; 0: the recording's size.
+    in-out property <int> live-height: 1080;
+    in-out property <int> live-fps: 60;
+    // Mbit/s.
+    in-out property <float> live-bitrate: 6;
+    in-out property <VideoCodec> live-codec: VideoCodec.h264;
+    // Where the stream key is kept ("" when there is none).
+    in property <string> live-key-state;
+    in property <LiveState> live-state: LiveState.off;
+    // On air for this long (across reconnections).
+    in property <int> live-seconds;
+    // "6.1 Mbit/s", or why it reconnects.
+    in property <string> live-detail;
+    in property <int> live-dropped;
+    in property <string> live-shortcut: "Ctrl+L";
+    callback toggle-live();
+    callback live-settings-changed();
+    callback live-key-entered(string);
+    callback live-key-removed();
+
     // Background: "Start with the session" (autostart entry), and whether a
     // tray icon keeps Vesper running once the window is closed.
     in-out property <bool> autostart;
@@ -907,8 +947,18 @@ export component AppWindow inherits Window {
     changed replay-enabled => {
         root.tray-state-changed();
     }
+    changed live-state => {
+        root.tray-state-changed();
+    }
 
     property <string> codec-name: root.codec == VideoCodec.av1 ? "AV1" : root.codec == VideoCodec.hevc ? "HEVC" : "H.264";
+    // The stream settings are locked unless it is off.
+    property <bool> live-off: root.live-state == LiveState.off;
+    property <bool> on-air: root.live-state == LiveState.live;
+    property <string> live-service-name: root.live-service == LiveService.twitch ? "Twitch" : root.live-service == LiveService.youtube ? "YouTube" : "Custom server";
+    property <int> live-m: Math.mod(Math.floor(root.live-seconds / 60), 60);
+    property <int> live-s: Math.mod(root.live-seconds, 60);
+    property <string> live-clock: "\{Math.floor(root.live-seconds / 3600)}:\{root.live-m < 10 ? "0" : ""}\{root.live-m}:\{root.live-s < 10 ? "0" : ""}\{root.live-s}";
     property <[int]> replay-options: [30, 60, 120];
     property <[int]> fps-options: [30, 60, 120, 144];
     // Showing the recording look (REC, stop square), including while stopping.
@@ -1065,6 +1115,13 @@ export component AppWindow inherits Window {
         }
     }
 
+    // Go live or end the stream (button, Ctrl+L, tray, global shortcut).
+    public function global-toggle-live() {
+        if (root.live-state != LiveState.ending) {
+            root.toggle-live();
+        }
+    }
+
     keys := FocusScope {
         focus-on-tab-navigation: false;
         focus-on-click: false;
@@ -1076,6 +1133,12 @@ export component AppWindow inherits Window {
             }
             if (event.modifiers.control && (event.text == "s" || event.text == "S")) {
                 root.request-save-replay();
+                return accept;
+            }
+            if (event.modifiers.control && (event.text == "l" || event.text == "L")) {
+                if (!root.settings-open) {
+                    root.global-toggle-live();
+                }
                 return accept;
             }
             if (event.modifiers.control && (event.text == "q" || event.text == "Q")) {
@@ -1241,7 +1304,7 @@ export component AppWindow inherits Window {
                         }
                         Segmented {
                             label: "Source type";
-                            enabled: !root.active && !root.settings-open;
+                            enabled: !root.active && !root.settings-open && root.live-off;
                             options: ["Screen or window", "Game"];
                             selected: root.game ? 1 : 0;
                             changed(i) => {
@@ -1401,6 +1464,79 @@ export component AppWindow inherits Window {
                                 shortcut-hint: root.replay-shortcut;
                                 clicked => {
                                     root.request-save-replay();
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // ---- Live stream -------------------------------------------
+                Card {
+                    accessible-role: groupbox;
+                    accessible-label: "Live stream";
+                    HorizontalLayout {
+                        padding: Theme.space-lg;
+                        spacing: Theme.space-md;
+                        VerticalLayout {
+                            horizontal-stretch: 1;
+                            alignment: center;
+                            spacing: 2px;
+                            accessible-role: text;
+                            accessible-label: live-title.text + ", " + live-subtitle.text;
+                            HorizontalLayout {
+                                alignment: start;
+                                spacing: 6px;
+                                if root.on-air: VerticalLayout {
+                                    alignment: center;
+                                    Rectangle {
+                                        width: 8px;
+                                        height: 8px;
+                                        border-radius: 4px;
+                                        background: Theme.rec;
+                                        opacity: 0.35 + 0.65 * Math.abs(Math.sin(animation-tick() / 2s * 360deg));
+                                    }
+                                }
+                                live-title := Text {
+                                    text: root.live-state == LiveState.connecting ? "Connecting…"
+                                        : root.live-state == LiveState.reconnecting ? "Reconnecting…"
+                                        : root.live-state == LiveState.ending ? "Ending the stream…"
+                                        : root.on-air ? "LIVE" : "Live stream";
+                                    font-size: Theme.font-body;
+                                    font-weight: root.on-air ? 700 : 600;
+                                    letter-spacing: root.on-air ? 1.2px : 0px;
+                                    color: root.on-air ? Theme.rec : root.live-state == LiveState.reconnecting ? Theme.warn : Theme.text;
+                                    vertical-alignment: center;
+                                }
+                                if root.on-air: Text {
+                                    text: root.live-clock;
+                                    font-size: Theme.font-body;
+                                    font-weight: 600;
+                                    color: Theme.text;
+                                    vertical-alignment: center;
+                                }
+                            }
+                            live-subtitle := Text {
+                                text: root.live-off
+                                    ? root.live-service-name + " · " + (root.live-height == 0 ? "native size" : root.live-height + "p") + root.live-fps + " · " + root.live-bitrate + " Mbit/s"
+                                    : root.on-air
+                                        ? root.live-detail + " · " + (root.live-dropped == 1 ? "1 dropped" : "\{root.live-dropped} dropped")
+                                        : root.live-detail != "" ? root.live-detail : "to " + root.live-service-name;
+                                font-size: Theme.font-small;
+                                color: root.on-air && root.live-dropped > 0 ? Theme.warn : Theme.text-muted;
+                                overflow: elide;
+                            }
+                        }
+                        VerticalLayout {
+                            alignment: center;
+                            Button {
+                                text: root.live-off ? "Go live" : "End stream";
+                                icon: root.live-off ? Icons.broadcast : "";
+                                kind: "secondary";
+                                enabled: !root.settings-open && root.live-state != LiveState.ending;
+                                accessible-label: root.live-off ? "Go live on " + root.live-service-name : "End the live stream";
+                                shortcut-hint: root.live-shortcut;
+                                clicked => {
+                                    root.global-toggle-live();
                                 }
                             }
                         }
@@ -1980,6 +2116,140 @@ export component AppWindow inherits Window {
                                     toggled(on) => {
                                         root.audio-mix = on;
                                         root.audio-mix-changed(on);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    SettingGroup {
+                        label: "LIVE STREAM";
+                        hint: root.live-service == LiveService.twitch
+                            ? "Sent to Twitch's automatic ingest over RTMPS, in H.264: the codec Twitch takes."
+                            : root.live-service == LiveService.youtube
+                                ? "Sent to YouTube over RTMPS. HEVC and AV1 go through Enhanced RTMP."
+                                : "An rtmp://, rtmps:// or srt:// server. The key ends the RTMP path, or is the SRT streamid.";
+                        VerticalLayout {
+                            spacing: Theme.space-md;
+                            Segmented {
+                                label: "Streaming service";
+                                enabled: root.live-off;
+                                options: ["Twitch", "YouTube", "Custom"];
+                                selected: root.live-service == LiveService.twitch ? 0 : root.live-service == LiveService.youtube ? 1 : 2;
+                                changed(i) => {
+                                    root.live-service = i == 0 ? LiveService.twitch : i == 1 ? LiveService.youtube : LiveService.custom;
+                                    root.live-settings-changed();
+                                }
+                            }
+                            if root.live-service == LiveService.custom: Field {
+                                title: "Server URL";
+                                TextField {
+                                    text: root.live-url;
+                                    label: "Server URL";
+                                    placeholder: "rtmp://host/app or srt://host:port";
+                                    enabled: root.live-off;
+                                    accepted(url) => {
+                                        root.live-url = url;
+                                        root.live-settings-changed();
+                                    }
+                                }
+                            }
+                            HorizontalLayout {
+                                spacing: Theme.space-md;
+                                Labeled {
+                                    horizontal-stretch: 1;
+                                    title: "Stream key";
+                                    subtitle: root.live-key-state != "" ? root.live-key-state : "Not set";
+                                }
+                                if root.live-key-state != "": VerticalLayout {
+                                    alignment: center;
+                                    Button {
+                                        text: "Remove";
+                                        kind: "ghost";
+                                        small: true;
+                                        enabled: root.live-off;
+                                        accessible-label: "Remove the stream key";
+                                        clicked => {
+                                            root.live-key-removed();
+                                        }
+                                    }
+                                }
+                            }
+                            TextField {
+                                label: "New stream key";
+                                password: true;
+                                placeholder: root.live-key-state != "" ? "Paste a new key to replace it" : "Paste the key, then press Enter";
+                                enabled: root.live-off;
+                                accepted(key) => {
+                                    root.live-key-entered(key);
+                                }
+                            }
+                            Field {
+                                title: "Resolution";
+                                Segmented {
+                                    label: "Stream resolution";
+                                    enabled: root.live-off;
+                                    options: ["Native", "1080p", "720p"];
+                                    selected: root.live-height == 0 ? 0 : root.live-height >= 1080 ? 1 : 2;
+                                    changed(i) => {
+                                        root.live-height = i == 0 ? 0 : i == 1 ? 1080 : 720;
+                                        root.live-settings-changed();
+                                    }
+                                }
+                            }
+                            Field {
+                                title: "Frame rate";
+                                Segmented {
+                                    label: "Stream frame rate";
+                                    enabled: root.live-off;
+                                    options: ["30", "60"];
+                                    selected: root.live-fps >= 60 ? 1 : 0;
+                                    changed(i) => {
+                                        root.live-fps = i == 0 ? 30 : 60;
+                                        root.live-settings-changed();
+                                    }
+                                }
+                            }
+                            Field {
+                                title: "Bitrate";
+                                HorizontalLayout {
+                                    spacing: Theme.space-md;
+                                    Slider {
+                                        horizontal-stretch: 1;
+                                        label: "Stream bitrate";
+                                        enabled: root.live-off;
+                                        minimum: 1;
+                                        maximum: 20;
+                                        step: 0.5;
+                                        page-step: 2;
+                                        default-value: 6;
+                                        value: root.live-bitrate;
+                                        value-text: "\{root.live-bitrate} Mbit/s";
+                                        changed(v) => {
+                                            root.live-bitrate = v;
+                                            root.live-settings-changed();
+                                        }
+                                    }
+                                    Text {
+                                        width: 76px;
+                                        text: "\{root.live-bitrate} Mbit/s";
+                                        horizontal-alignment: right;
+                                        vertical-alignment: center;
+                                        font-size: Theme.font-small;
+                                        color: Theme.text-muted;
+                                    }
+                                }
+                            }
+                            Field {
+                                title: "Encoder";
+                                Segmented {
+                                    label: "Stream codec";
+                                    enabled: root.live-off && root.live-service != LiveService.twitch;
+                                    options: ["H.264", "HEVC", "AV1"];
+                                    selected: root.live-service == LiveService.twitch || root.live-codec == VideoCodec.h264 ? 0 : root.live-codec == VideoCodec.hevc ? 1 : 2;
+                                    changed(i) => {
+                                        root.live-codec = i == 0 ? VideoCodec.h264 : i == 1 ? VideoCodec.hevc : VideoCodec.av1;
+                                        root.live-settings-changed();
                                     }
                                 }
                             }

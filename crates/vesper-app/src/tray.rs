@@ -18,6 +18,7 @@ pub enum Command {
     ToggleRecording,
     SaveReplay,
     ToggleReplay,
+    ToggleLive,
     Quit,
 }
 
@@ -29,6 +30,10 @@ pub struct State {
     /// Starting or stopping: record intents are ignored.
     pub busy: bool,
     pub replay: bool,
+    /// A live stream runs (or connects).
+    pub live: bool,
+    /// The stream is ending: toggling it is ignored.
+    pub live_busy: bool,
 }
 
 type OnCommand = Arc<dyn Fn(Command) + Send + Sync>;
@@ -66,8 +71,12 @@ impl ksni::Tray for Item {
     }
 
     fn tool_tip(&self) -> ToolTip {
-        let description = if self.state.recording {
+        let description = if self.state.recording && self.state.live {
+            "Recording and live"
+        } else if self.state.recording {
             "Recording"
+        } else if self.state.live {
+            "Live"
         } else if self.state.replay {
             "Replay buffer on"
         } else {
@@ -117,6 +126,11 @@ impl ksni::Tray for Item {
                 Command::ToggleRecording,
             ),
             item("Save replay", s.replay, Command::SaveReplay),
+            item(
+                if s.live { "End stream" } else { "Go live" },
+                !s.live_busy,
+                Command::ToggleLive,
+            ),
             CheckmarkItem {
                 label: "Replay buffer".into(),
                 checked: s.replay,

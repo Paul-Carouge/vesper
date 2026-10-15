@@ -142,6 +142,7 @@ fn rapid_start_stop_cycles_leave_valid_files() {
         settings(&rig.route),
         Some(Duration::from_secs(5)),
         None,
+        None,
         move |e| drop(tx.send(e)),
     )
     .unwrap();
@@ -183,6 +184,7 @@ fn saving_replays_while_recording_then_quitting_loses_nothing() {
         settings(&rig.route),
         Some(Duration::from_secs(10)),
         Some(out.clone()),
+        None,
         move |e| drop(tx.send(e)),
     )
     .unwrap();
@@ -226,9 +228,13 @@ fn a_game_pause_and_resize_keep_the_recording_continuous() {
     let Some(rig) = Rig::new() else { return };
     let out = dir("pause");
     let (tx, rx) = mpsc::channel();
-    let p = Pipeline::start(settings(&rig.route), None, Some(out.clone()), move |e| {
-        drop(tx.send(e))
-    })
+    let p = Pipeline::start(
+        settings(&rig.route),
+        None,
+        Some(out.clone()),
+        None,
+        move |e| drop(tx.send(e)),
+    )
     .unwrap();
     if !matches!(event(&rx), Some(Event::Started)) {
         return;
@@ -280,7 +286,7 @@ fn a_gone_game_neither_freezes_nor_ages_the_replay() {
     let out = dir("gone");
     let (tx, rx) = mpsc::channel();
     let span = Duration::from_secs(2);
-    let p = Pipeline::start(settings(&rig.route), Some(span), None, move |e| {
+    let p = Pipeline::start(settings(&rig.route), Some(span), None, None, move |e| {
         drop(tx.send(e))
     })
     .unwrap();
@@ -326,9 +332,13 @@ fn a_recording_keeps_repeating_while_the_game_is_gone() {
     let Some(rig) = Rig::new() else { return };
     let out = dir("gonerec");
     let (tx, rx) = mpsc::channel();
-    let p = Pipeline::start(settings(&rig.route), None, Some(out.clone()), move |e| {
-        drop(tx.send(e))
-    })
+    let p = Pipeline::start(
+        settings(&rig.route),
+        None,
+        Some(out.clone()),
+        None,
+        move |e| drop(tx.send(e)),
+    )
     .unwrap();
     if !matches!(event(&rx), Some(Event::Started)) {
         return;

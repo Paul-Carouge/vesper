@@ -7,7 +7,9 @@
 //!   notification, both for `VESPER_DEMO_FILE`.
 //!   Looks without a capture or a game, for screenshots: `screen-look`,
 //!   `game-look`, `consent-look`, `starting-look`, `stopping-look`, `layer-installed`, `layer-missing`,
-//!   `replay-on`, `replay-off`, `filters-look`; `scroll-end` scrolls the settings to the end.
+//!   `replay-on`, `replay-off`, `filters-look`, `live-look`, `live-dropping-look`,
+//!   `live-reconnecting-look`, `live-key-look`; `scroll-end` scrolls the settings
+//!   to the end, `scroll:<px>` that far.
 //!   `track-source` opens the first track's Source list, `desktop-devices` and
 //!   `mic-devices` a device list of the settings.
 //! - `VESPER_SNAPSHOT=<file.ppm>` saves the window as a PPM image once the
@@ -18,6 +20,8 @@
 //!   source or `VESPER_RESTORE_TOKEN`, with `default_settings()`.
 //! - `vesper --record-game <seconds>` records the game capture the same way,
 //!   with the saved allow list, once a game sends frames.
+//! - `vesper --stream-game <seconds> <url>` streams the game capture to a
+//!   custom RTMP or SRT URL (see `stream_game` for the knobs).
 //! - `vesper --replay <buffer_s> <wait_s>` runs the replay buffer for
 //!   `wait_s`, recording during the second half, then saves the replay.
 
@@ -72,7 +76,7 @@ fn wait_for(rx: &Receiver<Event>, want: impl Fn(&Event) -> bool) -> bool {
 
 pub fn record(seconds: u64, settings: Settings) {
     let (tx, rx) = std::sync::mpsc::channel();
-    let p = Pipeline::start(settings, None, Some(folder()), move |event| {
+    let p = Pipeline::start(settings, None, Some(folder()), None, move |event| {
         drop(tx.send(event))
     })
     .expect("spawn");
@@ -96,11 +100,83 @@ pub fn record_game(seconds: u64, mut settings: Settings) {
     drop(source);
 }
 
+pub fn stream_game_args() -> Option<(u64, String)> {
+    let mut args = std::env::args().skip(1);
+    if args.next()? != "--stream-game" {
+        return None;
+    }
+    Some((args.next()?.parse().ok()?, args.next()?))
+}
+
+/// Streams the game capture to `url` (a custom RTMP or SRT server) for
+/// `seconds`, recording at the same time when `VESPER_STREAM_RECORD=1`.
+/// `VESPER_STREAM_CODEC` (h264, hevc, av1), `VESPER_STREAM_HEIGHT` (0 for
+/// native), `VESPER_STREAM_FPS` and `VESPER_STREAM_KBPS` set the stream.
+pub fn stream_game(seconds: u64, url: String, mut settings: Settings) {
+    use crate::stream::{Service, StreamRequest, StreamSettings};
+    let env = |k: &str| std::env::var(k).ok();
+    let stream = StreamSettings {
+        service: Service::Custom,
+        custom_url: url,
+        height: env("VESPER_STREAM_HEIGHT")
+            .and_then(|h| h.parse().ok())
+            .map_or(Some(1080), |h: u32| (h > 0).then_some(h)),
+        fps: env("VESPER_STREAM_FPS")
+            .and_then(|f| f.parse().ok())
+            .unwrap_or(60),
+        bitrate: env("VESPER_STREAM_KBPS")
+            .and_then(|k| k.parse::<u64>().ok())
+            .map_or(6_000_000, |k| k * 1000),
+        codec: match env("VESPER_STREAM_CODEC").as_deref() {
+            Some("hevc") => vesper_core::Codec::Hevc,
+            Some("av1") => vesper_core::Codec::Av1,
+            _ => vesper_core::Codec::H264,
+        },
+    };
+    let prefs = Prefs::load(Prefs::default());
+    *ALLOWED_GAMES.lock().unwrap() = prefs.allowed_games;
+    let source = GameSource::start().expect("game capture");
+    settings.game = Some(source.frames.clone());
+    let record = (env("VESPER_STREAM_RECORD").as_deref() == Some("1")).then(folder);
+    let request = StreamRequest {
+        settings: stream,
+        key: None,
+    };
+    log!("waiting for an allowed game");
+    let (tx, rx) = std::sync::mpsc::channel();
+    let p = Pipeline::start(
+        settings,
+        None,
+        record.clone(),
+        Some(request),
+        move |event| drop(tx.send(event)),
+    )
+    .expect("spawn");
+    let end = std::time::Instant::now() + Duration::from_secs(seconds);
+    while let Some(left) = end.checked_duration_since(std::time::Instant::now()) {
+        match rx.recv_timeout(left) {
+            Ok(event) => log!("{event:?}"),
+            Err(_) => break,
+        }
+    }
+    p.stop_stream();
+    if record.is_some() {
+        p.stop_recording();
+    }
+    p.join();
+    for event in rx {
+        log!("{event:?}");
+    }
+    drop(source);
+}
+
 pub fn replay(buffer: u64, wait: u64, settings: Settings) {
     let (tx, rx) = std::sync::mpsc::channel();
     let span = Some(Duration::from_secs(buffer));
-    let p =
-        Pipeline::start(settings, span, None, move |event| drop(tx.send(event))).expect("spawn");
+    let p = Pipeline::start(settings, span, None, None, move |event| {
+        drop(tx.send(event))
+    })
+    .expect("spawn");
     std::thread::sleep(Duration::from_secs(wait / 2));
     if !p.record(folder()) || !wait_for(&rx, |e| matches!(e, Event::Started)) {
         return;
@@ -157,7 +233,12 @@ pub fn apply(ui: &AppWindow) {
                     demo_file().display().to_string(),
                     Some(demo_file()),
                 ),
-                "scroll-end" => {
+                step if step == "scroll-end" || step.starts_with("scroll:") => {
+                    // `scroll:<px>` scrolls that far down, `scroll-end` to the end.
+                    let delta = step
+                        .strip_prefix("scroll:")
+                        .and_then(|px| px.parse::<f32>().ok())
+                        .map_or(-5000.0, |px| -px);
                     let weak = ui.as_weak();
                     slint::Timer::single_shot(Duration::from_millis(400), move || {
                         let Some(ui) = weak.upgrade() else { return };
@@ -169,7 +250,7 @@ pub fn apply(ui: &AppWindow) {
                         window.dispatch_event(WindowEvent::PointerScrolled {
                             position,
                             delta_x: 0.0,
-                            delta_y: -5000.0,
+                            delta_y: delta,
                         });
                     });
                 }
@@ -302,6 +383,24 @@ fn look(ui: &AppWindow, step: &str) -> bool {
             ui.set_track_peaks(model(&[0.5, 0.66]));
             ui.set_filter_reductions(model(&[0.0, 0.0, 0.0, 4.2, 1.5, 0.8]));
         }
+        // On air for 12:34 on Twitch, as the stats show it.
+        "live-look" => {
+            ui.set_live_state(crate::LiveState::Live);
+            ui.set_live_seconds(754);
+            ui.set_live_detail("6.1 Mbit/s".into());
+            ui.set_live_dropped(0);
+        }
+        "live-dropping-look" => {
+            ui.set_live_state(crate::LiveState::Live);
+            ui.set_live_seconds(754);
+            ui.set_live_detail("2.8 Mbit/s".into());
+            ui.set_live_dropped(126);
+        }
+        "live-reconnecting-look" => {
+            ui.set_live_state(crate::LiveState::Reconnecting);
+            ui.set_live_detail("Connection lost · next try in 4 s".into());
+        }
+        "live-key-look" => ui.set_live_key_state("Saved in the system keyring".into()),
         "replay-on" => ui.set_replay_enabled(true),
         "replay-off" => ui.set_replay_enabled(false),
         _ => return false,

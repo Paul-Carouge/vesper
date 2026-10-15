@@ -20,6 +20,9 @@
 //!   mutex. The mix is encoded on whichever track thread completes a block.
 //! - Replay threads: each saved replay is muxed on its own thread from a
 //!   snapshot of the ring (shared packet data, no copy).
+//! - Live thread (`stream`): sends a live stream's packets. Its video comes
+//!   from the pipeline thread (the recording's packets, or a second encode of
+//!   the same pictures scaled on the GPU), its AAC audio from the mix's tap.
 
 use std::collections::VecDeque;
 use std::fs::OpenOptions;
@@ -32,13 +35,15 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use vesper_audio::{AudioCapture, CHANNELS, Mix, Options, SAMPLE_RATE, Source, TrackState};
+use vesper_audio::{Aac, AudioCapture, CHANNELS, Mix, Options, SAMPLE_RATE, Source, TrackState};
 use vesper_capture::Capture;
 use vesper_core::{Codec, EncodedPacket, VideoFrame};
 use vesper_dsp::{FilterSpec, LiveControl};
 use vesper_encode::{Encoder, RateControl};
 use vesper_gamecapture::{GameCapture, protocol};
 use vesper_mux::{AudioTrack, Muxer, VideoTrack};
+
+use crate::stream::{AudioTap, LiveSink, StreamRequest, StreamState, live_audio, stream_size};
 
 /// How often `Event::Stats` is sent.
 const STATS_PERIOD: Duration = Duration::from_millis(500);
@@ -189,6 +194,17 @@ pub enum Event {
     /// Some audio tracks or the mix could not start: what is left out, for
     /// a notice.
     AudioMissing(String),
+    /// The live stream's state changed.
+    Stream(StreamState),
+    /// Sent every second while the stream is on air.
+    StreamStats {
+        /// Since the stream first went on air.
+        elapsed: Duration,
+        /// Bits per second sent over the last second.
+        bitrate: u64,
+        /// Video frames dropped because the network was too slow.
+        dropped: u64,
+    },
     /// The pipeline ended, with the error that ended it if any. A recording
     /// still running then is lost only if the pipeline crashed.
     Stopped(Option<String>),
@@ -263,14 +279,26 @@ struct Audio {
     running: Vec<(usize, AudioCapture)>,
     /// Filter controls of the running captures, with their index in `tracks`.
     filters: Vec<(usize, LiveControl)>,
-    /// First in the files when set.
+    /// Runs whenever a track does: a live stream's audio. First in the
+    /// files when `mix_in_files`.
     mixer: Option<Mix>,
+    mix_in_files: bool,
+    /// The running live stream's audio, fed by the mix.
+    stream_tap: Option<Arc<AudioTap>>,
 }
 
 impl Audio {
     /// Number of audio streams in a file.
     fn streams(&self) -> usize {
-        usize::from(self.mixer.is_some()) + self.running.len()
+        usize::from(self.mix_in_files) + self.running.len()
+    }
+
+    /// Feeds `tap` (or nothing) with the mix, now and after audio restarts.
+    fn set_stream_tap(&mut self, tap: Option<Arc<AudioTap>>) {
+        if let Some(m) = &self.mixer {
+            m.set_tap(tap.as_ref().map(AudioTap::tap));
+        }
+        self.stream_tap = tap;
     }
 
     /// Audio stream descriptions for a new file, with the current names.
@@ -281,7 +309,11 @@ impl Audio {
             channels: u32::from(CHANNELS),
             extradata: extradata.to_vec(),
         };
-        let mix = self.mixer.iter().map(|m| track(MIX_NAME, m.extradata()));
+        let mix = self
+            .mixer
+            .iter()
+            .filter(|_| self.mix_in_files)
+            .map(|m| track(MIX_NAME, m.extradata()));
         let tracks = self.running.iter().map(|(i, capture)| {
             let name = self.tracks.get(*i).map_or("", |t| t.name.as_str());
             track(name, capture.extradata())
@@ -298,7 +330,7 @@ impl Audio {
 type AudioSources = Arc<Mutex<Audio>>;
 
 /// Locks, ignoring poisoning: a panicked holder must not take the UI down.
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
@@ -312,10 +344,13 @@ struct Control {
     replay: Option<Duration>,
     /// Folder to save the replay buffer to.
     save: Option<PathBuf>,
+    /// A live stream to start.
+    stream: Option<StreamRequest>,
+    stop_stream: bool,
     quit: bool,
     /// Set once the pipeline thread takes no more requests.
     ended: bool,
-    /// Replays being written, joined by `Pipeline::join`.
+    /// Replays being written and live streams ending, joined by `Pipeline::join`.
     saves: Vec<JoinHandle<()>>,
 }
 
@@ -339,11 +374,13 @@ impl Pipeline {
         settings: Settings,
         replay: Option<Duration>,
         record: Option<PathBuf>,
+        stream: Option<StreamRequest>,
         on_event: impl Fn(Event) + Send + Sync + 'static,
     ) -> std::io::Result<Self> {
         let control = Arc::new(Mutex::new(Control {
             record,
             replay,
+            stream,
             ..Control::default()
         }));
         let audio = Arc::new(Mutex::new(Audio {
@@ -415,6 +452,23 @@ impl Pipeline {
     /// Saves the replay buffer into `folder`; `Event::ReplaySaved` follows.
     pub fn save_replay(&self, folder: PathBuf) -> bool {
         self.request(|c| c.save = Some(folder))
+    }
+
+    /// Goes live at the next frame; `Event::Stream` follows.
+    pub fn start_stream(&self, request: StreamRequest) -> bool {
+        self.request(|c| {
+            c.stream = Some(request);
+            c.stop_stream = false;
+        })
+    }
+
+    /// Ends the live stream; `Event::Stream(Ended)` follows. False if the
+    /// pipeline already ended (and the stream with it).
+    pub fn stop_stream(&self) -> bool {
+        self.request(|c| {
+            c.stream = None;
+            c.stop_stream = true;
+        })
     }
 
     /// Mutes track `index` (it records silence), live.
@@ -754,25 +808,32 @@ fn start_audio(sources: &AudioSources, sinks: &SharedSinks, on_event: &OnEvent) 
     let enabled: Vec<usize> = (0..tracks.len()).filter(|&i| tracks[i].enabled).collect();
     // One clock for every track, so the mix lines their samples up.
     let anchor = monotonic_now();
+    // The mix always runs with the tracks: a live stream sends it. Only
+    // encoded to Opus when the files have it.
+    let want_mix = mix && enabled.len() >= 2;
     let mut mixer = None;
     let mut mix_failed = false;
-    if mix && enabled.len() >= 2 {
+    if !enabled.is_empty() {
         let sinks = sinks.clone();
         match Mix::start(anchor, move |packet| write_audio(&sinks, 0, packet)) {
-            Ok(m) => mixer = Some(m),
+            Ok(m) => {
+                m.set_encoding(want_mix);
+                mixer = Some(m);
+            }
             Err(e) => {
-                log!("recording without the mix: {e}");
-                mix_failed = true;
+                log!("running without the mix: {e}");
+                mix_failed = want_mix;
             }
         }
     }
+    let mut in_files = want_mix && mixer.is_some();
     // Every input exists before any track runs.
     let mut inputs: Vec<_> = enabled
         .iter()
         .map(|_| mixer.as_ref().map(Mix::input))
         .collect();
     // Streams before the tracks: the mix, until it is dropped below.
-    let first = Arc::new(AtomicUsize::new(usize::from(mixer.is_some())));
+    let first = Arc::new(AtomicUsize::new(usize::from(in_files)));
     let mut running = Vec::new();
     let mut controls = Vec::new();
     let mut failed = Vec::new();
@@ -810,8 +871,12 @@ fn start_audio(sources: &AudioSources, sinks: &SharedSinks, on_event: &OnEvent) 
         }
     }
     // A mix of one track would be a copy of it.
-    let dropped = running.len() < 2 && mixer.take().is_some();
+    let dropped = in_files && running.len() < 2;
     if dropped {
+        if let Some(m) = &mixer {
+            m.set_encoding(false);
+        }
+        in_files = false;
         // The tracks move up one stream: before any file or replay uses them.
         first.store(0, Ordering::Relaxed);
     }
@@ -829,6 +894,10 @@ fn start_audio(sources: &AudioSources, sinks: &SharedSinks, on_event: &OnEvent) 
         }
     }
     (audio.running, audio.mixer, audio.filters) = (running, mixer, controls);
+    audio.mix_in_files = in_files;
+    // A stream running across the restart goes on with the new mix.
+    let tap = audio.stream_tap.clone();
+    audio.set_stream_tap(tap);
 }
 
 /// One notice for the tracks that could not start, and a lost mix.
@@ -858,6 +927,7 @@ fn stop_audio(sources: &AudioSources) {
     let (running, mixer) = {
         let mut audio = lock(sources);
         audio.filters.clear();
+        audio.mix_in_files = false;
         (std::mem::take(&mut audio.running), audio.mixer.take())
     };
     drop(running);
@@ -918,6 +988,8 @@ fn run(
 struct Video {
     enc: Encoder,
     track: VideoTrack,
+    /// Bitrate cap of the encoder, bits per second.
+    bitrate: u64,
     /// Pts of the first frame: the tick grid starts there.
     start: Duration,
 }
@@ -957,8 +1029,155 @@ impl Video {
         Ok(Self {
             enc,
             track,
+            bitrate,
             start: next_tick(monotonic_now(), fps),
         })
+    }
+}
+
+/// A live stream, from the pipeline thread's side.
+struct Streaming {
+    sink: LiveSink,
+    /// The stream's own encoder; `None`: it sends the recording's packets.
+    enc: Option<Encoder>,
+    fps: u32,
+    /// Stream frame number of the last picture sent.
+    last: Option<u64>,
+    /// The recording encoder has a new picture since the stream's last one.
+    fresh: bool,
+    /// A keyframe was asked for and has not come out yet.
+    key_pending: bool,
+}
+
+impl Streaming {
+    /// Opens the stream's encoder (unless it can share the recording's) and
+    /// its audio, and starts connecting.
+    fn start(
+        request: &StreamRequest,
+        v: &Video,
+        settings: &Settings,
+        sources: &AudioSources,
+        on_event: &OnEvent,
+    ) -> Result<Self, String> {
+        let url = request.url()?;
+        let s = &request.settings;
+        let codec = s.codec();
+        let fps = s.fps.clamp(1, settings.fps);
+        let (width, height) = stream_size(v.track.width, v.track.height, s.height);
+        // Same codec, size and rate, and the recording's cap within the
+        // stream's budget: one encode serves both.
+        let shared = codec == settings.codec
+            && (width, height) == (v.track.width, v.track.height)
+            && fps == settings.fps
+            && v.bitrate <= s.bitrate;
+        let (enc, track) = if shared {
+            (None, v.track.clone())
+        } else {
+            let enc = v
+                .enc
+                .new_scaled(
+                    codec,
+                    width,
+                    height,
+                    fps,
+                    RateControl::ConstantBitrate(s.bitrate),
+                )
+                .map_err(|e| format!("Could not open the stream encoder: {e}"))?;
+            let track = VideoTrack {
+                codec,
+                width,
+                height,
+                fps,
+                extradata: enc.extradata().to_vec(),
+            };
+            (Some(enc), track)
+        };
+        // Audio when any track records: the mix, as AAC.
+        let any_track = lock(sources).tracks.iter().any(|t| t.enabled);
+        let aac = if any_track {
+            Some(Aac::new().map_err(|e| format!("Could not open the AAC encoder: {e}"))?)
+        } else {
+            None
+        };
+        let sink = LiveSink::start(url, track, aac.as_ref().map(live_audio), on_event.clone())
+            .map_err(|e| format!("Could not start the stream: {e}"))?;
+        if let Some(aac) = aac {
+            lock(sources).set_stream_tap(Some(AudioTap::new(aac, sink.audio_in())));
+        }
+        log!(
+            "live: {width}x{height} {fps} fps {codec:?}, {} kbit/s, {}",
+            s.bitrate / 1000,
+            if shared {
+                "sharing the recording's encode"
+            } else {
+                "own encode"
+            }
+        );
+        Ok(Self {
+            sink,
+            enc,
+            fps,
+            last: None,
+            fresh: true,
+            key_pending: false,
+        })
+    }
+
+    /// Sends this tick's picture. `packets`: what the recording encoder
+    /// made of it; `new_picture`: it encoded a new capture (not a repeat).
+    fn tick(
+        &mut self,
+        v: &mut Video,
+        k: u64,
+        fps: u32,
+        packets: &[EncodedPacket],
+        new_picture: bool,
+    ) -> Result<(), String> {
+        let want_key = self.sink.wants_keyframe();
+        let Some(enc) = &mut self.enc else {
+            if want_key && !self.key_pending {
+                // One more IDR in the recording, so the stream starts sooner.
+                v.enc.force_keyframe();
+                self.key_pending = true;
+            }
+            for p in packets {
+                self.key_pending &= !p.keyframe;
+                self.sink.push_video(p.clone());
+            }
+            return Ok(());
+        };
+        self.fresh |= new_picture;
+        // Every tick at the recording's rate, but only one per stream frame.
+        let n = k * u64::from(self.fps) / u64::from(fps);
+        if self.last == Some(n) {
+            return Ok(());
+        }
+        self.last = Some(n);
+        if want_key && !self.key_pending {
+            enc.force_keyframe();
+            self.key_pending = true;
+        }
+        let pts = v.start + frame_offset(n, self.fps);
+        let out = if std::mem::take(&mut self.fresh) {
+            enc.encode_scaled(&v.enc, pts)
+        } else {
+            enc.repeat(pts)
+        };
+        for p in out.map_err(|e| format!("Stream encoding failed: {e}"))? {
+            self.key_pending &= !p.keyframe;
+            self.sink.push_video(p);
+        }
+        Ok(())
+    }
+
+    /// Ends the stream (with `error` if it failed here) and its audio;
+    /// returns the live thread to join.
+    fn stop(self, sources: &AudioSources, error: Option<String>) -> Option<JoinHandle<()>> {
+        lock(sources).set_stream_tap(None);
+        match error {
+            Some(e) => self.sink.fail(e),
+            None => self.sink.stop(),
+        }
     }
 }
 
@@ -1075,6 +1294,8 @@ fn pump(
     let mut error = None;
     // Ticks were skipped because the game was gone: its return starts a GOP.
     let mut was_gone = false;
+    let mut streaming: Option<Streaming> = None;
+    let mut stopping: Option<Streaming> = None;
 
     loop {
         match &video {
@@ -1107,15 +1328,39 @@ fn pump(
         }
         // Requests are read under the control lock, so none lands on an
         // ended pipeline unseen.
-        let (record, stop, replay, save) = {
+        // The live thread ended on its own (the server refused the stream).
+        if streaming.as_ref().is_some_and(|s| s.sink.ended()) {
+            let handle = streaming.take().and_then(|s| s.stop(sources, None));
+            lock(control).saves.extend(handle);
+        }
+        let (record, stop, replay, save, go_live) = {
             // Only this thread sets `rec`; never take `sinks` under
             // `control`: the UI would wait on muxer writes.
             let recording = lock(sinks).rec.is_some();
             let mut c = lock(control);
-            if c.quit || !(recording || c.record.is_some() || c.replay.is_some()) {
+            let live = streaming.is_some() || c.stream.is_some();
+            if c.quit || !(recording || c.record.is_some() || c.replay.is_some() || live) {
                 c.ended = true;
                 break;
             }
+            // Stopped after the control lock: it takes the mix's lock,
+            // which an audio thread may hold while it waits on a muxer write.
+            if std::mem::take(&mut c.stop_stream) {
+                match streaming.take() {
+                    Some(s) => stopping = Some(s),
+                    // Still waiting for a first frame: nothing to close.
+                    None => on_event(Event::Stream(StreamState::Ended(None))),
+                }
+            }
+            // A stream waits for the first frame; one at a time.
+            let go_live = if video.is_some() && streaming.is_none() {
+                c.stream.take()
+            } else {
+                if streaming.is_some() {
+                    c.stream = None;
+                }
+                None
+            };
             let stop = std::mem::take(&mut c.stop_recording);
             if stop {
                 c.record = None;
@@ -1128,24 +1373,34 @@ fn pump(
                 None
             };
             // No frame at all (the game quit or stopped presenting): give up
-            // on the recording; the replay buffer keeps waiting.
-            waiting_since = (video.is_none() && c.record.is_some())
+            // on the recording and the stream; the replay buffer keeps waiting.
+            waiting_since = (video.is_none() && (c.record.is_some() || c.stream.is_some()))
                 .then(|| waiting_since.unwrap_or_else(monotonic_now));
             if waiting_since.is_some_and(|t| monotonic_now() - t >= FIRST_FRAME_TIMEOUT) {
-                c.record = None;
                 waiting_since = None;
                 let what = if settings.game.is_some() {
                     "the game"
                 } else {
                     "the source"
                 };
-                on_event(Event::Finished(Err(format!("No frame from {what}"))));
+                if c.record.take().is_some() {
+                    on_event(Event::Finished(Err(format!("No frame from {what}"))));
+                }
+                if c.stream.take().is_some() {
+                    on_event(Event::Stream(StreamState::Ended(Some(format!(
+                        "No frame from {what}"
+                    )))));
+                }
                 // Without a replay buffer the pipeline ends: check again at
                 // once instead of waiting for a frame.
                 slot.poke();
             }
-            (record, stop, c.replay, c.save.take())
+            (record, stop, c.replay, c.save.take(), go_live)
         };
+        if let Some(s) = stopping.take() {
+            let handle = s.stop(sources, None);
+            lock(control).saves.extend(handle);
+        }
         // New tracks: restart the audio, and its part of the replay buffer
         // (the old tracks' packets do not match the new files' streams).
         // Before the first frame, the audio has not started: it reads the
@@ -1182,6 +1437,7 @@ fn pump(
         if let (Some((_, since)), Some(f)) = (new_size, &frame)
             && monotonic_now() - since >= RESIZE_AFTER
             && lock(sinks).rec.is_none()
+            && streaming.is_none()
         {
             new_size = None;
             match Video::open(settings, f) {
@@ -1236,6 +1492,15 @@ fn pump(
         if stop && let Some(r) = lock(sinks).rec.as_mut() {
             r.stop_at.get_or_insert(pts);
         }
+        if let Some(request) = go_live {
+            match Streaming::start(&request, v, settings, sources, on_event) {
+                Ok(s) => streaming = Some(s),
+                Err(e) => {
+                    log!("live: {e}");
+                    on_event(Event::Stream(StreamState::Ended(Some(e))));
+                }
+            }
+        }
 
         // A resized source (window, game) is scaled to the file's size.
         if let Some(f) = &frame
@@ -1253,11 +1518,12 @@ fn pump(
             last_size = Some((f.width, f.height));
         }
         // The game quit or crashed: no frozen picture, so the replay
-        // buffer keeps the seconds before it. A recording keeps its frame
-        // rate until the UI stops it (its stop needs a packet).
-        let recording = lock(sinks).rec.is_some();
+        // buffer keeps the seconds before it. A recording or a stream keeps
+        // its frame rate until the UI stops it (its stop needs a packet).
+        let recording = lock(sinks).rec.is_some() || streaming.is_some();
         let gone =
             frame.is_none() && !recording && settings.game.as_ref().is_some_and(GameFrames::gone);
+        let new_picture = frame.is_some();
         let packets = match frame {
             Some(mut frame) => {
                 if std::mem::take(&mut was_gone) {
@@ -1279,6 +1545,15 @@ fn pump(
                 break;
             }
         };
+        // Before the sinks take the packets. A failing stream ends alone.
+        if !gone
+            && let Some(s) = &mut streaming
+            && let Err(e) = s.tick(v, k, fps, &packets, new_picture)
+        {
+            log!("live: {e}");
+            let handle = streaming.take().and_then(|s| s.stop(sources, Some(e)));
+            lock(control).saves.extend(handle);
+        }
         let ended = lock(sinks).write_video(packets);
         if let Some((r, e)) = ended {
             on_event(Event::Finished(r.finish(e)));
@@ -1322,6 +1597,15 @@ fn pump(
 
     // Error breaks too: later requests must start a new pipeline.
     lock(control).ended = true;
+    if let Some(s) = streaming.take() {
+        // Quitting or failed: do not wait for a slow network.
+        lock(sources).set_stream_tap(None);
+        let handle = s.sink.abort();
+        lock(control).saves.extend(handle);
+    } else if lock(control).stream.take().is_some() {
+        // Requested, never started: the UI waits for its end.
+        on_event(Event::Stream(StreamState::Ended(None)));
+    }
     if let Some(v) = &mut video {
         match v.enc.flush() {
             Ok(packets) => {
@@ -1744,7 +2028,7 @@ mod tests {
         settings: Settings,
     ) -> (Pipeline, Receiver<Event>) {
         let (tx, rx) = mpsc::channel();
-        let p = Pipeline::start(settings, replay, record, move |e| drop(tx.send(e))).unwrap();
+        let p = Pipeline::start(settings, replay, record, None, move |e| drop(tx.send(e))).unwrap();
         (p, rx)
     }
 
@@ -1820,6 +2104,57 @@ mod tests {
             !dir.exists(),
             "no folder or file for a recording that never started"
         );
+        p.join();
+    }
+
+    fn stream_request() -> StreamRequest {
+        StreamRequest {
+            settings: crate::stream::StreamSettings {
+                service: crate::stream::Service::Custom,
+                custom_url: "rtmp://127.0.0.1:1/live".into(),
+                ..Default::default()
+            },
+            key: None,
+        }
+    }
+
+    #[test]
+    fn a_stream_without_frames_ends_and_so_does_the_pipeline() {
+        let (p, rx) = start(None, None, settings());
+        assert!(p.start_stream(stream_request()));
+        match next(&rx, FIRST_FRAME_TIMEOUT.as_secs() + 3) {
+            Event::Stream(StreamState::Ended(Some(e))) => assert!(e.contains("No frame"), "{e}"),
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(next(&rx, 3), Event::Stopped(None)));
+        p.join();
+    }
+
+    #[test]
+    fn ending_a_stream_that_waits_for_a_frame_reports_its_end() {
+        let (p, rx) = start(Some(Duration::from_secs(30)), None, settings());
+        assert!(p.start_stream(stream_request()));
+        assert!(p.stop_stream());
+        assert!(matches!(
+            next(&rx, 3),
+            Event::Stream(StreamState::Ended(None))
+        ));
+        p.join();
+    }
+
+    #[test]
+    fn ending_a_stream_of_an_ended_pipeline_says_so() {
+        let s = settings();
+        let route = s.game.clone().unwrap();
+        let (p, rx) = start(Some(Duration::from_secs(30)), None, s);
+        for _ in 0..100 {
+            route.push(Err("boom".into()));
+            if rx.recv_timeout(Duration::from_millis(50)).is_ok() {
+                break;
+            }
+        }
+        // The UI then resets the Live card itself.
+        assert!(!p.stop_stream());
         p.join();
     }
 

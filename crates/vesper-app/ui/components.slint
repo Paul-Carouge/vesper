@@ -518,11 +518,14 @@ export component Slider inherits FocusScope {
 // Single-line text entry. Commits on Enter or when it loses focus, then
 // shows `text` again (as the parent cleaned or refused it); Escape puts
 // `text` back. `edited` reports each change, so a parent that removes the
-// field mid-edit can still commit it.
+// field mid-edit can still commit it. `password` hides what is typed;
+// `placeholder` shows while it is empty.
 export component TextField inherits Rectangle {
     in property <string> text;
     in property <string> label;
     in property <bool> enabled: true;
+    in property <bool> password;
+    in property <string> placeholder;
     callback accepted(string);
     callback edited(string);
 
@@ -533,12 +536,25 @@ export component TextField inherits Rectangle {
     border-color: input.has-focus ? Theme.accent : Theme.border-strong;
     opacity: root.enabled ? 1 : 0.4;
 
+    if input.text == "" && root.placeholder != "": Text {
+        x: input.x;
+        width: input.width;
+        height: 100%;
+        text: root.placeholder;
+        vertical-alignment: center;
+        font-size: Theme.font-body;
+        color: Theme.text-faint;
+        overflow: elide;
+        accessible-role: none;
+    }
+
     input := TextInput {
         x: Theme.space-sm + 2px;
         width: parent.width - 2 * self.x;
         height: 100%;
         text: root.text;
         enabled: root.enabled;
+        input-type: root.password ? InputType.password : InputType.text;
         single-line: true;
         vertical-alignment: center;
         font-size: Theme.font-body;

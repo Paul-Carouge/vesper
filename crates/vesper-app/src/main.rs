@@ -18,11 +18,14 @@ mod filters;
 mod game;
 mod instance;
 mod layer;
+mod live;
 mod meter;
 mod outputs;
 mod prefs;
 mod recorder;
+mod secret;
 mod shortcuts;
+mod stream;
 mod tray;
 
 use std::cell::RefCell;
@@ -107,6 +110,11 @@ fn main() -> Result<(), slint::PlatformError> {
         return Ok(());
     }
     #[cfg(debug_assertions)]
+    if let Some((seconds, url)) = dev::stream_game_args() {
+        dev::stream_game(seconds, url, default_settings());
+        return Ok(());
+    }
+    #[cfg(debug_assertions)]
     if let Some((buffer, wait)) = dev::replay_seconds() {
         dev::replay(buffer, wait, default_settings());
         return Ok(());
@@ -157,6 +165,7 @@ fn main() -> Result<(), slint::PlatformError> {
     set_source_mode(&ui, &games, ui.get_source_kind() == SourceKind::Game);
     wire_callbacks(&ui, &recording, &games);
     wire_game_callbacks(&ui, &games);
+    live::wire(&ui, &recording, &games);
     wire_global_shortcuts(&ui);
     let tray = spawn_tray(&ui);
     wire_background(&ui, tray.as_ref());
@@ -165,7 +174,7 @@ fn main() -> Result<(), slint::PlatformError> {
     let game_down = ui.get_source_kind() == SourceKind::Game && games.borrow().is_none();
     if ui.get_replay_enabled()
         && !game_down
-        && let Err(e) = start_pipeline(&ui, &recording, &games, None)
+        && let Err(e) = start_pipeline(&ui, &recording, &games, None, None)
     {
         flash_notice(&ui, &e);
     }
@@ -220,7 +229,7 @@ fn main() -> Result<(), slint::PlatformError> {
                         .is_some_and(|p| p.set_replay(replay_span(&ui)));
                     if !applied
                         && ui.get_replay_enabled()
-                        && let Err(e) = start_pipeline(&ui, &rec, &g, None)
+                        && let Err(e) = start_pipeline(&ui, &rec, &g, None, None)
                     {
                         flash_notice(&ui, &e);
                     }
@@ -318,7 +327,7 @@ fn wire_callbacks(ui: &AppWindow, recording: &Shared, games: &Games) {
             .borrow()
             .as_ref()
             .is_some_and(|p| p.record(folder.clone()));
-        if !joined && let Err(e) = start_pipeline(&ui, &rec, &g, Some(folder)) {
+        if !joined && let Err(e) = start_pipeline(&ui, &rec, &g, Some(folder), None) {
             ui.set_rec_state(RecState::Idle);
             flash_notice(&ui, &e);
         }
@@ -369,7 +378,7 @@ fn wire_callbacks(ui: &AppWindow, recording: &Shared, games: &Games) {
             .is_some_and(|p| p.set_replay(replay_span(&ui)));
         if !applied
             && enabled
-            && let Err(e) = start_pipeline(&ui, &rec, &g, None)
+            && let Err(e) = start_pipeline(&ui, &rec, &g, None, None)
         {
             ui.set_replay_enabled(false);
             flash_notice(&ui, &e);
@@ -443,6 +452,11 @@ fn wire_callbacks(ui: &AppWindow, recording: &Shared, games: &Games) {
         if ui.get_rec_state() != RecState::Idle {
             return;
         }
+        // The stream runs in this pipeline: end it first.
+        if ui.get_live_state() != LiveState::Off {
+            flash_notice(&ui, "End the stream to change the source");
+            return;
+        }
         log!("source-mode-changed: game={game}");
         if let Some(p) = rec.borrow_mut().take() {
             p.set_replay(None);
@@ -458,7 +472,7 @@ fn wire_callbacks(ui: &AppWindow, recording: &Shared, games: &Games) {
         } else if game && g.borrow().is_none() {
             // The start error is shown; the games tick starts the replay
             // buffer once game capture runs.
-        } else if let Err(e) = start_pipeline(&ui, &rec, &g, None) {
+        } else if let Err(e) = start_pipeline(&ui, &rec, &g, None, None) {
             flash_notice(&ui, &e);
         }
     });
@@ -523,6 +537,7 @@ fn spawn_tray(ui: &AppWindow) -> Option<Tray> {
             tray::Command::ToggleRecording => ui.invoke_global_toggle_recording(),
             tray::Command::SaveReplay => ui.invoke_global_save_replay(),
             tray::Command::ToggleReplay => ui.invoke_toggle_replay(),
+            tray::Command::ToggleLive => ui.invoke_global_toggle_live(),
             tray::Command::Quit => ui.invoke_quit(),
         });
     });
@@ -542,6 +557,8 @@ fn tray_state(ui: &AppWindow) -> tray::State {
         recording: matches!(rec, RecState::Recording | RecState::Stopping),
         busy: matches!(rec, RecState::Starting | RecState::Stopping),
         replay: ui.get_replay_enabled(),
+        live: ui.get_live_state() != LiveState::Off,
+        live_busy: ui.get_live_state() == LiveState::Ending,
     }
 }
 
@@ -729,6 +746,7 @@ fn wire_global_shortcuts(ui: &AppWindow) {
                     match action {
                         Action::ToggleRecording => "Ctrl+R".to_owned(),
                         Action::SaveReplay => "Ctrl+S".to_owned(),
+                        Action::ToggleLive => "Ctrl+L".to_owned(),
                     }
                 } else {
                     trigger
@@ -736,6 +754,7 @@ fn wire_global_shortcuts(ui: &AppWindow) {
                 match action {
                     Action::ToggleRecording => ui.set_record_shortcut(key.into()),
                     Action::SaveReplay => ui.set_replay_shortcut(key.into()),
+                    Action::ToggleLive => ui.set_live_shortcut(key.into()),
                 }
             });
         },
@@ -744,6 +763,7 @@ fn wire_global_shortcuts(ui: &AppWindow) {
             let _ = activated.upgrade_in_event_loop(move |ui| match action {
                 Action::ToggleRecording => ui.invoke_global_toggle_recording(),
                 Action::SaveReplay => ui.invoke_global_save_replay(),
+                Action::ToggleLive => ui.invoke_global_toggle_live(),
             });
         },
     );
@@ -769,13 +789,14 @@ fn replay_span(ui: &AppWindow) -> Option<Duration> {
 }
 
 /// Starts a pipeline with the UI's settings and replay buffer, recording into
-/// `record` if set. It replaces the previous, ended one: that thread ends on
-/// its own.
+/// `record` and streaming `stream` if set. It replaces the previous, ended
+/// one: that thread ends on its own.
 fn start_pipeline(
     ui: &AppWindow,
     shared: &Shared,
     games: &Games,
     record: Option<PathBuf>,
+    stream: Option<stream::StreamRequest>,
 ) -> Result<(), String> {
     if ui.get_source_kind() == SourceKind::Game && games.borrow().is_none() {
         return Err("Game capture is not running".into());
@@ -784,7 +805,7 @@ fn start_pipeline(
     log!("start-pipeline: {settings:?}");
     let weak = ui.as_weak();
     let generation = GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
-    let pipeline = Pipeline::start(settings, replay_span(ui), record, move |event| {
+    let pipeline = Pipeline::start(settings, replay_span(ui), record, stream, move |event| {
         let _ = weak.upgrade_in_event_loop(move |ui| on_recorder_event(&ui, generation, event));
     })
     .map_err(|e| format!("Could not start: {e}"))?;
@@ -867,6 +888,16 @@ fn on_recorder_event(ui: &AppWindow, generation: u64, event: Event) {
         Event::AudioTrack(name, TrackState::Running) => {
             flash_notice(ui, &format!("{name}: audio is back"));
         }
+        // An older pipeline's stream ended with it: its late news must not
+        // change the current one's.
+        Event::Stream(_) | Event::StreamStats { .. }
+            if generation != GENERATION.load(Ordering::Relaxed) => {}
+        Event::Stream(state) => live::on_state(ui, state),
+        Event::StreamStats {
+            elapsed,
+            bitrate,
+            dropped,
+        } => live::on_stats(ui, elapsed, bitrate, dropped),
         // A clean stop always follows `Finished`: nothing to reset (a new
         // pipeline may already be starting).
         Event::Stopped(None) => log!("pipeline stopped"),
@@ -875,10 +906,11 @@ fn on_recorder_event(ui: &AppWindow, generation: u64, event: Event) {
         }
         Event::Stopped(Some(e)) => {
             log!("pipeline stopped: {e}");
-            // Neither a recording nor the replay buffer runs any more.
+            // Neither a recording, the replay buffer nor a stream runs any more.
             ui.set_rec_state(RecState::Idle);
             ui.set_elapsed_seconds(0);
             ui.set_replay_enabled(false);
+            live::reset(ui);
             flash_notice(ui, &e);
         }
     }

@@ -24,6 +24,9 @@ use std::time::Duration;
 use ffmpeg_next::ffi as ff;
 use vesper_core::{Codec, EncodedPacket};
 
+mod live;
+pub use live::{Live, LiveAudio, LiveError, LiveErrorKind, redact};
+
 const NANOS: ff::AVRational = ff::AVRational {
     num: 1,
     den: 1_000_000_000,

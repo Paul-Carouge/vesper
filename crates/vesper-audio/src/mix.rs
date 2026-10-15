@@ -17,7 +17,7 @@ use vesper_core::EncodedPacket;
 
 use vesper_dsp::{Chain, FilterSpec};
 
-use crate::{CHANNELS, Encoder, Result, Shared, open_encoder, opus_head};
+use crate::{CHANNELS, Encoder, Result, Shared, Tap, open_encoder, opus_head};
 
 type OnPacket = Box<dyn FnMut(EncodedPacket) + Send>;
 
@@ -134,6 +134,22 @@ impl Mix {
     pub fn extradata(&self) -> &[u8] {
         &self.extradata
     }
+
+    /// Hands every mixed and limited block to `tap` from now on (`None`
+    /// stops it), e.g. a live stream's own audio encode.
+    pub fn set_tap(&self, tap: Option<Tap>) {
+        if let Some(enc) = &mut lock(&self.state).enc {
+            enc.tap = tap;
+        }
+    }
+
+    /// Off: the mix only feeds its tap; no Opus packet is made. For a mix
+    /// kept for a live stream while the files have none.
+    pub fn set_encoding(&self, on: bool) {
+        if let Some(enc) = &mut lock(&self.state).enc {
+            enc.opus = on;
+        }
+    }
 }
 
 impl Drop for Mix {
@@ -234,6 +250,33 @@ mod tests {
         let ceiling = 10f32.powf(CEILING_DB / 20.0);
         assert!(peak <= ceiling + 1e-6, "{peak}");
         assert!(peak > ceiling * 0.95, "{peak}");
+    }
+
+    #[test]
+    fn tap_gets_the_limited_mix_with_its_pts_even_without_opus() {
+        let (tx, rx) = mpsc::channel();
+        let anchor = Duration::from_secs(3);
+        let mix = Mix::start(anchor, move |p| tx.send(p).unwrap()).unwrap();
+        mix.set_encoding(false);
+        let (btx, brx) = mpsc::channel();
+        mix.set_tap(Some(Box::new(move |pts, block: &[f32]| {
+            btx.send((pts, block.to_vec())).unwrap()
+        })));
+        let a = mix.input();
+        a.push(&vec![2.0; FRAME * usize::from(CHANNELS) * 5]);
+        drop(a);
+        drop(mix);
+        assert!(rx.try_recv().is_err(), "no Opus packet");
+        let blocks: Vec<_> = brx.try_iter().collect();
+        assert!(blocks.len() >= 5, "{}", blocks.len());
+        for (k, (pts, block)) in blocks.iter().enumerate() {
+            assert_eq!(*pts, anchor + Duration::from_millis(20 * k as u64));
+            assert_eq!(block.len(), FRAME * usize::from(CHANNELS));
+        }
+        // Limited: the +6 dBFS input is held under the ceiling.
+        let ceiling = 10f32.powf(CEILING_DB / 20.0);
+        let peak = blocks[2].1.iter().fold(0f32, |m, s| m.max(s.abs()));
+        assert!(peak <= ceiling + 1e-6, "{peak}");
     }
 
     #[test]
