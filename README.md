@@ -55,7 +55,7 @@ Arch (and CachyOS): the package builds the last commit of this checkout (uncommi
 cd packaging/arch && makepkg -si
 ```
 
-It installs `/usr/bin/vesper`, the desktop file, the icon, and the game capture layer and the VST3 plugin host (`vesper-vst-host`) in `/usr/lib/vesper/`. The layer stays off: only the settings switch enables it, per user. Uninstall with `sudo pacman -R vesper-git`. Turn the switch off first: otherwise your per-user copy of the layer stays installed and keeps loading into Vulkan apps; remove it by hand with `rm ~/.local/share/vulkan/implicit_layer.d/vesper_capture.json ~/.local/share/vesper/libvesper_vklayer.so`. Each `makepkg` rewrites `pkgver=` in the PKGBUILD (normal for a -git package): `git checkout packaging/arch/PKGBUILD` before committing.
+It installs `/usr/bin/vesper`, the desktop file, the icons (app and tray), and the game capture layer and the VST3 plugin host (`vesper-vst-host`) in `/usr/lib/vesper/`. The layer stays off: only the settings switch enables it, per user. Uninstall with `sudo pacman -R vesper-git`. Turn the switch off first: otherwise your per-user copy of the layer stays installed and keeps loading into Vulkan apps; remove it by hand with `rm ~/.local/share/vulkan/implicit_layer.d/vesper_capture.json ~/.local/share/vesper/libvesper_vklayer.so`. Each `makepkg` rewrites `pkgver=` in the PKGBUILD (normal for a -git package): `git checkout packaging/arch/PKGBUILD` before committing.
 
 Manual alternative, in your home:
 
@@ -65,12 +65,14 @@ install -Dm755 target/release/vesper ~/.local/bin/vesper
 install -Dm644 target/release/libvesper_vklayer.so ~/.local/lib/vesper/libvesper_vklayer.so
 install -Dm755 target/release/vesper-vst-host ~/.local/lib/vesper/vesper-vst-host
 install -Dm644 crates/vesper-app/data/io.github.PaulCarouge.Vesper.desktop -t ~/.local/share/applications/
-install -Dm644 crates/vesper-app/data/io.github.PaulCarouge.Vesper.svg -t ~/.local/share/icons/hicolor/scalable/apps/
+mkdir -p ~/.local/share/icons && cp -r crates/vesper-app/data/icons/hicolor ~/.local/share/icons/
 ```
 
 Vesper looks for the layer and the plugin host next to its binary, then in `../lib/vesper/`; the settings switch installs that copy (build with `cargo build --release` at the workspace root, not `-p vesper-app`, so the layer is built too). If `~/.local/bin` is not in the session `PATH`, set `Exec=` to the full path. Without the desktop file, global shortcuts and desktop notifications (sent when a recording or replay is saved, or fails, while the window is in the background) are off; the in-window shortcuts still work. The saved source is forgotten once after updating to this version, since it is now tied to the app id: pick it again. Default global shortcuts: Alt+F9 starts or stops recording, Alt+F10 saves the replay, Alt+F8 goes live or ends the stream. KDE asks to confirm them on first launch; change them later in System Settings > Shortcuts.
 
 Settings are kept in `~/.config/vesper/settings`.
+
+The icons (`crates/vesper-app/data/icons/`) come from `scripts/icons.py`: edit it and run `python3 scripts/icons.py` (needs `rsvg-convert`) to regenerate the SVGs and PNGs. Preview: `docs/screenshots/icons.png`.
 
 Failure-injection lab (disk full, game crash, portal or PipeWire gone...): `scripts/robustness/go <name> <scenario>.sh` runs a scenario against a debug build in a private user/mount/pid namespace with its own D-Bus, PipeWire (no real device) and headless gamescope; see `scripts/robustness/run.sh`.
 
@@ -105,7 +107,7 @@ Tested without any real service, in the failure-injection lab (private network n
 
 ## Background and tray
 
-Vesper shows an icon in the system tray (StatusNotifierItem, as on KDE Plasma). A left click shows or hides the window; its menu starts or stops a recording, saves the replay (while the replay buffer runs), goes live or ends the stream, turns the replay buffer on or off, and quits. A red dot marks a recording in progress.
+Vesper shows an icon in the system tray (StatusNotifierItem, as on KDE Plasma). A left click shows or hides the window; its menu starts or stops a recording, saves the replay (while the replay buffer runs), goes live or ends the stream, turns the replay buffer on or off, and quits. Its icon follows the panel's colors and shows the state: a loop while the replay buffer runs, a red dot while recording, waves while live.
 
 With a tray, closing the window keeps Vesper running in the background, with the replay buffer and global shortcuts; the first time, a notification says so. Quit from the tray menu or with Ctrl+Q in the window (logging out, SIGTERM or SIGINT quit the same way): a recording in progress and replays being saved are finished first. Without a tray (no StatusNotifierWatcher on the session bus), closing the window quits, as before. Only one Vesper runs per session: launching it again shows the running one's window (it owns the D-Bus name `io.github.PaulCarouge.Vesper`). While the window is hidden, messages such as *No game to record yet* come as notifications.
 

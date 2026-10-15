@@ -38,10 +38,64 @@ pub struct State {
 
 type OnCommand = Arc<dyn Fn(Command) + Send + Sync>;
 
+/// The tray icon, one per state: the most public activity wins.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Look {
+    Idle,
+    Replay,
+    Recording,
+    Live,
+}
+
+impl Look {
+    const ALL: [Self; 4] = [Self::Idle, Self::Replay, Self::Recording, Self::Live];
+
+    fn of(state: State) -> Self {
+        if state.live {
+            Self::Live
+        } else if state.recording {
+            Self::Recording
+        } else if state.replay {
+            Self::Replay
+        } else {
+            Self::Idle
+        }
+    }
+
+    /// Symbolic icon names, installed under `hicolor/scalable/`: Plasma
+    /// recolors them to the panel's text color.
+    fn icon_name(self) -> String {
+        match self {
+            Self::Idle => format!("{APP_ID}-symbolic"),
+            Self::Replay => format!("{APP_ID}-replay-symbolic"),
+            Self::Recording => format!("{APP_ID}-recording-symbolic"),
+            Self::Live => format!("{APP_ID}-live-symbolic"),
+        }
+    }
+
+    fn svg(self) -> &'static str {
+        match self {
+            Self::Idle => include_str!(
+                "../data/icons/hicolor/scalable/apps/io.github.PaulCarouge.Vesper-symbolic.svg"
+            ),
+            Self::Replay => include_str!(
+                "../data/icons/hicolor/scalable/status/io.github.PaulCarouge.Vesper-replay-symbolic.svg"
+            ),
+            Self::Recording => include_str!(
+                "../data/icons/hicolor/scalable/status/io.github.PaulCarouge.Vesper-recording-symbolic.svg"
+            ),
+            Self::Live => include_str!(
+                "../data/icons/hicolor/scalable/status/io.github.PaulCarouge.Vesper-live-symbolic.svg"
+            ),
+        }
+    }
+}
+
 struct Item {
     state: State,
-    /// The app icon, used when the icon theme does not have it.
-    icon: Vec<Icon>,
+    /// Per [`Look`], shown when the icon theme does not have its name (not
+    /// installed): rendered once, at a few sizes.
+    pixmaps: [Vec<Icon>; 4],
     on_command: OnCommand,
 }
 
@@ -55,19 +109,11 @@ impl ksni::Tray for Item {
     }
 
     fn icon_name(&self) -> String {
-        APP_ID.into()
+        Look::of(self.state).icon_name()
     }
 
     fn icon_pixmap(&self) -> Vec<Icon> {
-        self.icon.clone()
-    }
-
-    fn overlay_icon_pixmap(&self) -> Vec<Icon> {
-        if self.state.recording {
-            vec![red_dot(32)]
-        } else {
-            Vec::new()
-        }
+        self.pixmaps[Look::of(self.state) as usize].clone()
     }
 
     fn tool_tip(&self) -> ToolTip {
@@ -168,7 +214,12 @@ impl Tray {
     ) -> Result<Self, ksni::Error> {
         let item = Item {
             state,
-            icon: app_icon().into_iter().collect(),
+            pixmaps: Look::ALL.map(|look| {
+                PIXMAP_SIZES
+                    .iter()
+                    .filter_map(|&size| pixmap(look, size))
+                    .collect()
+            }),
             on_command: Arc::new(on_command),
         };
         let handle = item.spawn()?;
@@ -202,10 +253,23 @@ impl Tray {
     }
 }
 
-/// The app icon rendered from its SVG (128 x 128).
-fn app_icon() -> Option<Icon> {
-    let svg = include_bytes!("../data/io.github.PaulCarouge.Vesper.svg");
-    let pixels = slint::Image::load_from_svg_data(svg).ok()?.to_rgba8()?;
+/// Fallback pixmap sizes: a 22 px panel at 1x, 1.5x and 2x.
+const PIXMAP_SIZES: [u32; 3] = [22, 32, 48];
+
+/// Pixmaps are not recolored by the panel: this violet keeps 3:1 or more on
+/// both light and dark Breeze panels (#EFF0F1, #1B1E20). The red dot stays.
+const PIXMAP_COLOR: &str = "#8577f2";
+
+/// `look`'s symbolic icon, rendered `size` px wide in [`PIXMAP_COLOR`].
+fn pixmap(look: Look, size: u32) -> Option<Icon> {
+    let svg = look.svg().replacen("#232629", PIXMAP_COLOR, 1).replacen(
+        r#"width="22" height="22""#,
+        &format!(r#"width="{size}" height="{size}""#),
+        1,
+    );
+    let pixels = slint::Image::load_from_svg_data(svg.as_bytes())
+        .ok()?
+        .to_rgba8()?;
     Some(argb_icon(
         pixels.as_bytes(),
         pixels.width() as i32,
@@ -226,25 +290,6 @@ fn argb_icon(rgba: &[u8], width: i32, height: i32) -> Icon {
     }
 }
 
-/// A red disc, the recording overlay.
-fn red_dot(size: i32) -> Icon {
-    let r = size as f32 / 2.0;
-    let mut data = Vec::with_capacity((size * size * 4) as usize);
-    for y in 0..size {
-        for x in 0..size {
-            let d = ((x as f32 + 0.5 - r).powi(2) + (y as f32 + 0.5 - r).powi(2)).sqrt();
-            // One pixel of antialiasing on the edge.
-            let alpha = ((r - d).clamp(0.0, 1.0) * 255.0) as u8;
-            data.extend_from_slice(&[alpha, 0xe5, 0x39, 0x35]);
-        }
-    }
-    Icon {
-        width: size,
-        height: size,
-        data,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -256,18 +301,39 @@ mod tests {
     }
 
     #[test]
-    fn app_icon_renders() {
-        let icon = app_icon().unwrap();
-        assert_eq!((icon.width, icon.height), (128, 128));
-        assert_eq!(icon.data.len(), 128 * 128 * 4);
+    fn look_follows_the_most_public_activity() {
+        let s = |recording, replay, live| State {
+            recording,
+            replay,
+            live,
+            ..Default::default()
+        };
+        assert_eq!(Look::of(s(false, false, false)), Look::Idle);
+        assert_eq!(Look::of(s(false, true, false)), Look::Replay);
+        assert_eq!(Look::of(s(true, true, false)), Look::Recording);
+        assert_eq!(Look::of(s(true, true, true)), Look::Live);
+        assert_eq!(Look::Idle.icon_name(), format!("{APP_ID}-symbolic"));
     }
 
     #[test]
-    fn red_dot_is_round() {
-        let dot = red_dot(32);
-        assert_eq!(dot.data.len(), 32 * 32 * 4);
-        let alpha = |x: usize, y: usize| dot.data[(y * 32 + x) * 4];
-        assert_eq!(alpha(16, 16), 255);
-        assert_eq!(alpha(0, 0), 0);
+    fn pixmaps_render_every_look() {
+        for look in Look::ALL {
+            for size in PIXMAP_SIZES {
+                let icon = pixmap(look, size).unwrap();
+                let n = size as i32;
+                assert_eq!((icon.width, icon.height), (n, n));
+                assert_eq!(icon.data.len(), (n * n * 4) as usize);
+                // Not blank.
+                assert!(icon.data.chunks(4).any(|p| p[0] == 255));
+            }
+        }
+    }
+
+    #[test]
+    fn pixmaps_are_violet_and_the_recording_dot_red() {
+        // ARGB of the center pixel, inside the dot.
+        let center = |look| pixmap(look, 22).unwrap().data[(11 * 22 + 11) * 4..][..4].to_vec();
+        assert_eq!(center(Look::Idle), [255, 0x85, 0x77, 0xf2]);
+        assert_eq!(center(Look::Recording), [255, 0xda, 0x44, 0x53]);
     }
 }

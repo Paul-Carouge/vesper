@@ -79,7 +79,9 @@ package() {
   install -Dm755 target/release/vesper-vst-host -t "$pkgdir/usr/lib/vesper/"
   install -Dm644 crates/vesper-app/data/io.github.PaulCarouge.Vesper.desktop \
     -t "$pkgdir/usr/share/applications/"
-  install -Dm644 crates/vesper-app/data/io.github.PaulCarouge.Vesper.svg \
-    -t "$pkgdir/usr/share/icons/hicolor/scalable/apps/"
+  # App icon at every hicolor size plus scalable; the symbolic tray icons
+  # (apps/ and status/) follow the panel's text color.
+  install -dm755 "$pkgdir/usr/share/icons"
+  cp -r --no-preserve=ownership crates/vesper-app/data/icons/hicolor "$pkgdir/usr/share/icons/"
   install -Dm644 README.md -t "$pkgdir/usr/share/doc/$pkgname/"
 }

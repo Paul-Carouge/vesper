@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+<defs>
+<linearGradient id="t" x1="0" y1="1" x2="0" y2="15" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#2B2C37"/><stop offset="1" stop-color="#0F1015"/></linearGradient>
+<linearGradient id="e" x1="0" y1="1" x2="0" y2="15" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#FFF" stop-opacity=".16"/><stop offset=".4" stop-color="#FFF" stop-opacity=".04"/><stop offset="1" stop-color="#FFF" stop-opacity=".02"/></linearGradient>
+<linearGradient id="g" x1="3.5" y1="3.5" x2="12.5" y2="12.5" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#A99CFF"/><stop offset=".55" stop-color="#C47DD6"/><stop offset="1" stop-color="#FF5C52"/></linearGradient>
+</defs>
+<rect x="1" y="1" width="14" height="14" rx="3.5" fill="url(#t)"/>
+<path d="M12.417 7.141A4.5 4.5 0 1 1 8.859 3.583" fill="none" stroke="url(#g)" stroke-width="1.5" stroke-linecap="round"/>
+<circle cx="8" cy="8" r="2" fill="url(#g)"/>
+<rect x="11" y="4" width="1" height="1" fill="#FFFFFF"/>
+<rect x="12" y="4" width="1" height="1" fill="#FFFFFF" fill-opacity="0.8"/>
+<rect x="10" y="4" width="1" height="1" fill="#FFFFFF" fill-opacity="0.8"/>
+<rect x="11" y="5" width="1" height="1" fill="#FFFFFF" fill-opacity="0.8"/>
+<rect x="11" y="3" width="1" height="1" fill="#FFFFFF" fill-opacity="0.8"/>
+<rect x="13" y="4" width="1" height="1" fill="#FFFFFF" fill-opacity="0.3"/>
+<rect x="9" y="4" width="1" height="1" fill="#FFFFFF" fill-opacity="0.3"/>
+<rect x="11" y="6" width="1" height="1" fill="#FFFFFF" fill-opacity="0.3"/>
+<rect x="11" y="2" width="1" height="1" fill="#FFFFFF" fill-opacity="0.3"/>
+</svg>
