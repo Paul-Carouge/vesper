@@ -34,6 +34,7 @@ use std::time::Duration;
 use vesper_audio::{AudioCapture, CHANNELS, Mix, Options, SAMPLE_RATE, Source};
 use vesper_capture::Capture;
 use vesper_core::{Codec, EncodedPacket, VideoFrame};
+use vesper_dsp::{FilterSpec, LiveControl};
 use vesper_encode::{Encoder, RateControl};
 use vesper_gamecapture::GameCapture;
 use vesper_mux::{AudioTrack, Muxer, VideoTrack};
@@ -159,6 +160,9 @@ pub enum Event {
 /// Most audio tracks a recording has, the mix aside.
 pub const MAX_TRACKS: usize = 8;
 
+/// Most filters a track has.
+pub const MAX_FILTERS: usize = 16;
+
 /// Name of the mix in the files.
 const MIX_NAME: &str = "Mix";
 
@@ -172,6 +176,25 @@ pub struct Track {
     pub muted: bool,
     /// See `vesper_audio::db_to_gain`.
     pub volume_db: f32,
+    /// Processing, in order, before the volume.
+    pub filters: Vec<TrackFilter>,
+}
+
+/// One filter of a track.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TrackFilter {
+    /// Off: left out of the chain, settings kept.
+    pub enabled: bool,
+    pub spec: FilterSpec,
+}
+
+/// The filters that run: the enabled ones, in order.
+pub fn active_filters(filters: &[TrackFilter]) -> Vec<FilterSpec> {
+    filters
+        .iter()
+        .filter(|f| f.enabled)
+        .map(|f| f.spec)
+        .collect()
 }
 
 impl Track {
@@ -182,6 +205,7 @@ impl Track {
             enabled: true,
             muted: false,
             volume_db: 0.0,
+            filters: Vec::new(),
         }
     }
 }
@@ -197,6 +221,8 @@ struct Audio {
     changed: bool,
     /// Running captures with their index in `tracks`, in file order.
     running: Vec<(usize, AudioCapture)>,
+    /// Filter controls of the running captures, with their index in `tracks`.
+    filters: Vec<(usize, LiveControl)>,
     /// First in the files when set.
     mixer: Option<Mix>,
 }
@@ -367,6 +393,34 @@ impl Pipeline {
         }
     }
 
+    /// Sets the filters of track `index`, live: parameters glide, a new
+    /// structure is handed to the audio thread at its next block.
+    pub fn set_filters(&self, index: usize, filters: Vec<TrackFilter>) {
+        let mut audio = lock(&self.audio);
+        // Once the tracks changed, running indices are stale: the restart
+        // applies the filters instead.
+        let changed = audio.changed;
+        if let Some((_, control)) = audio.filters.iter_mut().find(|(i, _)| *i == index)
+            && !changed
+        {
+            control.set(&active_filters(&filters));
+        }
+        if let Some(t) = audio.tracks.get_mut(index) {
+            t.filters = filters;
+        }
+    }
+
+    /// Gain reduction of running filter `filter` (among the enabled ones) of
+    /// track `index`, dB; 0 when it does not run.
+    pub fn reduction_db(&self, index: usize, filter: usize) -> f32 {
+        let audio = lock(&self.audio);
+        audio
+            .filters
+            .iter()
+            .find(|(i, _)| *i == index)
+            .map_or(0.0, |(_, control)| control.reduction_db(filter))
+    }
+
     /// Renames track `index`: files created from now on carry the new name.
     pub fn set_name(&self, index: usize, name: &str) {
         if let Some(t) = lock(&self.audio).tracks.get_mut(index) {
@@ -384,6 +438,11 @@ impl Pipeline {
     /// Recent peak of track `index`, linear 0..=1; 0 when it does not run.
     pub fn peak(&self, index: usize) -> f32 {
         let audio = lock(&self.audio);
+        // Ticked by the meters: frees a replaced filter chain soon after the
+        // audio thread hands it back, not at the next change.
+        if let Some((_, control)) = audio.filters.iter().find(|(i, _)| *i == index) {
+            control.collect();
+        }
         audio
             .running
             .iter()
@@ -602,21 +661,30 @@ fn start_audio(sources: &AudioSources, sinks: &SharedSinks) {
     // Streams before the tracks: the mix, until it is dropped below.
     let first = Arc::new(AtomicUsize::new(usize::from(mixer.is_some())));
     let mut running = Vec::new();
+    let mut controls = Vec::new();
     for (input, &i) in inputs.iter_mut().zip(&enabled) {
         let track = &tracks[i];
         let (index, sinks) = (StreamIndex::new(&first, running.len()), sinks.clone());
+        let (mut chain, control) =
+            vesper_dsp::live(&active_filters(&track.filters), usize::from(CHANNELS));
         let options = Options {
             anchor,
             muted: track.muted,
             volume_db: track.volume_db,
             mix: input.take(),
-            // Seam for per-track processing (noise suppression, compressor...).
-            process: None,
+            // Always there, even empty: filters can be added while it runs.
+            process: Some(Box::new(move |buf| {
+                chain.process(buf);
+                chain.latency()
+            })),
         };
         match AudioCapture::start(track.source.clone(), options, move |packet| {
             write_audio(&sinks, index.get(), packet)
         }) {
-            Ok(capture) => running.push((i, capture)),
+            Ok(capture) => {
+                running.push((i, capture));
+                controls.push((i, control));
+            }
             Err(e) => log!("running without the {:?} track: {e}", track.name),
         }
     }
@@ -628,13 +696,14 @@ fn start_audio(sources: &AudioSources, sinks: &SharedSinks) {
     // Started outside the lock (it blocks until PipeWire is ready); the
     // latest mute and volume applied under it, so no change is missed.
     let mut audio = lock(sources);
-    for (i, capture) in &running {
+    for ((i, capture), (_, control)) in running.iter().zip(&mut controls) {
         if let Some(t) = audio.tracks.get(*i) {
             capture.set_muted(t.muted);
             capture.set_volume_db(t.volume_db);
+            control.set(&active_filters(&t.filters));
         }
     }
-    (audio.running, audio.mixer) = (running, mixer);
+    (audio.running, audio.mixer, audio.filters) = (running, mixer, controls);
 }
 
 /// Stops the captures, then the mix: their last packets go to the sinks, so
@@ -642,6 +711,7 @@ fn start_audio(sources: &AudioSources, sinks: &SharedSinks) {
 fn stop_audio(sources: &AudioSources) {
     let (running, mixer) = {
         let mut audio = lock(sources);
+        audio.filters.clear();
         (std::mem::take(&mut audio.running), audio.mixer.take())
     };
     drop(running);

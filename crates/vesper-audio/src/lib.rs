@@ -42,8 +42,11 @@ pub type Error = Box<dyn std::error::Error + Send + Sync>;
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// Per-track processing of each 20 ms block (interleaved stereo F32), run on
-/// the encode thread before the volume and the encoder.
-pub type Process = Box<dyn FnMut(&mut [f32]) + Send>;
+/// the encode thread before the volume and the encoder. Returns its current
+/// delay in frames: the encoder drops that much of its output (or inserts
+/// silence when it shrinks), so the track and its pts stay on the timeline
+/// and the tracks of a mix stay aligned.
+pub type Process = Box<dyn FnMut(&mut [f32]) -> usize + Send>;
 
 /// Output sample rate of every track.
 pub const SAMPLE_RATE: u32 = 48_000;
@@ -362,6 +365,12 @@ struct Encoder<F> {
     pending: Vec<f32>,
     /// The 20 ms block being processed.
     block: Vec<f32>,
+    /// Processed samples, delay removed, waiting for a whole block.
+    ready: Vec<f32>,
+    /// Delay of the processing that `ready` accounts for, frames.
+    delay: usize,
+    /// Processed frames still to drop to remove that delay.
+    skip: usize,
     /// Frames sent to the encoder, the frame pts in 1/48000 s.
     sent: i64,
     anchor: Duration,
@@ -384,6 +393,10 @@ impl<F: FnMut(EncodedPacket)> Encoder<F> {
             frame,
             pending: Vec::new(),
             block: Vec::with_capacity(FRAME * usize::from(CHANNELS)),
+            // Room for a block and a delay change, so it rarely grows.
+            ready: Vec::with_capacity(4 * FRAME * usize::from(CHANNELS)),
+            delay: 0,
+            skip: 0,
             sent: 0,
             anchor,
             gain: f32::from_bits(shared.gain.load(Ordering::Relaxed)),
@@ -398,42 +411,73 @@ impl<F: FnMut(EncodedPacket)> Encoder<F> {
 
     fn push(&mut self, samples: &[f32]) {
         self.pending.extend_from_slice(samples);
-        let len = FRAME * usize::from(CHANNELS);
+        let ch = usize::from(CHANNELS);
+        let len = FRAME * ch;
         while self.pending.len() >= len {
             self.block.clear();
             self.block.extend(self.pending.drain(..len));
             // The DSP seam: a no-op unless a processor was given.
-            if let Some(process) = &mut self.process {
-                process(&mut self.block);
-            }
-            let gain = if self.shared.muted.load(Ordering::Relaxed) {
-                0.0
-            } else {
-                f32::from_bits(self.shared.gain.load(Ordering::Relaxed))
+            let delay = match &mut self.process {
+                Some(process) => process(&mut self.block),
+                None => 0,
             };
-            apply_gain(&mut self.block, self.gain, gain);
-            self.gain = gain;
-            if let Some(mix) = &self.mix {
-                mix.push(&self.block);
+            self.set_delay(delay);
+            let skip = self.skip.min(FRAME);
+            self.skip -= skip;
+            self.ready.extend_from_slice(&self.block[skip * ch..]);
+            while self.ready.len() >= len {
+                self.block.clear();
+                self.block.extend(self.ready.drain(..len));
+                self.encode_block();
             }
-            let out = self.frame.data_mut(0);
-            for (dst, &s) in out.as_chunks_mut::<4>().0.iter_mut().zip(&self.block) {
-                dst.copy_from_slice(&s.to_le_bytes());
-                self.peak = self.peak.max(s.abs());
-                self.peak_samples += 1;
-                if self.peak_samples == PEAK_WINDOW * usize::from(CHANNELS) {
-                    let peak = self.peak.min(1.0);
-                    self.shared.peak.store(peak.to_bits(), Ordering::Relaxed);
-                    (self.peak, self.peak_samples) = (0.0, 0);
-                }
-            }
-            self.frame.set_pts(Some(self.sent));
-            self.sent += FRAME as i64;
-            if let Err(e) = self.encoder.send_frame(&self.frame) {
-                error!("opus encode failed: {e}");
-            }
-            self.drain();
         }
+    }
+
+    /// Follows a change of the processing's delay. Output frame `n` must be
+    /// input frame `n`: a longer delay drops output, a shorter one inserts
+    /// silence where the old processing still held audio.
+    fn set_delay(&mut self, delay: usize) {
+        if delay >= self.delay {
+            self.skip += delay - self.delay;
+        } else {
+            let mut short = self.delay - delay;
+            let cancel = short.min(self.skip);
+            (self.skip, short) = (self.skip - cancel, short - cancel);
+            let ch = usize::from(CHANNELS);
+            self.ready.resize(self.ready.len() + short * ch, 0.0);
+        }
+        self.delay = delay;
+    }
+
+    /// Volume, mix, meter and encoder for the block in `self.block`.
+    fn encode_block(&mut self) {
+        let gain = if self.shared.muted.load(Ordering::Relaxed) {
+            0.0
+        } else {
+            f32::from_bits(self.shared.gain.load(Ordering::Relaxed))
+        };
+        apply_gain(&mut self.block, self.gain, gain);
+        self.gain = gain;
+        if let Some(mix) = &self.mix {
+            mix.push(&self.block);
+        }
+        let out = self.frame.data_mut(0);
+        for (dst, &s) in out.as_chunks_mut::<4>().0.iter_mut().zip(&self.block) {
+            dst.copy_from_slice(&s.to_le_bytes());
+            self.peak = self.peak.max(s.abs());
+            self.peak_samples += 1;
+            if self.peak_samples == PEAK_WINDOW * usize::from(CHANNELS) {
+                let peak = self.peak.min(1.0);
+                self.shared.peak.store(peak.to_bits(), Ordering::Relaxed);
+                (self.peak, self.peak_samples) = (0.0, 0);
+            }
+        }
+        self.frame.set_pts(Some(self.sent));
+        self.sent += FRAME as i64;
+        if let Err(e) = self.encoder.send_frame(&self.frame) {
+            error!("opus encode failed: {e}");
+        }
+        self.drain();
     }
 
     fn drain(&mut self) {
@@ -452,10 +496,16 @@ impl<F: FnMut(EncodedPacket)> Encoder<F> {
     }
 
     fn finish(mut self) {
-        // Pad the last partial frame so no captured audio is lost.
-        let rem = self.pending.len() % (FRAME * usize::from(CHANNELS));
-        if rem != 0 {
-            self.push(&vec![0.0; FRAME * usize::from(CHANNELS) - rem]);
+        // Pad the last partial frame and flush the processing's delay so no
+        // captured audio is lost.
+        let len = FRAME * usize::from(CHANNELS);
+        let tail = self.pending.len() + self.delay * usize::from(CHANNELS);
+        self.push(&vec![0.0; tail.next_multiple_of(len) - self.pending.len()]);
+        if !self.ready.is_empty() {
+            self.ready.resize(len, 0.0);
+            self.block.clear();
+            self.block.append(&mut self.ready);
+            self.encode_block();
         }
         if let Err(e) = self.encoder.send_eof() {
             error!("opus flush failed: {e}");
@@ -664,6 +714,89 @@ mod tests {
         assert!(packets[0].pts <= anchor);
     }
 
+    /// Decodes Opus packets back to channel 0's samples.
+    pub(crate) fn decode(head: &[u8], packets: &[EncodedPacket]) -> Vec<f32> {
+        use ffmpeg_next as ffmpeg;
+        let codec = ffmpeg::decoder::find(ffmpeg::codec::Id::OPUS).unwrap();
+        let mut ctx = ffmpeg::codec::Context::new_with_codec(codec);
+        unsafe {
+            let raw = ctx.as_mut_ptr();
+            let buf = ffmpeg::ffi::av_mallocz(head.len() + 64) as *mut u8;
+            std::ptr::copy_nonoverlapping(head.as_ptr(), buf, head.len());
+            (*raw).extradata = buf;
+            (*raw).extradata_size = head.len() as i32;
+        }
+        let mut dec = ctx.decoder().audio().unwrap();
+        let mut out = Vec::new();
+        let mut frame = ffmpeg::frame::Audio::empty();
+        for p in packets {
+            dec.send_packet(&ffmpeg::Packet::copy(&p.data)).unwrap();
+            while dec.receive_frame(&mut frame).is_ok() {
+                // libopus decodes to planar or packed float: read channel 0.
+                let plane: &[f32] = frame.plane(0);
+                out.extend_from_slice(&plane[..frame.samples()]);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn processing_delay_is_removed_from_the_timeline() {
+        let anchor = Duration::from_secs(10);
+        // 1 s of silence with a 10 ms, 2 kHz burst starting at frame `at`.
+        let at = 24_123;
+        let samples: Vec<f32> = (0..SAMPLE_RATE as usize)
+            .flat_map(|i| {
+                let t = i as f32 / SAMPLE_RATE as f32;
+                let on = (at..at + 480).contains(&i);
+                [if on {
+                    0.5 * (std::f32::consts::TAU * 2_000.0 * t).sin()
+                } else {
+                    0.0
+                }; 2]
+            })
+            .collect();
+        let (chunk_tx, chunk_rx) = mpsc::channel();
+        for (i, c) in samples.chunks(1_024 * 2).enumerate() {
+            let start = anchor + frames_to_duration(i * 1_024);
+            chunk_tx
+                .send(pw::Chunk {
+                    start,
+                    samples: c.to_vec(),
+                })
+                .unwrap();
+        }
+        drop(chunk_tx);
+        let (tx, rx) = mpsc::channel();
+        let encoder = open_encoder().unwrap();
+        let head = opus_head(&encoder).unwrap();
+        let mut enc = Encoder::new(encoder, anchor, Arc::default(), move |p| {
+            tx.send(p).unwrap()
+        });
+        // Delayed by RNNoise's 20 ms and the limiter's lookahead (the
+        // expander is left out: its attack would blur the onset).
+        let specs = ["high_pass", "noise_suppression", "limiter"]
+            .map(|n| vesper_dsp::FilterSpec::default_for(n).unwrap());
+        let (mut chain, _) = vesper_dsp::live(&specs, 2);
+        assert_eq!(chain.latency(), 960 + 99);
+        enc.process = Some(Box::new(move |buf: &mut [f32]| {
+            chain.process(buf);
+            chain.latency()
+        }));
+        encode_loop(enc, chunk_rx);
+        let packets: Vec<_> = rx.iter().collect();
+        let decoded = decode(&head, &packets);
+        let onset = decoded.iter().position(|s| s.abs() > 0.05).unwrap();
+        // The decoder drops the pre-skip: its first sample is at the anchor.
+        let pre_skip = usize::from(u16::from_le_bytes([head[10], head[11]]));
+        let heard = packets[0].pts + frames_to_duration(pre_skip + onset);
+        let truth = anchor + frames_to_duration(at);
+        let error_ms = (heard.as_secs_f64() - truth.as_secs_f64()) * 1e3;
+        assert!(error_ms.abs() < 0.1, "burst {error_ms} ms off");
+        // Nothing lost at the end: the delay was flushed.
+        assert!(packets.len() >= 50, "{} packets", packets.len());
+    }
+
     fn test_encoder(shared: &Arc<Shared>) -> Encoder<impl FnMut(EncodedPacket)> {
         Encoder::new(
             open_encoder().unwrap(),
@@ -720,7 +853,8 @@ mod tests {
         // Ramps from 1.0 towards -6 dB during the first block only.
         enc.push(&vec![0.5; FRAME * 2]);
         enc.process = Some(Box::new(|s: &mut [f32]| {
-            s.iter_mut().for_each(|x| *x *= 2.0)
+            s.iter_mut().for_each(|x| *x *= 2.0);
+            0
         }));
         enc.push(&vec![0.5; PEAK_WINDOW * 2 * 2]);
         // 0.5 doubled by the processor, then -6 dB.

@@ -7,8 +7,16 @@ import { Icon, Card, Button, IconButton, Switch, Segmented, Meter, SectionLabel,
 export { Theme }
 
 export enum TrackKind { desktop, microphone, output, input, app }
+/// A filter parameter. `index` is its place in the filter's parameters.
+export struct FilterParam { index: int, label: string, unit: string, value: float, minimum: float, maximum: float, step: float }
+/// One filter of a track. `kind` is the backend's filter name; `meters`: it
+/// reduces gain and shows how much. Parameters are split: `main` always
+/// shown, `advanced` behind "More settings".
+export struct FilterRow { kind: string, title: string, enabled: bool, meters: bool, main: [FilterParam], advanced: [FilterParam] }
+/// A filter the "Add filter" menu offers.
+export struct FilterKind { kind: string, title: string }
 /// One audio track. `source` is the backend's id of what it records.
-export struct AudioTrack { name: string, source: string, kind: TrackKind, enabled: bool, muted: bool, volume-db: float }
+export struct AudioTrack { name: string, source: string, kind: TrackKind, enabled: bool, muted: bool, volume-db: float, filters: [FilterRow] }
 /// A source the "Add track" picker offers. `section` heads the first of a group.
 export struct SourceOption { label: string, source: string, kind: TrackKind, section: string, added: bool }
 
@@ -323,6 +331,270 @@ component SourceRow inherits FocusScope {
     }
 }
 
+global FilterText {
+    // "-20 dB", "3:1", "6500 Hz", "0.5 ms": decimals as fine as the step.
+    public pure function value(p: FilterParam) -> string {
+        p.unit == "ratio" ? "\{Math.round(p.value * 10) / 10}:1"
+            : (p.step >= 1 ? "\{Math.round(p.value)}" : "\{Math.round(p.value * 10) / 10}") + " " + p.unit
+    }
+}
+
+// One filter parameter: name, slider, value.
+component ParamRow inherits HorizontalLayout {
+    in property <FilterParam> param;
+    in property <string> filter;
+    callback changed(float);
+    spacing: Theme.space-sm;
+    Text {
+        width: 76px;
+        text: root.param.label;
+        vertical-alignment: center;
+        font-size: Theme.font-small;
+        color: Theme.text-muted;
+        overflow: elide;
+    }
+    Slider {
+        horizontal-stretch: 1;
+        label: "\{root.filter} \{root.param.label}";
+        minimum: root.param.minimum;
+        maximum: root.param.maximum;
+        step: root.param.step;
+        page-step: root.param.step * 10;
+        value: root.param.value;
+        value-text: FilterText.value(root.param);
+        changed(v) => {
+            root.changed(v);
+        }
+    }
+    Text {
+        width: 60px;
+        text: FilterText.value(root.param);
+        horizontal-alignment: right;
+        vertical-alignment: center;
+        font-size: Theme.font-small;
+        color: Theme.text-muted;
+    }
+}
+
+// A filter of the open track: on/off, gain reduction, order, parameters.
+component FilterCard inherits Rectangle {
+    in property <FilterRow> filter;
+    // Gain reduction, dB (>= 0).
+    in property <float> reduction;
+    in property <bool> first;
+    in property <bool> last;
+    // Set by the list after it moved or removed a filter: -1 focuses the
+    // "up" button, 1 "down", 2 the switch (0: nothing). Keeps keyboard focus
+    // on the filter that moved, or on the next one after a removal.
+    in property <int> take-focus;
+    callback toggled(bool);
+    callback param-changed(int, float);
+    callback move(int);
+    callback remove;
+
+    property <bool> show-advanced;
+
+    border-radius: Theme.radius-md;
+    background: Theme.surface-raised;
+    accessible-role: groupbox;
+    accessible-label: root.filter.title;
+
+    changed take-focus => {
+        if (root.take-focus == -1) {
+            if (up.enabled) { up.focus(); } else { down.focus(); }
+        } else if (root.take-focus == 1) {
+            if (down.enabled) { down.focus(); } else { up.focus(); }
+        } else if (root.take-focus == 2) {
+            toggle.focus();
+        }
+    }
+
+    VerticalLayout {
+        padding-left: Theme.space-sm;
+        padding-right: Theme.space-xs;
+        padding-bottom: Theme.space-sm;
+        spacing: Theme.space-xs;
+        HorizontalLayout {
+            spacing: Theme.space-sm;
+            height: 36px;
+            VerticalLayout {
+                alignment: center;
+                toggle := Switch {
+                    label: root.filter.title;
+                    checked: root.filter.enabled;
+                    toggled(on) => {
+                        root.toggled(on);
+                    }
+                }
+            }
+            Text {
+                horizontal-stretch: 1;
+                text: root.filter.title;
+                vertical-alignment: center;
+                font-size: Theme.font-body;
+                font-weight: 500;
+                color: root.filter.enabled ? Theme.text : Theme.text-muted;
+                overflow: elide;
+            }
+            up := IconButton {
+                width: 28px;
+                height: 36px;
+                icon: Icons.chevron-up;
+                label: "Move \{root.filter.title} up";
+                enabled: !root.first;
+                opacity: self.enabled ? 1 : 0.35;
+                clicked => {
+                    root.move(-1);
+                }
+            }
+            down := IconButton {
+                width: 28px;
+                height: 36px;
+                icon: Icons.chevron-down;
+                label: "Move \{root.filter.title} down";
+                enabled: !root.last;
+                opacity: self.enabled ? 1 : 0.35;
+                clicked => {
+                    root.move(1);
+                }
+            }
+            IconButton {
+                width: 28px;
+                height: 36px;
+                icon: Icons.close;
+                label: "Remove \{root.filter.title}";
+                clicked => {
+                    root.remove();
+                }
+            }
+        }
+        VerticalLayout {
+            padding-right: Theme.space-xs;
+            spacing: Theme.space-xs;
+            opacity: root.filter.enabled ? 1 : 0.6;
+            // Gain reduction, laid out like a parameter. Purely visual (a
+            // 30 Hz value), like the level meters.
+            if root.filter.meters && root.filter.enabled: HorizontalLayout {
+                spacing: Theme.space-sm;
+                height: 24px;
+                accessible-role: none;
+                Text {
+                    width: 76px;
+                    text: "Reduction";
+                    vertical-alignment: center;
+                    font-size: Theme.font-small;
+                    color: Theme.text-muted;
+                }
+                VerticalLayout {
+                    alignment: center;
+                    horizontal-stretch: 1;
+                    Rectangle {
+                        height: 4px;
+                        border-radius: 2px;
+                        background: Theme.meter-track;
+                        clip: true;
+                        Rectangle {
+                            x: 0;
+                            width: parent.width * clamp(root.reduction / 24, 0, 1);
+                            border-radius: 2px;
+                            background: Theme.meter-hot;
+                            animate width { duration: 70ms; }
+                        }
+                    }
+                }
+                Text {
+                    width: 60px;
+                    text: root.reduction < 0.05 ? "0 dB" : "-\{Math.round(root.reduction * 10) / 10} dB";
+                    horizontal-alignment: right;
+                    vertical-alignment: center;
+                    font-size: Theme.font-small;
+                    color: Theme.text-muted;
+                }
+            }
+            for p in root.filter.main: ParamRow {
+                param: p;
+                filter: root.filter.title;
+                changed(v) => {
+                    root.param-changed(p.index, v);
+                }
+            }
+            if root.show-advanced: VerticalLayout {
+                spacing: Theme.space-xs;
+                for p in root.filter.advanced: ParamRow {
+                    param: p;
+                    filter: root.filter.title;
+                    changed(v) => {
+                        root.param-changed(p.index, v);
+                    }
+                }
+            }
+            if root.filter.advanced.length > 0: HorizontalLayout {
+                alignment: start;
+                Button {
+                    text: root.show-advanced ? "Fewer settings" : "More settings";
+                    kind: "ghost";
+                    small: true;
+                    accessible-label: (root.show-advanced ? "Hide" : "Show") + " the advanced settings of \{root.filter.title}";
+                    clicked => {
+                        root.show-advanced = !root.show-advanced;
+                    }
+                }
+            }
+        }
+    }
+}
+
+// A plain choice in an inline menu.
+component MenuRow inherits FocusScope {
+    in property <string> text;
+    in property <string> label: root.text;
+    callback clicked;
+
+    focus-on-click: false;
+    height: 32px;
+    accessible-role: button;
+    accessible-label: root.label;
+    accessible-action-default => {
+        root.clicked();
+    }
+
+    key-pressed(event) => {
+        if (event.text == Key.Space || event.text == Key.Return) {
+            root.clicked();
+            return accept;
+        }
+        reject
+    }
+
+    FocusRing {
+        visible-ring: root.has-focus;
+        radius: Theme.radius-sm;
+    }
+
+    Rectangle {
+        border-radius: Theme.radius-sm;
+        background: touch.pressed ? Theme.surface-pressed : touch.has-hover ? Theme.surface-hover : transparent;
+        animate background { duration: Theme.fast; }
+    }
+
+    Text {
+        x: Theme.space-sm;
+        width: parent.width - 2 * Theme.space-sm;
+        text: root.text;
+        vertical-alignment: center;
+        font-size: Theme.font-body;
+        color: Theme.text;
+        overflow: elide;
+    }
+
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => {
+            root.clicked();
+        }
+    }
+}
+
 component SettingGroup inherits VerticalLayout {
     in property <string> label;
     in property <string> hint;
@@ -378,6 +650,11 @@ export component AppWindow inherits Window {
     /// `source-options` lists applications.
     in property <bool> apps-playing;
     in property <int> max-tracks: 8;
+    /// What "Add filter" offers.
+    in property <[FilterKind]> filter-kinds;
+    /// Gain reduction of each filter of the open track, dB.
+    in property <[float]> filter-reductions;
+    in property <int> max-filters: 16;
     /// A mix of all tracks as the files' first audio track.
     in-out property <bool> audio-mix: true;
 
@@ -420,6 +697,14 @@ export component AppWindow inherits Window {
     /// The picker opened or closed: the backend watches sources meanwhile.
     callback track-picker-changed(bool);
     callback track-added(SourceOption);
+    callback filter-toggled(int, int, bool);
+    callback filter-param-changed(int, int, int, float);
+    /// Track, filter, then -1 (up) or 1 (down).
+    callback filter-moved(int, int, int);
+    callback filter-removed(int, int);
+    callback filter-added(int, string);
+    /// Replaces the track's filters with the voice chain.
+    callback filter-voice-preset(int);
     callback audio-mix-changed(bool);
     callback output-settings-changed();
     callback pick-output-folder();
@@ -459,8 +744,13 @@ export component AppWindow inherits Window {
     property <bool> notice-actions: root.notice-has-file && root.notice != "" && !root.active;
     property <string> fps-text: (root.recording ? "\{Math.round(root.measured-fps * 10) / 10}" : "\{root.fps}") + " fps";
     // Audio card: the track whose settings are open (-1: none), and the picker.
-    property <int> open-track: -1;
+    out property <int> open-track: -1;
     property <bool> picking;
+    // The open track's "Add filter" menu is shown.
+    property <bool> adding-filter;
+    // Filter card to give keyboard focus to, and how (see FilterCard).
+    property <int> filter-focus: -1;
+    property <int> filter-focus-how;
     // A name being typed in the open track's field, not committed yet.
     property <string> name-draft;
     property <int> name-draft-track: -1;
@@ -472,6 +762,8 @@ export component AppWindow inherits Window {
             root.name-draft-track = -1;
         }
         root.open-track = -1;
+        root.adding-filter = false;
+        root.filter-focus = -1;
     }
 
     function set-picking(on: bool) {
@@ -1019,6 +1311,79 @@ export component AppWindow inherits Window {
                                         vertical-alignment: center;
                                         font-size: Theme.font-small;
                                         color: Theme.text-muted;
+                                    }
+                                }
+                                // Filters: live, even while recording.
+                                HorizontalLayout {
+                                    spacing: Theme.space-xs;
+                                    padding-top: Theme.space-xs;
+                                    SectionLabel {
+                                        horizontal-stretch: 1;
+                                        vertical-alignment: center;
+                                        text: "FILTERS";
+                                    }
+                                    if track.kind == TrackKind.microphone || track.kind == TrackKind.input: Button {
+                                        text: "Voice preset";
+                                        kind: "ghost";
+                                        small: true;
+                                        accessible-description: "Replaces the filters with high-pass, noise suppression, expander, compressor, de-esser and limiter";
+                                        clicked => {
+                                            root.adding-filter = false;
+                                            root.filter-voice-preset(i);
+                                        }
+                                    }
+                                    Button {
+                                        text: root.adding-filter ? "Cancel" : "Add filter";
+                                        icon: root.adding-filter ? "" : Icons.plus;
+                                        kind: "ghost";
+                                        small: true;
+                                        enabled: root.adding-filter || track.filters.length < root.max-filters;
+                                        accessible-label: root.adding-filter ? "Close the filter list" : "Add filter";
+                                        clicked => {
+                                            root.adding-filter = !root.adding-filter;
+                                        }
+                                    }
+                                }
+                                if root.adding-filter: VerticalLayout {
+                                    spacing: 2px;
+                                    accessible-role: list;
+                                    accessible-label: "Filters";
+                                    for kind in root.filter-kinds: MenuRow {
+                                        text: kind.title;
+                                        label: "Add \{kind.title}";
+                                        clicked => {
+                                            root.adding-filter = false;
+                                            root.filter-added(i, kind.kind);
+                                        }
+                                    }
+                                }
+                                if track.filters.length == 0 && !root.adding-filter: Text {
+                                    text: "No filter: the track is recorded as is.";
+                                    font-size: Theme.font-small;
+                                    color: Theme.text-muted;
+                                    wrap: word-wrap;
+                                }
+                                for filter[j] in track.filters: FilterCard {
+                                    filter: filter;
+                                    reduction: root.filter-reductions[j];
+                                    first: j == 0;
+                                    last: j == track.filters.length - 1;
+                                    take-focus: root.filter-focus == j ? root.filter-focus-how : 0;
+                                    toggled(on) => {
+                                        root.filter-toggled(i, j, on);
+                                    }
+                                    param-changed(k, v) => {
+                                        root.filter-param-changed(i, j, k, v);
+                                    }
+                                    move(d) => {
+                                        root.filter-moved(i, j, d);
+                                        root.filter-focus-how = d;
+                                        root.filter-focus = j + d;
+                                    }
+                                    remove => {
+                                        root.filter-removed(i, j);
+                                        root.filter-focus-how = 2;
+                                        root.filter-focus = Math.min(j, track.filters.length - 1);
                                     }
                                 }
                                 HorizontalLayout {

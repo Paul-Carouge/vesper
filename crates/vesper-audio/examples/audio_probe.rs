@@ -3,6 +3,10 @@
 //! and pts continuity.
 //!
 //! `cargo run -p vesper-audio --example audio_probe [seconds] [app | output:<sink>...]`
+//!
+//! `VESPER_PROBE_VOICE=desktop,microphone` runs the voice filter chain on
+//! those tracks (the `Source` names, lowercase), e.g. to check that its
+//! delay is compensated against an unfiltered `output:<sink>` track.
 
 use std::sync::mpsc;
 use std::time::Duration;
@@ -30,6 +34,7 @@ fn main() -> Result<(), Error> {
         .into_iter()
         .chain(apps)
         .collect();
+    let voice = std::env::var("VESPER_PROBE_VOICE").unwrap_or_default();
     let mut tracks = Vec::new();
     let anchor = monotonic_now();
     let (mix_tx, mix_rx) = mpsc::channel::<EncodedPacket>();
@@ -42,7 +47,7 @@ fn main() -> Result<(), Error> {
             muted: false,
             volume_db: 0.0,
             mix: input.take(),
-            process: None,
+            process: voice_chain(&voice, &source),
         };
         let capture = AudioCapture::start(source.clone(), options, move |p| drop(tx.send(p)))?;
         tracks.push((source, capture, rx));
@@ -93,6 +98,19 @@ fn main() -> Result<(), Error> {
     write_mka(&path, &collected)?;
     println!("wrote {}", path.display());
     Ok(())
+}
+
+/// The voice chain, if `voice` names this source.
+fn voice_chain(voice: &str, source: &Source) -> Option<vesper_audio::Process> {
+    let name = format!("{source:?}").to_lowercase();
+    if !voice.split(',').any(|v| !v.is_empty() && name == v) {
+        return None;
+    }
+    let (mut chain, _) = vesper_dsp::live(&vesper_dsp::FilterSpec::voice_chain(), 2);
+    Some(Box::new(move |buf| {
+        chain.process(buf);
+        chain.latency()
+    }))
 }
 
 /// Muxes the tracks, rebased to the earliest pts, into a Matroska file.

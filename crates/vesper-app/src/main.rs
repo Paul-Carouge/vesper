@@ -14,6 +14,7 @@ mod autostart;
 mod desktop;
 #[cfg(debug_assertions)]
 mod dev;
+mod filters;
 mod game;
 mod instance;
 mod layer;
@@ -363,6 +364,7 @@ fn wire_callbacks(ui: &AppWindow, recording: &Shared, games: &Games) {
 
     // Mute and volume apply live; the next recording reads the UI state.
     audio::wire(ui, recording);
+    filters::wire(ui, recording);
 
     let weak = ui.as_weak();
     ui.on_output_settings_changed(move || {

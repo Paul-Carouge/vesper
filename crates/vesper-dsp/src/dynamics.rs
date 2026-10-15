@@ -86,6 +86,10 @@ impl Filter for Compressor {
         0
     }
 
+    fn reduction_db(&self) -> f32 {
+        -self.gs
+    }
+
     fn set_param(&mut self, index: usize, value: f32) {
         match index {
             0 => self.threshold = value,
@@ -168,6 +172,10 @@ impl Filter for Expander {
 
     fn latency(&self) -> usize {
         0
+    }
+
+    fn reduction_db(&self) -> f32 {
+        -self.gs
     }
 
     fn set_param(&mut self, index: usize, value: f32) {
@@ -262,6 +270,10 @@ impl Filter for DeEsser {
 
     fn latency(&self) -> usize {
         0
+    }
+
+    fn reduction_db(&self) -> f32 {
+        -self.gs
     }
 
     fn set_param(&mut self, index: usize, value: f32) {

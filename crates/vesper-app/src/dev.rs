@@ -7,7 +7,7 @@
 //!   notification, both for `VESPER_DEMO_FILE`.
 //!   Looks without a capture or a game, for screenshots: `screen-look`,
 //!   `game-look`, `consent-look`, `starting-look`, `stopping-look`, `layer-installed`, `layer-missing`,
-//!   `replay-on`, `replay-off`; `scroll-end` scrolls the settings to the end.
+//!   `replay-on`, `replay-off`, `filters-look`; `scroll-end` scrolls the settings to the end.
 //! - `VESPER_SNAPSHOT=<file.ppm>` saves the window as a PPM image once the
 //!   demo settled, then quits. Nothing outside the window is captured.
 //! - `VESPER_DEMO_DELAY=<ms>` runs `VESPER_DEMO` that long after launch
@@ -270,6 +270,32 @@ fn look(ui: &AppWindow, step: &str) -> bool {
             let model = |v: &[f32]| std::rc::Rc::new(slint::VecModel::from(v.to_vec())).into();
             ui.set_track_levels(model(&levels));
             ui.set_track_peaks(model(&levels.map(|l: f32| (l + 0.12).min(1.0))));
+        }
+        // The microphone's settings open, with the voice preset and some
+        // gain reduction.
+        "filters-look" => {
+            use crate::recorder::{Track, TrackFilter};
+            use vesper_audio::Source;
+            let voice = vesper_dsp::FilterSpec::voice_chain()
+                .into_iter()
+                .map(|spec| TrackFilter {
+                    enabled: spec.name() != "expander",
+                    spec,
+                })
+                .collect();
+            let tracks = [
+                Track::new("Desktop", Source::Desktop),
+                Track {
+                    filters: voice,
+                    ..Track::new("Microphone", Source::Microphone)
+                },
+            ];
+            crate::audio::show_tracks(ui, &tracks);
+            ui.invoke_open_track_settings(1);
+            let model = |v: &[f32]| std::rc::Rc::new(slint::VecModel::from(v.to_vec())).into();
+            ui.set_track_levels(model(&[0.4, 0.55]));
+            ui.set_track_peaks(model(&[0.5, 0.66]));
+            ui.set_filter_reductions(model(&[0.0, 0.0, 0.0, 4.2, 1.5, 0.8]));
         }
         "replay-on" => ui.set_replay_enabled(true),
         "replay-off" => ui.set_replay_enabled(false),

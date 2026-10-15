@@ -7,7 +7,7 @@
 //! the delayed peak plays (Signalsmith's design), and a release one-pole
 //! brings it back up. A final clamp catches rounding errors.
 
-use crate::{FS, Filter, Glide, coef, db_to_lin};
+use crate::{FS, Filter, Glide, coef, db_to_lin, lin_to_db};
 
 /// Taps per phase of the intersample peak interpolator.
 const TAPS: usize = 8;
@@ -135,6 +135,10 @@ impl Filter for Limiter {
 
     fn latency(&self) -> usize {
         self.n + TP_DELAY - 1
+    }
+
+    fn reduction_db(&self) -> f32 {
+        -lin_to_db(self.gain)
     }
 
     fn set_param(&mut self, index: usize, value: f32) {
