@@ -37,6 +37,7 @@ fn row(track: &Track) -> AudioTrack {
         enabled: track.enabled,
         muted: track.muted,
         volume_db: track.volume_db,
+        filters: crate::filters::rows(&track.filters),
     }
 }
 
@@ -51,6 +52,7 @@ pub fn tracks_from_ui(ui: &AppWindow) -> Vec<Track> {
                 enabled: t.enabled,
                 muted: t.muted,
                 volume_db: t.volume_db,
+                filters: crate::filters::from_rows(&t.filters),
             })
         })
         .collect()
@@ -271,6 +273,8 @@ pub fn start_meters(ui: &AppWindow, rec: &Shared) -> slint::Timer {
     let (levels, peaks) = (Rc::new(VecModel::default()), Rc::new(VecModel::default()));
     ui.set_track_levels(levels.clone().into());
     ui.set_track_peaks(peaks.clone().into());
+    let reductions = Rc::new(VecModel::default());
+    ui.set_filter_reductions(reductions.clone().into());
     tick.start(slint::TimerMode::Repeated, METER_TICK, move || {
         let Some(ui) = weak.upgrade() else { return };
         let n = ui.get_tracks().row_count();
@@ -279,6 +283,7 @@ pub fn start_meters(ui: &AppWindow, rec: &Shared) -> slint::Timer {
             levels.set_vec(vec![0.0; n]);
             peaks.set_vec(vec![0.0; n]);
         }
+        crate::filters::feed_reductions(&ui, &rec, &reductions);
         let rec = rec.borrow();
         for (i, meter) in meters.iter_mut().enumerate() {
             let before = *meter;

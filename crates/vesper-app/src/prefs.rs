@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use vesper_audio::{MAX_DB, MIN_DB, Source};
 
 use crate::outputs::{Kind, SourceLabel};
-use crate::recorder::{MAX_TRACKS, Track};
+use crate::recorder::{MAX_FILTERS, MAX_TRACKS, Track, TrackFilter};
 use crate::{AppWindow, QualityPreset, SourceKind, VideoCodec};
 
 /// Process names (`/proc/<pid>/comm`) the user allowed game capture for. Not
@@ -84,6 +84,8 @@ impl Prefs {
     /// the old `desktop_muted` and `mic_muted` apply to `self`'s tracks.
     pub fn parse(mut self, text: &str) -> Self {
         let mut tracks: Option<Vec<Track>> = None;
+        // The track the next `filter` lines belong to: the last one read, if valid.
+        let mut last_track: Option<usize> = None;
         let (mut desktop_muted, mut mic_muted) = (None, None);
         for line in text.lines() {
             let Some((key, value)) = line.split_once('=') else {
@@ -100,13 +102,25 @@ impl Prefs {
                 "mic_muted" => mic_muted = flag(value),
                 "tracks" => {
                     tracks.get_or_insert_default();
+                    last_track = None;
                 }
                 "track" => {
                     let list = tracks.get_or_insert_default();
+                    last_track = None;
                     if let Some(track) = parse_track(value)
                         && list.len() < MAX_TRACKS
                     {
                         list.push(track);
+                        last_track = Some(list.len() - 1);
+                    }
+                }
+                "filter" => {
+                    let track = last_track.and_then(|i| tracks.as_mut()?.get_mut(i));
+                    if let Some(track) = track
+                        && let Some(filter) = parse_filter(value)
+                        && track.filters.len() < MAX_FILTERS
+                    {
+                        track.filters.push(filter);
                     }
                 }
                 "audio_mix" => set(&mut self.audio_mix, flag(value)),
@@ -160,6 +174,9 @@ impl Prefs {
         text += "tracks=\n";
         for track in self.tracks.iter().filter(|t| valid_track(t)) {
             text += &format!("track={}\n", serialize_track(track));
+            for filter in &track.filters {
+                text += &format!("filter={}|{}\n", filter.enabled, filter.spec);
+            }
         }
         text += &format!("audio_mix={}\n", self.audio_mix);
         // A line break would split the line: keep the default folder instead.
@@ -298,6 +315,16 @@ fn parse_track(value: &str) -> Option<Track> {
         enabled,
         muted,
         volume_db: volume_db.clamp(MIN_DB, MAX_DB),
+        filters: Vec::new(),
+    })
+}
+
+/// `enabled|name:key=value,...`, after its track's line.
+fn parse_filter(value: &str) -> Option<TrackFilter> {
+    let (enabled, spec) = value.split_once('|')?;
+    Some(TrackFilter {
+        enabled: flag(enabled)?,
+        spec: spec.parse().ok()?,
     })
 }
 
@@ -394,6 +421,7 @@ pub fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use vesper_dsp::FilterSpec;
 
     const DEFAULT: &str = "/home/u/Videos/Vesper";
 
@@ -434,8 +462,22 @@ mod tests {
                         Source::Output("alsa_output.usb-x.analog-stereo".into()),
                     )
                 },
-                Track::new("Mic", Source::Input("alsa_input.pci-0000_0c_00.6".into())),
                 Track {
+                    filters: FilterSpec::voice_chain()
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, spec)| TrackFilter {
+                            enabled: i != 2,
+                            spec,
+                        })
+                        .collect(),
+                    ..Track::new("Mic", Source::Input("alsa_input.pci-0000_0c_00.6".into()))
+                },
+                Track {
+                    filters: vec![TrackFilter {
+                        enabled: true,
+                        spec: FilterSpec::Gain { db: -3.25 },
+                    }],
                     muted: true,
                     ..Track::new("Desktop", Source::Desktop)
                 },
@@ -529,6 +571,51 @@ mod tests {
             ..defaults()
         };
         assert_eq!(defaults().parse(&prefs.serialize(DEFAULT)).tracks, []);
+    }
+
+    #[test]
+    fn filters_follow_their_track_and_bad_ones_are_ignored() {
+        let text = "filter=true|gain:db=1\n\
+                    tracks=\n\
+                    filter=true|gain:db=2\n\
+                    track=true|false|0|desktop|Desktop\n\
+                    filter=true|gain:db=3\n\
+                    filter=true|reverb:size=9\n\
+                    filter=maybe|gain:db=4\n\
+                    filter=gain:db=5\n\
+                    filter=false|compressor:ratio=8,bogus=1\n\
+                    filter=false|limiter : ceiling_db = -40\n\
+                    track=true|false|loud|desktop|Bad\n\
+                    filter=true|gain:db=6\n\
+                    track=true|false|0|microphone|Mic\n\
+                    filter=true|high_pass\n";
+        let tracks = defaults().parse(text).tracks;
+        assert_eq!(tracks.len(), 2);
+        let limiter = FilterSpec::default_for("limiter").unwrap().with(0, -24.0);
+        assert_eq!(
+            tracks[0].filters,
+            [
+                TrackFilter {
+                    enabled: true,
+                    spec: FilterSpec::Gain { db: 3.0 },
+                },
+                // Clamped to the ceiling's range.
+                TrackFilter {
+                    enabled: false,
+                    spec: limiter,
+                },
+            ]
+        );
+        assert_eq!(
+            tracks[1].filters[0].spec,
+            FilterSpec::HighPass { freq_hz: 80.0 }
+        );
+        // No more than MAX_FILTERS per track.
+        let many = format!(
+            "track=true|false|0|desktop|D\n{}",
+            "filter=true|gain\n".repeat(MAX_FILTERS + 2)
+        );
+        assert_eq!(defaults().parse(&many).tracks[0].filters.len(), MAX_FILTERS);
     }
 
     #[test]

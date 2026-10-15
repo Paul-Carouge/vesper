@@ -15,17 +15,19 @@
 //! A change of structure (filters added, removed, reordered, or a limiter
 //! lookahead change, which changes the latency) needs a new [`Chain`]: build
 //! it off the audio thread, hand it over, and drop the old one off the audio
-//! thread too.
+//! thread too: [`live`] does both, with a lock-free handover.
 
 mod biquad;
 mod denoise;
 mod dynamics;
 mod limiter;
+mod live;
 mod spec;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
+pub use live::{LiveChain, LiveControl, live};
 pub use spec::{FilterSpec, MAX_PARAMS, ParseError};
 
 /// Sample rate of every filter (RNNoise only runs at 48 kHz).
@@ -46,6 +48,11 @@ pub trait Filter {
     /// filter glides to it over a few ms. Real-time safe; parameters that
     /// would change the latency are ignored.
     fn set_param(&mut self, index: usize, value: f32);
+    /// Gain reduction at the end of the last block, dB (0 for filters
+    /// that do not reduce dynamics). For meters.
+    fn reduction_db(&self) -> f32 {
+        0.0
+    }
 }
 
 /// Parameter values published by a [`ChainControl`] for one filter.
@@ -55,6 +62,8 @@ struct Params {
     dirty: AtomicU32,
     /// `f32` bits.
     values: [AtomicU32; MAX_PARAMS],
+    /// `f32` bits of the filter's last [`Filter::reduction_db`].
+    reduction: AtomicU32,
 }
 
 /// An ordered list of filters, run on the audio thread.
@@ -98,6 +107,10 @@ impl Chain {
                 }
             }
             filter.process(buf);
+            let reduction = filter.reduction_db().max(0.0);
+            params
+                .reduction
+                .store(reduction.to_bits(), Ordering::Relaxed);
         }
     }
 
@@ -164,6 +177,14 @@ impl ChainControl {
         params.dirty.fetch_or(dirty, Ordering::Release);
         *old = new;
         true
+    }
+
+    /// Gain reduction of filter `index` after the chain's last block, dB
+    /// (0 for filters without one, or no filter `index`).
+    pub fn reduction_db(&self, index: usize) -> f32 {
+        self.params
+            .get(index)
+            .map_or(0.0, |p| f32::from_bits(p.reduction.load(Ordering::Relaxed)))
     }
 }
 

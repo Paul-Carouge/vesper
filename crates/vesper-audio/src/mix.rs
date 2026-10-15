@@ -5,6 +5,9 @@
 //! queues position by position. It advances as far as the slowest open
 //! input; a stalled source still advances, filled with silence by its own
 //! encode thread, so the mix lags by at most about that stall timeout.
+//!
+//! A true-peak limiter (ceiling [`CEILING_DB`] dBTP) keeps a loud sum from
+//! clipping; the encoder removes its lookahead delay from the timeline.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -12,9 +15,33 @@ use std::time::Duration;
 
 use vesper_core::EncodedPacket;
 
-use crate::{Encoder, Result, Shared, open_encoder, opus_head};
+use vesper_dsp::{Chain, FilterSpec};
+
+use crate::{CHANNELS, Encoder, Result, Shared, open_encoder, opus_head};
 
 type OnPacket = Box<dyn FnMut(EncodedPacket) + Send>;
+
+/// Ceiling of the mix's limiter, dBTP.
+pub const CEILING_DB: f32 = -1.0;
+
+/// The mix's limiter, as an encoder [`crate::Process`].
+fn limiter() -> crate::Process {
+    let spec = FilterSpec::Limiter {
+        ceiling_db: CEILING_DB,
+        release_ms: 60.0,
+        lookahead_ms: 2.0,
+    };
+    let (mut chain, _) = Chain::new(&[spec], usize::from(CHANNELS));
+    let mut warm = false;
+    Box::new(move |buf| {
+        if !warm {
+            warm = true;
+            chain.warm_up();
+        }
+        chain.process(buf);
+        chain.latency()
+    })
+}
 
 #[derive(Default)]
 struct Queue {
@@ -55,11 +82,6 @@ impl State {
                 *s += x;
             }
         }
-        // shortcut: hard clip so a loud sum cannot wrap or blast players;
-        // replace with the DSP limiter once per-track chains are wired.
-        for s in &mut self.sum {
-            *s = s.clamp(-1.0, 1.0);
-        }
         if let Some(enc) = &mut self.enc {
             enc.push(&self.sum);
         }
@@ -86,7 +108,8 @@ impl Mix {
         let encoder = open_encoder()?;
         let extradata = opus_head(&encoder)?;
         let on_packet: OnPacket = Box::new(on_packet);
-        let enc = Encoder::new(encoder, anchor, Arc::new(Shared::default()), on_packet);
+        let mut enc = Encoder::new(encoder, anchor, Arc::new(Shared::default()), on_packet);
+        enc.process = Some(limiter());
         Ok(Self {
             state: Arc::new(Mutex::new(State {
                 inputs: Vec::new(),
@@ -155,34 +178,9 @@ impl Drop for MixInput {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{CHANNELS, FRAME};
+    use crate::FRAME;
+    use crate::tests::decode;
     use std::sync::mpsc;
-
-    /// Decodes the mix's packets back to interleaved samples.
-    fn decode(head: &[u8], packets: &[EncodedPacket]) -> Vec<f32> {
-        use ffmpeg_next as ffmpeg;
-        let codec = ffmpeg::decoder::find(ffmpeg::codec::Id::OPUS).unwrap();
-        let mut ctx = ffmpeg::codec::Context::new_with_codec(codec);
-        unsafe {
-            let raw = ctx.as_mut_ptr();
-            let buf = ffmpeg::ffi::av_mallocz(head.len() + 64) as *mut u8;
-            std::ptr::copy_nonoverlapping(head.as_ptr(), buf, head.len());
-            (*raw).extradata = buf;
-            (*raw).extradata_size = head.len() as i32;
-        }
-        let mut dec = ctx.decoder().audio().unwrap();
-        let mut out = Vec::new();
-        let mut frame = ffmpeg::frame::Audio::empty();
-        for p in packets {
-            dec.send_packet(&ffmpeg::Packet::copy(&p.data)).unwrap();
-            while dec.receive_frame(&mut frame).is_ok() {
-                // libopus decodes to planar or packed float: read channel 0.
-                let plane: &[f32] = frame.plane(0);
-                out.extend_from_slice(&plane[..frame.samples()]);
-            }
-        }
-        out
-    }
 
     #[test]
     fn mix_sums_aligned_inputs_and_waits_for_the_slowest() {
@@ -220,13 +218,22 @@ mod tests {
     }
 
     #[test]
-    fn mix_is_clipped_to_full_scale() {
+    fn mix_is_limited_to_the_ceiling() {
         let mix = Mix::start(Duration::ZERO, |_| {}).unwrap();
         let (a, b) = (mix.input(), mix.input());
-        a.push(&[0.75, -0.75, 0.25, 0.0]);
-        // Pushed with the lock held only by us: read the sum it produced.
-        b.push(&[0.75, -0.75, 0.25, 0.0]);
-        assert_eq!(lock(&mix.state).sum, [1.0, -1.0, 0.5, 0.0]);
+        // Two in-phase full-scale 1 kHz sines: the sum peaks at +6 dBFS.
+        let sine: Vec<f32> = (0..48_000)
+            .flat_map(|i| [(i as f32 * 1_000.0 / 48_000.0 * std::f32::consts::TAU).sin(); 2])
+            .collect();
+        a.push(&sine);
+        b.push(&sine);
+        // The peak of the last meter window, as sent to the encoder.
+        let state = lock(&mix.state);
+        let shared = &state.enc.as_ref().unwrap().shared;
+        let peak = f32::from_bits(shared.peak.load(std::sync::atomic::Ordering::Relaxed));
+        let ceiling = 10f32.powf(CEILING_DB / 20.0);
+        assert!(peak <= ceiling + 1e-6, "{peak}");
+        assert!(peak > ceiling * 0.95, "{peak}");
     }
 
     #[test]

@@ -40,7 +40,8 @@ macro_rules! specs {
                 match self { $( Self::$variant { .. } => &[$( stringify!($field), )+], )+ }
             }
 
-            fn ranges(&self) -> &'static [(f32, f32)] {
+            /// Valid `(min, max)` of each parameter, in [`Self::param_names`] order.
+            pub fn ranges(&self) -> &'static [(f32, f32)] {
                 match self { $( Self::$variant { .. } => &[$( ($min, $max), )+], )+ }
             }
 
@@ -157,8 +158,17 @@ impl FilterSpec {
         self
     }
 
+    /// The same filter with parameter `i` set to `value` (clamped; NaN:
+    /// the default). An index past the parameters changes nothing.
+    pub fn with(mut self, i: usize, value: f32) -> Self {
+        if i < self.param_names().len() {
+            *self.value_mut(i) = value;
+        }
+        self.clamped()
+    }
+
     /// Whether parameter `i` sets the latency (a change needs a new filter).
-    pub(crate) fn is_structural(&self, i: usize) -> bool {
+    pub fn is_structural(&self, i: usize) -> bool {
         matches!(self, Self::Limiter { .. }) && i == 2
     }
 
@@ -313,6 +323,9 @@ mod tests {
         );
         let nan = FilterSpec::Gain { db: f32::NAN }.clamped();
         assert_eq!(nan, FilterSpec::Gain { db: 0.0 });
+        let gain = FilterSpec::Gain { db: 0.0 };
+        assert_eq!(gain.with(0, 99.0), FilterSpec::Gain { db: 24.0 });
+        assert_eq!(gain.with(1, 3.0), gain);
     }
 
     #[test]

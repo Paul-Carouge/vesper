@@ -22,6 +22,7 @@ vesper-capture.workspace = true
 vesper-encode.workspace = true
 vesper-mux.workspace = true
 vesper-audio.workspace = true
+vesper-dsp.workspace = true
 vesper-gamecapture.workspace = true
 
 [build-dependencies]
