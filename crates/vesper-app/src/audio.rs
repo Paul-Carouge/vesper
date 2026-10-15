@@ -56,26 +56,66 @@ pub fn chosen_source(choice: &DeviceChoice, mic: bool) -> Source {
     }
 }
 
+/// What a track on `source` records: Desktop audio and Microphone on these.
+fn resolved(source: &Source, desktop: &Source, mic: &Source) -> Source {
+    match source {
+        Source::Desktop => desktop.clone(),
+        Source::Microphone => mic.clone(),
+        other => other.clone(),
+    }
+}
+
 /// `tracks` with the Desktop audio and Microphone ones on these sources.
 pub fn resolve(mut tracks: Vec<Track>, desktop: &Source, mic: &Source) -> Vec<Track> {
     for track in &mut tracks {
-        match track.source {
-            Source::Desktop => track.source = desktop.clone(),
-            Source::Microphone => track.source = mic.clone(),
-            _ => {}
-        }
+        track.source = resolved(&track.source, desktop, mic);
     }
     tracks
+}
+
+/// What Desktop audio and Microphone tracks record now.
+fn chosen_sources(ui: &AppWindow) -> (Source, Source) {
+    (
+        chosen_source(&ui.get_desktop_device(), false),
+        chosen_source(&ui.get_mic_device(), true),
+    )
+}
+
+/// Whether one of `tracks` records what a track on `source` would: one
+/// track per node.
+fn recorded(tracks: &[Track], source: &Source, desktop: &Source, mic: &Source) -> bool {
+    let source = resolved(source, desktop, mic);
+    tracks
+        .iter()
+        .any(|t| resolved(&t.source, desktop, mic) == source)
+}
+
+/// Whether choosing `device` for the Desktop audio (`mic` false) or
+/// Microphone tracks would record it twice: such a track exists and
+/// another track records `device` already.
+fn device_taken(
+    tracks: &[Track],
+    mic: bool,
+    device: &Source,
+    desktop: &Source,
+    mic_src: &Source,
+) -> bool {
+    let follows = if mic {
+        Source::Microphone
+    } else {
+        Source::Desktop
+    };
+    tracks.iter().any(|t| t.source == follows)
+        && tracks
+            .iter()
+            .any(|t| t.source != follows && &resolved(&t.source, desktop, mic_src) == device)
 }
 
 /// The tracks as they are recorded: Desktop audio and Microphone on the
 /// devices chosen in the settings.
 pub fn recorded_tracks(ui: &AppWindow) -> Vec<Track> {
-    resolve(
-        tracks_from_ui(ui),
-        &chosen_source(&ui.get_desktop_device(), false),
-        &chosen_source(&ui.get_mic_device(), true),
-    )
+    let (desktop, mic) = chosen_sources(ui);
+    resolve(tracks_from_ui(ui), &desktop, &mic)
 }
 
 /// A device's label, and whether it is plugged in (true while unknown).
@@ -255,16 +295,23 @@ fn options(
         _ => "DESKTOP AND MICROPHONE",
     };
     let listed = nodes.iter().map(|n| (n, default_mark(n)));
+    let (desktop, mic) = (chosen_source(desktop, false), chosen_source(mic, true));
     grouped(
         defaults.iter().map(|(n, d)| (n, d.clone())).chain(listed),
         heading,
-        |source| tracks.iter().any(|t| &t.source == source),
+        |source| recorded(tracks, source, &desktop, &mic),
     )
 }
 
 /// The choices of the Desktop audio (`mic` false) or Microphone device: the
 /// system default, then the devices, the chosen one listed even unplugged.
-fn device_options(nodes: &[Node], mic: bool, choice: &DeviceChoice) -> Vec<SourceOption> {
+/// `taken`: choosing it would record a node twice.
+fn device_options(
+    nodes: &[Node],
+    mic: bool,
+    choice: &DeviceChoice,
+    taken: impl Fn(&Source) -> bool,
+) -> Vec<SourceOption> {
     let (default, heading) = if mic {
         (Source::Microphone, "INPUT DEVICES")
     } else {
@@ -292,27 +339,52 @@ fn device_options(nodes: &[Node], mic: bool, choice: &DeviceChoice) -> Vec<Sourc
                 heading
             }
         },
-        |_| false,
+        taken,
     )
+}
+
+/// `choice` as `nodes` show it: plugged in or not, with the device's
+/// current label. True if the label changed (it is saved with the choice).
+fn listed_choice(choice: &mut DeviceChoice, mic: bool, nodes: &[Node]) -> bool {
+    let source = chosen_source(choice, mic);
+    let node = nodes.iter().find(|n| n.source == source);
+    choice.connected = choice.name.is_empty() || node.is_some();
+    match node.and_then(|n| Device::new(&choice.name, &n.label)) {
+        Some(device) if device.label != choice.label.as_str() => {
+            choice.label = device.label.into();
+            true
+        }
+        _ => false,
+    }
 }
 
 /// Shows `nodes` in the pickers, the device selectors and the tracks.
 fn show_sources(ui: &AppWindow, nodes: &[Node]) {
-    let plugged = |mut choice: DeviceChoice, mic: bool| {
-        let source = chosen_source(&choice, mic);
-        choice.connected = choice.name.is_empty() || nodes.iter().any(|n| n.source == source);
-        choice
-    };
-    let desktop = plugged(ui.get_desktop_device(), false);
-    let mic = plugged(ui.get_mic_device(), true);
+    let (mut desktop, mut mic) = (ui.get_desktop_device(), ui.get_mic_device());
+    let relabeled =
+        listed_choice(&mut desktop, false, nodes) | listed_choice(&mut mic, true, nodes);
     let model = |options: Vec<SourceOption>| ModelRc::new(VecModel::from(options));
-    let options = options(nodes, &tracks_from_ui(ui), &desktop, &mic);
+    let tracks = tracks_from_ui(ui);
+    let options = options(nodes, &tracks, &desktop, &mic);
     ui.set_apps_playing(options.iter().any(|o| o.kind == TrackKind::App));
     ui.set_source_options(model(options));
-    ui.set_desktop_device_options(model(device_options(nodes, false, &desktop)));
-    ui.set_mic_device_options(model(device_options(nodes, true, &mic)));
+    let (desktop_src, mic_src) = (chosen_source(&desktop, false), chosen_source(&mic, true));
+    for on_mic in [false, true] {
+        let choice = if on_mic { &mic } else { &desktop };
+        let list = device_options(nodes, on_mic, choice, |s| {
+            device_taken(&tracks, on_mic, s, &desktop_src, &mic_src)
+        });
+        if on_mic {
+            ui.set_mic_device_options(model(list));
+        } else {
+            ui.set_desktop_device_options(model(list));
+        }
+    }
     ui.set_desktop_device(desktop);
     ui.set_mic_device(mic);
+    if relabeled {
+        Prefs::from_ui(ui).save();
+    }
     refresh_rows(ui);
 }
 
@@ -474,7 +546,8 @@ pub fn wire(ui: &AppWindow, rec: &Shared) {
         let Some(source) = prefs::audio_source_from_id(&option.source) else {
             return;
         };
-        if tracks.len() >= MAX_TRACKS || tracks.iter().any(|t| t.source == source) {
+        let (desktop, mic) = chosen_sources(&ui);
+        if tracks.len() >= MAX_TRACKS || recorded(&tracks, &source, &desktop, &mic) {
             return;
         }
         let name = clean_name(&option.label).unwrap_or_else(|| "Track".into());
@@ -505,7 +578,8 @@ pub fn wire(ui: &AppWindow, rec: &Shared) {
             return;
         };
         // One track per source, as "Add track" has it.
-        if tracks.iter().any(|t| t.source == source) {
+        let (desktop, mic) = chosen_sources(&ui);
+        if recorded(&tracks, &source, &desktop, &mic) {
             return;
         }
         log!("track-source: {} ({})", tracks[i].name, option.source);
@@ -533,7 +607,15 @@ pub fn wire(ui: &AppWindow, rec: &Shared) {
         } else {
             ui.get_desktop_device()
         };
-        if choice.name == old.name {
+        let (desktop, mic_src) = chosen_sources(&ui);
+        let taken = device_taken(
+            &tracks_from_ui(&ui),
+            mic,
+            &chosen_source(&choice, mic),
+            &desktop,
+            &mic_src,
+        );
+        if choice.name == old.name || taken {
             return;
         }
         log!("device-chosen: {}", option.source);
@@ -699,7 +781,7 @@ mod tests {
 
     #[test]
     fn device_selectors_list_their_kind_and_keep_an_unplugged_choice() {
-        let desktop = device_options(&nodes(), false, &choice("", "", true));
+        let desktop = device_options(&nodes(), false, &choice("", "", true), |_| false);
         assert_eq!(
             column(&desktop, |o| o.label.to_string()),
             ["System default", "Headset", "Speakers"]
@@ -715,7 +797,7 @@ mod tests {
         assert_eq!(desktop[0].source, "desktop");
 
         let gone = choice("usb", "USB Interface", false);
-        let mic = device_options(&nodes(), true, &gone);
+        let mic = device_options(&nodes(), true, &gone, |_| false);
         assert_eq!(
             column(&mic, |o| (
                 o.label.to_string(),
@@ -732,6 +814,58 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn a_node_is_recorded_by_one_track_only() {
+        let dac = choice("b", "Speakers", true);
+        let none = choice("", "", true);
+        // Desktop audio on "b": "b" itself is taken, and the other way round.
+        let tracks = [Track::new("Desktop", Source::Desktop)];
+        let list = options(&nodes(), &tracks, &dac, &none);
+        let added = |label: &str| list.iter().find(|o| o.label == label).unwrap().added;
+        assert!(added("Desktop audio") && added("Speakers") && !added("Headset"));
+        let tracks = [Track::new("Speakers", Source::Output("b".into()))];
+        let list = super::options(&nodes(), &tracks, &dac, &none);
+        assert!(list[0].added);
+
+        // Choosing "b" for Desktop audio while a track records it: only with
+        // a Desktop audio track would it be recorded twice.
+        let b = Source::Output("b".into());
+        let (desktop, mic) = (Source::Desktop, Source::Microphone);
+        let mut tracks = vec![Track::new("Speakers", b.clone())];
+        assert!(!device_taken(&tracks, false, &b, &desktop, &mic));
+        tracks.push(Track::new("Desktop", Source::Desktop));
+        assert!(device_taken(&tracks, false, &b, &desktop, &mic));
+        assert!(!device_taken(
+            &tracks,
+            false,
+            &Source::Output("a".into()),
+            &desktop,
+            &mic
+        ));
+        assert!(!device_taken(
+            &tracks,
+            true,
+            &Source::Input("m".into()),
+            &desktop,
+            &mic
+        ));
+        let list = device_options(&nodes(), false, &none, |s| {
+            device_taken(&tracks, false, s, &desktop, &mic)
+        });
+        assert_eq!(column(&list, |o| o.added), [false, false, true]);
+    }
+
+    #[test]
+    fn a_chosen_device_takes_its_listed_label() {
+        let mut stale = choice("b", "Old name", true);
+        assert!(listed_choice(&mut stale, false, &nodes()));
+        assert_eq!((stale.label.as_str(), stale.connected), ("Speakers", true));
+        assert!(!listed_choice(&mut stale, false, &nodes()));
+        let mut gone = choice("x", "Kept", true);
+        assert!(!listed_choice(&mut gone, false, &nodes()));
+        assert_eq!((gone.label.as_str(), gone.connected), ("Kept", false));
     }
 
     #[test]

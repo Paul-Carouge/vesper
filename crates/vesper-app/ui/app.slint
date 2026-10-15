@@ -283,6 +283,8 @@ component SourceRow inherits FocusScope {
     in property <SourceOption> option;
     in property <bool> choosing;
     in property <bool> selected;
+    // Focused once shown (a list opened from the keyboard).
+    in property <bool> take-focus;
     callback clicked;
     // Escape: the list closes.
     callback cancel;
@@ -292,6 +294,12 @@ component SourceRow inherits FocusScope {
     property <string> spoken: root.option.detail != "" ? "\{root.option.label} (\{root.option.detail})" : root.option.label;
     // Desktop audio and Microphone name their device under the label.
     property <bool> below: root.option.detail != "" && (root.option.kind == TrackKind.desktop || root.option.kind == TrackKind.microphone);
+
+    init => {
+        if (self.take-focus) {
+            self.focus();
+        }
+    }
 
     focus-on-click: false;
     height: root.below ? 44px : 36px;
@@ -398,13 +406,16 @@ component SourceList inherits VerticalLayout {
     in property <bool> choosing;
     in property <string> current;
     in property <string> label;
+    // Opened from the keyboard: the current row (else the first) takes
+    // focus, again when the rows are refreshed.
+    in property <bool> focus-current;
     callback picked(SourceOption);
     callback cancel;
 
     spacing: 2px;
     accessible-role: list;
     accessible-label: root.label;
-    for option in root.options: VerticalLayout {
+    for option[k] in root.options: VerticalLayout {
         spacing: 2px;
         if option.section != "": SectionLabel {
             x: Theme.space-sm;
@@ -416,6 +427,8 @@ component SourceList inherits VerticalLayout {
             option: option;
             choosing: root.choosing;
             selected: root.choosing && option.source == root.current;
+            // The first row, then the current one, later, takes it over.
+            take-focus: root.focus-current && (k == 0 || self.selected);
             clicked => {
                 root.picked(option);
             }
@@ -460,6 +473,7 @@ component DevicePicker inherits VerticalLayout {
     }
     if root.open: SourceList {
         options: root.options;
+        focus-current: field.keyboard;
         choosing: true;
         current: root.choice.name == "" ? root.default-source : (root.default-source == "desktop" ? "output:" : "input:") + root.choice.name;
         label: root.title;
@@ -1512,6 +1526,7 @@ export component AppWindow inherits Window {
                                 }
                                 if root.choosing-source: SourceList {
                                     options: root.source-options;
+                                    focus-current: source-field.keyboard;
                                     choosing: true;
                                     current: track.source;
                                     label: "Sources for \{track.name}";
@@ -1651,7 +1666,7 @@ export component AppWindow inherits Window {
                                         clicked => {
                                             // Its name no longer matters.
                                             root.name-draft-track = -1;
-                                            root.open-track = -1;
+                                            root.close-track();
                                             root.track-removed(i);
                                         }
                                     }

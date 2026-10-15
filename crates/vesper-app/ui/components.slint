@@ -581,6 +581,8 @@ export component SelectField inherits FocusScope {
     in property <bool> expanded;
     in property <bool> warn;
     in property <string> description;
+    // The last activation came from the keyboard: the list should take focus.
+    out property <bool> keyboard;
     callback clicked;
 
     focus-on-click: false;
@@ -600,7 +602,10 @@ export component SelectField inherits FocusScope {
 
     key-pressed(event) => {
         if (event.text == Key.Space || event.text == Key.Return || (event.text == Key.DownArrow && !root.expanded) || (event.text == Key.Escape && root.expanded)) {
-            if (root.enabled) { root.clicked(); }
+            if (root.enabled) {
+                root.keyboard = true;
+                root.clicked();
+            }
             return accept;
         }
         reject
@@ -653,6 +658,11 @@ export component SelectField inherits FocusScope {
         enabled: root.enabled;
         mouse-cursor: root.enabled ? pointer : default;
         clicked => {
+            root.keyboard = false;
+            // Closing: focus leaves the list for the field.
+            if (root.expanded) {
+                root.focus();
+            }
             root.clicked();
         }
     }
