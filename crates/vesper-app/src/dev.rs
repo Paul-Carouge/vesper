@@ -5,6 +5,11 @@
 //!   for `,`). `recording-look` fakes the recording state (no capture).
 //!   `saved` shows the saved-file notice and `notify` sends the desktop
 //!   notification, both for `VESPER_DEMO_FILE`.
+//!   Looks without a capture or a game, for screenshots: `screen-look`,
+//!   `game-look`, `consent-look`, `starting-look`, `stopping-look`, `layer-installed`, `layer-missing`,
+//!   `replay-on`, `replay-off`; `scroll-end` scrolls the settings to the end.
+//! - `VESPER_SNAPSHOT=<file.ppm>` saves the window as a PPM image once the
+//!   demo settled, then quits. Nothing outside the window is captured.
 //! - `VESPER_DEMO_DELAY=<ms>` runs `VESPER_DEMO` that long after launch
 //!   (default 300), e.g. once a game asks for consent (`allow`, `ignore`).
 //! - `vesper --record <seconds>` records without the UI, from the saved
@@ -133,6 +138,9 @@ pub fn apply(ui: &AppWindow) {
     slint::Timer::single_shot(Duration::from_millis(delay), move || {
         let Some(ui) = weak.upgrade() else { return };
         for step in demo.split(',') {
+            if look(&ui, step.trim()) {
+                continue;
+            }
             match step.trim() {
                 "source" => ui.invoke_pick_source(),
                 "recording" => ui.invoke_start_recording(),
@@ -141,19 +149,28 @@ pub fn apply(ui: &AppWindow) {
                 "allow" => ui.invoke_allow_game(),
                 "ignore" => ui.invoke_ignore_game(),
                 "browse" => ui.invoke_pick_output_folder(),
-                // The recording look without a capture, for screenshots.
-                "recording-look" => {
-                    ui.set_rec_state(crate::RecState::Recording);
-                    ui.set_elapsed_seconds(83);
-                    ui.set_measured_fps(59.9);
-                    ui.set_resolution("3840×2160".into());
-                }
                 "saved" => crate::show_notice(&ui, "Replay saved", Some(demo_file())),
                 "notify" => crate::desktop::notify(
                     "Replay saved".into(),
                     demo_file().display().to_string(),
                     Some(demo_file()),
                 ),
+                "scroll-end" => {
+                    let weak = ui.as_weak();
+                    slint::Timer::single_shot(Duration::from_millis(400), move || {
+                        let Some(ui) = weak.upgrade() else { return };
+                        let size = ui.window().size().to_logical(ui.window().scale_factor());
+                        let position =
+                            slint::LogicalPosition::new(size.width - 40.0, size.height / 2.0);
+                        let window = ui.window();
+                        window.dispatch_event(WindowEvent::PointerMoved { position });
+                        window.dispatch_event(WindowEvent::PointerScrolled {
+                            position,
+                            delta_x: 0.0,
+                            delta_y: -5000.0,
+                        });
+                    });
+                }
                 "muted" => {
                     ui.set_mic_muted(true);
                     ui.invoke_mic_mute_changed(true);
@@ -168,6 +185,77 @@ pub fn apply(ui: &AppWindow) {
             }
         }
     });
+    if let Ok(path) = std::env::var("VESPER_SNAPSHOT") {
+        let weak = ui.as_weak();
+        slint::Timer::single_shot(Duration::from_millis(delay + 1200), move || {
+            let Some(ui) = weak.upgrade() else { return };
+            // Again: the games tick may have reset a game look meanwhile.
+            let demo = std::env::var("VESPER_DEMO").unwrap_or_default();
+            for step in demo.split(',') {
+                look(&ui, step.trim());
+            }
+            match ui.window().take_snapshot() {
+                Ok(image) => {
+                    let mut ppm =
+                        format!("P6\n{} {}\n255\n", image.width(), image.height()).into_bytes();
+                    ppm.extend(image.as_slice().iter().flat_map(|p| [p.r, p.g, p.b]));
+                    if let Err(e) = std::fs::write(&path, ppm) {
+                        log!("VESPER_SNAPSHOT: {e}");
+                    }
+                }
+                Err(e) => log!("VESPER_SNAPSHOT: {e}"),
+            }
+            drop(slint::quit_event_loop());
+        });
+    }
+}
+
+/// Applies a look step: UI state only, no capture. False for other steps.
+fn look(ui: &AppWindow, step: &str) -> bool {
+    match step {
+        // The recording look without a capture, for screenshots.
+        "recording-look" => {
+            ui.set_rec_state(crate::RecState::Recording);
+            ui.set_elapsed_seconds(83);
+            ui.set_measured_fps(59.9);
+            ui.set_resolution("3840×2160".into());
+        }
+        "screen-look" => {
+            ui.set_source_kind(crate::SourceKind::Screen);
+            ui.set_source_name("DP-1".into());
+            ui.set_source_detail("2560 × 1440".into());
+        }
+        "game-look" => {
+            ui.set_source_kind(crate::SourceKind::Game);
+            ui.set_game_layer_installed(true);
+            ui.set_source_name("eldenring.exe".into());
+            ui.set_source_detail("3840 × 2160".into());
+            let others = [crate::GameEntry {
+                name: "factorio".into(),
+                pid: 4242,
+            }];
+            ui.set_other_games(std::rc::Rc::new(slint::VecModel::from(others.to_vec())).into());
+        }
+        "consent-look" => {
+            ui.set_game_layer_installed(true);
+            ui.set_pending_game("eldenring.exe".into());
+        }
+        "layer-installed" => ui.set_game_layer_installed(true),
+        "layer-missing" => {
+            ui.set_game_layer_installed(false);
+            ui.set_game_layer_available(false);
+        }
+        "starting-look" => ui.set_rec_state(crate::RecState::Starting),
+        "stopping-look" => {
+            ui.set_measured_fps(59.9);
+            ui.set_rec_state(crate::RecState::Stopping);
+            ui.set_elapsed_seconds(83);
+        }
+        "replay-on" => ui.set_replay_enabled(true),
+        "replay-off" => ui.set_replay_enabled(false),
+        _ => return false,
+    }
+    true
 }
 
 fn demo_file() -> PathBuf {
