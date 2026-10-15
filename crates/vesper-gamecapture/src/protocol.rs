@@ -13,12 +13,12 @@
 //! `Release` when it is done with a buffer, and `Stop` to make the layer
 //! dormant again.
 
-use std::ffi::OsStr;
+use std::ffi::{CString, OsStr};
 use std::io;
 use std::mem::{size_of, zeroed};
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Bumped on any incompatible change. Peers with another version are ignored.
 pub const VERSION: u32 = 1;
@@ -246,13 +246,13 @@ impl Msg {
     }
 }
 
-/// Name of the server socket in the Linux abstract namespace (no file):
-/// `vesper/capture/<uid>`. Abstract sockets belong to the network namespace,
-/// not to the filesystem, so games in containers that hide
-/// `$XDG_RUNTIME_DIR` (Steam Linux Runtime / pressure-vessel) still reach it.
-/// They have no file permissions: both ends check the peer's uid instead.
-pub fn socket_name() -> Vec<u8> {
-    format!("vesper/capture/{}", unsafe { libc::getuid() }).into_bytes()
+/// `/tmp/vesper-<uid>/capture.sock`. Not `$XDG_RUNTIME_DIR`: the Steam
+/// Linux Runtime container (pressure-vessel) replaces it with its own tmpfs
+/// but shares the host's `/tmp`. Flatpak apps get a private `/tmp`, so
+/// unlike an abstract socket they cannot reach it.
+pub fn socket_path() -> PathBuf {
+    let uid = unsafe { libc::getuid() };
+    PathBuf::from(format!("/tmp/vesper-{uid}/capture.sock"))
 }
 
 fn cvt(ret: libc::c_int) -> io::Result<libc::c_int> {
@@ -263,43 +263,49 @@ fn cvt(ret: libc::c_int) -> io::Result<libc::c_int> {
     }
 }
 
-/// Abstract address: `sun_path` starts with a NUL and the name is not
-/// NUL-terminated; the address length delimits it.
-fn sockaddr(name: &[u8]) -> io::Result<(libc::sockaddr_un, libc::socklen_t)> {
+fn sockaddr(path: &Path) -> io::Result<(libc::sockaddr_un, libc::socklen_t)> {
     let mut addr: libc::sockaddr_un = unsafe { zeroed() };
     addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
-    if name.len() >= addr.sun_path.len() {
+    let bytes = path.as_os_str().as_bytes();
+    if bytes.len() >= addr.sun_path.len() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "socket name too long",
+            "socket path too long",
         ));
     }
-    for (d, s) in addr.sun_path[1..].iter_mut().zip(name) {
+    for (d, s) in addr.sun_path.iter_mut().zip(bytes) {
         *d = *s as libc::c_char;
     }
-    let len = std::mem::offset_of!(libc::sockaddr_un, sun_path) + 1 + name.len();
+    let len = size_of::<libc::sa_family_t>() + bytes.len() + 1;
     Ok((addr, len as libc::socklen_t))
 }
 
-fn seqpacket() -> io::Result<OwnedFd> {
-    let fd =
-        cvt(unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC, 0) })?;
+fn seqpacket(flags: libc::c_int) -> io::Result<OwnedFd> {
+    let fd = cvt(unsafe {
+        libc::socket(
+            libc::AF_UNIX,
+            libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC | flags,
+            0,
+        )
+    })?;
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
-/// Connects to the server (blocking socket; use `MSG_DONTWAIT` per call).
-pub fn connect(name: &[u8]) -> io::Result<OwnedFd> {
-    let (addr, len) = sockaddr(name)?;
-    let fd = seqpacket()?;
+/// Connects to the server and returns a blocking socket (use `MSG_DONTWAIT`
+/// per call). Never waits: a full backlog fails with `WouldBlock`.
+pub fn connect(path: &Path) -> io::Result<OwnedFd> {
+    let (addr, len) = sockaddr(path)?;
+    let fd = seqpacket(libc::SOCK_NONBLOCK)?;
     cvt(unsafe { libc::connect(fd.as_raw_fd(), (&raw const addr).cast(), len) })?;
+    let flags = cvt(unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) })?;
+    cvt(unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags & !libc::O_NONBLOCK) })?;
     Ok(fd)
 }
 
-/// Binds and listens on the abstract `name`. Fails with `AddrInUse` while
-/// another socket holds it; the name is freed when that socket closes.
-pub fn listen(name: &[u8]) -> io::Result<OwnedFd> {
-    let (addr, len) = sockaddr(name)?;
-    let fd = seqpacket()?;
+/// Binds and listens on `path`. The caller removes stale sockets first.
+pub fn listen(path: &Path) -> io::Result<OwnedFd> {
+    let (addr, len) = sockaddr(path)?;
+    let fd = seqpacket(0)?;
     cvt(unsafe { libc::bind(fd.as_raw_fd(), (&raw const addr).cast(), len) })?;
     cvt(unsafe { libc::listen(fd.as_raw_fd(), 8) })?;
     Ok(fd)
@@ -462,6 +468,36 @@ pub fn is_sync_file(fd: BorrowedFd) -> bool {
         .is_ok_and(|p| p.as_os_str().as_bytes() == b"anon_inode:sync_file")
 }
 
+/// Creates `dir` with mode 0700 if missing, then checks it is a real
+/// directory owned by this user with mode 0700 (not a symlink). In `/tmp`
+/// another user can create it first: that only denies service.
+pub(crate) fn create_private_dir(dir: &Path) -> io::Result<()> {
+    let c = CString::new(dir.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "nul in path"))?;
+    if unsafe { libc::mkdir(c.as_ptr(), 0o700) } < 0 {
+        let e = io::Error::last_os_error();
+        if e.kind() != io::ErrorKind::AlreadyExists {
+            return Err(e);
+        }
+    }
+    let mut st: libc::stat = unsafe { zeroed() };
+    cvt(unsafe { libc::lstat(c.as_ptr(), &mut st) })?;
+    if st.st_mode & libc::S_IFMT != libc::S_IFDIR
+        || st.st_uid != unsafe { libc::getuid() }
+        || st.st_mode & 0o777 != 0o700
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "{} is not a private directory of this user (owner, mode 0700, no symlink); \
+                 remove it to enable game capture",
+                dir.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -570,21 +606,47 @@ mod tests {
     }
 
     #[test]
-    fn encodes_abstract_addresses() {
-        let (addr, len) = sockaddr(b"vesper/capture/1000").unwrap();
-        let off = std::mem::offset_of!(libc::sockaddr_un, sun_path);
-        assert_eq!(len as usize, off + 1 + 19);
-        assert_eq!(addr.sun_family, libc::AF_UNIX as libc::sa_family_t);
-        let path: Vec<u8> = addr.sun_path[..21].iter().map(|c| *c as u8).collect();
-        assert_eq!(path, b"\0vesper/capture/1000\0");
+    fn socket_dir_must_be_private() {
+        use std::os::unix::fs::PermissionsExt;
         assert_eq!(
-            socket_name(),
-            format!("vesper/capture/{}", unsafe { libc::getuid() }).into_bytes()
+            socket_path(),
+            PathBuf::from(format!("/tmp/vesper-{}/capture.sock", unsafe {
+                libc::getuid()
+            }))
         );
-        // The leading NUL takes one byte of sun_path.
-        let max = addr.sun_path.len() - 1;
-        assert!(sockaddr(&vec![b'a'; max]).is_ok());
-        assert!(sockaddr(&vec![b'a'; max + 1]).is_err());
+        let base = std::env::temp_dir().join(format!("vesper-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir(&base).unwrap();
+        let dir = base.join("ok");
+        create_private_dir(&dir).unwrap();
+        create_private_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(create_private_dir(&dir).is_err());
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&dir, &link).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(create_private_dir(&link).is_err());
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn connect_never_waits_on_a_full_backlog() {
+        let path = std::env::temp_dir().join(format!("vesper-backlog-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let _listener = listen(&path).unwrap();
+        let mut held = Vec::new();
+        let err = loop {
+            match connect(&path) {
+                Ok(s) => held.push(s),
+                Err(e) => break e,
+            }
+            assert!(held.len() < 1000, "backlog never filled");
+        };
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+        // Connected sockets are blocking again.
+        let flags = unsafe { libc::fcntl(held[0].as_raw_fd(), libc::F_GETFL) };
+        assert_eq!(flags & libc::O_NONBLOCK, 0);
+        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]

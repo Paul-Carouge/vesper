@@ -1,10 +1,10 @@
 //! Game capture through Vesper's own Vulkan layer (`vesper-vklayer`).
 //!
-//! [`GameCapture::start`] listens on the abstract Unix socket
-//! `@vesper/capture/<uid>` ([`protocol::socket_name`]), reachable from Steam
-//! Runtime containers. Every Vulkan process with the layer installed
-//! connects while the server runs and reports its swapchain size. The server
-//! captures one game at a time and only with consent: Steam games (`SteamAppId` in their
+//! [`GameCapture::start`] listens on `/tmp/vesper-<uid>/capture.sock`
+//! ([`protocol::socket_path`]), reachable from Steam Runtime containers.
+//! Every Vulkan process with the layer installed connects while the server
+//! runs and reports its swapchain size. The server captures one game at a
+//! time and only with consent: Steam games (`SteamAppId` in their
 //! environment) are allowed, others wait for [`GameCapture::allow`]. Among
 //! allowed games it keeps the captured one while it sends frames (a game
 //! silent for 3 s gives way to a newer one), picks the newest otherwise, or
@@ -26,6 +26,7 @@ use std::fs::File;
 use std::io::{self, Seek, SeekFrom};
 use std::mem::ManuallyDrop;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -96,6 +97,7 @@ pub struct GameCapture {
     shared: Arc<Shared>,
     wake: OwnedFd,
     thread: Option<JoinHandle<()>>,
+    path: PathBuf,
 }
 
 impl GameCapture {
@@ -105,30 +107,26 @@ impl GameCapture {
     /// error: the server waits for the next one. It starts inactive: no
     /// game copies frames until [`GameCapture::set_active`].
     pub fn start(on_frame: impl FnMut(Result<VideoFrame>) + Send + 'static) -> Result<Self> {
-        Self::start_on(&protocol::socket_name(), on_frame)
+        Self::start_at(protocol::socket_path(), on_frame)
     }
 
-    /// [`GameCapture::start`] on another socket name (tests).
-    fn start_on(
-        name: &[u8],
+    /// [`GameCapture::start`] on another socket path (tests).
+    fn start_at(
+        path: PathBuf,
         on_frame: impl FnMut(Result<VideoFrame>) + Send + 'static,
     ) -> Result<Self> {
-        let listener = match protocol::listen(name) {
-            Ok(l) => l,
-            // Abstract names have no permissions: anyone may hold ours.
-            Err(e) if e.kind() == io::ErrorKind::AddrInUse => {
-                let ours =
-                    protocol::connect(name).is_ok_and(|s| protocol::peer_is_same_user(s.as_fd()));
-                return Err(if ours {
-                    "another Vesper instance is already capturing games".into()
-                } else {
-                    "game capture unavailable: socket name in use by another user".into()
-                });
+        protocol::create_private_dir(path.parent().expect("socket path has a parent"))?;
+        if path.exists() {
+            match protocol::connect(&path) {
+                // A full backlog is a live server too.
+                Err(e) if e.kind() != io::ErrorKind::WouldBlock => std::fs::remove_file(&path)?,
+                _ => return Err("another Vesper instance is already capturing games".into()),
             }
-            Err(e) => return Err(e.into()),
-        };
+        }
+        let listener = protocol::listen(&path)?;
         let mut pipe = [0; 2];
         if unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } < 0 {
+            let _ = std::fs::remove_file(&path);
             return Err(io::Error::last_os_error().into());
         }
         let (wake_r, wake) =
@@ -143,15 +141,20 @@ impl GameCapture {
         let s = shared.clone();
         let thread = std::thread::Builder::new()
             .name("vesper-gamecapture".into())
-            .spawn(move || Server::new(s, listener, wake_r, Box::new(on_frame)).run())?;
-        info!(
-            "game capture listening on @{}",
-            String::from_utf8_lossy(name)
-        );
+            .spawn(move || Server::new(s, listener, wake_r, Box::new(on_frame)).run());
+        let thread = match thread {
+            Ok(t) => t,
+            Err(e) => {
+                let _ = std::fs::remove_file(&path);
+                return Err(e.into());
+            }
+        };
+        info!("game capture listening on {}", path.display());
         Ok(Self {
             shared,
             wake,
             thread: Some(thread),
+            path,
         })
     }
 
@@ -213,6 +216,7 @@ impl Drop for GameCapture {
         {
             warn!("game capture thread panicked");
         }
+        let _ = std::fs::remove_file(&self.path);
     }
 }
 
@@ -276,6 +280,8 @@ struct Server {
     is_dmabuf: fn(BorrowedFd) -> bool,
     /// `alive`; replaced in tests, whose clients have made-up pids.
     alive: fn(u32) -> bool,
+    /// Uids already warned about.
+    refused_uids: Vec<u32>,
 }
 
 /// What selection needs to know about a client.
@@ -376,6 +382,7 @@ impl Server {
             is_sync_file: protocol::is_sync_file,
             is_dmabuf: protocol::is_dmabuf,
             alive,
+            refused_uids: Vec::new(),
         }
     }
 
@@ -453,7 +460,15 @@ impl Server {
         }
         let cred = match protocol::peer_cred(sock.as_fd()) {
             Ok(c) if c.uid == unsafe { libc::getuid() } => c,
-            _ => return warn!("refusing a connection from another user"),
+            other => {
+                // Once per uid: a peer must not flood the log.
+                let uid = other.map_or(u32::MAX, |c| c.uid);
+                if !self.refused_uids.contains(&uid) {
+                    self.refused_uids.push(uid);
+                    warn!("refusing connections from another user (uid {uid})");
+                }
+                return;
+            }
         };
         let pid = cred.pid.to_string();
         let exe = protocol::process_name_of(&pid);
@@ -859,10 +874,14 @@ mod tests {
     }
 
     #[test]
-    fn games_connect_over_the_abstract_socket() {
-        let name = format!("vesper/test/{}", std::process::id()).into_bytes();
-        let capture = GameCapture::start_on(&name, |_| {}).unwrap();
-        let err = GameCapture::start_on(&name, |_| {}).err().unwrap();
+    fn games_connect_over_the_socket() {
+        let dir = std::env::temp_dir().join(format!("vesper-test-{}", std::process::id()));
+        let name = dir.join("capture.sock");
+        // A stale socket from a crashed instance is replaced.
+        protocol::create_private_dir(&dir).unwrap();
+        drop(protocol::listen(&name).unwrap());
+        let capture = GameCapture::start_at(name.clone(), |_| {}).unwrap();
+        let err = GameCapture::start_at(name.clone(), |_| {}).err().unwrap();
         assert!(err.to_string().contains("another Vesper instance"), "{err}");
 
         let sock = protocol::connect(&name).unwrap();
@@ -885,9 +904,9 @@ mod tests {
         assert_eq!(games.len(), 1);
         assert_eq!(games[0].pid, std::process::id());
 
-        // The name is freed with the server: no stale socket to clean up.
         drop(capture);
-        drop(protocol::listen(&name).unwrap());
+        assert!(!name.exists());
+        std::fs::remove_dir(&dir).unwrap();
     }
 
     #[test]

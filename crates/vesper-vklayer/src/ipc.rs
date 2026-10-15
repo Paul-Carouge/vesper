@@ -105,16 +105,15 @@ fn pin_library() -> bool {
 }
 
 fn run() {
-    let name = protocol::socket_name();
+    let path = protocol::socket_path();
     let hello = Msg::Hello {
         version: protocol::VERSION,
         pid: std::process::id(),
         exe: protocol::process_name(),
     };
     loop {
-        if let Ok(sock) = protocol::connect(&name)
-            // Only talk to a server of our own user: anyone can bind an
-            // abstract name.
+        if let Ok(sock) = protocol::connect(&path)
+            // Only talk to a server of our own user.
             && protocol::peer_is_same_user(sock.as_fd())
             && protocol::send(sock.as_fd(), &hello, None, false).is_ok()
         {
