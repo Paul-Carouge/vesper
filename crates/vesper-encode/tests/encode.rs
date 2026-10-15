@@ -42,3 +42,37 @@ fn encodes_frames_releases_each_once_and_keeps_pts() {
     let got: Vec<Duration> = packets.iter().map(|p| p.pts).collect();
     assert_eq!(got, sent, "pts preserved, in order");
 }
+
+#[test]
+fn repeat_reencodes_last_picture_with_new_pts() {
+    if !Path::new("/dev/dri/renderD128").exists() {
+        eprintln!("no GPU, skipping");
+        return;
+    }
+    let (w, h) = (640, 360);
+    let producer = unsafe { Producer::new(w, h) };
+    let mut enc = Encoder::new(Codec::Hevc, w, h, 30, RateControl::ConstantQp(30)).unwrap();
+    assert!(enc.repeat(Duration::ZERO).is_err(), "nothing to repeat yet");
+
+    let ms = |t: u64| Duration::from_millis(1_000 + t * 33);
+    let mut packets = Vec::new();
+    packets.extend(
+        enc.encode(unsafe { producer.frame(0, 0, 0, ms(0)) })
+            .unwrap(),
+    );
+    // Many more repeats than any surface pool holds: the kept surface must not leak.
+    for t in 1..40 {
+        packets.extend(enc.repeat(ms(t)).unwrap());
+    }
+    packets.extend(
+        enc.encode(unsafe { producer.frame(1, 40, 0, ms(40)) })
+            .unwrap(),
+    );
+    packets.extend(enc.repeat(ms(41)).unwrap());
+    packets.extend(enc.flush().unwrap());
+
+    let got: Vec<Duration> = packets.iter().map(|p| p.pts).collect();
+    let want: Vec<Duration> = (0..42).map(ms).collect();
+    assert_eq!(got, want);
+    assert!(packets[0].keyframe);
+}

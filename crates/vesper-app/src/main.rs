@@ -1,8 +1,7 @@
-//! Vesper desktop app: the Slint UI shell.
+//! Vesper desktop app: the Slint UI and the video recording backend.
 //!
-//! No backend is wired yet. The callbacks below are stubs that log the intent
-//! and simulate the state a real backend would publish (elapsed time, audio
-//! levels, encoder stats), so the UI can be exercised end to end.
+//! Recording (video + desktop and microphone audio) lives in `recorder`.
+//! Audio sources only run while recording, so the meters rest at 0 when idle.
 
 /// Minimal stderr logger, enough until a real backend brings `tracing`.
 macro_rules! log {
@@ -11,26 +10,34 @@ macro_rules! log {
 
 #[cfg(debug_assertions)]
 mod dev;
-mod sim;
+mod meter;
+mod recorder;
 
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use slint::ComponentHandle;
+use vesper_audio::Source;
 
-use sim::Sim;
+use meter::MeterState;
+use recorder::{Event, Recorder, Settings};
+
+type Recording = Rc<RefCell<Option<Recorder>>>;
+
+/// Meter refresh period: ~30 Hz.
+const METER_TICK: Duration = Duration::from_millis(33);
 
 slint::include_modules!();
 
-/// Simulated latency of the portal picker / encoder start and of the final
-/// flush, so the transient `starting` / `stopping` states are visible.
-const FAKE_START_DELAY: Duration = Duration::from_millis(350);
-const FAKE_PICKER_DELAY: Duration = Duration::from_millis(600);
-const FAKE_STOP_DELAY: Duration = Duration::from_millis(450);
-
 fn main() -> Result<(), slint::PlatformError> {
+    #[cfg(debug_assertions)]
+    if let Some(seconds) = dev::record_seconds() {
+        dev::record(seconds, default_settings());
+        return Ok(());
+    }
+
     let ui = AppWindow::new()?;
 
     // `VESPER_THEME=light|dark` overrides the system color scheme.
@@ -48,94 +55,101 @@ fn main() -> Result<(), slint::PlatformError> {
         ui.set_output_folder(folder.to_string_lossy().as_ref().into());
     }
     ui.set_replay_enabled(true);
+    if recorder::load_restore_token().is_some() {
+        ui.set_source_kind(SourceKind::Screen);
+        ui.set_source_name("Last picked source".into());
+    }
 
-    let sim = Rc::new(RefCell::new(Sim::default()));
-    wire_callbacks(&ui, &sim);
+    let recording = Recording::default();
+    wire_callbacks(&ui, &recording);
 
-    // ~30 Hz is enough for meters and the clock.
     let tick = slint::Timer::default();
     let weak = ui.as_weak();
-    let sim_tick = sim.clone();
-    tick.start(
-        slint::TimerMode::Repeated,
-        Duration::from_millis(33),
-        move || {
-            let Some(ui) = weak.upgrade() else { return };
-            let s = sim_tick.borrow_mut().tick(Instant::now());
-            ui.set_desktop_level(s.desktop.level);
-            ui.set_desktop_peak(s.desktop.peak);
-            ui.set_mic_level(s.mic.level);
-            ui.set_mic_peak(s.mic.peak);
-            if let Some(rec) = s.recording {
-                ui.set_elapsed_seconds(rec.elapsed.as_secs() as i32);
-                ui.set_measured_fps(rec.fps);
-                ui.set_dropped_frames(rec.dropped as i32);
-            }
-        },
-    );
+    let rec = recording.clone();
+    let (mut desktop, mut mic) = (MeterState::default(), MeterState::default());
+    tick.start(slint::TimerMode::Repeated, METER_TICK, move || {
+        let Some(ui) = weak.upgrade() else { return };
+        let peak = |source| rec.borrow().as_ref().map_or(0.0, |r| r.peak(source));
+        desktop.feed(peak(Source::Desktop), METER_TICK);
+        mic.feed(peak(Source::Microphone), METER_TICK);
+        ui.set_desktop_level(desktop.level);
+        ui.set_desktop_peak(desktop.peak);
+        ui.set_mic_level(mic.level);
+        ui.set_mic_peak(mic.peak);
+    });
 
     #[cfg(debug_assertions)]
     dev::apply(&ui);
 
-    ui.run()
+    let result = ui.run();
+    // Closing the window mid-recording still finalizes the file. Before the
+    // capture started, the thread may wait on the portal picker: exit without it.
+    if let Some(rec) = recording.take()
+        && rec.started()
+    {
+        rec.join();
+    }
+    result
 }
 
-/// Stub handlers.
+/// Handlers.
 ///
-/// Contract for the real backend: callbacks run on the UI thread and must
-/// return immediately. Do the work elsewhere and push every state change back
-/// with `weak.upgrade_in_event_loop(..)` or `slint::invoke_from_event_loop(..)`;
+/// Contract: callbacks run on the UI thread and must return immediately. Do
+/// the work elsewhere and push every state change back with
+/// `weak.upgrade_in_event_loop(..)` or `slint::invoke_from_event_loop(..)`;
 /// never block inside a callback. `rec-state` goes
 /// `idle -> starting -> recording -> stopping -> idle`, or `starting -> idle`
 /// when the picker is cancelled or the pipeline fails to start; the UI ignores
 /// record intents while it is `starting` or `stopping`.
-fn wire_callbacks(ui: &AppWindow, sim: &Rc<RefCell<Sim>>) {
+fn wire_callbacks(ui: &AppWindow, recording: &Recording) {
     let weak = ui.as_weak();
     ui.on_pick_source(move || {
-        log!("pick-source: would open the xdg-desktop-portal picker");
         let Some(ui) = weak.upgrade() else { return };
-        cycle_fake_source(&ui);
+        // The portal has no "pick only" call: forget the source so the next
+        // recording opens the picker.
+        recorder::clear_restore_token();
+        ui.set_source_kind(SourceKind::None);
+        ui.set_source_name("".into());
+        ui.set_source_detail("".into());
+        flash_notice(&ui, "The picker opens when you record");
     });
 
     let weak = ui.as_weak();
-    let s = sim.clone();
+    let rec = recording.clone();
     ui.on_start_recording(move || {
         let Some(ui) = weak.upgrade() else { return };
         if ui.get_rec_state() != RecState::Idle {
             return;
         }
-        log!(
-            "start-recording: codec={:?} quality={:?} fps={}",
-            vesper_core::Codec::from(ui.get_codec()),
-            ui.get_quality(),
-            ui.get_fps()
-        );
-        ui.set_rec_state(RecState::Starting);
-        // Without a source, the portal picker opens first (async).
-        let needs_source = ui.get_source_kind() == SourceKind::None;
-        let delay = if needs_source {
-            FAKE_PICKER_DELAY
-        } else {
-            FAKE_START_DELAY
+        if ui.get_output_folder().is_empty() {
+            flash_notice(&ui, "Choose an output folder first");
+            return;
+        }
+        let settings = Settings {
+            codec: ui.get_codec().into(),
+            fps: ui.get_fps().max(1) as u32,
+            bits_per_pixel: bits_per_pixel(ui.get_codec(), ui.get_quality()),
+            folder: PathBuf::from(ui.get_output_folder().as_str()),
+            desktop_muted: ui.get_desktop_muted(),
+            mic_muted: ui.get_mic_muted(),
         };
+        log!("start-recording: {settings:?}");
+        ui.set_rec_state(RecState::Starting);
         let weak = ui.as_weak();
-        let s = s.clone();
-        slint::Timer::single_shot(delay, move || {
-            let Some(ui) = weak.upgrade() else { return };
-            if needs_source {
-                cycle_fake_source(&ui);
-            }
-            s.borrow_mut()
-                .start_recording(ui.get_fps() as f32, Instant::now());
-            ui.set_elapsed_seconds(0);
-            ui.set_dropped_frames(0);
-            ui.set_measured_fps(ui.get_fps() as f32);
-            ui.set_rec_state(RecState::Recording);
+        let started = Recorder::start(settings, move |event| {
+            let _ = weak.upgrade_in_event_loop(move |ui| on_recorder_event(&ui, event));
         });
+        match started {
+            Ok(r) => *rec.borrow_mut() = Some(r),
+            Err(e) => {
+                ui.set_rec_state(RecState::Idle);
+                flash_notice(&ui, &format!("Could not start: {e}"));
+            }
+        }
     });
 
     let weak = ui.as_weak();
-    let s = sim.clone();
+    let rec = recording.clone();
     ui.on_stop_recording(move || {
         let Some(ui) = weak.upgrade() else { return };
         if ui.get_rec_state() != RecState::Recording {
@@ -143,16 +157,9 @@ fn wire_callbacks(ui: &AppWindow, sim: &Rc<RefCell<Sim>>) {
         }
         log!("stop-recording");
         ui.set_rec_state(RecState::Stopping);
-        let weak = ui.as_weak();
-        let s = s.clone();
-        // Encoder flush + muxer finalization.
-        slint::Timer::single_shot(FAKE_STOP_DELAY, move || {
-            let Some(ui) = weak.upgrade() else { return };
-            s.borrow_mut().stop_recording();
-            ui.set_rec_state(RecState::Idle);
-            ui.set_elapsed_seconds(0);
-            flash_notice(&ui, "Recording saved");
-        });
+        if let Some(r) = rec.borrow().as_ref() {
+            r.stop();
+        }
     });
 
     let weak = ui.as_weak();
@@ -166,16 +173,19 @@ fn wire_callbacks(ui: &AppWindow, sim: &Rc<RefCell<Sim>>) {
         log!("replay-changed: enabled={enabled} seconds={seconds}");
     });
 
-    let s = sim.clone();
+    // Applied live while recording; the next recording reads the UI state.
+    let rec = recording.clone();
     ui.on_desktop_mute_changed(move |muted| {
-        log!("desktop-mute-changed: {muted}");
-        s.borrow_mut().desktop_muted = muted;
+        if let Some(r) = rec.borrow().as_ref() {
+            r.set_muted(Source::Desktop, muted);
+        }
     });
 
-    let s = sim.clone();
+    let rec = recording.clone();
     ui.on_mic_mute_changed(move |muted| {
-        log!("mic-mute-changed: {muted}");
-        s.borrow_mut().mic_muted = muted;
+        if let Some(r) = rec.borrow().as_ref() {
+            r.set_muted(Source::Microphone, muted);
+        }
     });
 
     let weak = ui.as_weak();
@@ -194,18 +204,75 @@ fn wire_callbacks(ui: &AppWindow, sim: &Rc<RefCell<Sim>>) {
     });
 }
 
-/// Alternates between a screen and a window so both looks can be seen.
-fn cycle_fake_source(ui: &AppWindow) {
-    if ui.get_source_kind() == SourceKind::Screen {
-        ui.set_source_kind(SourceKind::Window);
-        ui.set_source_name("Firefox  —  Vesper on GitHub".into());
-        ui.set_source_detail("Window  ·  1920 × 1080".into());
-        ui.set_resolution("1920×1080".into());
+/// Applies a recorder event on the UI thread.
+fn on_recorder_event(ui: &AppWindow, event: Event) {
+    match event {
+        Event::Started => {
+            ui.set_rec_state(RecState::Recording);
+            ui.set_elapsed_seconds(0);
+            ui.set_dropped_frames(0);
+            ui.set_measured_fps(ui.get_fps() as f32);
+            if ui.get_source_kind() == SourceKind::None {
+                // shortcut: Capture exposes neither the source type nor its name; show them once it does.
+                ui.set_source_kind(SourceKind::Screen);
+                ui.set_source_name("Picked source".into());
+            }
+        }
+        Event::Stats {
+            width,
+            height,
+            elapsed,
+            fps,
+            dropped,
+        } => {
+            ui.set_elapsed_seconds(elapsed.as_secs() as i32);
+            ui.set_measured_fps(fps);
+            ui.set_dropped_frames(dropped.min(i32::MAX as u64) as i32);
+            ui.set_resolution(format!("{width}×{height}").into());
+            ui.set_source_detail(format!("{width} × {height}").into());
+        }
+        Event::Finished(result) => {
+            ui.set_rec_state(RecState::Idle);
+            ui.set_elapsed_seconds(0);
+            match result {
+                Ok(path) => {
+                    log!("saved {}", path.display());
+                    flash_notice(ui, "Recording saved");
+                }
+                Err(e) => {
+                    log!("recording failed: {e}");
+                    flash_notice(ui, &e);
+                }
+            }
+        }
+    }
+}
+
+/// Target bits per pixel per frame of each quality preset for HEVC and AV1;
+/// H.264 gets 1.5x. At 3840x2160 60 fps: 15 / 25 / 40 Mbit/s.
+fn bits_per_pixel(codec: VideoCodec, quality: QualityPreset) -> f64 {
+    let bpp = match quality {
+        QualityPreset::Performance => 0.03,
+        QualityPreset::Balanced => 0.05,
+        QualityPreset::Quality => 0.08,
+    };
+    if codec == VideoCodec::H264 {
+        bpp * 1.5
     } else {
-        ui.set_source_kind(SourceKind::Screen);
-        ui.set_source_name("Dell U2724D".into());
-        ui.set_source_detail("DP-1  ·  2560 × 1440".into());
-        ui.set_resolution("2560×1440".into());
+        bpp
+    }
+}
+
+/// Settings of the debug `--record` path: HEVC, balanced, 60 fps.
+#[cfg(debug_assertions)]
+fn default_settings() -> Settings {
+    Settings {
+        codec: vesper_core::Codec::Hevc,
+        fps: 60,
+        bits_per_pixel: bits_per_pixel(VideoCodec::Hevc, QualityPreset::Balanced),
+        folder: default_output_folder().unwrap_or_else(|| PathBuf::from(".")),
+        desktop_muted: false,
+        mic_muted: false,
     }
 }
 
@@ -257,6 +324,17 @@ mod tests {
         assert_eq!(
             vesper_core::Codec::from(VideoCodec::H264),
             vesper_core::Codec::H264
+        );
+    }
+
+    #[test]
+    fn balanced_4k60_is_about_25_mbit() {
+        let px = 3840.0 * 2160.0 * 60.0;
+        let bps = px * bits_per_pixel(VideoCodec::Hevc, QualityPreset::Balanced);
+        assert!((24e6..26e6).contains(&bps), "{bps}");
+        assert!(
+            bits_per_pixel(VideoCodec::H264, QualityPreset::Balanced)
+                > bits_per_pixel(VideoCodec::Av1, QualityPreset::Balanced)
         );
     }
 
