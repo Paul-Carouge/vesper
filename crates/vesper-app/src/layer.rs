@@ -22,9 +22,13 @@ pub fn installed(data: &Path) -> bool {
 
 /// The layer built with this binary: next to it (`target/<profile>/`), or in
 /// `../lib/vesper/` (e.g. `~/.local/bin/vesper` and
-/// `~/.local/lib/vesper/libvesper_vklayer.so`).
+/// `~/.local/lib/vesper/libvesper_vklayer.so`, or the Arch package's
+/// `/usr/bin/vesper` and `/usr/lib/vesper/libvesper_vklayer.so`).
 pub fn shipped() -> Option<PathBuf> {
-    let exe = std::env::current_exe().ok()?;
+    shipped_beside(&std::env::current_exe().ok()?)
+}
+
+fn shipped_beside(exe: &Path) -> Option<PathBuf> {
     let dir = exe.parent()?;
     [dir.join(LIB), dir.join("../lib/vesper").join(LIB)]
         .into_iter()
@@ -141,6 +145,23 @@ mod tests {
         assert!(!installed(&data));
         assert!(!dest.exists() && !data.join("vesper").exists());
         uninstall(&data).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn finds_the_packaged_layer() {
+        let root = temp("usr");
+        let exe = root.join("usr/bin/vesper");
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        assert_eq!(shipped_beside(&exe), None);
+        let lib = root.join("usr/lib/vesper").join(LIB);
+        std::fs::create_dir_all(lib.parent().unwrap()).unwrap();
+        std::fs::write(&lib, b"v1").unwrap();
+        let found = shipped_beside(&exe).unwrap();
+        assert_eq!(
+            std::fs::canonicalize(found).unwrap(),
+            std::fs::canonicalize(&lib).unwrap()
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 

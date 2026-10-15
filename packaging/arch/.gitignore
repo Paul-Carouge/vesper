@@ -1,0 +1,6 @@
+# makepkg output
+/src/
+/pkg/
+/vesper/
+*.pkg.tar.*
+*.log
