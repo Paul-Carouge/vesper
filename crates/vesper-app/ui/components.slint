@@ -72,7 +72,7 @@ export component Button inherits FocusScope {
 
     key-pressed(event) => {
         if (event.text == Key.Space || event.text == Key.Return) {
-            root.clicked();
+            if (root.enabled) { root.clicked(); }
             return accept;
         }
         reject
@@ -141,6 +141,7 @@ export component IconButton inherits FocusScope {
     width: Theme.control-height;
     height: Theme.control-height;
     accessible-role: button;
+    accessible-enabled: root.enabled;
     accessible-label: root.label;
     accessible-action-default => {
         if (root.enabled) {
@@ -150,7 +151,7 @@ export component IconButton inherits FocusScope {
 
     key-pressed(event) => {
         if (event.text == Key.Space || event.text == Key.Return) {
-            root.clicked();
+            if (root.enabled) { root.clicked(); }
             return accept;
         }
         reject
@@ -192,6 +193,7 @@ export component Switch inherits FocusScope {
     width: 44px;
     height: 26px;
     accessible-role: switch;
+    accessible-enabled: root.enabled;
     accessible-label: root.label;
     accessible-checkable: true;
     accessible-checked: root.checked;
@@ -257,6 +259,7 @@ export component Segmented inherits FocusScope {
     focus-on-click: false;
     min-height: 36px;
     accessible-role: radio-group;
+    accessible-enabled: root.enabled;
     accessible-label: root.label;
     accessible-value: root.options[root.selected];
 

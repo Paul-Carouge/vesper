@@ -86,8 +86,9 @@ fn main() -> Result<(), slint::PlatformError> {
 /// return immediately. Do the work elsewhere and push every state change back
 /// with `weak.upgrade_in_event_loop(..)` or `slint::invoke_from_event_loop(..)`;
 /// never block inside a callback. `rec-state` goes
-/// `idle -> starting -> recording -> stopping -> idle`; the UI ignores record
-/// intents while it is `starting` or `stopping`.
+/// `idle -> starting -> recording -> stopping -> idle`, or `starting -> idle`
+/// when the picker is cancelled or the pipeline fails to start; the UI ignores
+/// record intents while it is `starting` or `stopping`.
 fn wire_callbacks(ui: &AppWindow, sim: &Rc<RefCell<Sim>>) {
     let weak = ui.as_weak();
     ui.on_pick_source(move || {
