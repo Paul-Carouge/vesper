@@ -5092,6 +5092,7 @@ dependencies = [
  "libc",
  "slint",
  "slint-build",
+ "tracing-subscriber",
  "vesper-audio",
  "vesper-capture",
  "vesper-core",

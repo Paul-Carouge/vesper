@@ -41,6 +41,7 @@ use prefs::Prefs;
 use recorder::{Event, Pipeline, Settings};
 use shortcuts::Action;
 use tray::Tray;
+use vesper_audio::TrackState;
 
 /// The last started pipeline; it may have ended since.
 type Shared = Rc<RefCell<Option<Pipeline>>>;
@@ -76,6 +77,15 @@ slint::include_modules!();
 fn main() -> Result<(), slint::PlatformError> {
     // First, before any thread starts, so they all inherit the blocked mask.
     handle_quit_signals();
+    // The crates' warnings and errors (and our own info) on stderr; RUST_LOG overrides.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "warn,vesper=info".into()),
+        )
+        .with_writer(std::io::stderr)
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
+        .init();
     // Started with the session: stay in the tray (when there is one).
     let background = std::env::args().skip(1).any(|a| a == "--background");
     if let Err(e) = futures_lite::future::block_on(shortcuts::register_app_id()) {
@@ -843,6 +853,13 @@ fn on_recorder_event(ui: &AppWindow, generation: u64, event: Event) {
                 announce_failure(ui, "Replay not saved", &e);
             }
         },
+        Event::AudioTrack(name, TrackState::Reconnecting(reason)) => {
+            log!("audio track {name:?}: {reason}");
+            flash_notice(ui, &format!("{name}: reconnecting…"));
+        }
+        Event::AudioTrack(name, TrackState::Running) => {
+            flash_notice(ui, &format!("{name}: audio is back"));
+        }
         // A clean stop always follows `Finished`: nothing to reset (a new
         // pipeline may already be starting).
         Event::Stopped(None) => log!("pipeline stopped"),

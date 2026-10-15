@@ -48,6 +48,7 @@ fn main() -> Result<(), Error> {
             volume_db: 0.0,
             mix: input.take(),
             process: voice_chain(&voice, &source),
+            on_state: None,
         };
         let capture = AudioCapture::start(source.clone(), options, move |p| drop(tx.send(p)))?;
         tracks.push((source, capture, rx));

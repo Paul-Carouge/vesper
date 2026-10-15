@@ -31,7 +31,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use vesper_audio::{AudioCapture, CHANNELS, Mix, Options, SAMPLE_RATE, Source};
+use vesper_audio::{AudioCapture, CHANNELS, Mix, Options, SAMPLE_RATE, Source, TrackState};
 use vesper_capture::Capture;
 use vesper_core::{Codec, EncodedPacket, VideoFrame};
 use vesper_dsp::{FilterSpec, LiveControl};
@@ -152,6 +152,8 @@ pub enum Event {
     /// finalized up to that point.
     Finished(Result<PathBuf, String>),
     ReplaySaved(Result<PathBuf, String>),
+    /// The audio track of this name lost its source, or has it back.
+    AudioTrack(String, TrackState),
     /// The pipeline ended, with the error that ended it if any. A recording
     /// still running then is lost only if the pipeline crashed.
     Stopped(Option<String>),
@@ -636,7 +638,7 @@ impl StreamIndex {
 
 /// Starts the enabled tracks and their mix. A track that fails to start is
 /// left out of the files (e.g. no microphone); the mix needs two tracks.
-fn start_audio(sources: &AudioSources, sinks: &SharedSinks) {
+fn start_audio(sources: &AudioSources, sinks: &SharedSinks, on_event: &OnEvent) {
     let (tracks, mix) = {
         let mut audio = lock(sources);
         audio.changed = false;
@@ -676,6 +678,10 @@ fn start_audio(sources: &AudioSources, sinks: &SharedSinks) {
             process: Some(Box::new(move |buf| {
                 chain.process(buf);
                 chain.latency()
+            })),
+            on_state: Some(Box::new({
+                let (on_event, name) = (on_event.clone(), track.name.clone());
+                move |state| on_event(Event::AudioTrack(name.clone(), state))
             })),
         };
         match AudioCapture::start(track.source.clone(), options, move |packet| {
@@ -747,7 +753,7 @@ fn run(
         }
     };
     let sinks = SharedSinks::default();
-    start_audio(sources, &sinks);
+    start_audio(sources, &sinks, on_event);
     started.store(true, Ordering::Relaxed);
     let result = pump(settings, &slot, control, &sinks, sources, on_event);
     drop(capture);
@@ -983,7 +989,7 @@ fn pump(
         if changed && lock(sinks).rec.is_none() {
             log!("audio tracks changed: restarting the audio");
             stop_audio(sources);
-            start_audio(sources, sinks);
+            start_audio(sources, sinks, on_event);
             let streams = lock(sources).streams();
             if let Some(ring) = lock(sinks).ring.as_mut() {
                 ring.audio = vec![VecDeque::new(); streams];
