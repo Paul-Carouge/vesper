@@ -1,0 +1,177 @@
+//! Connection to Vesper, one per process.
+//!
+//! A background thread tries to connect once per second, so the present path
+//! only reads atomics while Vesper is not running. Once connected, the thread
+//! blocks on the socket and records `Start`/`Stop`/`Release` from the server.
+//! The render thread sends its own messages with non-blocking writes.
+
+use std::io;
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Once};
+use std::time::Duration;
+
+use vesper_gamecapture::protocol::{self, Msg};
+
+use crate::LockExt;
+
+pub struct Ipc {
+    /// A server is connected. The only check on the present path when not.
+    pub connected: AtomicBool,
+    /// The server asked this process to capture.
+    pub capturing: AtomicBool,
+    /// Bumped on every new connection, so swapchains announce themselves again.
+    pub conn_id: AtomicU64,
+    /// Bumped on every `Start`, so the export ring is announced again.
+    pub start_id: AtomicU64,
+    /// Process that started the thread: a forked child has no thread, and
+    /// its copies of the mutexes may be held by threads that do not exist.
+    pid: AtomicU32,
+    sock: Mutex<Option<Arc<OwnedFd>>>,
+    modifiers: Mutex<Vec<u64>>,
+    releases: Mutex<Vec<(u32, u32)>>,
+}
+
+pub static IPC: Ipc = Ipc {
+    connected: AtomicBool::new(false),
+    capturing: AtomicBool::new(false),
+    conn_id: AtomicU64::new(0),
+    start_id: AtomicU64::new(0),
+    pid: AtomicU32::new(0),
+    sock: Mutex::new(None),
+    modifiers: Mutex::new(Vec::new()),
+    releases: Mutex::new(Vec::new()),
+};
+
+/// More releases than this pending means a misbehaving server.
+const MAX_RELEASES: usize = 64;
+
+static THREAD: Once = Once::new();
+
+/// Runs in a forked child: atomics only, the mutexes may be held.
+extern "C" fn after_fork_child() {
+    IPC.connected.store(false, Ordering::SeqCst);
+    IPC.capturing.store(false, Ordering::SeqCst);
+}
+
+fn same_process() -> bool {
+    IPC.pid.load(Ordering::SeqCst) == std::process::id()
+}
+
+/// Starts the connection thread once per process.
+pub fn ensure_thread() {
+    THREAD.call_once(|| {
+        // The loader unloads layers on vkDestroyInstance; the thread runs our
+        // code forever, so keep the library mapped.
+        if !pin_library() {
+            crate::warn("cannot pin the layer library; capture disabled");
+            return;
+        }
+        IPC.pid.store(std::process::id(), Ordering::SeqCst);
+        unsafe { libc::pthread_atfork(None, None, Some(after_fork_child)) };
+        // The thread inherits the signal mask: block everything so the game's
+        // signals (and handlers) never run on our thread.
+        let spawned = unsafe {
+            let mut all: libc::sigset_t = std::mem::zeroed();
+            let mut old: libc::sigset_t = std::mem::zeroed();
+            libc::sigfillset(&mut all);
+            libc::pthread_sigmask(libc::SIG_BLOCK, &all, &mut old);
+            let r = std::thread::Builder::new()
+                .name("vesper-layer".into())
+                .spawn(run);
+            libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut());
+            r
+        };
+        if let Err(e) = spawned {
+            crate::warn(&format!("cannot start the IPC thread: {e}"));
+        }
+    });
+}
+
+fn pin_library() -> bool {
+    unsafe {
+        let mut info: libc::Dl_info = std::mem::zeroed();
+        if libc::dladdr(ensure_thread as *const libc::c_void, &mut info) == 0
+            || info.dli_fname.is_null()
+        {
+            return false;
+        }
+        !libc::dlopen(
+            info.dli_fname,
+            libc::RTLD_NOW | libc::RTLD_NOLOAD | libc::RTLD_NODELETE,
+        )
+        .is_null()
+    }
+}
+
+fn run() {
+    let Some(path) = protocol::socket_path() else {
+        return;
+    };
+    let hello = Msg::Hello {
+        version: protocol::VERSION,
+        pid: std::process::id(),
+        exe: protocol::process_name(),
+    };
+    loop {
+        if let Ok(sock) = protocol::connect(&path)
+            // Only talk to a server of our own user.
+            && protocol::peer_is_same_user(sock.as_fd())
+            && protocol::send(sock.as_fd(), &hello, None, false).is_ok()
+        {
+            let sock = Arc::new(sock);
+            *IPC.sock.locked() = Some(sock.clone());
+            IPC.conn_id.fetch_add(1, Ordering::SeqCst);
+            IPC.connected.store(true, Ordering::SeqCst);
+            serve(sock.as_fd());
+            IPC.connected.store(false, Ordering::SeqCst);
+            IPC.capturing.store(false, Ordering::SeqCst);
+            *IPC.sock.locked() = None;
+            IPC.releases.locked().clear();
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
+fn serve(sock: BorrowedFd) {
+    loop {
+        match protocol::recv(sock, false) {
+            Ok(Some((Msg::Start { modifiers }, _))) => {
+                *IPC.modifiers.locked() = modifiers;
+                IPC.releases.locked().clear();
+                IPC.start_id.fetch_add(1, Ordering::SeqCst);
+                IPC.capturing.store(true, Ordering::SeqCst);
+            }
+            Ok(Some((Msg::Stop, _))) => IPC.capturing.store(false, Ordering::SeqCst),
+            Ok(Some((Msg::Release { generation, index }, _))) => {
+                let mut releases = IPC.releases.locked();
+                if IPC.capturing.load(Ordering::SeqCst)
+                    && index < protocol::RING
+                    && releases.len() < MAX_RELEASES
+                {
+                    releases.push((generation, index));
+                }
+            }
+            Ok(Some(_)) => {}
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Ok(None) | Err(_) => return,
+        }
+    }
+}
+
+/// Sends without blocking. False if the message was not sent.
+pub fn send(msg: &Msg, fd: Option<BorrowedFd>) -> bool {
+    if !same_process() {
+        return false;
+    }
+    let sock = IPC.sock.locked().clone();
+    sock.is_some_and(|s| protocol::send(s.as_fd(), msg, fd, true).is_ok())
+}
+
+pub fn modifiers() -> Vec<u64> {
+    IPC.modifiers.locked().clone()
+}
+
+pub fn take_releases() -> Vec<(u32, u32)> {
+    std::mem::take(&mut *IPC.releases.locked())
+}

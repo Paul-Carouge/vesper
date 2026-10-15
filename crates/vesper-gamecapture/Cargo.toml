@@ -1,0 +1,13 @@
+[package]
+name = "vesper-gamecapture"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+libc = "0.2"
+tracing = "0.1"
+vesper-core.workspace = true
+
+[dev-dependencies]
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+vesper-encode.workspace = true

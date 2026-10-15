@@ -5023,12 +5023,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "vesper-gamecapture"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "tracing",
+ "tracing-subscriber",
+ "vesper-core",
+ "vesper-encode",
+]
+
+[[package]]
 name = "vesper-mux"
 version = "0.1.0"
 dependencies = [
  "ffmpeg-next",
  "vesper-core",
  "vesper-encode",
+]
+
+[[package]]
+name = "vesper-vklayer"
+version = "0.1.0"
+dependencies = [
+ "ash",
+ "libc",
+ "vesper-gamecapture",
 ]
 
 [[package]]
