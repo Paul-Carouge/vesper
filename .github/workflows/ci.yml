@@ -7,13 +7,16 @@ on:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # Superseded PR runs are cancelled; every master commit is checked.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
 
 env:
   CARGO_TERM_COLOR: always
+  # No debuginfo: smaller cache, faster builds and links.
+  CARGO_PROFILE_DEV_DEBUG: 0
 
 jobs:
   check:
@@ -26,8 +29,11 @@ jobs:
         run: >-
           pacman -Syu --noconfirm --needed
           git rust clang pkgconf ffmpeg libva pipewire fontconfig freetype2 libxkbcommon
-      - uses: actions/checkout@v7.0.1
-      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # PRs restore master's cache but don't each store a ~1 GB copy.
+          save-if: ${{ github.ref == 'refs/heads/master' }}
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
