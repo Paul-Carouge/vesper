@@ -1,6 +1,6 @@
 //! The PipeWire thread: format negotiation and frame delivery.
 
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::os::fd::{BorrowedFd, OwnedFd};
 use std::rc::Rc;
 use std::time::Duration;
@@ -11,7 +11,7 @@ use pw::spa::param::video::VideoFormat;
 use pw::spa::pod::Pod;
 use pw::spa::sys as spa_sys;
 use pw::sys::pw_buffer;
-use pw::{core::CoreRc, main_loop::MainLoopRc, stream::StreamRc};
+use pw::{core::CoreRc, main_loop::MainLoopRc, registry::RegistryRc, stream::StreamRc};
 use tracing::{error, info, warn};
 use vesper_core::{DmaBufPlane, ReleaseGuard, VideoFrame};
 
@@ -49,8 +49,12 @@ pub fn handle_msg(
 const ROUNDTRIP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Runs `mainloop` until `finished` holds, which callbacks signal by quitting
-/// the loop. Returns false if `timeout` passes first.
-fn run_until(mainloop: &MainLoopRc, finished: impl Fn() -> bool, timeout: Duration) -> bool {
+/// the loop. Returns `Ok(false)` if `timeout` passes first.
+fn run_until(
+    mainloop: &MainLoopRc,
+    finished: impl Fn() -> bool,
+    timeout: Duration,
+) -> Result<bool, Error> {
     let timed_out = Rc::new(Cell::new(false));
     let timer = mainloop.loop_().add_timer({
         let (timed_out, mainloop) = (timed_out.clone(), mainloop.clone());
@@ -59,14 +63,14 @@ fn run_until(mainloop: &MainLoopRc, finished: impl Fn() -> bool, timeout: Durati
             mainloop.quit();
         }
     });
-    if let Err(e) = timer.update_timer(Some(timeout), None).into_result() {
-        error!("arming the roundtrip timer failed: {e}");
-        return false;
-    }
+    timer
+        .update_timer(Some(timeout), None)
+        .into_result()
+        .map_err(|e| format!("arming the roundtrip timer failed: {e}"))?;
     while !finished() && !timed_out.get() {
         mainloop.run();
     }
-    finished()
+    Ok(finished())
 }
 
 /// Runs a full roundtrip with the server.
@@ -94,7 +98,7 @@ fn roundtrip(mainloop: &MainLoopRc, core: &CoreRc) -> Result<(), Error> {
             }
         })
         .register();
-    if !run_until(mainloop, || done.get() || failed.get(), ROUNDTRIP_TIMEOUT) {
+    if !run_until(mainloop, || done.get() || failed.get(), ROUNDTRIP_TIMEOUT)? {
         return Err("pipewire server did not answer in time".into());
     }
     if failed.get() {
@@ -110,9 +114,9 @@ type Advertised = Vec<(VideoFormat, Vec<u64>)>;
 fn advertised_formats(
     mainloop: &MainLoopRc,
     core: &CoreRc,
+    registry: &RegistryRc,
     node_id: u32,
 ) -> Result<Advertised, Error> {
-    let registry = core.get_registry_rc()?;
     let found: Rc<RefCell<Advertised>> = Rc::default();
     let node: Rc<RefCell<Option<(pw::node::Node, pw::node::NodeListener)>>> = Rc::default();
     let _listener = registry
@@ -341,8 +345,36 @@ pub fn run<F>(
     let setup = (|| -> Result<_, Error> {
         let context = pw::context::ContextRc::new(&mainloop, None)?;
         let core = context.connect_fd_rc(fd, None)?;
+        let generation = Rc::new(Cell::new(0u32));
+        // An AUTOCONNECT stream only pauses when its source node goes away
+        // (sharing stopped, window closed): watch the node itself from now on.
+        // Disconnecting moves the stream to Unconnected, which ends the capture.
+        let registry = core.get_registry_rc()?;
+        let removed = Rc::new(Cell::new(false));
+        let stream_slot: Rc<OnceCell<StreamRc>> = Rc::default();
+        let node_listener = registry
+            .add_listener_local()
+            .global_remove({
+                let (removed, stream_slot, generation) =
+                    (removed.clone(), stream_slot.clone(), generation.clone());
+                move |id| {
+                    if id != node_id {
+                        return;
+                    }
+                    removed.set(true);
+                    // Releases still queued in this loop iteration must not
+                    // requeue buffers that the disconnect frees.
+                    generation.set(generation.get().wrapping_add(1));
+                    if let Some(stream) = stream_slot.get()
+                        && let Err(e) = stream.disconnect()
+                    {
+                        error!("pw_stream_disconnect failed: {e}");
+                    }
+                }
+            })
+            .register();
         let offer: Vec<Vec<u8>> = {
-            let advertised = advertised_formats(&mainloop, &core, node_id)?;
+            let advertised = advertised_formats(&mainloop, &core, &registry, node_id)?;
             let supported: Vec<_> = advertised
                 .into_iter()
                 .filter(|(f, _)| format::spa_to_drm(*f).is_some())
@@ -370,7 +402,6 @@ pub fn run<F>(
                 *pw::keys::MEDIA_ROLE => "Screen",
             },
         )?;
-        let generation = Rc::new(Cell::new(0));
         let state = State {
             on_frame,
             offer: offer.clone(),
@@ -440,23 +471,10 @@ pub fn run<F>(
             pw::stream::StreamFlags::AUTOCONNECT,
             &mut pods,
         )?;
-        // An AUTOCONNECT stream only pauses when its source node goes away
-        // (sharing stopped, window closed): watch the node itself. Disconnecting
-        // moves the stream to Unconnected, which ends the capture.
-        let registry = core.get_registry_rc()?;
-        let node_listener = registry
-            .add_listener_local()
-            .global_remove({
-                let stream = stream.clone();
-                move |id| {
-                    if id == node_id
-                        && let Err(e) = stream.disconnect()
-                    {
-                        error!("pw_stream_disconnect failed: {e}");
-                    }
-                }
-            })
-            .register();
+        let _ = stream_slot.set(stream.clone());
+        if removed.get() {
+            return Err("source closed".into());
+        }
         Ok((
             context,
             core,
@@ -537,8 +555,8 @@ mod tests {
         pw::init();
         let mainloop = MainLoopRc::new(None).unwrap();
         let start = std::time::Instant::now();
-        assert!(!run_until(&mainloop, || false, Duration::from_millis(50)));
+        assert!(!run_until(&mainloop, || false, Duration::from_millis(50)).unwrap());
         assert!(start.elapsed() >= Duration::from_millis(50));
-        assert!(run_until(&mainloop, || true, Duration::from_secs(60)));
+        assert!(run_until(&mainloop, || true, Duration::from_secs(60)).unwrap());
     }
 }

@@ -32,7 +32,8 @@ impl Capture {
     /// and starts streaming. `on_frame` runs on the PipeWire thread: keep it
     /// short, e.g. send the frame to a channel. It gets one final `Err` when
     /// the capture ends on its own (source closed, stream error, no DMA-BUF);
-    /// no frame follows. Dropping the `Capture` from `on_frame` is allowed.
+    /// no frame follows. Dropping the `Capture` from `on_frame` is allowed,
+    /// but blocks the PipeWire loop while the D-Bus session closes.
     /// Blocks until the user picks a source.
     pub fn start(
         restore_token: Option<&str>,
