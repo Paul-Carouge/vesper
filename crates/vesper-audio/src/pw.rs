@@ -252,6 +252,21 @@ struct Port {
     channel: String,
 }
 
+/// The sink an app plays to: among the graph's links (output node, input
+/// node) from one of its `nodes` to a sink, the lowest sink id, so the same
+/// one on every call whatever the map order.
+fn app_sink<'a>(
+    links: impl IntoIterator<Item = &'a (u32, u32)>,
+    nodes: &HashSet<u32>,
+    is_sink: impl Fn(u32) -> bool,
+) -> Option<u32> {
+    links
+        .into_iter()
+        .filter(|(out, inp)| nodes.contains(out) && is_sink(*inp))
+        .map(|&(_, sink)| sink)
+        .min()
+}
+
 /// Ticks of `rate` in nanoseconds.
 fn ticks_ns(ticks: i64, rate: spa::utils::Fraction) -> i128 {
     if rate.denom == 0 {
@@ -341,8 +356,10 @@ pub(crate) struct AppLinks {
     ports: HashMap<u32, Port>,
     /// Ours, by (output port, input port).
     links: HashMap<(u32, u32), pw::link::Link>,
-    /// Every sink: id -> node.name.
+    /// Every sink: id -> what a stream targets it by (node.name, else object.serial).
     sinks: HashMap<u32, String>,
+    /// A sink that could not be followed: not retried until the choice changes.
+    failed: Option<u32>,
     /// Monitor ports, by node, to bind the one of the app's sink.
     monitors: HashMap<u32, GlobalObject<PropertiesBox>>,
     /// Every link in the graph: id -> (output node, input node).
@@ -355,13 +372,18 @@ pub(crate) struct AppLinks {
     core: Option<pw::core::CoreRc>,
 }
 
+/// Fields drop in declaration order: each listener comes before the proxy
+/// or stream it listens to, since dropping it unhooks it from that object's
+/// hook list, which the object frees with itself.
+// shortcut: one timing stream per app track, so N app tracks on one sink
+// open N; share one per sink if that ever shows in pw-top.
 struct SinkWatch {
     id: u32,
     port: u32,
-    _proxy: pw::port::Port,
     _port_listener: pw::port::PortListener,
-    reference: pw::stream::StreamRc,
+    _proxy: pw::port::Port,
     _reference_listener: pw::stream::StreamListener<()>,
+    reference: pw::stream::StreamRc,
 }
 
 impl Drop for SinkWatch {
@@ -378,6 +400,7 @@ impl AppLinks {
             ports: HashMap::new(),
             links: HashMap::new(),
             sinks: HashMap::new(),
+            failed: None,
             monitors: HashMap::new(),
             graph: HashMap::new(),
             sink: None,
@@ -410,8 +433,15 @@ impl AppLinks {
                             s.nodes.insert(global.id);
                         }
                         ObjectType::Node if get(*pw::keys::MEDIA_CLASS) == "Audio/Sink" => {
-                            s.sinks
-                                .insert(global.id, get(*pw::keys::NODE_NAME).to_owned());
+                            // WirePlumber did not find the monitor by serial
+                            // on PipeWire 1.6: by name, the serial if unnamed.
+                            let name = get(*pw::keys::NODE_NAME);
+                            let target = if name.is_empty() {
+                                get(*pw::keys::OBJECT_SERIAL)
+                            } else {
+                                name
+                            };
+                            s.sinks.insert(global.id, target.to_owned());
                         }
                         ObjectType::Port => {
                             let Ok(node) = get(*pw::keys::NODE_ID).parse() else {
@@ -506,19 +536,19 @@ impl AppLinks {
     /// a monitor port for its latency and opens a timing-only capture of its
     /// monitor. A new sink keeps the old timing until its own arrives.
     fn follow_sink(&mut self) {
-        let sink = self
-            .graph
-            .values()
-            .filter(|(out, inp)| self.nodes.contains(out) && self.sinks.contains_key(inp))
-            .map(|&(_, sink)| sink)
-            .min();
+        let sink = app_sink(self.graph.values(), &self.nodes, |id| {
+            self.sinks.contains_key(&id)
+        });
+        if sink != self.failed {
+            self.failed = None;
+        }
         let Some(sink) = sink else {
             self.sink = None;
             self.timing.monitor.set(Latency::default());
             self.timing.reference_ns.set(None);
             return;
         };
-        if self.sink.as_ref().is_some_and(|w| w.id == sink) {
+        if self.sink.as_ref().is_some_and(|w| w.id == sink) || self.failed == Some(sink) {
             return;
         }
         let port = self
@@ -532,7 +562,10 @@ impl AppLinks {
         };
         match self.watch_sink(sink, port, registry.clone(), core.clone()) {
             Ok(w) => self.sink = Some(w),
-            Err(e) => warn!("{}: cannot follow sink {sink}: {e}", self.app),
+            Err(e) => {
+                warn!("{}: cannot follow sink {sink}: {e}", self.app);
+                self.failed = Some(sink);
+            }
         }
     }
 
@@ -570,8 +603,14 @@ impl AppLinks {
         };
         let reference = pw::stream::StreamRc::new(core, "vesper-app-timing", props)?;
         let timing = self.timing.clone();
+        let app = self.app.clone();
         let reference_listener = reference
             .add_local_listener_with_user_data(())
+            .state_changed(move |_, _, _, new| match new {
+                pw::stream::StreamState::Streaming => info!("{app}: timing its sink's monitor"),
+                pw::stream::StreamState::Error(e) => warn!("{app}: sink monitor timing: {e}"),
+                _ => {}
+            })
             .process(move |stream, _| {
                 if let Ok(t) = stream.time()
                     && t.now() > 0
@@ -649,7 +688,7 @@ mod tests {
             ..Latency::default()
         });
         timing.reference_ns.set(Some(0));
-        // ALSA sink measured: monitor delay 0, app delay 1 quantum -> 0.
+        // ALSA sink, expected (not validated): monitor delay 0, app delay 1 quantum -> 0.
         assert_eq!(timing.extra_ns(1_024, quantum_ns, rate), 0);
         // Easy Effects: monitor delay 2 quanta -> 2 quanta later.
         timing.reference_ns.set(Some(2 * quantum_ns));
@@ -662,6 +701,17 @@ mod tests {
             buffer_start(true, now, 0, 20_000_000, rate, 1, 960),
             Duration::from_millis(9_980)
         );
+    }
+
+    #[test]
+    fn app_sink_is_the_lowest_linked_sink() {
+        let nodes = HashSet::from([10, 11]);
+        let is_sink = |id| id >= 50;
+        // (output node, input node); 30 is not a sink, 12 not the app.
+        let links = [(10, 66), (11, 57), (10, 30), (12, 40)];
+        assert_eq!(app_sink(&links, &nodes, is_sink), Some(57));
+        assert_eq!(app_sink(&links[2..], &nodes, is_sink), None);
+        assert_eq!(app_sink(&[], &nodes, is_sink), None);
     }
 
     #[test]

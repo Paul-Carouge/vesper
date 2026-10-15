@@ -118,7 +118,9 @@ fn advertised_formats(
     node_id: u32,
 ) -> Result<Advertised, Error> {
     let found: Rc<RefCell<Advertised>> = Rc::default();
-    let node: Rc<RefCell<Option<(pw::node::Node, pw::node::NodeListener)>>> = Rc::default();
+    // Listener first: tuple fields drop in order, and a listener must go before
+    // its proxy (dropping it unhooks from the proxy's list).
+    let node: Rc<RefCell<Option<(pw::node::NodeListener, pw::node::Node)>>> = Rc::default();
     let _listener = registry
         .add_listener_local()
         .global({
@@ -154,7 +156,7 @@ fn advertised_formats(
                     })
                     .register();
                 proxy.enum_params(0, Some(ParamType::EnumFormat), 0, u32::MAX);
-                *node.borrow_mut() = Some((proxy, listener));
+                *node.borrow_mut() = Some((listener, proxy));
             }
         })
         .register();
