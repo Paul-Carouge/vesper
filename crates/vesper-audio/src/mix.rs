@@ -55,6 +55,11 @@ impl State {
                 *s += x;
             }
         }
+        // shortcut: hard clip so a loud sum cannot wrap or blast players;
+        // replace with the DSP limiter once per-track chains are wired.
+        for s in &mut self.sum {
+            *s = s.clamp(-1.0, 1.0);
+        }
         if let Some(enc) = &mut self.enc {
             enc.push(&self.sum);
         }
@@ -212,6 +217,16 @@ mod tests {
         let mid = &decoded[decoded.len() / 3..decoded.len() * 2 / 3];
         let peak = mid.iter().fold(0f32, |m, s| m.max(s.abs()));
         assert!((peak - 0.375).abs() < 0.03, "{peak}");
+    }
+
+    #[test]
+    fn mix_is_clipped_to_full_scale() {
+        let mix = Mix::start(Duration::ZERO, |_| {}).unwrap();
+        let (a, b) = (mix.input(), mix.input());
+        a.push(&[0.75, -0.75, 0.25, 0.0]);
+        // Pushed with the lock held only by us: read the sum it produced.
+        b.push(&[0.75, -0.75, 0.25, 0.0]);
+        assert_eq!(lock(&mix.state).sum, [1.0, -1.0, 0.5, 0.0]);
     }
 
     #[test]

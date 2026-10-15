@@ -461,14 +461,27 @@ export component AppWindow inherits Window {
     // Audio card: the track whose settings are open (-1: none), and the picker.
     property <int> open-track: -1;
     property <bool> picking;
+    // A name being typed in the open track's field, not committed yet.
+    property <string> name-draft;
+    property <int> name-draft-track: -1;
+
+    // Closes the open track's settings; a name being typed is kept.
+    function close-track() {
+        if (root.name-draft-track >= 0) {
+            root.track-renamed(root.name-draft-track, root.name-draft);
+            root.name-draft-track = -1;
+        }
+        root.open-track = -1;
+    }
 
     function set-picking(on: bool) {
+        root.close-track();
         root.picking = on;
-        root.open-track = -1;
         root.track-picker-changed(on);
     }
 
     public function open-track-settings(i: int) {
+        root.close-track();
         root.picking = false;
         root.open-track = i;
     }
@@ -956,8 +969,12 @@ export component AppWindow inherits Window {
                                     root.track-mute-toggled(i);
                                 }
                                 toggle-open => {
-                                    root.picking = false;
-                                    root.open-track = root.open-track == i ? -1 : i;
+                                    let was-open = root.open-track == i;
+                                    root.close-track();
+                                    if (root.picking) {
+                                        root.set-picking(false);
+                                    }
+                                    root.open-track = was-open ? -1 : i;
                                 }
                             }
                             // Settings of the open track, under its name.
@@ -972,7 +989,12 @@ export component AppWindow inherits Window {
                                     label: "Track name";
                                     enabled: !root.active;
                                     accepted(name) => {
+                                        root.name-draft-track = -1;
                                         root.track-renamed(i, name);
+                                    }
+                                    edited(name) => {
+                                        root.name-draft = name;
+                                        root.name-draft-track = name != track.name ? i : -1;
                                     }
                                 }
                                 HorizontalLayout {
@@ -983,6 +1005,7 @@ export component AppWindow inherits Window {
                                         minimum: -60;
                                         maximum: 12;
                                         step: 1;
+                                        page-step: 6;
                                         value: track.volume-db;
                                         value-text: TrackText.volume(track.volume-db);
                                         changed(db) => {
@@ -1025,6 +1048,8 @@ export component AppWindow inherits Window {
                                         enabled: !root.active;
                                         accessible-label: "Remove \{track.name}";
                                         clicked => {
+                                            // Its name no longer matters.
+                                            root.name-draft-track = -1;
                                             root.open-track = -1;
                                             root.track-removed(i);
                                         }

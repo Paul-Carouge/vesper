@@ -95,6 +95,8 @@ fn options(nodes: &[Node], tracks: &[Track]) -> Vec<SourceOption> {
     defaults
         .iter()
         .chain(nodes)
+        // A name the settings cannot store (e.g. with a `|`) is left out.
+        .filter(|node| prefs::audio_source_from_id(&prefs::audio_source_id(&node.source)).is_some())
         .map(|node| {
             let heading = match node.source {
                 Source::Output(_) => "OUTPUT DEVICES",
@@ -327,6 +329,10 @@ mod tests {
             Node {
                 source: Source::App("Firefox".into()),
                 label: "Firefox".into(),
+            },
+            Node {
+                source: Source::App("a|b".into()),
+                label: "a|b".into(),
             },
         ];
         let tracks = [Track::new("Desktop", Source::Desktop)];

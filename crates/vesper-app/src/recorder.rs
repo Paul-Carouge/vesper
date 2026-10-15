@@ -26,7 +26,7 @@ use std::io::ErrorKind;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -556,6 +556,25 @@ fn write_audio(sinks: &SharedSinks, index: usize, packet: EncodedPacket) {
     }
 }
 
+/// File stream of a track among the audio streams: after the mix, if any.
+struct StreamIndex {
+    first: Arc<AtomicUsize>,
+    track: usize,
+}
+
+impl StreamIndex {
+    fn new(first: &Arc<AtomicUsize>, track: usize) -> Self {
+        Self {
+            first: first.clone(),
+            track,
+        }
+    }
+
+    fn get(&self) -> usize {
+        self.first.load(Ordering::Relaxed) + self.track
+    }
+}
+
 /// Starts the enabled tracks and their mix. A track that fails to start is
 /// left out of the files (e.g. no microphone); the mix needs two tracks.
 fn start_audio(sources: &AudioSources, sinks: &SharedSinks) {
@@ -580,11 +599,12 @@ fn start_audio(sources: &AudioSources, sinks: &SharedSinks) {
         .iter()
         .map(|_| mixer.as_ref().map(Mix::input))
         .collect();
-    let first = usize::from(mixer.is_some());
+    // Streams before the tracks: the mix, until it is dropped below.
+    let first = Arc::new(AtomicUsize::new(usize::from(mixer.is_some())));
     let mut running = Vec::new();
     for (input, &i) in inputs.iter_mut().zip(&enabled) {
         let track = &tracks[i];
-        let (index, sinks) = (first + running.len(), sinks.clone());
+        let (index, sinks) = (StreamIndex::new(&first, running.len()), sinks.clone());
         let options = Options {
             anchor,
             muted: track.muted,
@@ -594,15 +614,16 @@ fn start_audio(sources: &AudioSources, sinks: &SharedSinks) {
             process: None,
         };
         match AudioCapture::start(track.source.clone(), options, move |packet| {
-            write_audio(&sinks, index, packet)
+            write_audio(&sinks, index.get(), packet)
         }) {
             Ok(capture) => running.push((i, capture)),
             Err(e) => log!("running without the {:?} track: {e}", track.name),
         }
     }
     // A mix of one track would be a copy of it.
-    if running.len() < 2 {
-        drop(mixer.take());
+    if running.len() < 2 && mixer.take().is_some() {
+        // The tracks move up one stream: before any file or replay uses them.
+        first.store(0, Ordering::Relaxed);
     }
     // Started outside the lock (it blocks until PipeWire is ready); the
     // latest mute and volume applied under it, so no change is missed.
@@ -1277,6 +1298,20 @@ mod tests {
             snap.iter().filter(|(s, _)| *s == 1).count(),
             ring.audio[0].len()
         );
+    }
+
+    #[test]
+    fn tracks_move_up_when_the_mix_is_dropped() {
+        // Mix + 2 tracks, then one track failed: the mix goes, the other
+        // track must write stream 0, the only one its files have.
+        let first = Arc::new(AtomicUsize::new(1));
+        let tracks: Vec<_> = (0..2).map(|k| StreamIndex::new(&first, k)).collect();
+        assert_eq!(
+            tracks.iter().map(StreamIndex::get).collect::<Vec<_>>(),
+            [1, 2]
+        );
+        first.store(0, Ordering::Relaxed);
+        assert_eq!(tracks[0].get(), 0);
     }
 
     #[test]
