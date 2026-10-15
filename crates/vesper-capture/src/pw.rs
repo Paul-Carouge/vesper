@@ -1,0 +1,459 @@
+//! The PipeWire thread: format negotiation and frame delivery.
+
+use std::cell::{Cell, RefCell};
+use std::os::fd::{BorrowedFd, OwnedFd};
+use std::rc::Rc;
+
+use pipewire as pw;
+use pw::spa::param::ParamType;
+use pw::spa::param::video::VideoFormat;
+use pw::spa::pod::Pod;
+use pw::spa::sys as spa_sys;
+use pw::sys::pw_buffer;
+use pw::{core::CoreRc, main_loop::MainLoopRc, stream::StreamRc};
+use tracing::{error, info, warn};
+use vesper_core::{DmaBufPlane, ReleaseGuard, VideoFrame};
+
+use crate::Error;
+use crate::format::{self, MOD_LINEAR};
+
+/// A `pw_buffer` pointer sent back to the PipeWire thread.
+pub struct BufferPtr(pub *mut pw_buffer);
+// SAFETY: the pointer is only dereferenced on the PipeWire thread, which owns it.
+unsafe impl Send for BufferPtr {}
+
+/// Messages to the PipeWire thread.
+pub enum Msg {
+    /// A frame was dropped: requeue its buffer if its pool still exists.
+    Release(BufferPtr, u32),
+    Stop,
+}
+
+/// Handles one message. A release from an older pool generation is ignored:
+/// that buffer was freed by the renegotiation.
+pub fn handle_msg(
+    msg: Msg,
+    generation: u32,
+    mut queue: impl FnMut(*mut pw_buffer),
+    quit: impl FnOnce(),
+) {
+    match msg {
+        Msg::Release(buffer, gen_of_frame) if gen_of_frame == generation => queue(buffer.0),
+        Msg::Release(..) => {}
+        Msg::Stop => quit(),
+    }
+}
+
+/// Runs a full roundtrip with the server.
+fn roundtrip(mainloop: &MainLoopRc, core: &CoreRc) -> Result<(), Error> {
+    let pending = core.sync(0)?.seq();
+    let done = Rc::new(Cell::new(false));
+    let failed = Rc::new(Cell::new(false));
+    let _listener = core
+        .add_listener_local()
+        .done({
+            let (done, mainloop) = (done.clone(), mainloop.clone());
+            move |id, seq| {
+                if id == pw::core::PW_ID_CORE && seq.seq() == pending {
+                    done.set(true);
+                    mainloop.quit();
+                }
+            }
+        })
+        .error({
+            let (failed, mainloop) = (failed.clone(), mainloop.clone());
+            move |id, _, res, msg| {
+                error!("pipewire core error on {id}: {msg} ({res})");
+                failed.set(true);
+                mainloop.quit();
+            }
+        })
+        .register();
+    while !done.get() && !failed.get() {
+        mainloop.run();
+    }
+    if failed.get() {
+        return Err("pipewire connection failed".into());
+    }
+    Ok(())
+}
+
+/// Formats the node can produce, each with its DMA-BUF modifiers (empty: shm only).
+type Advertised = Vec<(VideoFormat, Vec<u64>)>;
+
+/// Asks the screencast node which formats and modifiers it can produce.
+fn advertised_formats(
+    mainloop: &MainLoopRc,
+    core: &CoreRc,
+    node_id: u32,
+) -> Result<Advertised, Error> {
+    let registry = core.get_registry_rc()?;
+    let found: Rc<RefCell<Advertised>> = Rc::default();
+    let node: Rc<RefCell<Option<(pw::node::Node, pw::node::NodeListener)>>> = Rc::default();
+    let _listener = registry
+        .add_listener_local()
+        .global({
+            let (registry, found, node) = (registry.clone(), found.clone(), node.clone());
+            move |global| {
+                if global.id != node_id || global.type_ != pw::types::ObjectType::Node {
+                    return;
+                }
+                let Ok(proxy) = registry.bind::<pw::node::Node, _>(global) else {
+                    return;
+                };
+                let found = found.clone();
+                let listener = proxy
+                    .add_listener_local()
+                    .param(move |_, _, _, _, pod| {
+                        let Some(info) = pod.and_then(|p| format::parse_format(p.as_bytes()))
+                        else {
+                            return;
+                        };
+                        let mut found = found.borrow_mut();
+                        for f in info.formats {
+                            match found.iter_mut().find(|(g, _)| *g == f) {
+                                Some((_, mods)) => {
+                                    for m in &info.modifiers {
+                                        if !mods.contains(m) {
+                                            mods.push(*m);
+                                        }
+                                    }
+                                }
+                                None => found.push((f, info.modifiers.clone())),
+                            }
+                        }
+                    })
+                    .register();
+                proxy.enum_params(0, Some(ParamType::EnumFormat), 0, u32::MAX);
+                *node.borrow_mut() = Some((proxy, listener));
+            }
+        })
+        .register();
+    // First roundtrip: globals announced and enum_params sent. Second: replies in.
+    roundtrip(mainloop, core)?;
+    roundtrip(mainloop, core)?;
+    if node.borrow().is_none() {
+        return Err(format!("pipewire node {node_id} not found").into());
+    }
+    Ok(found.take())
+}
+
+/// The format both sides agreed on.
+struct Negotiated {
+    width: u32,
+    height: u32,
+    fourcc: u32,
+    modifier: u64,
+}
+
+struct State<F> {
+    on_frame: F,
+    /// Our `EnumFormat` offer, reused when fixating a modifier.
+    offer: Vec<Vec<u8>>,
+    format: Option<Negotiated>,
+    generation: Rc<Cell<u32>>,
+    next_buffer_id: u32,
+    tx: pw::channel::Sender<Msg>,
+}
+
+fn update_params(stream: &pw::stream::Stream, pods: &[Vec<u8>]) {
+    let mut pods: Vec<&Pod> = pods.iter().filter_map(|b| Pod::from_bytes(b)).collect();
+    if let Err(e) = stream.update_params(&mut pods) {
+        error!("pw_stream_update_params failed: {e}");
+    }
+}
+
+fn on_format<F>(stream: &pw::stream::Stream, state: &mut State<F>, pod: &Pod) {
+    let Some(info) = format::parse_format(pod.as_bytes()) else {
+        warn!("ignoring a non raw-video format");
+        return;
+    };
+    let (Some(&spa_format), Some(size)) = (info.formats.first(), info.size) else {
+        warn!("ignoring a format without video format or size: {info:?}");
+        return;
+    };
+    let Some(fourcc) = format::spa_to_drm(spa_format) else {
+        error!("server picked unsupported format {spa_format:?}");
+        return;
+    };
+    if info.dont_fixate && !info.modifiers.is_empty() {
+        // The server lists modifiers by preference: take the first and renegotiate.
+        info!(
+            "fixating modifier {:#x} out of {} offered",
+            info.modifiers[0],
+            info.modifiers.len()
+        );
+        let mut pods = vec![format::enum_format(spa_format, &info.modifiers[..1])];
+        pods.extend(state.offer.iter().cloned());
+        update_params(stream, &pods);
+        return;
+    }
+    let dmabuf = !info.modifiers.is_empty();
+    let modifier = info.modifiers.first().copied().unwrap_or(MOD_LINEAR);
+    if dmabuf {
+        info!(
+            "negotiated DMA-BUF {}x{} {spa_format:?} modifier {modifier:#x}",
+            size.width, size.height
+        );
+    } else {
+        warn!(
+            "DMA-BUF negotiation failed: falling back to MemFd shared memory \
+             ({}x{} {spa_format:?}). Frames are in system RAM, not GPU memory.",
+            size.width, size.height
+        );
+    }
+    state.format = Some(Negotiated {
+        width: size.width,
+        height: size.height,
+        fourcc,
+        modifier,
+    });
+    update_params(
+        stream,
+        &[format::buffers_param(dmabuf), format::header_meta_param()],
+    );
+}
+
+/// Builds a frame from a dequeued buffer, or `None` if it carries no image.
+///
+/// # Safety
+/// `buffer` must be a buffer dequeued from the stream and not yet requeued.
+unsafe fn build_frame<F>(buffer: *mut pw_buffer, state: &State<F>) -> Option<VideoFrame> {
+    let format = state.format.as_ref()?;
+    // SAFETY: per the contract, `buffer` and its spa_buffer are valid.
+    let spa_buf = unsafe { (*buffer).buffer };
+    if spa_buf.is_null() || unsafe { (*spa_buf).n_datas == 0 } {
+        return None;
+    }
+    let datas =
+        unsafe { std::slice::from_raw_parts((*spa_buf).datas, (*spa_buf).n_datas as usize) };
+    let header = unsafe {
+        spa_sys::spa_buffer_find_meta_data(
+            spa_buf,
+            spa_sys::SPA_META_Header,
+            size_of::<spa_sys::spa_meta_header>(),
+        ) as *const spa_sys::spa_meta_header
+    };
+    let header = unsafe { header.as_ref() };
+    if header.is_some_and(|h| h.flags & spa_sys::SPA_META_HEADER_FLAG_CORRUPTED != 0) {
+        return None;
+    }
+    let mut planes = Vec::with_capacity(datas.len());
+    for (i, data) in datas.iter().enumerate() {
+        let chunk = unsafe { data.chunk.as_ref() }?;
+        // A zero-sized first chunk is a cursor-only update with no new image.
+        if (i == 0 && chunk.size == 0)
+            || chunk.flags & spa_sys::SPA_CHUNK_FLAG_CORRUPTED as i32 != 0
+        {
+            return None;
+        }
+        let offset = match data.type_ {
+            spa_sys::SPA_DATA_DmaBuf => chunk.offset,
+            spa_sys::SPA_DATA_MemFd => chunk.offset + data.mapoffset,
+            other => {
+                warn!("unexpected buffer data type {other}");
+                return None;
+            }
+        };
+        // Planes may share one BO: dup an fd per plane anyway.
+        // SAFETY: the fd is open while the buffer is dequeued.
+        let fd: OwnedFd = unsafe { BorrowedFd::borrow_raw(data.fd as i32) }
+            .try_clone_to_owned()
+            .inspect_err(|e| error!("dup of buffer fd failed: {e}"))
+            .ok()?;
+        planes.push(DmaBufPlane {
+            fd,
+            offset,
+            stride: chunk.stride as u32,
+        });
+    }
+    let generation = state.generation.get();
+    let msg = Msg::Release(BufferPtr(buffer), generation);
+    let tx = state.tx.clone();
+    Some(VideoFrame {
+        width: format.width,
+        height: format.height,
+        fourcc: format.fourcc,
+        modifier: format.modifier,
+        planes,
+        buffer_id: unsafe { (*buffer).user_data } as usize as u32,
+        pool_generation: generation,
+        pts: format::frame_pts(header.map(|h| h.pts)),
+        release: ReleaseGuard::new(move || {
+            // Fails only after the capture stopped; the pool is gone then anyway.
+            let _ = tx.send(msg);
+        }),
+    })
+}
+
+/// Connects to the portal's PipeWire remote and streams `node_id` until a
+/// `Msg::Stop` arrives. Reports setup success on `ready` before streaming.
+pub fn run<F>(
+    fd: OwnedFd,
+    node_id: u32,
+    on_frame: F,
+    tx: pw::channel::Sender<Msg>,
+    rx: pw::channel::Receiver<Msg>,
+    ready: std::sync::mpsc::Sender<Result<(), Error>>,
+) where
+    F: FnMut(VideoFrame) + 'static,
+{
+    pw::init();
+    let mainloop = match MainLoopRc::new(None) {
+        Ok(m) => m,
+        Err(e) => return drop(ready.send(Err(e.into()))),
+    };
+    let setup = (|| -> Result<_, Error> {
+        let context = pw::context::ContextRc::new(&mainloop, None)?;
+        let core = context.connect_fd_rc(fd, None)?;
+        let offer: Vec<Vec<u8>> = {
+            let advertised = advertised_formats(&mainloop, &core, node_id)?;
+            let supported: Vec<_> = advertised
+                .into_iter()
+                .filter(|(f, _)| format::spa_to_drm(*f).is_some())
+                .collect();
+            if supported.is_empty() {
+                return Err("screencast node offers no supported RGB format".into());
+            }
+            // DMA-BUF offers first, in the server's order; shared memory last.
+            let dmabuf = supported
+                .iter()
+                .filter(|(_, mods)| !mods.is_empty())
+                .map(|(f, mods)| format::enum_format(*f, mods));
+            let shm = supported.iter().map(|(f, _)| format::enum_format(*f, &[]));
+            dmabuf.chain(shm).collect()
+        };
+        let stream = StreamRc::new(
+            core.clone(),
+            "vesper-capture",
+            pw::properties::properties! {
+                *pw::keys::MEDIA_TYPE => "Video",
+                *pw::keys::MEDIA_CATEGORY => "Capture",
+                *pw::keys::MEDIA_ROLE => "Screen",
+            },
+        )?;
+        let generation = Rc::new(Cell::new(0));
+        let state = State {
+            on_frame,
+            offer: offer.clone(),
+            format: None,
+            generation: generation.clone(),
+            next_buffer_id: 0,
+            tx,
+        };
+        let listener = stream
+            .add_local_listener_with_user_data(state)
+            .state_changed(|_, _, old, new| info!("stream state {old:?} -> {new:?}"))
+            .param_changed(|stream, state, id, pod| {
+                if let Some(pod) = pod
+                    && id == ParamType::Format.as_raw()
+                {
+                    on_format(stream, state, pod);
+                }
+            })
+            .add_buffer(|_, state, buffer| {
+                // SAFETY: PipeWire hands us a valid buffer; user_data is ours.
+                unsafe { (*buffer).user_data = state.next_buffer_id as usize as *mut _ };
+                state.next_buffer_id += 1;
+            })
+            .remove_buffer(|_, state, _| {
+                // The pool is being replaced: frames still out must not requeue.
+                state.generation.set(state.generation.get().wrapping_add(1));
+                state.next_buffer_id = 0;
+            })
+            .process(|stream, state| {
+                // Keep only the newest buffer; requeue older ones at once.
+                let mut newest: *mut pw_buffer = std::ptr::null_mut();
+                loop {
+                    // SAFETY: called on the stream's own thread.
+                    let buffer = unsafe { stream.dequeue_raw_buffer() };
+                    if buffer.is_null() {
+                        break;
+                    }
+                    if !newest.is_null() {
+                        unsafe { stream.queue_raw_buffer(newest) };
+                    }
+                    newest = buffer;
+                }
+                if newest.is_null() {
+                    return;
+                }
+                // SAFETY: `newest` is dequeued and not requeued.
+                match unsafe { build_frame(newest, state) } {
+                    // The buffer goes back from the frame's ReleaseGuard.
+                    Some(frame) => (state.on_frame)(frame),
+                    None => unsafe { stream.queue_raw_buffer(newest) },
+                }
+            })
+            .register()?;
+        let mut pods: Vec<&Pod> = offer.iter().filter_map(|b| Pod::from_bytes(b)).collect();
+        stream.connect(
+            pw::spa::utils::Direction::Input,
+            Some(node_id),
+            pw::stream::StreamFlags::AUTOCONNECT,
+            &mut pods,
+        )?;
+        Ok((context, core, stream, listener, generation))
+    })();
+    let (_context, _core, stream, _listener, generation) = match setup {
+        Ok(s) => s,
+        Err(e) => return drop(ready.send(Err(e))),
+    };
+    let _rx = rx.attach(mainloop.loop_(), {
+        let (stream, mainloop) = (stream.clone(), mainloop.clone());
+        move |msg| {
+            handle_msg(
+                msg,
+                generation.get(),
+                // SAFETY: same generation, so the buffer is still in the pool.
+                |buffer| unsafe { stream.queue_raw_buffer(buffer) },
+                || mainloop.quit(),
+            )
+        }
+    });
+    let _ = ready.send(Ok(()));
+    mainloop.run();
+    if let Err(e) = stream.disconnect() {
+        warn!("pw_stream_disconnect failed: {e}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn release_from_another_thread_requeues_current_pool_only() {
+        pw::init();
+        let mainloop = MainLoopRc::new(None).unwrap();
+        let (tx, rx) = pw::channel::channel::<Msg>();
+        let queued: Rc<RefCell<Vec<usize>>> = Rc::default();
+        let _rx = rx.attach(mainloop.loop_(), {
+            let (queued, mainloop) = (queued.clone(), mainloop.clone());
+            move |msg| {
+                handle_msg(
+                    msg,
+                    1,
+                    |b| queued.borrow_mut().push(b as usize),
+                    || mainloop.quit(),
+                )
+            }
+        });
+        let guard = |ptr: usize, generation: u32| {
+            let tx = tx.clone();
+            let msg = Msg::Release(BufferPtr(ptr as *mut pw_buffer), generation);
+            ReleaseGuard::new(move || drop(tx.send(msg)))
+        };
+        let (stale, current) = (guard(0x10, 0), guard(0x20, 1));
+        let stop = tx.clone();
+        std::thread::spawn(move || {
+            drop(stale);
+            drop(current);
+            let _ = stop.send(Msg::Stop);
+        })
+        .join()
+        .unwrap();
+        mainloop.run();
+        assert_eq!(*queued.borrow(), vec![0x20]);
+    }
+}
