@@ -110,6 +110,10 @@ impl Recorder {
                     run(&settings, &flag, &started_flag, &sources, &mut on_event)
                 }))
                 .unwrap_or_else(|_| Err("Internal error: the recorder crashed".into()));
+                // After a panic, the audio captures (mic included) must not keep running.
+                // Taken under the lock, dropped outside it (their flush writes to the muxer).
+                let running = std::mem::take(&mut lock(&sources).running);
+                drop(running);
                 on_event(Event::Finished(result));
             })?;
         Ok(Self {
