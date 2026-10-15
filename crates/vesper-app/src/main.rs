@@ -17,6 +17,7 @@ mod recorder;
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use slint::ComponentHandle;
@@ -27,6 +28,10 @@ use recorder::{Event, Pipeline, Settings};
 
 /// The last started pipeline; it may have ended since.
 type Shared = Rc<RefCell<Option<Pipeline>>>;
+
+/// Generation of the last started pipeline: a late `Stopped` from an older
+/// one must not reset the UI of the current one.
+static GENERATION: AtomicU64 = AtomicU64::new(0);
 
 /// Meter refresh period: ~30 Hz.
 const METER_TICK: Duration = Duration::from_millis(33);
@@ -62,6 +67,7 @@ fn main() -> Result<(), slint::PlatformError> {
         ui.set_output_folder(folder.to_string_lossy().as_ref().into());
     }
     ui.set_replay_enabled(true);
+    update_replay_memory(&ui);
     if recorder::load_restore_token().is_some() {
         ui.set_source_kind(SourceKind::Screen);
         ui.set_source_name("Last picked source".into());
@@ -97,7 +103,7 @@ fn main() -> Result<(), slint::PlatformError> {
     let result = ui.run();
     // Closing the window mid-recording still finalizes the file. Before the
     // capture started, the thread may wait on the portal picker: exit without it.
-    // Replays being saved are cut short.
+    // Replays being saved are finished too.
     if let Some(rec) = recording.take()
         && rec.started()
     {
@@ -172,6 +178,10 @@ fn wire_callbacks(ui: &AppWindow, recording: &Shared) {
     ui.on_save_replay(move || {
         let Some(ui) = weak.upgrade() else { return };
         log!("save-replay: last {} s", ui.get_replay_seconds());
+        if ui.get_output_folder().is_empty() {
+            flash_notice(&ui, "Choose an output folder first");
+            return;
+        }
         let folder = PathBuf::from(ui.get_output_folder().as_str());
         let saving =
             ui.get_replay_enabled() && rec.borrow().as_ref().is_some_and(|p| p.save_replay(folder));
@@ -185,6 +195,7 @@ fn wire_callbacks(ui: &AppWindow, recording: &Shared) {
     ui.on_replay_changed(move |enabled, seconds| {
         let Some(ui) = weak.upgrade() else { return };
         log!("replay-changed: enabled={enabled} seconds={seconds}");
+        update_replay_memory(&ui);
         let applied = rec
             .borrow()
             .as_ref()
@@ -222,6 +233,7 @@ fn wire_callbacks(ui: &AppWindow, recording: &Shared) {
             ui.get_quality(),
             ui.get_fps()
         );
+        update_replay_memory(&ui);
     });
 
     ui.on_pick_output_folder(|| {
@@ -253,8 +265,9 @@ fn start_pipeline(ui: &AppWindow, shared: &Shared, record: Option<PathBuf>) -> R
     let settings = settings(ui);
     log!("start-pipeline: {settings:?}");
     let weak = ui.as_weak();
+    let generation = GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
     let pipeline = Pipeline::start(settings, replay_span(ui), record, move |event| {
-        let _ = weak.upgrade_in_event_loop(move |ui| on_recorder_event(&ui, event));
+        let _ = weak.upgrade_in_event_loop(move |ui| on_recorder_event(&ui, generation, event));
     })
     .map_err(|e| format!("Could not start: {e}"))?;
     *shared.borrow_mut() = Some(pipeline);
@@ -262,7 +275,9 @@ fn start_pipeline(ui: &AppWindow, shared: &Shared, record: Option<PathBuf>) -> R
 }
 
 /// Applies a pipeline event on the UI thread.
-fn on_recorder_event(ui: &AppWindow, event: Event) {
+/// Events of an older pipeline still count (its recording or replay really
+/// ended), except `Stopped(Some)`, which would reset the current one.
+fn on_recorder_event(ui: &AppWindow, generation: u64, event: Event) {
     match event {
         Event::Started => {
             ui.set_rec_state(RecState::Recording);
@@ -315,6 +330,9 @@ fn on_recorder_event(ui: &AppWindow, event: Event) {
         // A clean stop always follows `Finished`: nothing to reset (a new
         // pipeline may already be starting).
         Event::Stopped(None) => log!("pipeline stopped"),
+        Event::Stopped(Some(e)) if generation != GENERATION.load(Ordering::Relaxed) => {
+            log!("earlier pipeline stopped: {e}");
+        }
         Event::Stopped(Some(e)) => {
             log!("pipeline stopped: {e}");
             // Neither a recording nor the replay buffer runs any more.
@@ -324,6 +342,22 @@ fn on_recorder_event(ui: &AppWindow, event: Event) {
             flash_notice(ui, &e);
         }
     }
+}
+
+/// Shows the RAM the replay buffer may take at 4K with the current settings:
+/// its length (plus a 2 s GOP) times the target bitrate.
+fn update_replay_memory(ui: &AppWindow) {
+    let bitrate = 3840.0
+        * 2160.0
+        * f64::from(ui.get_fps())
+        * bits_per_pixel(ui.get_codec(), ui.get_quality());
+    let mb = bitrate / 8e6 * f64::from(ui.get_replay_seconds() + 2);
+    let quality = match ui.get_quality() {
+        QualityPreset::Performance => "Performance",
+        QualityPreset::Balanced => "Balanced",
+        QualityPreset::Quality => "Quality",
+    };
+    ui.set_replay_memory(format!("≈ {} MB at 4K{} {quality}", mb.round(), ui.get_fps()).into());
 }
 
 /// Target bits per pixel per frame of each quality preset for HEVC and AV1;

@@ -105,6 +105,8 @@ struct Control {
     quit: bool,
     /// Set once the pipeline thread takes no more requests.
     ended: bool,
+    /// Replays being written, joined by `Pipeline::join`.
+    saves: Vec<JoinHandle<()>>,
 }
 
 type OnEvent = Arc<dyn Fn(Event) + Send + Sync>;
@@ -228,9 +230,14 @@ impl Pipeline {
     }
 
     /// Stops and waits for the recording, if any, to be finalized.
+    /// Also waits for replays being saved, so none is cut short.
     pub fn join(self) {
         self.request(|c| c.quit = true);
         let _ = self.thread.join();
+        let saves = std::mem::take(&mut lock(&self.control).saves);
+        for save in saves {
+            let _ = save.join();
+        }
     }
 }
 
@@ -341,15 +348,22 @@ impl Ring {
         }
     }
 
-    /// All packets as `(stream, packet)`, video being stream 0, in pts order.
-    fn snapshot(&self) -> Vec<(usize, EncodedPacket)> {
-        let mut all: Vec<_> = self.video.iter().map(|p| (0, p.clone())).collect();
-        for (i, track) in self.audio.iter().enumerate() {
-            all.extend(track.iter().map(|p| (1 + i, p.clone())));
-        }
-        all.sort_by_key(|(_, p)| p.pts);
-        all
+    /// A copy of the packets (shared data): cheap enough under the lock.
+    fn snapshot(&self) -> Snapshot {
+        (self.video.clone(), self.audio.clone())
     }
+}
+
+type Snapshot = (VecDeque<EncodedPacket>, Vec<VecDeque<EncodedPacket>>);
+
+/// All packets as `(stream, packet)`, video being stream 0, in pts order.
+fn interleave((video, audio): Snapshot) -> Vec<(usize, EncodedPacket)> {
+    let mut all: Vec<_> = video.into_iter().map(|p| (0, p)).collect();
+    for (i, track) in audio.into_iter().enumerate() {
+        all.extend(track.into_iter().map(|p| (1 + i, p)));
+    }
+    all.sort_by_key(|(_, p)| p.pts);
+    all
 }
 
 /// Starts the desktop and microphone captures. A source that fails to start
@@ -497,8 +511,9 @@ fn write_replay(
     folder: &Path,
     video: &VideoTrack,
     audio: &[AudioTrack],
-    packets: &[(usize, EncodedPacket)],
+    snapshot: Snapshot,
 ) -> Result<PathBuf, String> {
+    let packets = interleave(snapshot);
     let start = packets
         .iter()
         .find(|(s, _)| *s == 0)
@@ -524,11 +539,12 @@ fn save_replay(
     folder: PathBuf,
     video: Option<&Video>,
     sinks: &SharedSinks,
+    control: &Mutex<Control>,
     audio: &[AudioTrack],
     on_event: &OnEvent,
 ) {
     let snapshot = lock(sinks).ring.as_ref().map(Ring::snapshot);
-    let (Some(video), Some(packets)) = (video, snapshot) else {
+    let (Some(video), Some(snapshot)) = (video, snapshot) else {
         on_event(Event::ReplaySaved(Err("The replay buffer is empty".into())));
         return;
     };
@@ -537,13 +553,18 @@ fn save_replay(
         .name("vesper-replay".into())
         .spawn(move || {
             event(Event::ReplaySaved(write_replay(
-                &folder, &track, &audio, &packets,
+                &folder, &track, &audio, snapshot,
             )))
         });
-    if let Err(e) = spawned {
-        on_event(Event::ReplaySaved(Err(format!(
+    match spawned {
+        Ok(save) => {
+            let mut c = lock(control);
+            c.saves.retain(|s| !s.is_finished());
+            c.saves.push(save);
+        }
+        Err(e) => on_event(Event::ReplaySaved(Err(format!(
             "Could not save the replay: {e}"
-        ))));
+        )))),
     }
 }
 
@@ -592,8 +613,10 @@ fn pump(
         // Requests are read under the control lock, so none lands on an
         // ended pipeline unseen.
         let (record, stop, replay, save) = {
-            let mut c = lock(control);
+            // Only this thread sets `rec`; never take `sinks` under
+            // `control`: the UI would wait on muxer writes.
             let recording = lock(sinks).rec.is_some();
+            let mut c = lock(control);
             if c.quit || !(recording || c.record.is_some() || c.replay.is_some()) {
                 c.ended = true;
                 break;
@@ -623,7 +646,7 @@ fn pump(
             }
         }
         if let Some(folder) = save {
-            save_replay(folder, video.as_ref(), sinks, audio, on_event);
+            save_replay(folder, video.as_ref(), sinks, control, audio, on_event);
         }
         let Some(v) = &mut video else {
             // Waiting for the first frame: poll once per interval.
@@ -954,7 +977,7 @@ mod tests {
     #[test]
     fn ring_snapshot_is_in_pts_order() {
         let ring = filled(3, 4000);
-        let snap = ring.snapshot();
+        let snap = interleave(ring.snapshot());
         assert!(snap.windows(2).all(|w| w[0].1.pts <= w[1].1.pts));
         assert_eq!(
             snap.iter().filter(|(s, _)| *s == 0).count(),
