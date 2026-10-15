@@ -24,5 +24,9 @@ vesper-mux.workspace = true
 vesper-audio.workspace = true
 vesper-gamecapture.workspace = true
 
+[features]
+# Measurement build: counting allocator and per-tick pipeline stats.
+perf-audit = []
+
 [build-dependencies]
 slint-build = "~1.18"

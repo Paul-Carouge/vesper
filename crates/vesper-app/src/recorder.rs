@@ -422,6 +422,10 @@ fn park(slot: &Mutex<Slot>, event: Result<VideoFrame, String>) {
         }
     };
     drop(s);
+    #[cfg(feature = "perf-audit")]
+    if old.is_some() {
+        crate::audit::REPLACED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     drop(old);
 }
 
@@ -848,9 +852,13 @@ fn pump(
     let mut deadline = monotonic_now();
     let mut window = (monotonic_now(), 0u32);
     let mut error = None;
+    #[cfg(feature = "perf-audit")]
+    let mut audit = crate::audit::Audit::new();
 
     loop {
         sleep_until(deadline);
+        #[cfg(feature = "perf-audit")]
+        audit.woke(deadline, monotonic_now());
         let (frame, ended) = {
             let mut s = lock(slot);
             (s.frame.take(), s.ended.take())
@@ -1015,6 +1023,8 @@ fn pump(
             }
             last_size = Some((f.width, f.height));
         }
+        #[cfg(feature = "perf-audit")]
+        audit.before_encode(frame.as_ref(), pts, monotonic_now());
         let packets = match frame {
             Some(mut frame) => {
                 frame.pts = pts;
@@ -1029,7 +1039,11 @@ fn pump(
                 break;
             }
         };
+        #[cfg(feature = "perf-audit")]
+        audit.after_encode(&packets, monotonic_now());
         let ended = lock(sinks).write_video(packets);
+        #[cfg(feature = "perf-audit")]
+        audit.after_write(monotonic_now());
         if let Some((r, e)) = ended {
             on_event(Event::Finished(r.finish(e)));
         }
@@ -1068,7 +1082,11 @@ fn pump(
         if span >= STATS_PERIOD {
             window = (now, 0);
         }
+        #[cfg(feature = "perf-audit")]
+        audit.end(monotonic_now());
     }
+    #[cfg(feature = "perf-audit")]
+    audit.report(fps, skipped);
 
     // Error breaks too: later requests must start a new pipeline.
     lock(control).ended = true;

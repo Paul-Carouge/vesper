@@ -85,6 +85,14 @@ pub fn record(seconds: u64, settings: Settings) {
 }
 
 pub fn record_game(seconds: u64, mut settings: Settings) {
+    // Measurement knob: `VESPER_FPS=144`.
+    #[cfg(feature = "perf-audit")]
+    if let Some(fps) = std::env::var("VESPER_FPS")
+        .ok()
+        .and_then(|f| f.parse().ok())
+    {
+        settings.fps = fps;
+    }
     let prefs = Prefs::load(Prefs::default());
     *ALLOWED_GAMES.lock().unwrap() = prefs.allowed_games;
     let source = GameSource::start().expect("game capture");

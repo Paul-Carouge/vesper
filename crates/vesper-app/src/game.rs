@@ -64,6 +64,8 @@ impl GameSource {
             if event.is_err() {
                 fail.store(true, Ordering::Relaxed);
             }
+            #[cfg(feature = "perf-audit")]
+            crate::audit::server_frame();
             f.push(event.map_err(|e| format!("Game capture failed: {e}")));
         })
         .map_err(|e| format!("Could not start game capture: {e}"))?;

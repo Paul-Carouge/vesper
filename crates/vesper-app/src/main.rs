@@ -10,6 +10,8 @@ macro_rules! log {
 }
 
 mod audio;
+#[cfg(feature = "perf-audit")]
+mod audit;
 mod autostart;
 mod desktop;
 #[cfg(debug_assertions)]
@@ -99,7 +101,11 @@ fn main() -> Result<(), slint::PlatformError> {
         return Ok(());
     }
 
+    #[cfg(feature = "perf-audit")]
+    audit::startup("main entered");
     let ui = AppWindow::new()?;
+    #[cfg(feature = "perf-audit")]
+    audit::startup("window created");
     // Before anything starts: a second launch only shows the first window.
     let weak = ui.as_weak();
     let instance = match instance::claim(!background, move || {
@@ -225,12 +231,25 @@ fn main() -> Result<(), slint::PlatformError> {
     });
 
     let _meters = audio::start_meters(&ui, &recording);
+    #[cfg(feature = "perf-audit")]
+    let _audit_tick = audit::ui_thread_report();
 
     #[cfg(debug_assertions)]
     dev::apply(&ui);
 
     if !(background && tray.is_some()) {
         ui.show()?;
+        #[cfg(feature = "perf-audit")]
+        {
+            audit::startup("window shown");
+            let mut first = true;
+            let _ = ui.window().set_rendering_notifier(move |state, _| {
+                if first && matches!(state, slint::RenderingState::AfterRendering) {
+                    first = false;
+                    audit::startup("first frame rendered");
+                }
+            });
+        }
         ui.invoke_tray_state_changed();
     }
     // Hiding the window does not end the loop: only Quit, Ctrl+Q, or closing
