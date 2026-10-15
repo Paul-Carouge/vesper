@@ -2215,8 +2215,13 @@ mod tests {
 
     #[test]
     fn a_stream_without_frames_ends_and_so_does_the_pipeline() {
-        let (p, rx) = start(None, None, settings());
-        assert!(p.start_stream(stream_request()));
+        // Passed at start like the app does: a pipeline started with nothing
+        // to do may end before a later start_stream request reaches it.
+        let (tx, rx) = mpsc::channel();
+        let p = Pipeline::start(settings(), None, None, Some(stream_request()), move |e| {
+            drop(tx.send(e))
+        })
+        .unwrap();
         match next(&rx, FIRST_FRAME_TIMEOUT.as_secs() + 3) {
             Event::Stream(StreamState::Ended(Some(e))) => assert!(e.contains("No frame"), "{e}"),
             other => panic!("{other:?}"),
