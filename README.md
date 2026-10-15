@@ -51,7 +51,7 @@ Arch (and CachyOS): the package builds the last commit of this checkout (uncommi
 cd packaging/arch && makepkg -si
 ```
 
-It installs `/usr/bin/vesper`, the desktop file, the icon and the game capture layer in `/usr/lib/vesper/`. The layer stays off: only the settings switch enables it, per user. Uninstall with `sudo pacman -R vesper-git` (turn the switch off first to remove your per-user copy).
+It installs `/usr/bin/vesper`, the desktop file, the icon and the game capture layer in `/usr/lib/vesper/`. The layer stays off: only the settings switch enables it, per user. Uninstall with `sudo pacman -R vesper-git`. Turn the switch off first: otherwise your per-user copy of the layer stays installed and keeps loading into Vulkan apps; remove it by hand with `rm ~/.local/share/vulkan/implicit_layer.d/vesper_capture.json ~/.local/share/vesper/libvesper_vklayer.so`. Each `makepkg` rewrites `pkgver=` in the PKGBUILD (normal for a -git package): `git checkout packaging/arch/PKGBUILD` before committing.
 
 Manual alternative, in your home:
 

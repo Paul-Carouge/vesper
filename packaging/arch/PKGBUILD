@@ -37,12 +37,16 @@ conflicts=('vesper')
 # makepkg's -flto turns libspa's C shims into GCC bytecode that rust-lld
 # cannot link (undefined libspa_rs_* symbols). Cargo does its own thin LTO.
 options=('!lto')
-source=("vesper::git+file://$(realpath "$startdir/../..")")
+# Pinned to the checkout's HEAD: otherwise a rebuild after a branch switch
+# reuses the old clone's origin/HEAD and silently packages an older commit.
+source=("vesper::git+file://$(realpath "$startdir/../..")#commit=$(git -C "$startdir" rev-parse HEAD)")
 sha256sums=('SKIP')
 
 pkgver() {
   cd vesper
-  printf '0.1.0.r%s.g%s' "$(git rev-list --count HEAD)" "$(git rev-parse --short=7 HEAD)"
+  local version
+  version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
+  printf '%s.r%s.g%s' "$version" "$(git rev-list --count HEAD)" "$(git rev-parse --short=7 HEAD)"
 }
 
 prepare() {
