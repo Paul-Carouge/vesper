@@ -597,7 +597,8 @@ fn settings(ui: &AppWindow, games: &Games) -> Settings {
         game: games.borrow().as_ref().map(|g| g.frames.clone()),
         codec: ui.get_codec().into(),
         fps: ui.get_fps().max(1) as u32,
-        bits_per_pixel: bits_per_pixel(ui.get_codec(), ui.get_quality()),
+        quality: quality(ui.get_codec(), ui.get_quality()),
+        max_bits_per_pixel: max_bits_per_pixel(ui.get_codec(), ui.get_quality()),
         desktop_muted: ui.get_desktop_muted(),
         mic_muted: ui.get_mic_muted(),
     }
@@ -716,13 +717,13 @@ fn on_recorder_event(ui: &AppWindow, generation: u64, event: Event) {
     }
 }
 
-/// Shows the RAM the replay buffer may take at 4K with the current settings:
-/// its length (plus a 2 s GOP) times the target bitrate.
+/// Shows the most RAM the replay buffer may take at 4K with the current
+/// settings: its length (plus a 2 s GOP) times the bitrate cap.
 fn update_replay_memory(ui: &AppWindow) {
     let bitrate = 3840.0
         * 2160.0
         * f64::from(ui.get_fps())
-        * bits_per_pixel(ui.get_codec(), ui.get_quality());
+        * max_bits_per_pixel(ui.get_codec(), ui.get_quality());
     let mb = bitrate / 8e6 * f64::from(ui.get_replay_seconds() + 2);
     let quality = match ui.get_quality() {
         QualityPreset::Performance => "Performance",
@@ -732,13 +733,30 @@ fn update_replay_memory(ui: &AppWindow) {
     ui.set_replay_memory(format!("≈ {} MB at 4K{} {quality}", mb.round(), ui.get_fps()).into());
 }
 
-/// Target bits per pixel per frame of each quality preset for HEVC and AV1;
-/// H.264 gets 1.5x. At 3840x2160 60 fps: 15 / 25 / 40 Mbit/s.
-fn bits_per_pixel(codec: VideoCodec, quality: QualityPreset) -> f64 {
+/// Constant-quality target of each preset, on the encoder's QP scale (AV1:
+/// 0-255). Measured on VCN 5 at 1440p and 4K 60 fps against the old VBR
+/// presets: Balanced HEVC needs 22-32% fewer bits on fast motion for the same
+/// VMAF, and 50-80% fewer on desktop content. The AV1 values match HEVC's
+/// quality on fast motion.
+fn quality(codec: VideoCodec, quality: QualityPreset) -> u32 {
+    match (codec == VideoCodec::Av1, quality) {
+        (false, QualityPreset::Performance) => 32,
+        (false, QualityPreset::Balanced) => 28,
+        (false, QualityPreset::Quality) => 25,
+        (true, QualityPreset::Performance) => 130,
+        (true, QualityPreset::Balanced) => 105,
+        (true, QualityPreset::Quality) => 90,
+    }
+}
+
+/// Bitrate cap of each preset in bits per pixel per frame for HEVC and AV1,
+/// H.264 gets 1.5x. Only very noisy content reaches it. At 3840x2160 60 fps:
+/// 30 / 50 / 80 Mbit/s.
+fn max_bits_per_pixel(codec: VideoCodec, quality: QualityPreset) -> f64 {
     let bpp = match quality {
-        QualityPreset::Performance => 0.03,
-        QualityPreset::Balanced => 0.05,
-        QualityPreset::Quality => 0.08,
+        QualityPreset::Performance => 0.06,
+        QualityPreset::Balanced => 0.1,
+        QualityPreset::Quality => 0.16,
     };
     if codec == VideoCodec::H264 {
         bpp * 1.5
@@ -753,7 +771,8 @@ fn default_settings() -> Settings {
     Settings {
         codec: vesper_core::Codec::Hevc,
         fps: 60,
-        bits_per_pixel: bits_per_pixel(VideoCodec::Hevc, QualityPreset::Balanced),
+        quality: quality(VideoCodec::Hevc, QualityPreset::Balanced),
+        max_bits_per_pixel: max_bits_per_pixel(VideoCodec::Hevc, QualityPreset::Balanced),
         desktop_muted: false,
         mic_muted: false,
         game: None,
@@ -892,13 +911,13 @@ mod tests {
     }
 
     #[test]
-    fn balanced_4k60_is_about_25_mbit() {
+    fn balanced_4k60_is_capped_at_50_mbit() {
         let px = 3840.0 * 2160.0 * 60.0;
-        let bps = px * bits_per_pixel(VideoCodec::Hevc, QualityPreset::Balanced);
-        assert!((24e6..26e6).contains(&bps), "{bps}");
+        let bps = px * max_bits_per_pixel(VideoCodec::Hevc, QualityPreset::Balanced);
+        assert!((49e6..51e6).contains(&bps), "{bps}");
         assert!(
-            bits_per_pixel(VideoCodec::H264, QualityPreset::Balanced)
-                > bits_per_pixel(VideoCodec::Av1, QualityPreset::Balanced)
+            max_bits_per_pixel(VideoCodec::H264, QualityPreset::Balanced)
+                > max_bits_per_pixel(VideoCodec::Av1, QualityPreset::Balanced)
         );
     }
 
@@ -912,6 +931,19 @@ mod tests {
         assert_eq!(home_relative("/home/u", "/home/u/").unwrap(), "~");
         assert_eq!(home_relative("/home/user2/x", home), None);
         assert_eq!(home_relative("/mnt/clips", home), None);
+    }
+
+    #[test]
+    fn better_presets_have_lower_quality_values() {
+        for codec in [VideoCodec::Hevc, VideoCodec::Av1] {
+            assert!(
+                quality(codec, QualityPreset::Performance)
+                    > quality(codec, QualityPreset::Balanced)
+            );
+            assert!(
+                quality(codec, QualityPreset::Balanced) > quality(codec, QualityPreset::Quality)
+            );
+        }
     }
 
     #[test]

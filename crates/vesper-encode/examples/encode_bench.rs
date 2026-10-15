@@ -2,7 +2,8 @@
 //! of VA surfaces, exports them as DMA-BUFs, and encodes them with
 //! `vesper_encode::Encoder` as if they came from screen capture.
 //!
-//! `cargo run --release -p vesper-encode --example encode_bench [frames]`
+//! `cargo run --release -p vesper-encode --example encode_bench [frames] [WxH]`
+//! (default 600 frames at 2560x1440).
 //!
 //! Writes `vesper-bench.ivf` (AV1) and `vesper-bench.hevc` (Annex B) to the
 //! system temp dir. The CPU upload of the pattern is outside the timed region.
@@ -19,8 +20,6 @@ use ffmpeg_next::ffi as ff;
 use vesper_core::{Codec, EncodedPacket};
 use vesper_encode::{Encoder, RateControl};
 
-const W: u32 = 2560;
-const H: u32 = 1440;
 const FPS: u32 = 60;
 
 fn percentile(sorted: &[Duration], p: f64) -> Duration {
@@ -31,8 +30,15 @@ fn ms(d: Duration) -> f64 {
     d.as_secs_f64() * 1000.0
 }
 
-fn bench(producer: &Producer, codec: Codec, frames: u32) -> Vec<EncodedPacket> {
-    let mut enc = Encoder::new(codec, W, H, FPS, RateControl::Bitrate(20_000_000)).unwrap();
+fn bench(producer: &Producer, codec: Codec, (w, h): (u32, u32), frames: u32) -> Vec<EncodedPacket> {
+    // The app's Balanced preset.
+    let quality = if codec == Codec::Av1 { 105 } else { 28 };
+    let max_bitrate = (f64::from(w * h * FPS) * 0.1) as u64;
+    let rate = RateControl::Quality {
+        quality,
+        max_bitrate,
+    };
+    let mut enc = Encoder::new(codec, w, h, FPS, rate).unwrap();
     // CLOCK_MONOTONIC, like PipeWire timestamps.
     let base = Duration::from_micros(unsafe { ff::av_gettime_relative() } as u64);
     let mut packets = Vec::new();
@@ -81,7 +87,7 @@ fn bench(producer: &Producer, codec: Codec, frames: u32) -> Vec<EncodedPacket> {
     latencies.sort();
     let bytes: usize = packets.iter().map(|p| p.data.len()).sum();
     println!(
-        "{codec:?} {W}x{H}: {frames} frames, {:.0} fps encode throughput, {:.1} Mbit/s at {FPS} fps",
+        "{codec:?} {w}x{h}: {frames} frames, {:.0} fps encode throughput, {:.1} Mbit/s at {FPS} fps",
         frames as f64 / encode_total.as_secs_f64(),
         bytes as f64 * 8.0 * FPS as f64 / frames as f64 / 1e6,
     );
@@ -101,14 +107,14 @@ fn bench(producer: &Producer, codec: Codec, frames: u32) -> Vec<EncodedPacket> {
     packets
 }
 
-fn write_ivf(path: &std::path::Path, packets: &[EncodedPacket]) {
+fn write_ivf(path: &std::path::Path, (w, h): (u32, u32), packets: &[EncodedPacket]) {
     let mut out = Vec::new();
     out.extend_from_slice(b"DKIF");
     out.extend_from_slice(&0u16.to_le_bytes());
     out.extend_from_slice(&32u16.to_le_bytes());
     out.extend_from_slice(b"AV01");
-    out.extend_from_slice(&(W as u16).to_le_bytes());
-    out.extend_from_slice(&(H as u16).to_le_bytes());
+    out.extend_from_slice(&(w as u16).to_le_bytes());
+    out.extend_from_slice(&(h as u16).to_le_bytes());
     out.extend_from_slice(&FPS.to_le_bytes());
     out.extend_from_slice(&1u32.to_le_bytes());
     out.extend_from_slice(&(packets.len() as u32).to_le_bytes());
@@ -122,19 +128,24 @@ fn write_ivf(path: &std::path::Path, packets: &[EncodedPacket]) {
 }
 
 fn main() {
-    let frames: u32 = std::env::args()
-        .nth(1)
+    let mut args = std::env::args().skip(1);
+    let frames: u32 = args
+        .next()
         .map(|a| a.parse().expect("frame count"))
         .unwrap_or(600);
-    let producer = unsafe { Producer::new(W, H) };
+    let size = args.next().map_or((2560, 1440), |a| {
+        let (w, h) = a.split_once('x').expect("WxH");
+        (w.parse().expect("width"), h.parse().expect("height"))
+    });
+    let producer = unsafe { Producer::new(size.0, size.1) };
     let dir = std::env::temp_dir();
 
-    let av1 = bench(&producer, Codec::Av1, frames);
+    let av1 = bench(&producer, Codec::Av1, size, frames);
     let path = dir.join("vesper-bench.ivf");
-    write_ivf(&path, &av1);
+    write_ivf(&path, size, &av1);
     println!("  wrote {}", path.display());
 
-    let hevc = bench(&producer, Codec::Hevc, frames);
+    let hevc = bench(&producer, Codec::Hevc, size, frames);
     let path = dir.join("vesper-bench.hevc");
     fs::write(
         &path,

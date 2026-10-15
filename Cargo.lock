@@ -5022,6 +5022,7 @@ name = "vesper-encode"
 version = "0.1.0"
 dependencies = [
  "ffmpeg-next",
+ "tracing",
  "vesper-core",
 ]
 

@@ -236,3 +236,43 @@ unsafe fn decode_luma(extradata: &[u8], packets: &[vesper_core::EncodedPacket]) 
         out
     }
 }
+
+#[test]
+fn quality_rate_control_trades_size_for_quality() {
+    if !Path::new("/dev/dri/renderD128").exists() {
+        eprintln!("no GPU, skipping");
+        return;
+    }
+    // radeonsi's H.264 QVBR ignores the quality value at 640x360 (measured
+    // with the ffmpeg CLI too); it follows it from 1280x720 up.
+    let (w, h) = (1280, 720);
+    let producer = unsafe { Producer::new(w, h) };
+    let bytes = |codec, quality| {
+        let rate = RateControl::Quality {
+            quality,
+            max_bitrate: 50_000_000,
+        };
+        let mut enc = Encoder::new(codec, w, h, 30, rate).unwrap();
+        let mut packets = Vec::new();
+        for t in 0..4 {
+            let pts = Duration::from_millis(1_000 + t as u64 * 33);
+            packets.extend(
+                enc.encode(unsafe { producer.frame(t as usize % POOL, t, 0, pts) })
+                    .unwrap(),
+            );
+        }
+        packets.extend(enc.flush().unwrap());
+        assert_eq!(packets.len(), 4, "{codec:?}");
+        assert!(packets[0].keyframe, "{codec:?}");
+        packets.iter().map(|p| p.data.len()).sum::<usize>()
+    };
+    // AV1 quality is on a 0-255 scale: 80 / 160 is the same step as 20 / 40.
+    for (codec, good, poor) in [
+        (Codec::H264, 20, 40),
+        (Codec::Hevc, 20, 40),
+        (Codec::Av1, 80, 160),
+    ] {
+        let (big, small) = (bytes(codec, good), bytes(codec, poor));
+        assert!(small < big, "{codec:?}: {small} >= {big} bytes");
+    }
+}

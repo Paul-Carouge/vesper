@@ -31,6 +31,35 @@ const TIME_BASE: ff::AVRational = ff::AVRational {
 #[link(name = "va")]
 unsafe extern "C" {
     fn vaSyncSurface(dpy: *mut c_void, surface: u32) -> c_int;
+    fn vaQueryVendorString(dpy: *mut c_void) -> *const std::ffi::c_char;
+}
+
+/// VA quality level for [`RateControl::Quality`] on radeonsi, which reads it
+/// as bit masks: bit 0 = set, bits 1-2 = preset (speed, balanced, quality,
+/// high quality), bit 4 = VBAQ. Measured on VCN 5: quality + VBAQ (21 =
+/// 0b10101) needs 15-30% fewer bits than the driver default for the same
+/// VMAF, but HEVC/H.264 then encode only ~550 Mpx/s, so faster pixel rates
+/// use balanced + VBAQ (19 = 0b10011). AV1 runs at the same speed with any
+/// level. Other drivers (Intel: 1-7) read the level differently: `None`
+/// keeps FFmpeg's default.
+fn quality_level(vendor: &str, codec: Codec, px_rate: u64) -> Option<c_int> {
+    if !vendor.contains("radeonsi") {
+        return None;
+    }
+    Some(if codec == Codec::Av1 || px_rate <= 300_000_000 {
+        21
+    } else {
+        19
+    })
+}
+
+/// What to open instead when `rate` fails: drivers without QVBR get VBR at
+/// half the cap.
+fn fallback(rate: RateControl) -> Option<RateControl> {
+    match rate {
+        RateControl::Quality { max_bitrate, .. } => Some(RateControl::Bitrate(max_bitrate / 2)),
+        _ => None,
+    }
 }
 
 /// Rate control of the encoder.
@@ -40,6 +69,9 @@ pub enum RateControl {
     Bitrate(u64),
     /// Constant QP. Range depends on the codec: 0-51 for H.264/HEVC, 0-255 for AV1.
     ConstantQp(u32),
+    /// Constant quality capped at `max_bitrate` bits per second (VAAPI QVBR).
+    /// `quality` is on the QP scale of [`RateControl::ConstantQp`]; lower is better.
+    Quality { quality: u32, max_bitrate: u64 },
 }
 
 #[derive(Debug)]
@@ -175,7 +207,14 @@ impl Encoder {
             e.display = (*((*dev).hwctx as *mut ff::AVVAAPIDeviceContext)).display;
 
             e.set_import_size(width, height)?;
-            e.open_encoder(codec, fps, rate)?;
+            if let Err(err) = e.open_encoder(codec, fps, rate) {
+                let Some(fb) = fallback(rate) else {
+                    return Err(err);
+                };
+                tracing::warn!("{rate:?} failed ({err}), falling back to {fb:?}");
+                ff::avcodec_free_context(&mut e.enc);
+                e.open_encoder(codec, fps, fb)?;
+            }
         }
         Ok(e)
     }
@@ -347,32 +386,44 @@ impl Encoder {
                 ff::av_buffer_ref(ff::av_buffersink_get_hw_frames_ctx(self.sink)),
                 "sink frames",
             )?;
-            match rate {
+            let mode = match rate {
                 RateControl::Bitrate(bps) => {
                     enc.bit_rate = bps as i64;
-                    check(
-                        ff::av_opt_set(
-                            self.enc.cast(),
-                            c"rc_mode".as_ptr(),
-                            c"VBR".as_ptr(),
-                            ff::AV_OPT_SEARCH_CHILDREN,
-                        ),
-                        "rc_mode",
-                    )?;
+                    c"VBR"
                 }
                 RateControl::ConstantQp(qp) => {
                     enc.global_quality = qp as c_int;
-                    check(
-                        ff::av_opt_set(
-                            self.enc.cast(),
-                            c"rc_mode".as_ptr(),
-                            c"CQP".as_ptr(),
-                            ff::AV_OPT_SEARCH_CHILDREN,
-                        ),
-                        "rc_mode",
-                    )?;
+                    c"CQP"
                 }
-            }
+                RateControl::Quality {
+                    quality,
+                    max_bitrate,
+                } => {
+                    enc.global_quality = quality as c_int;
+                    enc.bit_rate = max_bitrate as i64;
+                    enc.rc_max_rate = max_bitrate as i64;
+                    let vendor = vaQueryVendorString(self.display);
+                    let vendor = if vendor.is_null() {
+                        ""
+                    } else {
+                        CStr::from_ptr(vendor).to_str().unwrap_or("")
+                    };
+                    let px_rate = u64::from(self.width) * u64::from(self.height) * u64::from(fps);
+                    if let Some(level) = quality_level(vendor, codec, px_rate) {
+                        enc.compression_level = level;
+                    }
+                    c"QVBR"
+                }
+            };
+            check(
+                ff::av_opt_set(
+                    self.enc.cast(),
+                    c"rc_mode".as_ptr(),
+                    mode.as_ptr(),
+                    ff::AV_OPT_SEARCH_CHILDREN,
+                ),
+                "rc_mode",
+            )?;
             check(
                 ff::avcodec_open2(self.enc, c, ptr::null_mut()),
                 "open encoder",
@@ -614,6 +665,26 @@ mod tests {
     use super::*;
     use std::path::Path;
     use vesper_core::{DmaBufPlane, ReleaseGuard};
+
+    #[test]
+    fn quality_level_only_on_radeonsi() {
+        let amd = "Mesa Gallium driver 26.2.4 for AMD Radeon RX 9070 XT (radeonsi, gfx1201)";
+        assert_eq!(quality_level(amd, Codec::Hevc, 2560 * 1440 * 60), Some(21));
+        assert_eq!(quality_level(amd, Codec::Hevc, 3840 * 2160 * 60), Some(19));
+        assert_eq!(quality_level(amd, Codec::Av1, 3840 * 2160 * 60), Some(21));
+        assert_eq!(quality_level("Intel iHD driver", Codec::Hevc, 1), None);
+    }
+
+    #[test]
+    fn only_quality_falls_back_to_vbr_at_half_the_cap() {
+        let q = RateControl::Quality {
+            quality: 28,
+            max_bitrate: 20_000_000,
+        };
+        assert_eq!(fallback(q), Some(RateControl::Bitrate(10_000_000)));
+        assert_eq!(fallback(RateControl::Bitrate(1)), None);
+        assert_eq!(fallback(RateControl::ConstantQp(30)), None);
+    }
 
     #[test]
     fn rejects_a_bad_dmabuf_and_releases_it() {
