@@ -32,7 +32,9 @@ impl Capture {
     /// and starts streaming. `on_frame` runs on the PipeWire thread: keep it
     /// short, e.g. send the frame to a channel. It gets one final `Err` when
     /// the capture ends on its own (source closed, stream error, no DMA-BUF);
-    /// no frame follows. Blocks until the user picks a source.
+    /// no frame follows. Dropping the `Capture` from `on_frame` is allowed,
+    /// but blocks the PipeWire loop while the D-Bus session closes.
+    /// Blocks until the user picks a source.
     pub fn start(
         restore_token: Option<&str>,
         on_frame: impl FnMut(Result<VideoFrame>) + Send + 'static,
@@ -67,7 +69,10 @@ impl Capture {
 impl Drop for Capture {
     fn drop(&mut self) {
         let _ = self.control.send(pw::Msg::Stop);
+        // Dropped from `on_frame`: joining our own thread would deadlock, and
+        // the loop exits on `Stop` once the callback returns.
         if let Some(thread) = self.thread.take()
+            && thread.thread().id() != std::thread::current().id()
             && thread.join().is_err()
         {
             warn!("pipewire thread panicked");
