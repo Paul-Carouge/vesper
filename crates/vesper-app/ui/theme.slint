@@ -1,0 +1,75 @@
+// Design tokens. One accent (violet, "vesper"), plus a semantic recording red.
+// Colors follow the system color scheme; `Theme.scheme` can be overridden from Rust.
+
+import { Palette } from "std-widgets.slint";
+
+export global Theme {
+    in-out property <ColorScheme> scheme: Palette.color-scheme;
+    out property <bool> dark: scheme != ColorScheme.light;
+
+    // Surfaces
+    out property <color> window-bg: dark ? #0E0F13 : #F3F3F6;
+    out property <color> surface: dark ? #17181D : #FFFFFF;
+    out property <color> surface-raised: dark ? #1F2027 : #F1F1F5;
+    out property <color> surface-hover: dark ? #262730 : #E9E9EE;
+    out property <color> surface-pressed: dark ? #2E2F39 : #E1E1E7;
+    out property <color> border: dark ? #24252D : #E4E4EA;
+    out property <color> border-strong: dark ? #34353F : #D0D0D8;
+    out property <color> scrim: dark ? #000000a0 : #16171c50;
+
+    // Text (AA on `surface` and `window-bg` in both schemes)
+    out property <color> text: dark ? #ECECF1 : #16171C;
+    out property <color> text-muted: dark ? #A1A3B0 : #5B5D6A;
+    out property <color> text-faint: dark ? #80838F : #696C7A;
+
+    // Accent
+    out property <color> accent: dark ? #9A8CFF : #5847D6;
+    out property <color> accent-hover: dark ? #AA9EFF : #4C3BC9;
+    out property <color> on-accent: dark ? #0E0F13 : #FFFFFF;
+    out property <color> accent-soft: dark ? #9A8CFF24 : #5847D617;
+
+    // Recording state (semantic, never decorative)
+    out property <color> rec: dark ? #FF5C52 : #D23A30;
+    out property <color> rec-soft: dark ? #FF5C5226 : #D23A301a;
+    out property <color> warn: dark ? #F2B84B : #9A6200;
+
+    // Meter
+    out property <color> meter-track: dark ? #23242C : #E9E9EE;
+    out property <color> meter-hot: dark ? #F2B84B : #D08A00;
+
+    // Metrics
+    out property <length> radius-sm: 8px;
+    out property <length> radius-md: 10px;
+    out property <length> radius-lg: 16px;
+    out property <length> space-xs: 4px;
+    out property <length> space-sm: 8px;
+    out property <length> space-md: 12px;
+    out property <length> space-lg: 16px;
+    out property <length> space-xl: 24px;
+    out property <length> control-height: 40px;
+
+    // Type scale
+    out property <length> font-caption: 11px;
+    out property <length> font-small: 12px;
+    out property <length> font-body: 13px;
+    out property <length> font-title: 15px;
+    out property <length> font-display: 42px;
+
+    out property <duration> fast: 120ms;
+    out property <duration> medium: 240ms;
+}
+
+// SVG path data, 24x24 viewbox, meant to be stroked.
+export global Icons {
+    out property <string> monitor: "M4 4.5 L20 4.5 A1.5 1.5 0 0 1 21.5 6 L21.5 15.5 A1.5 1.5 0 0 1 20 17 L4 17 A1.5 1.5 0 0 1 2.5 15.5 L2.5 6 A1.5 1.5 0 0 1 4 4.5 Z M8 20.5 L16 20.5 M12 17 L12 20.5";
+    out property <string> window: "M4 4 L20 4 A1.5 1.5 0 0 1 21.5 5.5 L21.5 18.5 A1.5 1.5 0 0 1 20 20 L4 20 A1.5 1.5 0 0 1 2.5 18.5 L2.5 5.5 A1.5 1.5 0 0 1 4 4 Z M2.5 8.5 L21.5 8.5";
+    out property <string> sliders: "M4 7 L12 7 M16 7 L20 7 M4 17 L8 17 M12 17 L20 17 M14 4.5 L14 9.5 M10 14.5 L10 19.5";
+    out property <string> speaker: "M11 5 L6.5 9 L3.5 9 L3.5 15 L6.5 15 L11 19 Z M15.5 9 A4.2 4.2 0 0 1 15.5 15 M18.5 6 A8.5 8.5 0 0 1 18.5 18";
+    out property <string> speaker-off: "M11 5 L6.5 9 L3.5 9 L3.5 15 L6.5 15 L11 19 Z M16 9.5 L21 14.5 M21 9.5 L16 14.5";
+    out property <string> mic: "M12 3 A3 3 0 0 1 15 6 L15 11.5 A3 3 0 0 1 9 11.5 L9 6 A3 3 0 0 1 12 3 Z M18.5 11 A6.5 6.5 0 0 1 5.5 11 M12 17.5 L12 21";
+    out property <string> mic-off: "M12 3 A3 3 0 0 1 15 6 L15 11.5 A3 3 0 0 1 9 11.5 L9 6 A3 3 0 0 1 12 3 Z M18.5 11 A6.5 6.5 0 0 1 5.5 11 M12 17.5 L12 21 M3.5 3.5 L20.5 20.5";
+    out property <string> close: "M6 6 L18 18 M18 6 L6 18";
+    out property <string> folder: "M3.5 7 A1.5 1.5 0 0 1 5 5.5 L9.5 5.5 L11.5 7.5 L19 7.5 A1.5 1.5 0 0 1 20.5 9 L20.5 17 A1.5 1.5 0 0 1 19 18.5 L5 18.5 A1.5 1.5 0 0 1 3.5 17 Z";
+    out property <string> replay: "M4.5 12 A7.5 7.5 0 1 0 6.7 6.7 M5.5 3.5 L5.5 7.5 L9.5 7.5";
+    out property <string> save: "M12 4 L12 14.5 M7.5 10 L12 14.5 L16.5 10 M5 19.5 L19 19.5";
+}

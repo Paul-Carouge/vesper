@@ -8,3 +8,9 @@ name = "vesper"
 path = "src/main.rs"
 
 [dependencies]
+slint = "1.18"
+dirs = "7"
+vesper-core.workspace = true
+
+[build-dependencies]
+slint-build = "1.18"
