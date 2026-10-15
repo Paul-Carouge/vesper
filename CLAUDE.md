@@ -10,7 +10,7 @@ Fast, bloat-free screen recorder in Rust. See README.md for goals, architecture 
 - `crates/vesper-vklayer`: implicit Vulkan layer (cdylib) loaded into games; copies presented images into exported DMA-BUFs. Must never crash or block the game. `install.sh` installs it per user.
 - `crates/vesper-encode`: VAAPI hardware encoding.
 - `crates/vesper-mux`: Matroska (MKV) muxing of encoded video and Opus audio.
-- `crates/vesper-audio`: PipeWire desktop + microphone capture, Opus encoding (libopus via ffmpeg-next).
+- `crates/vesper-audio`: PipeWire capture (desktop, microphone, devices, applications), mixing, Opus encoding (libopus via ffmpeg-next).
 - `crates/vesper-app`: the `vesper` binary and the Slint UI.
 
 ## Target machine

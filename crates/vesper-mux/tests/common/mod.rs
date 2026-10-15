@@ -25,6 +25,7 @@ pub fn opus_track() -> AudioTrack {
     head.extend_from_slice(&0i16.to_le_bytes()); // output gain
     head.push(0); // channel mapping family
     AudioTrack {
+        name: "Desktop".into(),
         sample_rate: 48_000,
         channels: 2,
         extradata: head,

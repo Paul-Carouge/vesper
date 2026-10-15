@@ -42,6 +42,8 @@ pub struct VideoTrack {
 /// Opus audio stream description.
 #[derive(Debug, Clone)]
 pub struct AudioTrack {
+    /// Track name shown by players and editors (Matroska `Name`); empty for none.
+    pub name: String,
     pub sample_rate: u32,
     pub channels: u32,
     /// `OpusHead` identification header.
@@ -174,8 +176,16 @@ impl Muxer {
             };
             set_extradata(par, &video.extradata)?;
 
-            for a in audio {
+            for (i, a) in audio.iter().enumerate() {
                 let st = m.new_stream()?;
+                if !a.name.is_empty() {
+                    let title = CString::new(a.name.replace('\0', "")).unwrap_or_default();
+                    ff::av_dict_set(&mut (*st).metadata, c"title".as_ptr(), title.as_ptr(), 0);
+                }
+                // Players pick the first audio track (the mix, when there is one).
+                if i == 0 {
+                    (*st).disposition = ff::AV_DISPOSITION_DEFAULT as c_int;
+                }
                 let par = (*st).codecpar;
                 (*par).codec_type = ff::AVMediaType::AVMEDIA_TYPE_AUDIO;
                 (*par).codec_id = ff::AVCodecID::AV_CODEC_ID_OPUS;
@@ -321,4 +331,70 @@ impl Drop for Muxer {
 
 fn is_opus_head(extradata: &[u8]) -> bool {
     extradata.len() >= 19 && extradata.starts_with(b"OpusHead")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn opus(name: &str) -> AudioTrack {
+        let mut head = b"OpusHead".to_vec();
+        head.extend_from_slice(&[1, 2]); // version, channels
+        head.extend_from_slice(&312u16.to_le_bytes()); // pre-skip
+        head.extend_from_slice(&48_000u32.to_le_bytes());
+        head.extend_from_slice(&[0, 0, 0]); // gain, mapping family
+        AudioTrack {
+            name: name.into(),
+            sample_rate: 48_000,
+            channels: 2,
+            extradata: head,
+        }
+    }
+
+    #[test]
+    fn audio_tracks_keep_their_order_and_names() {
+        let path =
+            std::env::temp_dir().join(format!("vesper-mux-names-{}.mkv", std::process::id()));
+        let video = VideoTrack {
+            codec: Codec::Av1,
+            width: 64,
+            height: 64,
+            fps: 30,
+            extradata: Vec::new(),
+        };
+        let tracks = [opus("Mix"), opus("Desktop"), opus(""), opus("Firefox")];
+        let start = Duration::from_secs(5);
+        let mut mux = Muxer::create(&path, start, video, &tracks).unwrap();
+        for i in 0..tracks.len() {
+            let packet = EncodedPacket {
+                data: std::sync::Arc::from(&[(31 << 3) | 0b100][..]),
+                pts: start,
+                keyframe: true,
+            };
+            mux.write_audio(i, &packet).unwrap();
+        }
+        mux.finish().unwrap();
+        let input = ffmpeg_next::format::input(&path).unwrap();
+        let audio: Vec<_> = input
+            .streams()
+            .skip(1)
+            .map(|s| {
+                let title = s.metadata().get("title").map(str::to_owned);
+                let default = s
+                    .disposition()
+                    .contains(ffmpeg_next::format::stream::Disposition::DEFAULT);
+                (title, default)
+            })
+            .collect();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(
+            audio,
+            [
+                (Some("Mix".into()), true),
+                (Some("Desktop".into()), false),
+                (None, false),
+                (Some("Firefox".into()), false),
+            ]
+        );
+    }
 }
