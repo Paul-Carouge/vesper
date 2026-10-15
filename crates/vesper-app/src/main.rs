@@ -21,7 +21,7 @@ mod shortcuts;
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use slint::ComponentHandle;
@@ -42,6 +42,9 @@ type Games = Rc<RefCell<Option<GameSource>>>;
 /// Generation of the last started pipeline: a late `Stopped` from an older
 /// one must not reset the UI of the current one.
 static GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// The recording was stopped because the captured game closed.
+static GAME_CLOSED: AtomicBool = AtomicBool::new(false);
 
 /// Meter refresh period: ~30 Hz.
 const METER_TICK: Duration = Duration::from_millis(33);
@@ -102,7 +105,10 @@ fn main() -> Result<(), slint::PlatformError> {
     wire_game_callbacks(&ui, &games);
     wire_global_shortcuts(&ui);
     // The replay buffer runs from launch (may open the picker once).
+    // In game mode without a server, the games tick starts it once it runs.
+    let game_down = ui.get_source_kind() == SourceKind::Game && games.borrow().is_none();
     if ui.get_replay_enabled()
+        && !game_down
         && let Err(e) = start_pipeline(&ui, &recording, &games, None)
     {
         flash_notice(&ui, &e);
@@ -127,6 +133,14 @@ fn main() -> Result<(), slint::PlatformError> {
             Some(true) => {
                 if now > retry_at + Duration::from_secs(60) {
                     failures = 0;
+                }
+                // A game that quit would leave a frozen picture recording
+                // forever; a paused one stays connected and keeps recording.
+                let closed = g.borrow_mut().as_mut().is_some_and(GameSource::take_closed);
+                if closed && ui.get_rec_state() == RecState::Recording {
+                    log!("captured game closed: stopping the recording");
+                    GAME_CLOSED.store(true, Ordering::Relaxed);
+                    ui.invoke_stop_recording();
                 }
                 return;
             }
@@ -366,6 +380,9 @@ fn wire_callbacks(ui: &AppWindow, recording: &Shared, games: &Games) {
         // Without a saved source the portal picker would pop up right away.
         if !game && recorder::load_restore_token().is_none() {
             flash_notice(&ui, "Replay starts once a source is picked");
+        } else if game && g.borrow().is_none() {
+            // The start error is shown; the games tick starts the replay
+            // buffer once game capture runs.
         } else if let Err(e) = start_pipeline(&ui, &rec, &g, None) {
             flash_notice(&ui, &e);
         }
@@ -582,9 +599,14 @@ fn on_recorder_event(ui: &AppWindow, generation: u64, event: Event) {
             match result {
                 Ok(path) => {
                     log!("saved {}", path.display());
-                    flash_notice(ui, "Recording saved");
+                    if GAME_CLOSED.swap(false, Ordering::Relaxed) {
+                        flash_notice(ui, "Game closed — recording saved");
+                    } else {
+                        flash_notice(ui, "Recording saved");
+                    }
                 }
                 Err(e) => {
+                    GAME_CLOSED.store(false, Ordering::Relaxed);
                     log!("recording failed: {e}");
                     flash_notice(ui, &e);
                 }

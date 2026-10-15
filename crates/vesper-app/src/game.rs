@@ -32,6 +32,26 @@ pub struct GameSource {
     selected: Option<u32>,
     /// Last list shown, so the UI model is only replaced on change.
     shown: Vec<(String, u32)>,
+    /// Pid of the game last seen captured, to notice it closing.
+    captured: Option<u32>,
+    /// The captured game disconnected since the last `take_closed`.
+    closed: bool,
+}
+
+/// The game a recording would capture, as the server's `choose` picks it:
+/// the captured one, or the picked one only (if allowed, with a swapchain),
+/// or the newest allowed game with a swapchain.
+fn candidate(games: &[Game], selected: Option<u32>) -> Option<&Game> {
+    let ready = |g: &&Game| g.consent == Consent::Allowed && g.width > 0;
+    match selected {
+        Some(pid) => games
+            .iter()
+            .find(|g| g.pid == pid && (g.captured || ready(g))),
+        None => games
+            .iter()
+            .find(|g| g.captured)
+            .or_else(|| games.iter().filter(ready).max_by_key(|g| g.seq)),
+    }
 }
 
 impl GameSource {
@@ -58,29 +78,20 @@ impl GameSource {
             failed,
             selected: None,
             shown: Vec::new(),
+            captured: None,
+            closed: false,
         })
-    }
-
-    /// The game a recording would capture: the captured one, else the
-    /// picked one, else the newest allowed game with a swapchain.
-    fn candidate(&self, games: &[Game]) -> Option<Game> {
-        let ready = |g: &&Game| g.consent == Consent::Allowed && g.width > 0;
-        games
-            .iter()
-            .find(|g| g.captured)
-            .or_else(|| {
-                games
-                    .iter()
-                    .filter(ready)
-                    .find(|g| Some(g.pid) == self.selected)
-            })
-            .or_else(|| games.iter().rfind(|g| ready(g)))
-            .cloned()
     }
 
     /// Whether there is a game to record.
     pub fn has_game(&self) -> bool {
-        self.candidate(&self.capture.games()).is_some()
+        candidate(&self.capture.games(), self.selected).is_some()
+    }
+
+    /// Whether the captured game disconnected (quit or crashed; a paused
+    /// game stays connected) since the last call.
+    pub fn take_closed(&mut self) -> bool {
+        std::mem::take(&mut self.closed)
     }
 
     /// Allows `exe` now and in later sessions. False if the name is not a
@@ -120,7 +131,13 @@ impl GameSource {
             self.selected = None;
             self.capture.select(None);
         }
-        let shown_game = self.candidate(&games);
+        if let Some(pid) = self.captured
+            && !games.iter().any(|g| g.pid == pid)
+        {
+            self.closed = true;
+        }
+        self.captured = games.iter().find(|g| g.captured).map(|g| g.pid);
+        let shown_game = candidate(&games, self.selected).cloned();
         ui.set_source_name(shown_game.as_ref().map_or("", |g| g.exe.as_str()).into());
         let detail = shown_game
             .as_ref()
@@ -172,4 +189,42 @@ pub fn clear(ui: &AppWindow) {
     ui.set_source_detail("".into());
     ui.set_pending_game("".into());
     ui.set_other_games(ModelRc::default());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn game(pid: u32, consent: Consent, width: u32, captured: bool, seq: u64) -> Game {
+        Game {
+            pid,
+            exe: format!("g{pid}"),
+            width,
+            height: width,
+            consent,
+            captured,
+            seq,
+        }
+    }
+
+    #[test]
+    fn candidate_mirrors_the_server_choice() {
+        let pid = |g: Option<&Game>| g.map(|g| g.pid);
+        let a = game(1, Consent::Allowed, 640, false, 2);
+        let b = game(2, Consent::Allowed, 640, false, 1);
+        let pending = game(3, Consent::Pending, 640, false, 9);
+        let no_swapchain = game(4, Consent::Allowed, 0, false, 8);
+        let all = [a.clone(), b.clone(), pending, no_swapchain];
+        // Newest allowed game with a swapchain, not list order.
+        assert_eq!(pid(candidate(&all, None)), Some(1));
+        // The captured game wins.
+        let captured = [a.clone(), game(2, Consent::Allowed, 640, true, 1)];
+        assert_eq!(pid(candidate(&captured, None)), Some(2));
+        // A pick sticks, and never falls back to another game.
+        assert_eq!(pid(candidate(&all, Some(2))), Some(2));
+        assert_eq!(pid(candidate(&all, Some(3))), None);
+        assert_eq!(pid(candidate(&all, Some(4))), None);
+        assert_eq!(pid(candidate(&all, Some(99))), None);
+        assert_eq!(pid(candidate(&[], None)), None);
+    }
 }

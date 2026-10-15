@@ -82,7 +82,8 @@ impl GameFrames {
     /// Ties the route to its capture, inactive until a pipeline attaches.
     pub fn bind(&self, capture: &Arc<GameCapture>) {
         let _ = self.0.capture.set(Arc::downgrade(capture));
-        capture.set_active(lock(&self.0.slot).is_some());
+        let attached = lock(&self.0.slot).is_some();
+        capture.set_active(attached);
     }
 
     /// Hands a frame (or the capture's final error) to the pipeline.
@@ -94,6 +95,8 @@ impl GameFrames {
         }
     }
 
+    /// Never called under the slot lock: dropping the upgraded capture may
+    /// join the server thread, which takes that lock in `push`.
     fn set_active(&self, active: bool) {
         if let Some(capture) = self.0.capture.get().and_then(Weak::upgrade) {
             capture.set_active(active);
@@ -101,7 +104,8 @@ impl GameFrames {
     }
 
     fn attach(&self, slot: &Arc<Mutex<Slot>>) {
-        *lock(&self.0.slot) = Some(slot.clone());
+        let old = lock(&self.0.slot).replace(slot.clone());
+        drop(old);
         self.set_active(true);
     }
 
@@ -112,6 +116,11 @@ impl GameFrames {
             *current = None;
             drop(current);
             self.set_active(false);
+            // A newer pipeline attached meanwhile: keep it fed.
+            let attached = lock(&self.0.slot).is_some();
+            if attached {
+                self.set_active(true);
+            }
         }
     }
 }

@@ -77,6 +77,9 @@ pub struct Game {
     pub consent: Consent,
     /// Whether this game is the one being captured.
     pub captured: bool,
+    /// Order of its first swapchain: the newest game (highest) is captured
+    /// by default.
+    pub seq: u64,
 }
 
 struct Shared {
@@ -100,7 +103,8 @@ impl GameCapture {
     /// Starts listening for games. `on_frame` runs on the server thread:
     /// keep it short, e.g. send the frame to a channel. It gets one final
     /// `Err` if the server fails; no frame follows. A game closing is not an
-    /// error: the server waits for the next one.
+    /// error: the server waits for the next one. It starts inactive: no
+    /// game copies frames until [`GameCapture::set_active`].
     pub fn start(on_frame: impl FnMut(Result<VideoFrame>) + Send + 'static) -> Result<Self> {
         let path = protocol::socket_path().ok_or("XDG_RUNTIME_DIR is not set")?;
         protocol::create_private_dir(path.parent().expect("socket path has a parent"))?;
@@ -122,7 +126,7 @@ impl GameCapture {
             games: Mutex::new(Vec::new()),
             select: Mutex::new(None),
             allowed: Mutex::new(Vec::new()),
-            active: AtomicBool::new(true),
+            active: AtomicBool::new(false),
             stop: AtomicBool::new(false),
         });
         let s = shared.clone();
@@ -176,7 +180,7 @@ impl GameCapture {
         self.wake();
     }
 
-    /// Whether the selected game should copy frames (default true). While
+    /// Whether the selected game should copy frames (default false). While
     /// inactive no game is started: games stay a pass-through and
     /// [`Game::captured`] is false, but games and consent are still listed.
     pub fn set_active(&self, active: bool) {
@@ -766,6 +770,7 @@ impl Server {
                     .started
                     .as_ref()
                     .is_some_and(|s| Arc::ptr_eq(s, &c.sock)),
+                seq: c.announced,
             })
             .collect();
         *self.shared.games.lock().unwrap() = games;
