@@ -4,17 +4,16 @@
 //! bus: KWallet's ksecretd on Plasma, GNOME Keyring, KeePassXC), which keeps
 //! it encrypted at rest and unlocked with the session. The Secret portal is
 //! for sandboxed apps only and would still leave the encryption to us, so it
-//! is not used. Without a Secret Service (or when it refuses), the key goes
-//! to `$XDG_CONFIG_HOME/vesper/stream-key` with mode 0600, like the portal
-//! restore token: readable by this user's processes only, but in clear on
-//! disk. The key is never logged.
+//! is not used. Only when the session has no Secret Service at all does the
+//! key go to `$XDG_CONFIG_HOME/vesper/stream-key` (mode 0600, written
+//! atomically), like the portal restore token: readable by this user's
+//! processes only, but in clear on disk. A keyring that is there but stays
+//! locked (the user dismissed the prompt) never sends the key to the file.
+//! The key is never logged.
 //!
 //! Every call may block (D-Bus, an unlock prompt): never on the UI thread.
 
 use std::collections::HashMap;
-use std::fs::OpenOptions;
-use std::io::Write;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
 
 use futures_lite::StreamExt;
@@ -61,17 +60,38 @@ async fn proxy<'a>(
         .map_err(|e| e.to_string())
 }
 
+/// The error of every call when the session has no Secret Service.
+const ABSENT: &str = "no Secret Service on the session bus";
+
+/// Whether `e` says nothing provides the Secret Service.
+fn absent(e: &zbus::Error) -> bool {
+    match e {
+        zbus::Error::MethodError(name, _, _) => matches!(
+            name.as_str(),
+            "org.freedesktop.DBus.Error.ServiceUnknown"
+                | "org.freedesktop.DBus.Error.NameHasNoOwner"
+        ),
+        _ => false,
+    }
+}
+
 /// A connection and a "plain" session (the bus is local: no transport
-/// encryption needed).
+/// encryption needed). [`ABSENT`] when there is no service.
 async fn open() -> Result<(zbus::Connection, OwnedObjectPath)> {
     let conn = zbus::Connection::session()
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|_| ABSENT.to_owned())?;
     let service = proxy(&conn, SERVICE, "org.freedesktop.Secret.Service").await?;
     let (_, session): (OwnedValue, OwnedObjectPath) = service
         .call("OpenSession", &("plain", Value::from("")))
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| {
+            if absent(&e) {
+                ABSENT.to_owned()
+            } else {
+                e.to_string()
+            }
+        })?;
     Ok((conn, session))
 }
 
@@ -144,8 +164,9 @@ async fn keyring_store(key: &StreamKey) -> Result<()> {
         .call("ReadAlias", &("default",))
         .await
         .map_err(|e| e.to_string())?;
+    // A service without a keyring to store in: as good as none.
     if collection.as_str() == "/" {
-        return Err("no default keyring".into());
+        return Err(ABSENT.into());
     }
     if !unlock(&conn, &service, std::slice::from_ref(&collection)).await? {
         return Err("the keyring stayed locked".into());
@@ -201,17 +222,10 @@ fn file_store(key: &StreamKey) -> std::io::Result<()> {
     write_private(&file_path().ok_or(std::io::ErrorKind::NotFound)?, key)
 }
 
+/// A new 0600 file renamed over `path`: never readable by others, even
+/// for a moment, and never half written.
 fn write_private(path: &std::path::Path, key: &StreamKey) -> std::io::Result<()> {
-    std::fs::create_dir_all(path.parent().unwrap_or(std::path::Path::new("/")))?;
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)?;
-    // `mode` only applies on creation; fix an older file too.
-    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    file.write_all(key.expose().as_bytes())
+    crate::prefs::write_atomically(path, key.expose().as_bytes())
 }
 
 fn file_clear() {
@@ -241,17 +255,17 @@ pub fn store(key: &StreamKey) -> std::result::Result<Store, String> {
             file_clear();
             Ok(Store::Keyring)
         }
-        // A key in a keyring that stayed locked would be read back first
-        // later: never leave it behind a newer one in the file.
-        Err(e) if block_on(keyring_has()).unwrap_or(false) => {
-            log!("secret service: {e}");
-            Err("The keyring stayed locked: unlock it to replace the stream key".into())
-        }
-        Err(e) => {
+        Err(e) if e == ABSENT => {
             log!("secret service: {e}; keeping the stream key in a private file");
             file_store(key)
                 .map(|()| Store::File)
                 .map_err(|e| format!("Could not save the stream key: {e}"))
+        }
+        // There is a keyring, which refused (locked, prompt dismissed): no
+        // copy in clear.
+        Err(e) => {
+            log!("secret service: {e}");
+            Err("The keyring stayed locked: key not saved".into())
         }
     }
 }
@@ -278,6 +292,7 @@ pub fn saved() -> Option<Store> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     /// Against whatever Secret Service the session bus has: never run it on
     /// a user session, only in a private `dbus-run-session` with a
@@ -296,6 +311,20 @@ mod tests {
         block_on(keyring_clear()).unwrap();
         assert!(!block_on(keyring_has()).unwrap());
         assert_eq!(block_on(keyring_load()).unwrap(), None);
+    }
+
+    /// `EXPECT=absent` on a private bus without a Secret Service, or
+    /// `EXPECT=refused` with the fake one started with `DISMISS=1`.
+    #[test]
+    #[ignore = "needs a private session bus prepared as EXPECT says"]
+    fn a_refusing_keyring_is_not_an_absent_one() {
+        let key = StreamKey::new("live_test_key_123").unwrap();
+        let result = block_on(keyring_store(&key));
+        match std::env::var("EXPECT").as_deref() {
+            Ok("absent") => assert_eq!(result, Err(ABSENT.into())),
+            Ok("refused") => assert!(result.is_err_and(|e| e != ABSENT)),
+            other => panic!("EXPECT={other:?}"),
+        }
     }
 
     #[test]

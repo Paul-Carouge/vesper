@@ -918,6 +918,8 @@ export component AppWindow inherits Window {
     in-out property <VideoCodec> live-codec: VideoCodec.h264;
     // Where the stream key is kept ("" when there is none).
     in property <string> live-key-state;
+    // Why the custom URL may send the key in clear ("" when it does not).
+    in property <string> live-url-warning;
     in property <LiveState> live-state: LiveState.off;
     // On air for this long (across reconnections).
     in property <int> live-seconds;
@@ -2128,7 +2130,7 @@ export component AppWindow inherits Window {
                             ? "Sent to Twitch's automatic ingest over RTMPS, in H.264: the codec Twitch takes."
                             : root.live-service == LiveService.youtube
                                 ? "Sent to YouTube over RTMPS. HEVC and AV1 go through Enhanced RTMP."
-                                : "An rtmp://, rtmps:// or srt:// server. The key ends the RTMP path, or is the SRT streamid.";
+                                : "An rtmp://, rtmps:// or srt:// server. The key ends the RTMP path, or is the SRT streamid." + (root.live-url-warning != "" ? " " + root.live-url-warning : "");
                         VerticalLayout {
                             spacing: Theme.space-md;
                             Segmented {

@@ -5,6 +5,12 @@
 //! Every network call can block: run a [`Live`] on its own thread. Each call
 //! gives up after a timeout, or at once when the `abort` flag passed to
 //! [`Live::connect`] is set.
+//!
+//! `rtmps://` always checks the server's certificate and host name
+//! (`tls_verify=1`); a libavformat that cannot is refused. Only the network
+//! protocols a stream needs are allowed (no `file:`, no HTTP redirection).
+//! Never raise FFmpeg's log level above `AV_LOG_VERBOSE` without a callback
+//! that filters it: the RTMP debug logs print the play path, the stream key.
 
 use std::ffi::{CString, c_int, c_void};
 use std::fmt;
@@ -21,6 +27,74 @@ use crate::{NANOS, VideoTrack, set_extradata};
 /// A write blocked this long means the connection is dead.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Name resolution gives up after this long (it cannot be interrupted).
+const RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The protocols a stream may open, nested ones included.
+const PROTOCOLS: &std::ffi::CStr = c"rtmp,rtmps,tls,tcp,srt";
+
+/// libavformat 62 (FFmpeg 8) and later check the TLS host name with every
+/// backend; older OpenSSL builds checked the chain only.
+const MIN_TLS_AVFORMAT: u32 = 62;
+
+/// Test only: a CA file the TLS layer trusts, for a local test server.
+#[cfg(test)]
+static TEST_CA: std::sync::Mutex<Option<CString>> = std::sync::Mutex::new(None);
+
+/// Options of every `avio_open2`: the protocol whitelist, and certificate
+/// checks for TLS. Freed by the caller.
+fn open_options(tls: bool) -> *mut ff::AVDictionary {
+    let mut opts = ptr::null_mut();
+    unsafe {
+        ff::av_dict_set(
+            &mut opts,
+            c"protocol_whitelist".as_ptr(),
+            PROTOCOLS.as_ptr(),
+            0,
+        );
+        if tls {
+            ff::av_dict_set(&mut opts, c"tls_verify".as_ptr(), c"1".as_ptr(), 0);
+            #[cfg(test)]
+            if let Some(ca) = TEST_CA.lock().unwrap().as_ref() {
+                ff::av_dict_set(&mut opts, c"ca_file".as_ptr(), ca.as_ptr(), 0);
+            }
+        }
+    }
+    opts
+}
+
+/// Whether `key` is still in `opts`: no protocol took it.
+fn unconsumed(opts: *mut ff::AVDictionary, key: &std::ffi::CStr) -> bool {
+    unsafe { !ff::av_dict_get(opts, key.as_ptr(), ptr::null(), 0).is_null() }
+}
+
+/// Resolves `host` on a throwaway thread: `getaddrinfo` cannot be
+/// interrupted, so a stop does not wait for it. `None`: no address, or no
+/// answer within [`RESOLVE_TIMEOUT`] or before `abort`.
+fn resolve(host: &str, port: u16, abort: &AtomicBool) -> Option<bool> {
+    use std::net::ToSocketAddrs;
+    let (tx, rx) = std::sync::mpsc::channel();
+    let host = host.to_owned();
+    std::thread::Builder::new()
+        .name("vesper-resolve".into())
+        .spawn(move || {
+            let found = (host.as_str(), port)
+                .to_socket_addrs()
+                .is_ok_and(|mut a| a.next().is_some());
+            let _ = tx.send(found);
+        })
+        .ok()?;
+    let end = Instant::now() + RESOLVE_TIMEOUT;
+    while Instant::now() < end && !abort.load(Ordering::Relaxed) {
+        match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(found) => return Some(found),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
 /// AAC audio stream description.
 #[derive(Debug, Clone)]
 pub struct LiveAudio {
@@ -33,8 +107,10 @@ pub struct LiveAudio {
 /// Why a connection or a write failed, for a message the user can act on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LiveErrorKind {
-    /// No network, an unknown host, or no answer in time.
+    /// No network, or no answer in time.
     Unreachable,
+    /// The host name does not exist (or no network to look it up).
+    Unresolved,
     /// Nothing listens there: a wrong server address or port.
     Refused,
     /// The server answered, then refused or closed the stream while it
@@ -183,17 +259,32 @@ impl Live {
         } else {
             c"flv"
         };
+        let tls = url.starts_with("rtmps://");
+        // SAFETY: a plain getter.
+        if tls && unsafe { ff::avformat_version() } >> 16 < MIN_TLS_AVFORMAT {
+            return Err(LiveError::new(
+                Insecure,
+                "this FFmpeg cannot check TLS host names",
+            ));
+        }
         // libavformat's resolver error is a plain EIO, as is a refused
         // stream: resolve first to tell them apart.
         let endpoint = endpoint(url);
         if let Some((host, port)) = &endpoint {
-            use std::net::ToSocketAddrs;
-            let resolved = (host.as_str(), *port).to_socket_addrs();
-            if !resolved.is_ok_and(|mut addrs| addrs.next().is_some()) {
-                return Err(LiveError::new(
-                    Unreachable,
-                    format!("cannot resolve {host}"),
-                ));
+            match resolve(host, *port, &abort) {
+                Some(true) => {}
+                _ if abort.load(Ordering::Relaxed) => {
+                    return Err(LiveError::new(Aborted, "stopped"));
+                }
+                Some(false) => {
+                    return Err(LiveError::new(Unresolved, format!("cannot resolve {host}")));
+                }
+                None => {
+                    return Err(LiveError::new(
+                        Unreachable,
+                        format!("no answer resolving {host}"),
+                    ));
+                }
             }
         }
         let mut live = Self {
@@ -258,7 +349,7 @@ impl Live {
                 set_extradata(par, &a.extradata).map_err(|e| LiveError::new(Other, e.0))?;
             }
 
-            let mut opts = ptr::null_mut();
+            let mut opts = open_options(tls);
             let ret = ff::avio_open2(
                 &mut (*live.ctx).pb,
                 curl.as_ptr(),
@@ -266,11 +357,27 @@ impl Live {
                 &(*live.ctx).interrupt_callback,
                 &mut opts,
             );
+            // Fail closed: a TLS layer that did not take `tls_verify` did
+            // not check the certificate.
+            let unchecked = tls && ret >= 0 && unconsumed(opts, c"tls_verify");
             ff::av_dict_free(&mut opts);
-            let connected = live.check(ret, "connect", Rejected);
+            if unchecked {
+                return Err(LiveError::new(
+                    Insecure,
+                    "the TLS layer does not check certificates",
+                ));
+            }
+            // An SRT caller with no listener fails with a generic error:
+            // never blame the key for it. RTMP gets refused instead.
+            let fallback = if url.starts_with("srt://") {
+                Unreachable
+            } else {
+                Rejected
+            };
+            let connected = live.check(ret, "connect", fallback);
             // A failed TLS handshake is a plain EIO too: try one alone.
             if connected.as_ref().is_err_and(|e| e.kind == Rejected)
-                && url.starts_with("rtmps://")
+                && tls
                 && let Some((host, port)) = &endpoint
                 && !live.tls_handshake(host, *port)
             {
@@ -343,15 +450,18 @@ impl Live {
         self.interrupt.arm(Duration::from_secs(5));
         let mut pb = ptr::null_mut();
         unsafe {
+            let mut opts = open_options(true);
             let ret = ff::avio_open2(
                 &mut pb,
                 url.as_ptr(),
                 ff::AVIO_FLAG_WRITE,
                 &(*self.ctx).interrupt_callback,
-                ptr::null_mut(),
+                &mut opts,
             );
+            let unchecked = unconsumed(opts, c"tls_verify");
+            ff::av_dict_free(&mut opts);
             ff::avio_closep(&mut pb);
-            ret >= 0
+            ret >= 0 && !unchecked
         }
     }
 
@@ -541,28 +651,197 @@ mod tests {
         )
         .err()
         .unwrap();
-        assert_eq!(e.kind(), LiveErrorKind::Unreachable, "{e}");
+        assert_eq!(e.kind(), LiveErrorKind::Unresolved, "{e}");
         assert!(!e.to_string().contains("key"), "{e}");
     }
 
-    #[test]
-    fn a_failed_tls_handshake_is_not_blamed_on_the_key() {
-        // A server that answers the TLS ClientHello with garbage.
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let url = format!("rtmps://{}/app/key", listener.local_addr().unwrap());
-        std::thread::spawn(move || {
-            for stream in listener.incoming().take(2) {
-                use std::io::{Read, Write};
-                let mut stream = stream.unwrap();
-                let _ = stream.read(&mut [0; 512]);
-                let _ = stream.write_all(&[0x42; 64]);
+    /// Runs `openssl` in `dir`; false when it fails or is missing.
+    fn openssl(dir: &std::path::Path, args: &[&str]) -> bool {
+        std::process::Command::new("openssl")
+            .args(args)
+            .current_dir(dir)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    }
+
+    /// An `openssl s_server` on 127.0.0.1 with `cert`/`key` from `dir`,
+    /// killed on drop.
+    struct TlsServer(std::process::Child, u16);
+
+    impl TlsServer {
+        fn start(dir: &std::path::Path, cert: &str, key: &str) -> Option<Self> {
+            let port = std::net::TcpListener::bind("127.0.0.1:0")
+                .ok()?
+                .local_addr()
+                .ok()?
+                .port();
+            let accept = format!("127.0.0.1:{port}");
+            let child = std::process::Command::new("openssl")
+                .args([
+                    "s_server", "-quiet", "-accept", &accept, "-cert", cert, "-key", key,
+                ])
+                .current_dir(dir)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .ok()?;
+            let server = Self(child, port);
+            for _ in 0..50 {
+                if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                    return Some(server);
+                }
+                std::thread::sleep(Duration::from_millis(50));
             }
-        });
+            None
+        }
+    }
+
+    impl Drop for TlsServer {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    fn connect_kind(port: u16) -> LiveErrorKind {
+        let url = format!("rtmps://localhost:{port}/app/key");
         let abort = Arc::new(AtomicBool::new(false));
-        let e = Live::connect(&url, &video(), None, abort, Duration::from_secs(5))
+        Live::connect(&url, &video(), None, abort, Duration::from_secs(3))
             .err()
-            .unwrap();
-        assert_eq!(e.kind(), LiveErrorKind::Insecure, "{e}");
+            .expect("an openssl server does not speak RTMP")
+            .kind()
+    }
+
+    /// Certificates are checked: a self-signed one and one for another host
+    /// are refused as insecure (not blamed on the key); one from a trusted
+    /// CA for the right host passes TLS (then fails at RTMP).
+    #[test]
+    fn rtmps_checks_the_certificate_and_the_host_name() {
+        let dir = std::env::temp_dir().join(format!("vesper-tls-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let san = |host: &str| format!("subjectAltName=DNS:{host}");
+        let made = openssl(
+            &dir,
+            &[
+                "req",
+                "-x509",
+                "-newkey",
+                "rsa:2048",
+                "-nodes",
+                "-days",
+                "1",
+                "-keyout",
+                "self.key",
+                "-out",
+                "self.pem",
+                "-subj",
+                "/CN=localhost",
+                "-addext",
+                &san("localhost"),
+            ],
+        ) && openssl(
+            &dir,
+            &[
+                "req",
+                "-x509",
+                "-newkey",
+                "rsa:2048",
+                "-nodes",
+                "-days",
+                "1",
+                "-keyout",
+                "ca.key",
+                "-out",
+                "ca.pem",
+                "-subj",
+                "/CN=Vesper test CA",
+            ],
+        ) && ["localhost", "other.example"].iter().all(|host| {
+            openssl(
+                &dir,
+                &[
+                    "req",
+                    "-newkey",
+                    "rsa:2048",
+                    "-nodes",
+                    "-keyout",
+                    &format!("{host}.key"),
+                    "-out",
+                    &format!("{host}.csr"),
+                    "-subj",
+                    &format!("/CN={host}"),
+                    "-addext",
+                    &san(host),
+                ],
+            ) && openssl(
+                &dir,
+                &[
+                    "x509",
+                    "-req",
+                    "-days",
+                    "1",
+                    "-in",
+                    &format!("{host}.csr"),
+                    "-CA",
+                    "ca.pem",
+                    "-CAkey",
+                    "ca.key",
+                    "-CAcreateserial",
+                    "-copy_extensions",
+                    "copy",
+                    "-out",
+                    &format!("{host}.pem"),
+                ],
+            )
+        });
+        if !made {
+            eprintln!("no openssl, skipping");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let ca = CString::new(dir.join("ca.pem").to_str().unwrap()).unwrap();
+
+        let server = TlsServer::start(&dir, "self.pem", "self.key").unwrap();
+        assert_eq!(
+            connect_kind(server.1),
+            LiveErrorKind::Insecure,
+            "self-signed"
+        );
+        drop(server);
+
+        *TEST_CA.lock().unwrap() = Some(ca);
+        let server = TlsServer::start(&dir, "other.example.pem", "other.example.key").unwrap();
+        let wrong_host = connect_kind(server.1);
+        drop(server);
+        let server = TlsServer::start(&dir, "localhost.pem", "localhost.key").unwrap();
+        let trusted = connect_kind(server.1);
+        drop(server);
+        *TEST_CA.lock().unwrap() = None;
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(
+            wrong_host,
+            LiveErrorKind::Insecure,
+            "certificate for another host"
+        );
+        assert_ne!(trusted, LiveErrorKind::Insecure, "trusted CA, right host");
+    }
+
+    #[test]
+    fn srt_without_a_listener_is_not_blamed_on_the_key() {
+        let abort = Arc::new(AtomicBool::new(false));
+        let e = Live::connect(
+            "srt://127.0.0.1:9?streamid=key",
+            &video(),
+            None,
+            abort,
+            Duration::from_secs(5),
+        )
+        .err()
+        .unwrap();
+        assert_ne!(e.kind(), LiveErrorKind::Rejected, "{e}");
     }
 
     #[test]

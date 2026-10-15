@@ -192,15 +192,20 @@ fn scaled_encoder_encodes_the_source_pictures_at_its_own_size() {
     }
     let (w, h) = (640, 360);
     let mut enc = Encoder::new(Codec::Hevc, w, h, 30, RateControl::ConstantQp(30)).unwrap();
-    let mut live = enc
-        .new_scaled(
+    // Opened on another thread, as the pipeline does.
+    let source = enc.scaled_source().unwrap();
+    let mut live = std::thread::spawn(move || {
+        source.open(
             Codec::Hevc,
             480,
             270,
             30,
             RateControl::ConstantBitrate(1_000_000),
         )
-        .unwrap();
+    })
+    .join()
+    .unwrap()
+    .unwrap();
     assert!(
         live.encode_scaled(&enc, Duration::ZERO).is_err(),
         "no picture yet"

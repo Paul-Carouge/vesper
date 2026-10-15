@@ -231,13 +231,70 @@ impl Encoder {
         fps: u32,
         rate: RateControl,
     ) -> Result<Self, Error> {
+        self.scaled_source()?.open(codec, width, height, fps, rate)
+    }
+
+    /// What [`ScaledSource::open`] needs from `self`, to open a scaled
+    /// encoder on another thread (opening one takes tens of milliseconds).
+    pub fn scaled_source(&self) -> Result<ScaledSource, Error> {
+        unsafe {
+            let mut source = ScaledSource {
+                device: not_null(ff::av_buffer_ref(self.device), "device ref")?,
+                frames: ptr::null_mut(),
+                display: self.display,
+                width: self.width,
+                height: self.height,
+            };
+            source.frames = not_null(
+                ff::av_buffer_ref(ff::av_buffersink_get_hw_frames_ctx(self.sink)),
+                "frames ref",
+            )?;
+            Ok(source)
+        }
+    }
+}
+
+/// References to an encoder's device and picture pool: enough to open a
+/// scaled encoder for it ([`Encoder::new_scaled`]) on any thread.
+pub struct ScaledSource {
+    device: *mut ff::AVBufferRef,
+    frames: *mut ff::AVBufferRef,
+    display: *mut c_void,
+    width: u32,
+    height: u32,
+}
+
+// SAFETY: reference-counted FFmpeg buffers (thread-safe counts) and a VA
+// display, which libva lets several threads use.
+unsafe impl Send for ScaledSource {}
+
+impl Drop for ScaledSource {
+    fn drop(&mut self) {
+        unsafe {
+            ff::av_buffer_unref(&mut self.frames);
+            ff::av_buffer_unref(&mut self.device);
+        }
+    }
+}
+
+impl ScaledSource {
+    /// Opens the scaled encoder; it then takes the source encoder's
+    /// pictures through [`Encoder::encode_scaled`].
+    pub fn open(
+        mut self,
+        codec: Codec,
+        width: u32,
+        height: u32,
+        fps: u32,
+        rate: RateControl,
+    ) -> Result<Encoder, Error> {
         if width == 0 || height == 0 || fps == 0 {
             return Err(Error("width, height and fps must be non-zero".into()));
         }
-        let mut e = Self {
+        let mut e = Encoder {
             width,
             height,
-            device: ptr::null_mut(),
+            device: std::mem::replace(&mut self.device, ptr::null_mut()),
             display: self.display,
             import_frames: ptr::null_mut(),
             graph: ptr::null_mut(),
@@ -256,14 +313,14 @@ impl Encoder {
         // On error, `e` is dropped and frees whatever was created so far.
         unsafe {
             e.packet = not_null(ff::av_packet_alloc(), "av_packet_alloc")?;
-            e.device = not_null(ff::av_buffer_ref(self.device), "device ref")?;
-            let frames = ff::av_buffersink_get_hw_frames_ctx(self.sink);
-            e.build_scaled_graph(frames, self.width, self.height)?;
+            e.build_scaled_graph(self.frames, self.width, self.height)?;
             e.open_with_fallback(codec, fps, rate)?;
         }
         Ok(e)
     }
+}
 
+impl Encoder {
     unsafe fn open_with_fallback(
         &mut self,
         codec: Codec,

@@ -95,7 +95,9 @@ impl Aac {
         match self.base {
             None => self.base = Some(pts),
             Some(base) if (pts - (base + samples_ns(queued))).abs() > JUMP_NS => {
-                // A partial packet of the old timeline is dropped.
+                // A partial packet of the old timeline is dropped. The
+                // encoder's lookahead still holds up to 1024 old frames: they
+                // come out once, ~21 ms of overlap at an audio restart. Fine.
                 self.pending.clear();
                 self.base = Some(pts - samples_ns(self.sent));
             }

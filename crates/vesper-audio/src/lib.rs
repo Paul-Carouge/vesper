@@ -464,6 +464,15 @@ impl<F: FnMut(EncodedPacket)> Encoder<F> {
         }
     }
 
+    /// Starts over at frame `at` of the timeline (a mix that was idle):
+    /// what waits is dropped, and so is the processing's delay of old audio.
+    fn restart_at(&mut self, at: u64) {
+        self.pending.clear();
+        self.ready.clear();
+        self.skip = self.delay;
+        self.sent = at as i64;
+    }
+
     /// Follows a change of the processing's delay. Output frame `n` must be
     /// input frame `n`: a longer delay drops output, a shorter one inserts
     /// silence where the old processing still held audio.
@@ -490,7 +499,7 @@ impl<F: FnMut(EncodedPacket)> Encoder<F> {
         apply_gain(&mut self.block, self.gain, gain);
         self.gain = gain;
         if let Some(mix) = &self.mix {
-            mix.push(&self.block);
+            mix.push(&self.block, self.sent as u64);
         }
         if let Some(tap) = &mut self.tap {
             tap(

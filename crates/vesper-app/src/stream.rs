@@ -171,9 +171,74 @@ fn custom_url(url: &str, key: Option<&str>) -> Result<String, String> {
         (Some("srt"), None) => Ok(url.to_owned()),
         (Some("srt"), Some(key)) => {
             let sep = if url.contains('?') { '&' } else { '?' };
-            Ok(format!("{url}{sep}streamid={key}"))
+            // `streamid=...&passphrase=...` as is, else the stream id.
+            if key.contains('=') {
+                Ok(format!("{url}{sep}{key}"))
+            } else {
+                Ok(format!("{url}{sep}streamid={key}"))
+            }
         }
         _ => Err("The server URL must start with rtmp://, rtmps:// or srt://".into()),
+    }
+}
+
+/// SRT URL parameters that are secrets: they belong in the key field.
+const SRT_SECRETS: [&str; 2] = ["streamid", "passphrase"];
+
+/// `url` without a key pasted into it, and that key: an RTMP path deeper
+/// than the application (`/app/<key>`), or SRT's `streamid` and
+/// `passphrase` (kept as `streamid=...&passphrase=...` when there is a
+/// passphrase). The settings file only ever gets the first part.
+pub fn split_secret(url: &str) -> (String, Option<String>) {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return (url.to_owned(), None);
+    };
+    match scheme {
+        "rtmp" | "rtmps" => {
+            let (host, path) = rest.split_once('/').unwrap_or((rest, ""));
+            let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+            match segments.split_last() {
+                Some((key, app)) if !app.is_empty() => (
+                    format!("{scheme}://{host}/{}", app.join("/")),
+                    Some((*key).to_owned()),
+                ),
+                _ => (url.to_owned(), None),
+            }
+        }
+        "srt" => {
+            let Some((base, query)) = rest.split_once('?') else {
+                return (url.to_owned(), None);
+            };
+            let (secret, kept): (Vec<&str>, Vec<&str>) = query
+                .split('&')
+                .filter(|p| !p.is_empty())
+                .partition(|p| SRT_SECRETS.contains(&p.split('=').next().unwrap_or("")));
+            if secret.is_empty() {
+                return (url.to_owned(), None);
+            }
+            let key = match secret.as_slice() {
+                [one] if one.starts_with("streamid=") => one["streamid=".len()..].to_owned(),
+                _ => secret.join("&"),
+            };
+            let clean = if kept.is_empty() {
+                format!("srt://{base}")
+            } else {
+                format!("srt://{base}?{}", kept.join("&"))
+            };
+            (clean, Some(key))
+        }
+        _ => (url.to_owned(), None),
+    }
+}
+
+/// Why a custom URL may send the key in clear, for the settings.
+pub fn cleartext_warning(url: &str) -> &'static str {
+    if url.starts_with("rtmp://") {
+        "rtmp:// sends the key in clear: prefer rtmps:// if the server has it."
+    } else if url.starts_with("srt://") {
+        "srt:// is encrypted only with a passphrase: key streamid=...&passphrase=..."
+    } else {
+        ""
     }
 }
 
@@ -210,6 +275,9 @@ pub enum StreamState {
 fn describe(kind: LiveErrorKind, host: &str, live_before: bool) -> String {
     match kind {
         LiveErrorKind::Unreachable => format!("Cannot reach {host}: check the network"),
+        LiveErrorKind::Unresolved => {
+            format!("Unknown server {host}: check the URL and the network")
+        }
         LiveErrorKind::Refused if live_before => format!("{host} refused the connection"),
         LiveErrorKind::Refused => format!("{host} refused the connection: check the server URL"),
         LiveErrorKind::Rejected if !live_before => {
@@ -319,6 +387,13 @@ impl LiveSink {
     pub fn wants_keyframe(&self) -> bool {
         let q = lock(&self.shared.queue);
         q.connected && q.want_key
+    }
+
+    /// Whether video waits for a keyframe because of a new connection (not
+    /// a congestion): only then may the recording's encoder make one.
+    pub fn starting(&self) -> bool {
+        let q = lock(&self.shared.queue);
+        q.connected && q.want_key && !q.congested
     }
 
     /// The thread ended on its own (the server refused the stream).
@@ -439,8 +514,11 @@ fn run(
             Err(e) => {
                 log!("live: {e}");
                 let text = describe(e.kind(), host, on_air.is_some());
-                // A wrong key or URL will not fix itself: only retry what may.
-                let retry = on_air.is_some() || e.kind() == LiveErrorKind::Unreachable;
+                // A wrong key or URL will not fix itself: only retry what
+                // may. An unknown host that never worked gets 3 tries.
+                let retry = on_air.is_some()
+                    || e.kind() == LiveErrorKind::Unreachable
+                    || (e.kind() == LiveErrorKind::Unresolved && failures < 2);
                 if !retry {
                     return Some(text);
                 }
@@ -623,6 +701,46 @@ mod tests {
         assert!(request(Service::Twitch, "", "  ").url().is_err());
         assert!(request(Service::Custom, "http://h/x", "k").url().is_err());
         assert!(request(Service::Custom, "rtmp://", "k").url().is_err());
+    }
+
+    #[test]
+    fn keys_pasted_into_a_url_are_split_off() {
+        let split = |u: &str| split_secret(u);
+        assert_eq!(
+            split("rtmp://h.example/app/live_123"),
+            ("rtmp://h.example/app".into(), Some("live_123".into()))
+        );
+        assert_eq!(
+            split("rtmps://h.example:443/live2/a-b/c-d/"),
+            ("rtmps://h.example:443/live2/a-b".into(), Some("c-d".into()))
+        );
+        assert_eq!(
+            split("rtmp://h.example/app"),
+            ("rtmp://h.example/app".into(), None)
+        );
+        assert_eq!(
+            split("srt://h:9000?latency=200000&streamid=k"),
+            ("srt://h:9000?latency=200000".into(), Some("k".into()))
+        );
+        assert_eq!(
+            split("srt://h:9000?streamid=k&passphrase=0123456789"),
+            (
+                "srt://h:9000".into(),
+                Some("streamid=k&passphrase=0123456789".into())
+            )
+        );
+        assert_eq!(
+            split("srt://h:9000?latency=1"),
+            ("srt://h:9000?latency=1".into(), None)
+        );
+        // And back: the key goes where it came from.
+        let (url, key) = split("srt://h:9000?latency=1&passphrase=0123456789&streamid=k");
+        assert_eq!(
+            custom_url(&url, key.as_deref()).unwrap(),
+            "srt://h:9000?latency=1&passphrase=0123456789&streamid=k"
+        );
+        let (url, key) = split("rtmp://h/app/k");
+        assert_eq!(custom_url(&url, key.as_deref()).unwrap(), "rtmp://h/app/k");
     }
 
     #[test]

@@ -1035,23 +1035,42 @@ impl Video {
     }
 }
 
+/// The video of a live stream.
+enum StreamVideo {
+    /// The recording's packets.
+    Shared,
+    /// The stream's own encoder, being opened on a helper thread (opening
+    /// takes tens of milliseconds: never on the tick).
+    Opening(std::sync::mpsc::Receiver<Result<Encoder, String>>),
+    Own(Encoder),
+}
+
 /// A live stream, from the pipeline thread's side.
 struct Streaming {
-    sink: LiveSink,
-    /// The stream's own encoder; `None`: it sends the recording's packets.
-    enc: Option<Encoder>,
+    /// `None` until the stream's encoder is open: its header is needed.
+    sink: Option<LiveSink>,
+    video: StreamVideo,
+    url: String,
+    codec: Codec,
+    width: u32,
+    height: u32,
     fps: u32,
+    /// AAC when the mix runs.
+    aac: Option<Aac>,
+    on_event: OnEvent,
     /// Stream frame number of the last picture sent.
     last: Option<u64>,
     /// The recording encoder has a new picture since the stream's last one.
     fresh: bool,
     /// A keyframe was asked for and has not come out yet.
     key_pending: bool,
+    /// Stream frames in a row whose encode took longer than a frame.
+    slow: u32,
 }
 
 impl Streaming {
-    /// Opens the stream's encoder (unless it can share the recording's) and
-    /// its audio, and starts connecting.
+    /// Checks the request, starts opening the stream's encoder (unless it
+    /// can share the recording's) and opens its audio.
     fn start(
         request: &StreamRequest,
         v: &Video,
@@ -1070,40 +1089,35 @@ impl Streaming {
             && (width, height) == (v.track.width, v.track.height)
             && fps == settings.fps
             && v.bitrate <= s.bitrate;
-        let (enc, track) = if shared {
-            (None, v.track.clone())
+        let video = if shared {
+            StreamVideo::Shared
         } else {
-            let enc = v
+            let source = v
                 .enc
-                .new_scaled(
-                    codec,
-                    width,
-                    height,
-                    fps,
-                    RateControl::ConstantBitrate(s.bitrate),
-                )
+                .scaled_source()
                 .map_err(|e| format!("Could not open the stream encoder: {e}"))?;
-            let track = VideoTrack {
-                codec,
-                width,
-                height,
-                fps,
-                extradata: enc.extradata().to_vec(),
-            };
-            (Some(enc), track)
+            let (tx, rx) = std::sync::mpsc::channel();
+            let rate = RateControl::ConstantBitrate(s.bitrate);
+            std::thread::Builder::new()
+                .name("vesper-live-open".into())
+                .spawn(move || {
+                    let opened = source
+                        .open(codec, width, height, fps, rate)
+                        .map_err(|e| format!("Could not open the stream encoder: {e}"));
+                    let _ = tx.send(opened);
+                })
+                .map_err(|e| format!("Could not open the stream encoder: {e}"))?;
+            StreamVideo::Opening(rx)
         };
-        // Audio when any track records: the mix, as AAC.
-        let any_track = lock(sources).tracks.iter().any(|t| t.enabled);
-        let aac = if any_track {
+        // The mix runs whenever a track does: without it, a silent stream.
+        let aac = if lock(sources).mixer.is_some() {
             Some(Aac::new().map_err(|e| format!("Could not open the AAC encoder: {e}"))?)
         } else {
+            on_event(Event::AudioMissing(
+                "Streaming without sound: no audio track runs".into(),
+            ));
             None
         };
-        let sink = LiveSink::start(url, track, aac.as_ref().map(live_audio), on_event.clone())
-            .map_err(|e| format!("Could not start the stream: {e}"))?;
-        if let Some(aac) = aac {
-            lock(sources).set_stream_tap(Some(AudioTap::new(aac, sink.audio_in())));
-        }
         log!(
             "live: {width}x{height} {fps} fps {codec:?}, {} kbit/s, {}",
             s.bitrate / 1000,
@@ -1113,14 +1127,47 @@ impl Streaming {
                 "own encode"
             }
         );
-        Ok(Self {
-            sink,
-            enc,
+        let mut streaming = Self {
+            sink: None,
+            video,
+            url,
+            codec,
+            width,
+            height,
             fps,
+            aac,
+            on_event: on_event.clone(),
             last: None,
             fresh: true,
             key_pending: false,
-        })
+            slow: 0,
+        };
+        if shared {
+            streaming.connect(v.track.clone(), sources)?;
+        }
+        Ok(streaming)
+    }
+
+    /// Starts the live thread and the audio, once the video header is known.
+    fn connect(&mut self, track: VideoTrack, sources: &AudioSources) -> Result<(), String> {
+        let audio = self.aac.as_ref().map(live_audio);
+        let sink = LiveSink::start(
+            std::mem::take(&mut self.url),
+            track,
+            audio,
+            self.on_event.clone(),
+        )
+        .map_err(|e| format!("Could not start the stream: {e}"))?;
+        if let Some(aac) = self.aac.take() {
+            lock(sources).set_stream_tap(Some(AudioTap::new(aac, sink.audio_in())));
+        }
+        self.sink = Some(sink);
+        Ok(())
+    }
+
+    /// The live thread ended on its own (the server refused the stream).
+    fn ended(&self) -> bool {
+        self.sink.as_ref().is_some_and(LiveSink::ended)
     }
 
     /// Sends this tick's picture. `packets`: what the recording encoder
@@ -1132,51 +1179,98 @@ impl Streaming {
         fps: u32,
         packets: &[EncodedPacket],
         new_picture: bool,
+        sources: &AudioSources,
     ) -> Result<(), String> {
-        let want_key = self.sink.wants_keyframe();
-        let Some(enc) = &mut self.enc else {
-            if want_key && !self.key_pending {
-                // One more IDR in the recording, so the stream starts sooner.
-                v.enc.force_keyframe();
-                self.key_pending = true;
-            }
-            for p in packets {
-                self.key_pending &= !p.keyframe;
-                self.sink.push_video(p.clone());
-            }
+        self.fresh |= new_picture;
+        if let StreamVideo::Opening(rx) = &self.video {
+            let enc = match rx.try_recv() {
+                Ok(opened) => opened?,
+                Err(std::sync::mpsc::TryRecvError::Empty) => return Ok(()),
+                Err(_) => return Err("Could not open the stream encoder".into()),
+            };
+            let track = VideoTrack {
+                codec: self.codec,
+                width: self.width,
+                height: self.height,
+                fps: self.fps,
+                extradata: enc.extradata().to_vec(),
+            };
+            self.video = StreamVideo::Own(enc);
+            self.connect(track, sources)?;
+        }
+        let Some(sink) = &self.sink else {
             return Ok(());
         };
-        self.fresh |= new_picture;
+        let enc = match &mut self.video {
+            StreamVideo::Own(enc) => enc,
+            _ => {
+                // A keyframe in the recording only for a new connection;
+                // after a congestion, the next one comes within a GOP (2 s).
+                if sink.starting() && !self.key_pending {
+                    v.enc.force_keyframe();
+                    self.key_pending = true;
+                }
+                for p in packets {
+                    self.key_pending &= !p.keyframe;
+                    sink.push_video(p.clone());
+                }
+                return Ok(());
+            }
+        };
         // Every tick at the recording's rate, but only one per stream frame.
         let n = k * u64::from(self.fps) / u64::from(fps);
         if self.last == Some(n) {
             return Ok(());
         }
         self.last = Some(n);
-        if want_key && !self.key_pending {
+        if sink.wants_keyframe() && !self.key_pending {
             enc.force_keyframe();
             self.key_pending = true;
         }
         let pts = v.start + frame_offset(n, self.fps);
+        let t = std::time::Instant::now();
         let out = if std::mem::take(&mut self.fresh) {
             enc.encode_scaled(&v.enc, pts)
         } else {
             enc.repeat(pts)
         };
+        // The GPU cannot keep up with both encodes: the recording comes first.
+        if t.elapsed() > frame_offset(1, fps) {
+            self.slow += 1;
+            if self.slow >= self.fps {
+                return Err("The GPU encoder is overloaded: the stream ended so the \
+                            recording stays smooth"
+                    .into());
+            }
+        } else {
+            self.slow = 0;
+        }
         for p in out.map_err(|e| format!("Stream encoding failed: {e}"))? {
             self.key_pending &= !p.keyframe;
-            self.sink.push_video(p);
+            sink.push_video(p);
         }
         Ok(())
     }
 
     /// Ends the stream (with `error` if it failed here) and its audio;
-    /// returns the live thread to join.
-    fn stop(self, sources: &AudioSources, error: Option<String>) -> Option<JoinHandle<()>> {
+    /// returns the live thread to join. `abort`: do not wait for a slow
+    /// network (the pipeline is ending).
+    fn stop(
+        self,
+        sources: &AudioSources,
+        error: Option<String>,
+        abort: bool,
+    ) -> Option<JoinHandle<()>> {
         lock(sources).set_stream_tap(None);
-        match error {
-            Some(e) => self.sink.fail(e),
-            None => self.sink.stop(),
+        match (self.sink, error) {
+            // Never connected: the UI still waits for the end.
+            (None, error) => {
+                (self.on_event)(Event::Stream(StreamState::Ended(error)));
+                None
+            }
+            (Some(sink), _) if abort => sink.abort(),
+            (Some(sink), Some(e)) => sink.fail(e),
+            (Some(sink), None) => sink.stop(),
         }
     }
 }
@@ -1329,8 +1423,8 @@ fn pump(
         // Requests are read under the control lock, so none lands on an
         // ended pipeline unseen.
         // The live thread ended on its own (the server refused the stream).
-        if streaming.as_ref().is_some_and(|s| s.sink.ended()) {
-            let handle = streaming.take().and_then(|s| s.stop(sources, None));
+        if streaming.as_ref().is_some_and(Streaming::ended) {
+            let handle = streaming.take().and_then(|s| s.stop(sources, None, false));
             lock(control).saves.extend(handle);
         }
         let (record, stop, replay, save, go_live) = {
@@ -1398,7 +1492,7 @@ fn pump(
             (record, stop, c.replay, c.save.take(), go_live)
         };
         if let Some(s) = stopping.take() {
-            let handle = s.stop(sources, None);
+            let handle = s.stop(sources, None, false);
             lock(control).saves.extend(handle);
         }
         // New tracks: restart the audio, and its part of the replay buffer
@@ -1548,10 +1642,12 @@ fn pump(
         // Before the sinks take the packets. A failing stream ends alone.
         if !gone
             && let Some(s) = &mut streaming
-            && let Err(e) = s.tick(v, k, fps, &packets, new_picture)
+            && let Err(e) = s.tick(v, k, fps, &packets, new_picture, sources)
         {
             log!("live: {e}");
-            let handle = streaming.take().and_then(|s| s.stop(sources, Some(e)));
+            let handle = streaming
+                .take()
+                .and_then(|s| s.stop(sources, Some(e), false));
             lock(control).saves.extend(handle);
         }
         let ended = lock(sinks).write_video(packets);
@@ -1599,8 +1695,7 @@ fn pump(
     lock(control).ended = true;
     if let Some(s) = streaming.take() {
         // Quitting or failed: do not wait for a slow network.
-        lock(sources).set_stream_tap(None);
-        let handle = s.sink.abort();
+        let handle = s.stop(sources, None, true);
         lock(control).saves.extend(handle);
     } else if lock(control).stream.take().is_some() {
         // Requested, never started: the UI waits for its end.

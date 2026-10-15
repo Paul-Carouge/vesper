@@ -137,6 +137,23 @@ pub fn wire(ui: &AppWindow, recording: &Shared, games: &Games) {
     let weak = ui.as_weak();
     ui.on_live_settings_changed(move || {
         let Some(ui) = weak.upgrade() else { return };
+        // A key pasted into the URL goes to the keyring, not the settings.
+        let (url, key) = crate::stream::split_secret(ui.get_live_url().trim());
+        if let Some(key) = key.as_deref().and_then(StreamKey::new) {
+            ui.set_live_url(url.as_str().into());
+            off_ui(
+                &ui,
+                move || secret::store(&key),
+                |ui, result| match result {
+                    Ok(store) => {
+                        show_store(ui, Some(store));
+                        flash_notice(ui, "The key in the URL was moved to the stream key");
+                    }
+                    Err(e) => flash_notice(ui, &e),
+                },
+            );
+        }
+        ui.set_live_url_warning(crate::stream::cleartext_warning(&url).into());
         log!("live-settings-changed: {:?}", settings(&ui));
         Prefs::from_ui(&ui).save();
     });

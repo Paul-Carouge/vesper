@@ -4,6 +4,7 @@
 
 use std::collections::HashSet;
 use std::io::{Read, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -100,6 +101,7 @@ impl Prefs {
             Service::Custom => LiveService::Custom,
         });
         ui.set_live_url(live.custom_url.as_str().into());
+        ui.set_live_url_warning(crate::stream::cleartext_warning(&live.custom_url).into());
         ui.set_live_height(live.height.map_or(0, |h| h as i32));
         ui.set_live_fps(live.fps as i32);
         ui.set_live_bitrate(live.bitrate as f32 / 1e6);
@@ -270,8 +272,10 @@ impl Prefs {
             live.fps,
             live.bitrate / 1000
         );
-        if one_line(&live.custom_url) {
-            text += &format!("live_url={}\n", live.custom_url);
+        // Never a key pasted into the URL.
+        let (url, _) = crate::stream::split_secret(&live.custom_url);
+        if one_line(&url) {
+            text += &format!("live_url={url}\n");
         }
         text
     }
@@ -593,9 +597,12 @@ pub fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         .subsec_nanos();
     let n = WRITES.fetch_add(1, Ordering::Relaxed);
     let tmp = path.with_extension(format!("tmp.{}.{n}.{nanos:x}", std::process::id()));
+    // Private (0600): the settings name devices and folders, and the
+    // stream key fallback goes through here too.
     let written = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
+        .mode(0o600)
         .open(&tmp)
         .and_then(|mut file| file.write_all(bytes))
         .and_then(|()| std::fs::rename(&tmp, path));
@@ -744,6 +751,15 @@ mod tests {
         let text = "live_service=kick\nlive_height=1440\nlive_fps=144\nlive_kbps=6200\n\
                     live_kbps=999999\nlive_codec=vp9\nlive_url=a\u{1}b\n";
         assert_eq!(defaults().parse(text), defaults());
+        let prefs = Prefs {
+            live: StreamSettings {
+                custom_url: "rtmp://h/app/live_secret".into(),
+                ..StreamSettings::default()
+            },
+            ..defaults()
+        };
+        let text = prefs.serialize(DEFAULT);
+        assert!(text.contains("live_url=rtmp://h/app\n") && !text.contains("secret"));
         let prefs = defaults().parse("live_height=0\nlive_kbps=8000\n");
         assert_eq!(prefs.live.height, None);
         assert_eq!(prefs.live.bitrate, 8_000_000);
