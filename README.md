@@ -43,15 +43,24 @@ Risks and limits: anti-cheats (EAC, BattlEye) may flag or reject unknown Vulkan 
 
 ## Install
 
-Global shortcuts need an app id, and the portal only accepts one with an installed desktop file whose `Exec` binary it can find:
+Global shortcuts need an app id, and the portal only accepts one with an installed desktop file whose `Exec` binary it can find.
+
+Arch (and CachyOS): the package builds the last commit of this checkout (uncommitted changes are left out), no GitHub access needed:
+
+```sh
+cd packaging/arch && makepkg -si
+```
+
+It installs `/usr/bin/vesper`, the desktop file, the icon and the game capture layer in `/usr/lib/vesper/`. The layer stays off: only the settings switch enables it, per user. Uninstall with `sudo pacman -R vesper-git`. Turn the switch off first: otherwise your per-user copy of the layer stays installed and keeps loading into Vulkan apps; remove it by hand with `rm ~/.local/share/vulkan/implicit_layer.d/vesper_capture.json ~/.local/share/vesper/libvesper_vklayer.so`. Each `makepkg` rewrites `pkgver=` in the PKGBUILD (normal for a -git package): `git checkout packaging/arch/PKGBUILD` before committing.
+
+Manual alternative, in your home:
 
 ```sh
 cargo build --release
 install -Dm755 target/release/vesper ~/.local/bin/vesper
-# Optional, for game capture: the workspace build also produces the layer.
 install -Dm644 target/release/libvesper_vklayer.so ~/.local/lib/vesper/libvesper_vklayer.so
-install -Dm644 crates/vesper-app/data/io.github.PaulCarouge.Vesper.desktop \
-    ~/.local/share/applications/io.github.PaulCarouge.Vesper.desktop
+install -Dm644 crates/vesper-app/data/io.github.PaulCarouge.Vesper.desktop -t ~/.local/share/applications/
+install -Dm644 crates/vesper-app/data/io.github.PaulCarouge.Vesper.svg -t ~/.local/share/icons/hicolor/scalable/apps/
 ```
 
 Vesper looks for the layer next to its binary, then in `../lib/vesper/`; the settings switch installs that copy (build with `cargo build --release` at the workspace root, not `-p vesper-app`, so the layer is built too). If `~/.local/bin` is not in the session `PATH`, set `Exec=` to the full path. Without the desktop file, global shortcuts are off (the in-window ones still work). The saved source is forgotten once after updating to this version, since it is now tied to the app id: pick it again. Default global shortcuts: Alt+F9 starts or stops recording, Alt+F10 saves the replay. KDE asks to confirm them on first launch; change them later in System Settings > Shortcuts.

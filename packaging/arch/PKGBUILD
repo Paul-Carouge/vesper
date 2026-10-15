@@ -1,0 +1,83 @@
+# Maintainer: Paul Carouge
+#
+# Builds the last commit of the local checkout this file lives in (two
+# levels up), so no GitHub credentials are needed: `makepkg -si` here.
+# Uncommitted changes are not packaged.
+
+pkgname=vesper-git
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Fast, bloat-free screen recorder with replay buffer and Vulkan game capture'
+arch=('x86_64')
+url='https://github.com/Paul-Carouge/vesper'
+# No license file in the repository yet.
+license=('custom')
+# Linked: ffmpeg, libva, pipewire, fontconfig. Loaded at runtime by the UI:
+# libEGL/libGL (libglvnd), libwayland-*, libxkbcommon. mesa: VAAPI driver.
+depends=(
+  'ffmpeg'
+  'fontconfig'
+  'gcc-libs'
+  'glibc'
+  'libglvnd'
+  'libva'
+  'libxkbcommon'
+  'mesa'
+  'pipewire'
+  'wayland'
+  'xdg-desktop-portal'
+)
+optdepends=(
+  'vulkan-icd-loader: game capture (the opt-in Vulkan layer)'
+  'xdg-desktop-portal-kde: screen capture and global shortcuts on KDE'
+)
+makedepends=('cargo' 'clang' 'git')
+provides=('vesper')
+conflicts=('vesper')
+# makepkg's -flto turns libspa's C shims into GCC bytecode that rust-lld
+# cannot link (undefined libspa_rs_* symbols). Cargo does its own thin LTO.
+options=('!lto')
+# Pinned to the checkout's HEAD: otherwise a rebuild after a branch switch
+# reuses the old clone's origin/HEAD and silently packages an older commit.
+source=("vesper::git+file://$(realpath "$startdir/../..")#commit=$(git -C "$startdir" rev-parse HEAD)")
+sha256sums=('SKIP')
+
+pkgver() {
+  cd vesper
+  local version
+  version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
+  printf '%s.r%s.g%s' "$version" "$(git rev-list --count HEAD)" "$(git rev-parse --short=7 HEAD)"
+}
+
+prepare() {
+  cd vesper
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd vesper
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  cargo build --release --locked --frozen --workspace
+}
+
+check() {
+  cd vesper
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  cargo test --release --locked --frozen --workspace
+}
+
+package() {
+  cd vesper
+  install -Dm755 target/release/vesper -t "$pkgdir/usr/bin/"
+  # Only the library: the per-user settings switch is the only way to enable
+  # it, so no manifest in /usr/share/vulkan/implicit_layer.d/.
+  install -Dm644 target/release/libvesper_vklayer.so -t "$pkgdir/usr/lib/vesper/"
+  install -Dm644 crates/vesper-app/data/io.github.PaulCarouge.Vesper.desktop \
+    -t "$pkgdir/usr/share/applications/"
+  install -Dm644 crates/vesper-app/data/io.github.PaulCarouge.Vesper.svg \
+    -t "$pkgdir/usr/share/icons/hicolor/scalable/apps/"
+  install -Dm644 README.md -t "$pkgdir/usr/share/doc/$pkgname/"
+}
