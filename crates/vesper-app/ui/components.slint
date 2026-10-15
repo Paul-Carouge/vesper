@@ -1,6 +1,6 @@
 // Small, keyboard-accessible building blocks styled with `Theme`.
 
-import { Theme } from "theme.slint";
+import { Theme, Icons } from "theme.slint";
 
 // A stroked 24x24 icon.
 export component Icon inherits Rectangle {
@@ -566,6 +566,104 @@ export component TextField inherits Rectangle {
                 root.accepted(self.text);
                 self.text = root.text;
             }
+        }
+    }
+}
+
+// Shows the current choice; activating it opens or closes the list of
+// choices, which the parent shows below it. Stateless: the parent owns
+// `expanded`. `warn` tints a choice that is not available right now;
+// `description` tells why the field is disabled.
+export component SelectField inherits FocusScope {
+    in property <string> text;
+    in property <string> label;
+    in property <string> icon;
+    in property <bool> expanded;
+    in property <bool> warn;
+    in property <string> description;
+    // The last activation came from the keyboard: the list should take focus.
+    out property <bool> keyboard;
+    callback clicked;
+
+    focus-on-click: false;
+    height: Theme.control-height;
+    accessible-role: combobox;
+    accessible-label: root.label;
+    accessible-value: root.text;
+    accessible-description: root.description;
+    accessible-enabled: root.enabled;
+    accessible-expandable: true;
+    accessible-expanded: root.expanded;
+    accessible-action-default => {
+        if (root.enabled) {
+            root.clicked();
+        }
+    }
+
+    key-pressed(event) => {
+        if (event.text == Key.Space || event.text == Key.Return || (event.text == Key.DownArrow && !root.expanded) || (event.text == Key.Escape && root.expanded)) {
+            if (root.enabled) {
+                root.keyboard = true;
+                root.clicked();
+            }
+            return accept;
+        }
+        reject
+    }
+
+    FocusRing {
+        visible-ring: root.has-focus;
+        radius: Theme.radius-md;
+    }
+
+    Rectangle {
+        border-radius: Theme.radius-md;
+        border-width: 1px;
+        border-color: root.expanded ? Theme.accent : Theme.border-strong;
+        background: touch.pressed ? Theme.surface-pressed : touch.has-hover ? Theme.surface-hover : Theme.surface-raised;
+        opacity: root.enabled ? 1 : 0.4;
+        animate background { duration: Theme.fast; }
+    }
+
+    HorizontalLayout {
+        padding-left: Theme.space-md;
+        padding-right: Theme.space-sm;
+        spacing: Theme.space-sm;
+        opacity: root.enabled ? 1 : 0.4;
+        if root.icon != "": Icon {
+            y: (parent.height - self.height) / 2;
+            width: 18px;
+            height: 18px;
+            data: root.icon;
+            tint: Theme.text-muted;
+        }
+        Text {
+            horizontal-stretch: 1;
+            text: root.text;
+            vertical-alignment: center;
+            font-size: Theme.font-body;
+            color: root.warn ? Theme.warn : Theme.text;
+            overflow: elide;
+        }
+        Icon {
+            y: (parent.height - self.height) / 2;
+            width: 18px;
+            height: 18px;
+            data: root.expanded ? Icons.chevron-up : Icons.chevron-down;
+            tint: Theme.text-muted;
+        }
+    }
+
+    touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: root.enabled ? pointer : default;
+        clicked => {
+            root.keyboard = false;
+            // Closing: focus leaves the list for the field.
+            if (root.expanded) {
+                root.focus();
+            }
+            root.clicked();
         }
     }
 }

@@ -36,7 +36,7 @@ Risks and limits: anti-cheats (EAC, BattlEye) may flag or reject unknown Vulkan 
 ## Done
 
 - Record a screen, a window or a game (Vulkan layer), constant frame rate, AV1 / HEVC / H.264 with constant-quality presets.
-- Up to 8 named audio tracks (desktop, mic, devices, applications) with volume and mute, plus a mix track, sample-aligned and drift-corrected.
+- Up to 8 named audio tracks (desktop, mic, devices, applications) with volume and mute, plus a mix track, sample-aligned and drift-corrected. The desktop and microphone devices are chosen in the settings (system default or a specific device, never silently replaced when unplugged), and any track's source can be changed after it was added.
 - Built-in filters per track (noise suppression, expander, compressor, de-esser, limiter, high-pass, gain), changed live, with a one-click voice preset and gain reduction meters.
 - Global hotkeys (GlobalShortcuts portal).
 - Replay buffer: ring buffer of encoded packets, save the last N seconds.
