@@ -1,0 +1,10 @@
+[package]
+name = "vesper-app"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "vesper"
+path = "src/main.rs"
+
+[dependencies]

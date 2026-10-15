@@ -3,5 +3,23 @@
 version = 4
 
 [[package]]
-name = "vesper"
+name = "vesper-app"
 version = "0.1.0"
+
+[[package]]
+name = "vesper-capture"
+version = "0.1.0"
+dependencies = [
+ "vesper-core",
+]
+
+[[package]]
+name = "vesper-core"
+version = "0.1.0"
+
+[[package]]
+name = "vesper-encode"
+version = "0.1.0"
+dependencies = [
+ "vesper-core",
+]

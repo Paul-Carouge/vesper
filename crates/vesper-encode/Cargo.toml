@@ -1,0 +1,7 @@
+[package]
+name = "vesper-encode"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+vesper-core.workspace = true
