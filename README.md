@@ -33,13 +33,13 @@ Escape hatches: a built-in blocklist keeps compositors, browsers, Electron apps,
 
 Risks and limits: anti-cheats (EAC, BattlEye) may flag or reject unknown Vulkan layers, so use the escape hatches for those games. 32-bit games, OpenGL games and HDR output are not captured.
 
-## v1 scope
+## Done
 
-- Record a screen or a window.
-- Two audio tracks (desktop, mic).
+- Record a screen, a window or a game (Vulkan layer), constant frame rate, AV1 / HEVC / H.264 with constant-quality presets.
+- Two audio tracks (desktop, mic), drift-corrected.
 - Global hotkeys (GlobalShortcuts portal).
 - Replay buffer: ring buffer of encoded packets, save the last N seconds.
-- Slint UI + tray icon.
+- Slint UI, tray icon, start with the session.
 
 ## Install
 
@@ -75,9 +75,18 @@ With a tray, closing the window keeps Vesper running in the background, with the
 
 *Start with the session* in the settings (off by default) writes `~/.config/autostart/io.github.PaulCarouge.Vesper.desktop` (under `$XDG_CONFIG_HOME` if set), which runs `vesper --background`; turning it off removes the file. `--background` starts with the window hidden in the tray (shown anyway when there is no tray), and the replay buffer starts if it is on in the settings.
 
-## Out of scope
+## Roadmap
 
-Scenes, source compositing, filters, browser sources, streaming, plugins.
+Every feature below must keep recording quality, game performance and compatibility intact: nothing on the game's render path, compositing and encoding on the GPU, audio processing off the PipeWire real-time thread.
+
+1. **Audio**: multiple tracks (devices, per-application capture, optional mix track), built-in filters per track (noise suppression, expander, compressor, de-esser, limiter, high-pass, gain).
+2. **VST3 plugins** per track, hosted out of process so a crashing plugin can't take a recording down.
+3. **Scenes and profiles**: sources composited on the GPU (VA-VPP / Vulkan) into the encoded picture, saved per profile.
+4. **Overlays**: images, text, webcam, and optional browser sources, on the same GPU compositor.
+5. **Streaming** to YouTube and Twitch (RTMP / SRT), sharing the recording's encode when settings match.
+6. **Game capture**: 32-bit Vulkan games, native OpenGL games.
+
+Not planned: plugin APIs for the video pipeline itself.
 
 ## Known risks
 
