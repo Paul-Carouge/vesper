@@ -59,8 +59,7 @@ fn format_pod() -> Vec<u8> {
 /// - Playback (sink monitor): the newest buffer was mixed at `now` and is
 ///   heard `delay` later. We stamp it when it is heard, as the video shows it.
 ///   An application's streams are linked to us directly, without the sink:
-///   `delay` is ours only, and `sink_ns` adds what the monitor path adds
-///   (see `AppLinks`).
+///   `sink_ns` moves them onto the monitor's stamps (see `AppTiming`).
 fn buffer_start(
     input: bool,
     now_ns: i64,
@@ -84,6 +83,17 @@ fn buffer_start(
         now_ns as i128 + delay_ns + sink_ns
     };
     Duration::from_nanos((newest_start - backlog_ns).max(0) as u64)
+}
+
+/// The graph quantum in ns: the samples of this cycle (`pw_time.size`), or
+/// this buffer's length if PipeWire does not tell.
+fn quantum_ns(t: &pw::stream::Time, frames: usize) -> i128 {
+    let (size, rate) = (t.as_raw().size, t.rate());
+    if size > 0 && rate.denom > 0 {
+        size as i128 * rate.num as i128 * 1_000_000_000 / rate.denom as i128
+    } else {
+        frames as i128 * 1_000_000_000 / SAMPLE_RATE as i128
+    }
 }
 
 /// Streams `source` into `tx` until `stop` fires. Reports setup success on
@@ -127,10 +137,10 @@ pub fn run(
             props.insert("node.dont-fallback", "true");
         }
         let input = source.is_input();
-        // Latency of the sink an app plays to; zero for other sources.
-        let latency = Rc::new(Cell::new(Latency::default()));
+        // How the sink an app plays to stamps its monitor; unused otherwise.
+        let timing = Rc::new(AppTiming::default());
         let app = match &source {
-            Source::App(app) => Some(AppLinks::new(app.clone(), latency.clone())),
+            Source::App(app) => Some(AppLinks::new(app.clone(), timing.clone())),
             _ => None,
         };
         let stream = pw::stream::StreamRc::new(core.clone(), name, props)?;
@@ -179,10 +189,7 @@ pub fn run(
                         input,
                         t.now(),
                         t.delay(),
-                        2 * latency.get().to_ns(
-                            frames as i128 * 1_000_000_000 / SAMPLE_RATE as i128,
-                            t.rate(),
-                        ),
+                        timing.extra_ns(t.delay(), quantum_ns(&t, frames), t.rate()),
                         t.rate(),
                         t.queued_buffers(),
                         frames,
@@ -245,6 +252,45 @@ struct Port {
     channel: String,
 }
 
+/// Ticks of `rate` in nanoseconds.
+fn ticks_ns(ticks: i64, rate: spa::utils::Fraction) -> i128 {
+    if rate.denom == 0 {
+        0
+    } else {
+        i128::from(ticks) * rate.num as i128 * 1_000_000_000 / rate.denom as i128
+    }
+}
+
+/// Puts an app track on the same pts as the monitor of the sink it plays to
+/// (the desktop or device track), so a sound in both does not comb in the mix.
+///
+/// The app's samples reach us in the cycle the sink mixes them; the monitor
+/// hands that mix out its port's output latency later (one quantum on Easy
+/// Effects' sink and on a null sink) and the desktop track stamps it
+/// `now + delay` of its capture. That delay depends on the sink and its
+/// driver (2 quanta on Easy Effects' sink, 1 on a null sink driving itself,
+/// 0 on an ALSA sink's monitor) and no param gives it, so a timing-only
+/// capture of the monitor reports it (`reference_ns`). Measured with
+/// `audio_probe`: the app and monitor tracks then line up to the sample.
+#[derive(Debug, Default)]
+pub(crate) struct AppTiming {
+    /// Output latency of the sink's monitor port.
+    monitor: Cell<Latency>,
+    /// `delay` of a capture of the sink's monitor, in ns.
+    reference_ns: Cell<Option<i128>>,
+}
+
+impl AppTiming {
+    /// What to add to an app buffer's `now + delay` (`own_delay` in ticks of
+    /// `rate`); 0 until the monitor's delay is known.
+    fn extra_ns(&self, own_delay: i64, quantum_ns: i128, rate: spa::utils::Fraction) -> i128 {
+        self.reference_ns.get().map_or(0, |reference| {
+            reference + self.monitor.get().to_ns(quantum_ns, rate)
+                - ticks_ns(own_delay.max(0), rate)
+        })
+    }
+}
+
 /// A `Latency` param: in quanta, graph-rate frames and nanoseconds.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub(crate) struct Latency {
@@ -256,11 +302,7 @@ pub(crate) struct Latency {
 impl Latency {
     /// In nanoseconds, with a quantum of `quantum_ns` and the graph `rate`.
     fn to_ns(self, quantum_ns: i128, rate: spa::utils::Fraction) -> i128 {
-        let frames_ns = if rate.denom == 0 {
-            0
-        } else {
-            i128::from(self.frames) * rate.num as i128 * 1_000_000_000 / rate.denom as i128
-        };
+        let frames_ns = ticks_ns(i64::from(self.frames), rate);
         (f64::from(self.quanta) * quantum_ns as f64) as i128 + frames_ns + i128::from(self.ns)
     }
 }
@@ -291,12 +333,7 @@ fn parse_latency(pod: &Pod) -> Option<Latency> {
 /// Links every playback stream of one application to our capture stream,
 /// following streams as they come and go. Several streams mix on our ports.
 ///
-/// The app's samples reach us in the graph cycle the sink mixes them. A
-/// sink's monitor hands out that mix its monitor latency later, and the
-/// desktop track adds that latency again, read as playback delay. So the
-/// same sound gets the same pts in both tracks (and the mix does not comb)
-/// when an app track adds twice the monitor latency of the sink it plays to,
-/// kept in `latency`.
+/// Also follows the sink the app plays to, for `AppTiming`.
 pub(crate) struct AppLinks {
     app: String,
     /// The application's playback stream nodes.
@@ -304,31 +341,49 @@ pub(crate) struct AppLinks {
     ports: HashMap<u32, Port>,
     /// Ours, by (output port, input port).
     links: HashMap<(u32, u32), pw::link::Link>,
-    /// Every sink.
-    sinks: HashSet<u32>,
+    /// Every sink: id -> node.name.
+    sinks: HashMap<u32, String>,
     /// Monitor ports, by node, to bind the one of the app's sink.
     monitors: HashMap<u32, GlobalObject<PropertiesBox>>,
     /// Every link in the graph: id -> (output node, input node).
     graph: HashMap<u32, (u32, u32)>,
-    /// A monitor port of the sink the app plays to: (sink, port id, proxy).
-    sink: Option<(u32, u32, pw::port::Port, pw::port::PortListener)>,
-    latency: Rc<Cell<Latency>>,
+    /// The sink the app plays to: its id, a monitor port bound for its
+    /// latency, and the timing-only capture of its monitor.
+    sink: Option<SinkWatch>,
+    timing: Rc<AppTiming>,
     registry: Option<pw::registry::RegistryRc>,
+    core: Option<pw::core::CoreRc>,
+}
+
+struct SinkWatch {
+    id: u32,
+    port: u32,
+    _proxy: pw::port::Port,
+    _port_listener: pw::port::PortListener,
+    reference: pw::stream::StreamRc,
+    _reference_listener: pw::stream::StreamListener<()>,
+}
+
+impl Drop for SinkWatch {
+    fn drop(&mut self) {
+        let _ = self.reference.disconnect();
+    }
 }
 
 impl AppLinks {
-    pub(crate) fn new(app: String, latency: Rc<Cell<Latency>>) -> Rc<RefCell<Self>> {
+    pub(crate) fn new(app: String, timing: Rc<AppTiming>) -> Rc<RefCell<Self>> {
         Rc::new(RefCell::new(Self {
             app,
             nodes: HashSet::new(),
             ports: HashMap::new(),
             links: HashMap::new(),
-            sinks: HashSet::new(),
+            sinks: HashMap::new(),
             monitors: HashMap::new(),
             graph: HashMap::new(),
             sink: None,
-            latency,
+            timing,
             registry: None,
+            core: None,
         }))
     }
 
@@ -340,6 +395,7 @@ impl AppLinks {
     ) -> Result<pw::registry::Listener, Error> {
         let registry = core.get_registry_rc()?;
         state.borrow_mut().registry = Some(registry.clone());
+        state.borrow_mut().core = Some(core.clone());
         let listener = registry
             .add_listener_local()
             .global({
@@ -354,7 +410,8 @@ impl AppLinks {
                             s.nodes.insert(global.id);
                         }
                         ObjectType::Node if get(*pw::keys::MEDIA_CLASS) == "Audio/Sink" => {
-                            s.sinks.insert(global.id);
+                            s.sinks
+                                .insert(global.id, get(*pw::keys::NODE_NAME).to_owned());
                         }
                         ObjectType::Port => {
                             let Ok(node) = get(*pw::keys::NODE_ID).parse() else {
@@ -395,13 +452,10 @@ impl AppLinks {
                         // Gone with the port on the server: forget our proxy.
                         s.links.retain(|&(o, i), _| o != id && i != id);
                     }
-                    if s.sink
-                        .as_ref()
-                        .is_some_and(|(sink, port, ..)| *sink == id || *port == id)
-                    {
+                    if s.sink.as_ref().is_some_and(|w| w.id == id || w.port == id) {
                         s.sink = None;
-                        s.latency.set(Latency::default());
                     }
+                    s.follow_sink();
                 }
             })
             .register();
@@ -448,47 +502,102 @@ impl AppLinks {
         }
     }
 
-    /// Binds a monitor port of the sink the app plays to (the first one
-    /// found), to follow its latency.
+    /// Follows the sink the app plays to (the lowest id if several): binds
+    /// a monitor port for its latency and opens a timing-only capture of its
+    /// monitor. A new sink keeps the old timing until its own arrives.
     fn follow_sink(&mut self) {
         let sink = self
             .graph
             .values()
-            .find(|(out, inp)| self.nodes.contains(out) && self.sinks.contains(inp))
-            .map(|&(_, sink)| sink);
-        let port = sink.and_then(|sink| {
-            let (&id, _) = self
-                .monitors
-                .iter()
-                .find(|(id, _)| self.ports.get(id).is_some_and(|p| p.node == sink))?;
-            Some(id)
-        });
-        if port == self.sink.as_ref().map(|(_, port, ..)| *port) {
+            .filter(|(out, inp)| self.nodes.contains(out) && self.sinks.contains_key(inp))
+            .map(|&(_, sink)| sink)
+            .min();
+        let Some(sink) = sink else {
+            self.sink = None;
+            self.timing.monitor.set(Latency::default());
+            self.timing.reference_ns.set(None);
+            return;
+        };
+        if self.sink.as_ref().is_some_and(|w| w.id == sink) {
             return;
         }
-        self.sink = None;
-        self.latency.set(Latency::default());
-        let (Some(sink), Some(port), Some(registry)) = (sink, port, &self.registry) else {
+        let port = self
+            .monitors
+            .keys()
+            .filter(|id| self.ports.get(id).is_some_and(|p| p.node == sink))
+            .min()
+            .copied();
+        let (Some(port), Some(registry), Some(core)) = (port, &self.registry, &self.core) else {
             return;
         };
-        let Ok(proxy) = registry.bind::<pw::port::Port, _>(&self.monitors[&port]) else {
-            return;
-        };
-        let latency = self.latency.clone();
-        let app = self.app.clone();
-        let listener = proxy
+        match self.watch_sink(sink, port, registry.clone(), core.clone()) {
+            Ok(w) => self.sink = Some(w),
+            Err(e) => warn!("{}: cannot follow sink {sink}: {e}", self.app),
+        }
+    }
+
+    fn watch_sink(
+        &self,
+        sink: u32,
+        port: u32,
+        registry: pw::registry::RegistryRc,
+        core: pw::core::CoreRc,
+    ) -> Result<SinkWatch, Error> {
+        let proxy = registry.bind::<pw::port::Port, _>(&self.monitors[&port])?;
+        let (timing, app) = (self.timing.clone(), self.app.clone());
+        let port_listener = proxy
             .add_listener_local()
             .param(move |_, _, _, _, pod| {
                 if let Some(l) = pod.and_then(parse_latency)
-                    && l != latency.get()
+                    && l != timing.monitor.get()
                 {
                     info!("{app}: monitor latency of its sink {l:?}");
-                    latency.set(l);
+                    timing.monitor.set(l);
                 }
             })
             .register();
         proxy.subscribe_params(&[spa::param::ParamType::Latency]);
-        self.sink = Some((sink, port, proxy, listener));
+        // Like the desktop track's stream, on this sink; its data is dropped.
+        let props = pw::properties::properties! {
+            *pw::keys::MEDIA_TYPE => "Audio",
+            *pw::keys::MEDIA_CATEGORY => "Capture",
+            *pw::keys::MEDIA_ROLE => "Production",
+            *pw::keys::STREAM_CAPTURE_SINK => "true",
+            *pw::keys::TARGET_OBJECT => self.sinks[&sink].as_str(),
+            "node.dont-fallback" => "true",
+            // Never keeps the sink running on its own.
+            "node.passive" => "true",
+        };
+        let reference = pw::stream::StreamRc::new(core, "vesper-app-timing", props)?;
+        let timing = self.timing.clone();
+        let reference_listener = reference
+            .add_local_listener_with_user_data(())
+            .process(move |stream, _| {
+                if let Ok(t) = stream.time()
+                    && t.now() > 0
+                {
+                    timing.reference_ns.set(Some(ticks_ns(t.delay(), t.rate())));
+                }
+                // Given back at once: only the timing matters.
+                drop(stream.dequeue_buffer());
+            })
+            .register()?;
+        let pod = format_pod();
+        let mut params = [Pod::from_bytes(&pod).ok_or("invalid audio format pod")?];
+        reference.connect(
+            spa::utils::Direction::Input,
+            None,
+            pw::stream::StreamFlags::AUTOCONNECT,
+            &mut params,
+        )?;
+        Ok(SinkWatch {
+            id: sink,
+            port,
+            _proxy: proxy,
+            _port_listener: port_listener,
+            reference,
+            _reference_listener: reference_listener,
+        })
     }
 }
 
@@ -531,6 +640,20 @@ mod tests {
         assert_eq!(l.to_ns(quantum_ns, rate), quantum_ns + 10_666_666 + 1_000);
         let input = latency_pod(spa::sys::SPA_DIRECTION_INPUT);
         assert_eq!(parse_latency(Pod::from_bytes(&input).unwrap()), None);
+        // The app track lands on the monitor's stamps: its delay, plus the
+        // monitor's latency, minus the app stream's own delay.
+        let timing = AppTiming::default();
+        assert_eq!(timing.extra_ns(2_048, quantum_ns, rate), 0, "unknown yet");
+        timing.monitor.set(Latency {
+            quanta: 1.0,
+            ..Latency::default()
+        });
+        timing.reference_ns.set(Some(0));
+        // ALSA sink measured: monitor delay 0, app delay 1 quantum -> 0.
+        assert_eq!(timing.extra_ns(1_024, quantum_ns, rate), 0);
+        // Easy Effects: monitor delay 2 quanta -> 2 quanta later.
+        timing.reference_ns.set(Some(2 * quantum_ns));
+        assert_eq!(timing.extra_ns(1_024, quantum_ns, rate), 2 * quantum_ns);
         // Playback is stamped that much later; input never.
         let now = 10_000_000_000;
         let app = buffer_start(false, now, 0, 20_000_000, rate, 1, 960);

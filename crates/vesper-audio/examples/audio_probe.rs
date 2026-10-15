@@ -2,7 +2,7 @@
 //! plus their mix, to one MKA in the temp dir, printing peaks, packet counts
 //! and pts continuity.
 //!
-//! `cargo run -p vesper-audio --example audio_probe [seconds] [app...]`
+//! `cargo run -p vesper-audio --example audio_probe [seconds] [app | output:<sink>...]`
 
 use std::sync::mpsc;
 use std::time::Duration;
@@ -19,7 +19,13 @@ fn main() -> Result<(), Error> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
     let secs: u64 = std::env::args().nth(1).map_or(Ok(5), |s| s.parse())?;
-    let apps = std::env::args().skip(2).map(Source::App);
+    // `output:<node.name>` records a sink's monitor, anything else an app.
+    let apps = std::env::args()
+        .skip(2)
+        .map(|a| match a.strip_prefix("output:") {
+            Some(node) => Source::Output(node.into()),
+            None => Source::App(a),
+        });
     let sources: Vec<_> = [Source::Desktop, Source::Microphone]
         .into_iter()
         .chain(apps)
