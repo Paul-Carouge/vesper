@@ -77,12 +77,17 @@ pub struct Game {
     pub consent: Consent,
     /// Whether this game is the one being captured.
     pub captured: bool,
+    /// Order of its first swapchain: the newest game (highest) is captured
+    /// by default.
+    pub seq: u64,
 }
 
 struct Shared {
     games: Mutex<Vec<Game>>,
     select: Mutex<Option<u32>>,
     allowed: Mutex<Vec<String>>,
+    /// Whether frames are wanted ([`GameCapture::set_active`]).
+    active: AtomicBool,
     stop: AtomicBool,
 }
 
@@ -98,7 +103,8 @@ impl GameCapture {
     /// Starts listening for games. `on_frame` runs on the server thread:
     /// keep it short, e.g. send the frame to a channel. It gets one final
     /// `Err` if the server fails; no frame follows. A game closing is not an
-    /// error: the server waits for the next one.
+    /// error: the server waits for the next one. It starts inactive: no
+    /// game copies frames until [`GameCapture::set_active`].
     pub fn start(on_frame: impl FnMut(Result<VideoFrame>) + Send + 'static) -> Result<Self> {
         let path = protocol::socket_path().ok_or("XDG_RUNTIME_DIR is not set")?;
         protocol::create_private_dir(path.parent().expect("socket path has a parent"))?;
@@ -120,6 +126,7 @@ impl GameCapture {
             games: Mutex::new(Vec::new()),
             select: Mutex::new(None),
             allowed: Mutex::new(Vec::new()),
+            active: AtomicBool::new(false),
             stop: AtomicBool::new(false),
         });
         let s = shared.clone();
@@ -170,6 +177,14 @@ impl GameCapture {
             allowed.push(exe.to_owned());
         }
         drop(allowed);
+        self.wake();
+    }
+
+    /// Whether the selected game should copy frames (default false). While
+    /// inactive no game is started: games stay a pass-through and
+    /// [`Game::captured`] is false, but games and consent are still listed.
+    pub fn set_active(&self, active: bool) {
+        self.shared.active.store(active, Ordering::SeqCst);
         self.wake();
     }
 
@@ -254,6 +269,8 @@ struct Server {
     /// (no GPU to make them).
     is_sync_file: fn(BorrowedFd) -> bool,
     is_dmabuf: fn(BorrowedFd) -> bool,
+    /// `alive`; replaced in tests, whose clients have made-up pids.
+    alive: fn(u32) -> bool,
 }
 
 /// What selection needs to know about a client.
@@ -353,6 +370,7 @@ impl Server {
             pool_generation: 0,
             is_sync_file: protocol::is_sync_file,
             is_dmabuf: protocol::is_dmabuf,
+            alive,
         }
     }
 
@@ -701,10 +719,14 @@ impl Server {
                 ready: c.hello && c.width > 0 && c.height > 0,
                 seq: c.announced,
                 stale: Some(i) == current
-                    && (c.last_frame.elapsed() > STALE_AFTER || !alive(c.pid)),
+                    && (c.last_frame.elapsed() > STALE_AFTER || !(self.alive)(c.pid)),
             })
             .collect();
-        let want = choose(&candidates, select, current);
+        let want = if self.shared.active.load(Ordering::SeqCst) {
+            choose(&candidates, select, current)
+        } else {
+            None
+        };
         if want == current {
             return;
         }
@@ -751,6 +773,7 @@ impl Server {
                     .started
                     .as_ref()
                     .is_some_and(|s| Arc::ptr_eq(s, &c.sock)),
+                seq: c.announced,
             })
             .collect();
         *self.shared.games.lock().unwrap() = games;
@@ -870,6 +893,7 @@ mod tests {
             games: Mutex::new(Vec::new()),
             select: Mutex::new(None),
             allowed: Mutex::new(Vec::new()),
+            active: AtomicBool::new(true),
             stop: AtomicBool::new(false),
         });
         let (tx, rx) = mpsc::channel();
@@ -880,6 +904,7 @@ mod tests {
             Box::new(move |f| drop(tx.send(f.unwrap()))),
         );
         s.is_dmabuf = |_| true;
+        s.alive = |_| true;
         (s, rx)
     }
 
@@ -966,6 +991,25 @@ mod tests {
         let (_, steam) = connect(&mut s, "game.exe", true);
         s.reselect();
         assert_eq!(next(&steam), None);
+    }
+
+    #[test]
+    fn inactive_starts_no_game() {
+        let (mut s, _rx) = server();
+        s.shared.active.store(false, Ordering::SeqCst);
+        let (_, layer) = connect(&mut s, "game.exe", true);
+        s.reselect();
+        assert!(s.started.is_none());
+        assert_eq!(next(&layer), None);
+
+        s.shared.active.store(true, Ordering::SeqCst);
+        s.reselect();
+        assert!(matches!(next(&layer), Some(Msg::Start { .. })));
+
+        s.shared.active.store(false, Ordering::SeqCst);
+        s.reselect();
+        assert!(s.started.is_none());
+        assert_eq!(next(&layer), Some(Msg::Stop));
     }
 
     #[test]

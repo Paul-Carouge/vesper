@@ -40,6 +40,7 @@ fn main() -> vesper_gamecapture::Result<()> {
     for exe in &allow {
         capture.allow(exe);
     }
+    capture.set_active(true);
     println!("waiting for a game (VESPER_CAPTURE_DISABLE unset, layer installed)");
     let mut listed = Vec::new();
 

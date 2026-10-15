@@ -4982,6 +4982,7 @@ dependencies = [
  "vesper-capture",
  "vesper-core",
  "vesper-encode",
+ "vesper-gamecapture",
  "vesper-mux",
 ]
 

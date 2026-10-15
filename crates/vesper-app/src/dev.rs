@@ -1,9 +1,13 @@
 //! Developer knobs for layout checks and screenshots (debug builds only):
 //! - `VESPER_WINDOW_SIZE=360x700` sets the initial logical window size.
-//! - `VESPER_DEMO=source,recording,settings,muted,tab,esc,ctrl+<key>` replays
+//! - `VESPER_DEMO=source,game,allow,ignore,recording,settings,muted,tab,esc,ctrl+<key>` replays
 //!   UI intents and key presses once the window is up (`ctrl+comma` for `,`).
+//! - `VESPER_DEMO_DELAY=<ms>` runs `VESPER_DEMO` that long after launch
+//!   (default 300), e.g. once a game asks for consent (`allow`, `ignore`).
 //! - `vesper --record <seconds>` records without the UI, from the saved
 //!   source or `VESPER_RESTORE_TOKEN`, with `default_settings()`.
+//! - `vesper --record-game <seconds>` records the game capture the same way,
+//!   with the saved allow list, once a game sends frames.
 //! - `vesper --replay <buffer_s> <wait_s>` runs the replay buffer for
 //!   `wait_s`, recording during the second half, then saves the replay.
 
@@ -16,11 +20,18 @@ use std::path::PathBuf;
 use std::sync::mpsc::Receiver;
 
 use crate::AppWindow;
+use crate::game::GameSource;
+use crate::prefs::{ALLOWED_GAMES, Prefs};
 use crate::recorder::{Event, Pipeline, Settings};
 
 pub fn record_seconds() -> Option<u64> {
     let mut args = std::env::args().skip(1);
     (args.next()? == "--record").then(|| args.next()?.parse().ok())?
+}
+
+pub fn record_game_seconds() -> Option<u64> {
+    let mut args = std::env::args().skip(1);
+    (args.next()? == "--record-game").then(|| args.next()?.parse().ok())?
 }
 
 pub fn replay_seconds() -> Option<(u64, u64)> {
@@ -65,6 +76,16 @@ pub fn record(seconds: u64, settings: Settings) {
     }
 }
 
+pub fn record_game(seconds: u64, mut settings: Settings) {
+    let prefs = Prefs::load(Prefs::default());
+    *ALLOWED_GAMES.lock().unwrap() = prefs.allowed_games;
+    let source = GameSource::start().expect("game capture");
+    settings.game = Some(source.frames.clone());
+    log!("waiting for an allowed game");
+    record(seconds, settings);
+    drop(source);
+}
+
 pub fn replay(buffer: u64, wait: u64, settings: Settings) {
     let (tx, rx) = std::sync::mpsc::channel();
     let span = Some(Duration::from_secs(buffer));
@@ -101,14 +122,21 @@ pub fn apply(ui: &AppWindow) {
     let Ok(demo) = std::env::var("VESPER_DEMO") else {
         return;
     };
+    let delay = std::env::var("VESPER_DEMO_DELAY")
+        .ok()
+        .and_then(|d| d.parse().ok())
+        .unwrap_or(300);
     let weak = ui.as_weak();
-    slint::Timer::single_shot(Duration::from_millis(300), move || {
+    slint::Timer::single_shot(Duration::from_millis(delay), move || {
         let Some(ui) = weak.upgrade() else { return };
         for step in demo.split(',') {
             match step.trim() {
                 "source" => ui.invoke_pick_source(),
                 "recording" => ui.invoke_start_recording(),
                 "settings" => ui.set_settings_open(true),
+                "game" => ui.invoke_source_mode_changed(true),
+                "allow" => ui.invoke_allow_game(),
+                "ignore" => ui.invoke_ignore_game(),
                 "muted" => {
                     ui.set_mic_muted(true);
                     ui.invoke_mic_mute_changed(true);

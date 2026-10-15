@@ -94,7 +94,9 @@ fn borrow_file(fd: RawFd) -> ManuallyDrop<File> {
 
 /// Hardware encoder for DMA-BUF frames.
 ///
-/// Uses the GPU at [`RENDER_NODE`]. Frames must have the encoder's size.
+/// Uses the GPU at [`RENDER_NODE`]. Frames of another size than the encoder's
+/// (a resized window or game) are scaled to fit it on the GPU, keeping their
+/// aspect ratio (black bars).
 pub struct Encoder {
     width: u32,
     height: u32,
@@ -172,28 +174,82 @@ impl Encoder {
             let dev = (*e.device).data as *mut ff::AVHWDeviceContext;
             e.display = (*((*dev).hwctx as *mut ff::AVVAAPIDeviceContext)).display;
 
-            e.import_frames = not_null(ff::av_hwframe_ctx_alloc(e.device), "av_hwframe_ctx_alloc")?;
-            let fc = (*e.import_frames).data as *mut ff::AVHWFramesContext;
+            e.set_import_size(width, height)?;
+            e.open_encoder(codec, fps, rate)?;
+        }
+        Ok(e)
+    }
+
+    /// Makes the import frames context and the filter graph take
+    /// `width`x`height` frames: DMA-BUFs are imported at their own size, and
+    /// a size other than the encoder's is scaled to fit it, keeping its
+    /// aspect ratio (black bars). Rebuilt only when the size changes; on
+    /// error the previous graph stays. Imported surfaces and `last` keep
+    /// references to the previous context and pool.
+    unsafe fn set_import_size(&mut self, width: u32, height: u32) -> Result<(), Error> {
+        unsafe {
+            if !self.import_frames.is_null() {
+                let fc = &*((*self.import_frames).data as *const ff::AVHWFramesContext);
+                if (fc.width, fc.height) == (width as c_int, height as c_int) {
+                    return Ok(());
+                }
+            }
+            let mut frames = not_null(
+                ff::av_hwframe_ctx_alloc(self.device),
+                "av_hwframe_ctx_alloc",
+            )?;
+            let fc = (*frames).data as *mut ff::AVHWFramesContext;
             (*fc).format = ff::AVPixelFormat::AV_PIX_FMT_VAAPI;
             // Only describes the frames for VPP; imports take their real
             // format (XRGB/ARGB/...) from the DRM fourcc.
             (*fc).sw_format = ff::AVPixelFormat::AV_PIX_FMT_BGR0;
             (*fc).width = width as c_int;
             (*fc).height = height as c_int;
-            check(ff::av_hwframe_ctx_init(e.import_frames), "init VA frames")?;
-
-            e.build_graph()?;
-            e.open_encoder(codec, fps, rate)?;
+            let mut graph = ptr::null_mut();
+            let built = check(ff::av_hwframe_ctx_init(frames), "init VA frames")
+                .and_then(|_| self.build_graph(&mut graph, frames, width, height));
+            match built {
+                Ok((src, sink)) => {
+                    ff::avfilter_graph_free(&mut self.graph);
+                    ff::av_buffer_unref(&mut self.import_frames);
+                    (self.graph, self.src, self.sink, self.import_frames) =
+                        (graph, src, sink, frames);
+                    Ok(())
+                }
+                Err(e) => {
+                    ff::avfilter_graph_free(&mut graph);
+                    ff::av_buffer_unref(&mut frames);
+                    Err(e)
+                }
+            }
         }
-        Ok(e)
     }
 
-    unsafe fn build_graph(&mut self) -> Result<(), Error> {
+    /// Builds `buffer [-> scale_vaapi -> pad_vaapi] -> scale_vaapi (NV12) ->
+    /// buffersink` into
+    /// `graph` (freed by the caller on error) for `width`x`height` input.
+    unsafe fn build_graph(
+        &self,
+        graph: &mut *mut ff::AVFilterGraph,
+        frames: *mut ff::AVBufferRef,
+        width: u32,
+        height: u32,
+    ) -> Result<(*mut ff::AVFilterContext, *mut ff::AVFilterContext), Error> {
+        let (w, h) = (self.width, self.height);
+        let native = (width, height) == (w, h);
+        // Fit and pad while still RGB: radeonsi fills pad_vaapi bars of an
+        // NV12 surface green.
+        let fit = std::ffi::CString::new(format!(
+            "w={w}:h={h}:force_original_aspect_ratio=decrease:force_divisible_by=2"
+        ))
+        .expect("no NUL");
+        let pad =
+            std::ffi::CString::new(format!("w={w}:h={h}:x=(ow-iw)/2:y=(oh-ih)/2")).expect("no NUL");
         unsafe {
-            self.graph = not_null(ff::avfilter_graph_alloc(), "avfilter_graph_alloc")?;
-            self.src = not_null(
+            *graph = not_null(ff::avfilter_graph_alloc(), "avfilter_graph_alloc")?;
+            let src = not_null(
                 ff::avfilter_graph_alloc_filter(
-                    self.graph,
+                    *graph,
                     ff::avfilter_get_by_name(c"buffer".as_ptr()),
                     c"in".as_ptr(),
                 ),
@@ -202,48 +258,54 @@ impl Encoder {
             let par = not_null(ff::av_buffersrc_parameters_alloc(), "buffersrc params")?;
             (*par).format = ff::AVPixelFormat::AV_PIX_FMT_VAAPI as c_int;
             (*par).time_base = TIME_BASE;
-            (*par).width = self.width as c_int;
-            (*par).height = self.height as c_int;
-            (*par).hw_frames_ctx = self.import_frames;
-            let ret = ff::av_buffersrc_parameters_set(self.src, par);
+            (*par).width = width as c_int;
+            (*par).height = height as c_int;
+            (*par).hw_frames_ctx = frames;
+            let ret = ff::av_buffersrc_parameters_set(src, par);
             ff::av_free(par.cast());
             check(ret, "buffersrc params")?;
             check(
-                ff::avfilter_init_dict(self.src, ptr::null_mut()),
+                ff::avfilter_init_dict(src, ptr::null_mut()),
                 "init buffersrc",
             )?;
 
-            let mut vpp = ptr::null_mut();
-            check(
-                ff::avfilter_graph_create_filter(
-                    &mut vpp,
-                    ff::avfilter_get_by_name(c"scale_vaapi".as_ptr()),
-                    c"vpp".as_ptr(),
-                    c"format=nv12:out_color_matrix=bt709:out_range=tv".as_ptr(),
-                    ptr::null_mut(),
-                    self.graph,
-                ),
-                "create scale_vaapi",
+            let create = |name: &CStr, label: &CStr, args: *const std::ffi::c_char| {
+                let mut f = ptr::null_mut();
+                check(
+                    ff::avfilter_graph_create_filter(
+                        &mut f,
+                        ff::avfilter_get_by_name(name.as_ptr()),
+                        label.as_ptr(),
+                        args,
+                        ptr::null_mut(),
+                        *graph,
+                    ),
+                    "create filter",
+                )
+                .map(|_| f)
+            };
+            let vpp = create(
+                c"scale_vaapi",
+                c"vpp",
+                c"format=nv12:out_color_matrix=bt709:out_range=tv".as_ptr(),
             )?;
+            let sink = create(c"buffersink", c"out", ptr::null())?;
+            if native {
+                check(ff::avfilter_link(src, 0, vpp, 0), "link")?;
+            } else {
+                let fit = create(c"scale_vaapi", c"fit", fit.as_ptr())?;
+                let pad = create(c"pad_vaapi", c"pad", pad.as_ptr())?;
+                check(ff::avfilter_link(src, 0, fit, 0), "link")?;
+                check(ff::avfilter_link(fit, 0, pad, 0), "link")?;
+                check(ff::avfilter_link(pad, 0, vpp, 0), "link")?;
+            }
+            check(ff::avfilter_link(vpp, 0, sink, 0), "link")?;
             check(
-                ff::avfilter_graph_create_filter(
-                    &mut self.sink,
-                    ff::avfilter_get_by_name(c"buffersink".as_ptr()),
-                    c"out".as_ptr(),
-                    ptr::null(),
-                    ptr::null_mut(),
-                    self.graph,
-                ),
-                "create buffersink",
-            )?;
-            check(ff::avfilter_link(self.src, 0, vpp, 0), "link")?;
-            check(ff::avfilter_link(vpp, 0, self.sink, 0), "link")?;
-            check(
-                ff::avfilter_graph_config(self.graph, ptr::null_mut()),
+                ff::avfilter_graph_config(*graph, ptr::null_mut()),
                 "configure graph",
             )?;
+            Ok((src, sink))
         }
-        Ok(())
     }
 
     unsafe fn open_encoder(
@@ -334,7 +396,7 @@ impl Encoder {
     }
 
     /// Imports `frame`'s DMA-BUF as a VA surface (no copy).
-    unsafe fn import(&self, frame: &VideoFrame) -> Result<Frame, Error> {
+    unsafe fn import(&mut self, frame: &VideoFrame) -> Result<Frame, Error> {
         let n = frame.planes.len();
         if n == 0 || n > 4 {
             return Err(Error(format!("unsupported plane count {n}")));
@@ -356,6 +418,7 @@ impl Encoder {
             .map_err(|e| Error(format!("seek dmabuf: {e}")))? as usize;
 
         unsafe {
+            self.set_import_size(frame.width, frame.height)?;
             let src = Frame::new()?;
             let desc_buf = not_null(
                 ff::av_buffer_allocz(size_of::<ff::AVDRMFrameDescriptor>()),
@@ -397,13 +460,6 @@ impl Encoder {
     /// Encodes one frame. The RGB->NV12 GPU copy is complete when this
     /// returns, and `frame` is dropped (released to the producer) right after it.
     pub fn encode(&mut self, frame: VideoFrame) -> Result<Vec<EncodedPacket>, Error> {
-        if frame.width != self.width || frame.height != self.height {
-            // shortcut: no scaling of mismatched sizes; rebuild the encoder or add scale_vaapi w/h if capture resizes.
-            return Err(Error(format!(
-                "frame is {}x{}, encoder is {}x{}",
-                frame.width, frame.height, self.width, self.height
-            )));
-        }
         if self.generation != Some(frame.pool_generation) {
             self.imports.clear();
             self.generation = Some(frame.pool_generation);
@@ -560,7 +616,7 @@ mod tests {
     use vesper_core::{DmaBufPlane, ReleaseGuard};
 
     #[test]
-    fn rejects_frame_of_wrong_size_and_releases_it() {
+    fn rejects_a_bad_dmabuf_and_releases_it() {
         if !Path::new("/dev/dri/renderD128").exists() {
             eprintln!("no GPU, skipping");
             return;

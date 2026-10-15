@@ -1,11 +1,12 @@
-//! The capture pipeline: screen capture -> constant-frame-rate VAAPI encode ->
+//! The capture pipeline: screen or game capture -> constant-frame-rate VAAPI encode ->
 //! a recording (MKV) and/or the replay buffer (encoded packets in RAM).
 //!
 //! One [`Pipeline`] runs while a recording or the replay buffer needs it, and
 //! ends on its own once neither does. Both share one capture and one encode.
 //!
 //! Threads:
-//! - PipeWire thread (`vesper-capture`): `on_frame` only parks the newest
+//! - Capture thread (`vesper-capture` PipeWire, or `vesper-gamecapture`
+//!   through [`GameFrames`]): `on_frame` only parks the newest
 //!   frame in a one-slot mailbox. A frame it replaces is released at once:
 //!   the compositor may send more frames than the recording's `fps`.
 //! - Pipeline thread (here): opens the capture (blocks on the portal picker),
@@ -25,7 +26,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -33,6 +34,7 @@ use vesper_audio::{AudioCapture, CHANNELS, SAMPLE_RATE, Source};
 use vesper_capture::Capture;
 use vesper_core::{Codec, EncodedPacket, VideoFrame};
 use vesper_encode::{Encoder, RateControl};
+use vesper_gamecapture::GameCapture;
 use vesper_mux::{AudioTrack, Muxer, VideoTrack};
 
 /// How often `Event::Stats` is sent.
@@ -41,6 +43,14 @@ const STATS_PERIOD: Duration = Duration::from_millis(500);
 /// Audio kept before the replay's first video packet, so the muxer can pick
 /// the packet whose pre-skip covers the start.
 const AUDIO_MARGIN: Duration = Duration::from_millis(100);
+
+/// A recording request waiting this long for a first frame fails (e.g. the
+/// game quit), so the UI does not stay in `starting`.
+const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// A new source size kept this long reopens the encoder at that size while
+/// nothing records (a launcher, then the game in fullscreen).
+const RESIZE_AFTER: Duration = Duration::from_secs(1);
 
 /// Encoder settings, fixed for the life of a pipeline.
 #[derive(Debug, Clone)]
@@ -51,6 +61,68 @@ pub struct Settings {
     pub bits_per_pixel: f64,
     pub desktop_muted: bool,
     pub mic_muted: bool,
+    /// Record the game these frames come from instead of a portal source.
+    pub game: Option<GameFrames>,
+}
+
+/// Routes game capture frames to the running pipeline. The game capture
+/// outlives pipelines (the UI lists games and asks for consent while none
+/// runs); it only asks the game for frames while a pipeline is attached.
+#[derive(Debug, Clone, Default)]
+pub struct GameFrames(Arc<GameRoute>);
+
+#[derive(Debug, Default)]
+struct GameRoute {
+    slot: Mutex<Option<Arc<Mutex<Slot>>>>,
+    /// Weak: the capture's frame callback holds this route.
+    capture: OnceLock<Weak<GameCapture>>,
+}
+
+impl GameFrames {
+    /// Ties the route to its capture, inactive until a pipeline attaches.
+    pub fn bind(&self, capture: &Arc<GameCapture>) {
+        let _ = self.0.capture.set(Arc::downgrade(capture));
+        let attached = lock(&self.0.slot).is_some();
+        capture.set_active(attached);
+    }
+
+    /// Hands a frame (or the capture's final error) to the pipeline.
+    pub fn push(&self, event: Result<VideoFrame, String>) {
+        let slot = lock(&self.0.slot).clone();
+        match slot {
+            Some(slot) => park(&slot, event),
+            None => drop(event),
+        }
+    }
+
+    /// Never called under the slot lock: dropping the upgraded capture may
+    /// join the server thread, which takes that lock in `push`.
+    fn set_active(&self, active: bool) {
+        if let Some(capture) = self.0.capture.get().and_then(Weak::upgrade) {
+            capture.set_active(active);
+        }
+    }
+
+    fn attach(&self, slot: &Arc<Mutex<Slot>>) {
+        let old = lock(&self.0.slot).replace(slot.clone());
+        drop(old);
+        self.set_active(true);
+    }
+
+    /// Detaches `slot`, unless a newer pipeline replaced it already.
+    fn detach(&self, slot: &Arc<Mutex<Slot>>) {
+        let mut current = lock(&self.0.slot);
+        if current.as_ref().is_some_and(|s| Arc::ptr_eq(s, slot)) {
+            *current = None;
+            drop(current);
+            self.set_active(false);
+            // A newer pipeline attached meanwhile: keep it fed.
+            let attached = lock(&self.0.slot).is_some();
+            if attached {
+                self.set_active(true);
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -241,11 +313,26 @@ impl Pipeline {
     }
 }
 
-/// Mailbox between the PipeWire thread and the pipeline thread.
-#[derive(Default)]
-struct Slot {
+/// Mailbox between the capture thread (PipeWire or game) and the pipeline
+/// thread.
+#[derive(Debug, Default)]
+pub struct Slot {
     frame: Option<VideoFrame>,
     ended: Option<String>,
+}
+
+/// Parks the newest frame; the one it replaces is released outside the lock.
+fn park(slot: &Mutex<Slot>, event: Result<VideoFrame, String>) {
+    let mut s = lock(slot);
+    let old = match event {
+        Ok(frame) => s.frame.replace(frame),
+        Err(e) => {
+            s.ended = Some(e);
+            s.frame.take()
+        }
+    };
+    drop(s);
+    drop(old);
 }
 
 /// An open recording.
@@ -410,31 +497,33 @@ fn run(
     on_event: &OnEvent,
 ) -> Result<(), String> {
     let slot = Arc::new(Mutex::new(Slot::default()));
-    let s = slot.clone();
-    let capture = Capture::start(load_restore_token().as_deref(), move |event| {
-        let mut slot = lock(&s);
-        let old = match event {
-            Ok(frame) => slot.frame.replace(frame),
-            Err(e) => {
-                slot.ended = Some(e.to_string());
-                slot.frame.take()
+    let capture = match &settings.game {
+        Some(game) => {
+            game.attach(&slot);
+            None
+        }
+        None => {
+            let s = slot.clone();
+            let capture = Capture::start(load_restore_token().as_deref(), move |event| {
+                park(&s, event.map_err(|e| e.to_string()));
+            })
+            .map_err(|e| format!("Could not start the capture: {e}"))?;
+            if let Some(token) = capture.restore_token()
+                && let Err(e) = save_restore_token(token)
+            {
+                log!("could not save the restore token: {e}");
             }
-        };
-        drop(slot);
-        // Released outside the lock.
-        drop(old);
-    })
-    .map_err(|e| format!("Could not start the capture: {e}"))?;
-    if let Some(token) = capture.restore_token()
-        && let Err(e) = save_restore_token(token)
-    {
-        log!("could not save the restore token: {e}");
-    }
+            Some(capture)
+        }
+    };
     let sinks = SharedSinks::default();
     let audio = start_audio(sources, &sinks);
     started.store(true, Ordering::Relaxed);
     let result = pump(settings, &slot, control, &sinks, &audio, on_event);
     drop(capture);
+    if let Some(game) = &settings.game {
+        game.detach(&slot);
+    }
     // Stopping the audio flushes its last packets into the sinks, so do it
     // before closing, without holding the sinks lock the audio threads need.
     let running = std::mem::take(&mut lock(sources).running);
@@ -584,8 +673,12 @@ fn pump(
     // `skipped` when the recording started, and whether Stats were sent since.
     let mut rec_skipped = 0;
     let mut stats_sent = false;
-    // Last capture size the encoder could not take, logged once per change.
-    let mut bad_size = None;
+    // Last capture size, to log size changes once.
+    let mut last_size = None;
+    // A source size other than the encoder's, and since when.
+    let mut new_size: Option<((u32, u32), Duration)> = None;
+    // Since when a recording request waits for a first frame.
+    let mut waiting_since = None;
     let mut deadline = monotonic_now();
     let mut window = (monotonic_now(), 0u32);
     let mut error = None;
@@ -600,7 +693,7 @@ fn pump(
             error = Some(format!("Capture ended: {e}"));
             break;
         }
-        let first = video.is_none() && frame.is_some();
+        let mut first = video.is_none() && frame.is_some();
         if let (None, Some(f)) = (&video, &frame) {
             match Video::open(settings, f) {
                 Ok(v) => video = Some(v),
@@ -632,6 +725,20 @@ fn pump(
             } else {
                 None
             };
+            // No frame at all (the game quit or stopped presenting): give up
+            // on the recording; the replay buffer keeps waiting.
+            waiting_since = (video.is_none() && c.record.is_some())
+                .then(|| waiting_since.unwrap_or_else(monotonic_now));
+            if waiting_since.is_some_and(|t| monotonic_now() - t >= FIRST_FRAME_TIMEOUT) {
+                c.record = None;
+                waiting_since = None;
+                let what = if settings.game.is_some() {
+                    "the game"
+                } else {
+                    "the source"
+                };
+                on_event(Event::Finished(Err(format!("No frame from {what}"))));
+            }
             (record, stop, c.replay, c.save.take())
         };
         {
@@ -647,6 +754,33 @@ fn pump(
         }
         if let Some(folder) = save {
             save_replay(folder, video.as_ref(), sinks, control, audio, on_event);
+        }
+        // While nothing records, follow a lasting size change with a new
+        // encoder (and an empty replay buffer: its packets need the old one).
+        if let (Some(v), Some(f)) = (&video, &frame) {
+            let size = (f.width, f.height);
+            if size == (v.track.width, v.track.height) {
+                new_size = None;
+            } else if new_size.is_none_or(|(s, _)| s != size) {
+                new_size = Some((size, monotonic_now()));
+            }
+        }
+        if let (Some((_, since)), Some(f)) = (new_size, &frame)
+            && monotonic_now() - since >= RESIZE_AFTER
+            && lock(sinks).rec.is_none()
+        {
+            new_size = None;
+            match Video::open(settings, f) {
+                Ok(v) => video = Some(v),
+                Err(e) => {
+                    error = Some(e);
+                    break;
+                }
+            }
+            (k, first, last_size) = (0, true, None);
+            if let Some(ring) = lock(sinks).ring.as_mut() {
+                *ring = Ring::new(ring.span, audio.len());
+            }
         }
         let Some(v) = &mut video else {
             // Waiting for the first frame: poll once per interval.
@@ -689,21 +823,21 @@ fn pump(
             r.stop_at.get_or_insert(pts);
         }
 
-        // shortcut: a resized source (e.g. a resized window) keeps the
-        // last picture; scale or restart the encoder to follow it.
-        let frame = frame.filter(|f| {
-            let size = (f.width, f.height);
-            let fits = size == (v.track.width, v.track.height);
-            if !fits && bad_size != Some(size) {
+        // A resized source (window, game) is scaled to the file's size.
+        if let Some(f) = &frame
+            && last_size != Some((f.width, f.height))
+        {
+            if last_size.is_some() {
                 log!(
-                    "source is now {}x{}: holding the last picture",
-                    size.0,
-                    size.1
+                    "source is now {}x{}: scaled to {}x{}",
+                    f.width,
+                    f.height,
+                    v.track.width,
+                    v.track.height
                 );
             }
-            bad_size = (!fits).then_some(size);
-            fits
-        });
+            last_size = Some((f.width, f.height));
+        }
         let packets = match frame {
             Some(mut frame) => {
                 frame.pts = pts;
