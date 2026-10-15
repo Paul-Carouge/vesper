@@ -1,0 +1,373 @@
+// Small, keyboard-accessible building blocks styled with `Theme`.
+
+import { Theme } from "theme.slint";
+
+// A stroked 24x24 icon.
+export component Icon inherits Rectangle {
+    in property <string> data;
+    in property <brush> tint: Theme.text;
+    in property <length> stroke: 1.75px;
+    width: 20px;
+    height: 20px;
+    Path {
+        width: 100%;
+        height: 100%;
+        viewbox-width: 24;
+        viewbox-height: 24;
+        commands: root.data;
+        stroke: root.tint;
+        stroke-width: root.stroke;
+        stroke-line-cap: round;
+        stroke-line-join: round;
+        fill: transparent;
+    }
+}
+
+// Keyboard focus indicator drawn around a control.
+// Fills its parent; the ring itself sits 3px outside.
+export component FocusRing inherits Rectangle {
+    in property <bool> visible-ring;
+    in property <length> radius;
+    in property <length> offset: 3px;
+    Rectangle {
+        x: -root.offset;
+        y: -root.offset;
+        width: root.width + 2 * root.offset;
+        height: root.height + 2 * root.offset;
+        border-radius: root.radius + root.offset;
+        border-width: root.visible-ring ? 2px : 0px;
+        border-color: Theme.accent;
+    }
+}
+
+// Card that groups related controls.
+export component Card inherits Rectangle {
+    background: Theme.surface;
+    border-radius: Theme.radius-lg;
+    border-width: 1px;
+    border-color: Theme.border;
+}
+
+// Text button. `kind`: "secondary" (default), "primary", "ghost".
+export component Button inherits FocusScope {
+    in property <string> text;
+    in property <string> icon;
+    in property <string> kind: "secondary";
+    in property <string> shortcut-hint;
+    callback clicked;
+
+    focus-on-click: false;
+    min-height: Theme.control-height;
+    min-width: layout.min-width;
+    horizontal-stretch: 0;
+    accessible-role: button;
+    accessible-label: root.text;
+    accessible-description: root.shortcut-hint;
+    accessible-enabled: root.enabled;
+    accessible-action-default => {
+        root.clicked();
+    }
+
+    key-pressed(event) => {
+        if (event.text == Key.Space || event.text == Key.Return) {
+            root.clicked();
+            return accept;
+        }
+        reject
+    }
+
+    FocusRing {
+        visible-ring: root.has-focus;
+        radius: Theme.radius-md;
+    }
+
+    bg := Rectangle {
+        border-radius: Theme.radius-md;
+        border-width: root.kind == "secondary" ? 1px : 0px;
+        border-color: Theme.border-strong;
+        background: root.kind == "primary"
+            ? (touch.pressed ? Theme.accent.darker(0.15) : touch.has-hover ? Theme.accent-hover : Theme.accent)
+            : root.kind == "ghost"
+                ? (touch.pressed ? Theme.surface-pressed : touch.has-hover ? Theme.surface-hover : transparent)
+                : (touch.pressed ? Theme.surface-pressed : touch.has-hover ? Theme.surface-hover : Theme.surface-raised);
+        opacity: root.enabled ? 1 : 0.4;
+        animate background { duration: Theme.fast; }
+    }
+
+    layout := HorizontalLayout {
+        padding-left: root.icon != "" ? 12px : 16px;
+        padding-right: 16px;
+        spacing: 8px;
+        alignment: center;
+        if root.icon != "": Icon {
+            y: (parent.height - self.height) / 2;
+            width: 18px;
+            height: 18px;
+            data: root.icon;
+            tint: root.kind == "primary" ? Theme.on-accent : Theme.text;
+            opacity: root.enabled ? 1 : 0.4;
+        }
+        Text {
+            text: root.text;
+            vertical-alignment: center;
+            font-size: Theme.font-body;
+            font-weight: 600;
+            color: root.kind == "primary" ? Theme.on-accent : Theme.text;
+            opacity: root.enabled ? 1 : 0.4;
+        }
+    }
+
+    touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: root.enabled ? pointer : default;
+        clicked => {
+            root.clicked();
+        }
+    }
+}
+
+// Square icon-only button. `active` gives it a toggled look.
+export component IconButton inherits FocusScope {
+    in property <string> icon;
+    in property <string> label;
+    in property <bool> active;
+    in property <brush> active-tint: Theme.accent;
+    in property <brush> tint: Theme.text-muted;
+    callback clicked;
+
+    focus-on-click: false;
+    width: Theme.control-height;
+    height: Theme.control-height;
+    accessible-role: button;
+    accessible-label: root.label;
+    accessible-action-default => {
+        root.clicked();
+    }
+
+    key-pressed(event) => {
+        if (event.text == Key.Space || event.text == Key.Return) {
+            root.clicked();
+            return accept;
+        }
+        reject
+    }
+
+    FocusRing {
+        visible-ring: root.has-focus;
+        radius: Theme.radius-md;
+    }
+
+    Rectangle {
+        border-radius: Theme.radius-md;
+        background: touch.pressed ? Theme.surface-pressed : touch.has-hover ? Theme.surface-hover : transparent;
+        animate background { duration: Theme.fast; }
+    }
+
+    Icon {
+        data: root.icon;
+        tint: root.active ? root.active-tint : touch.has-hover ? Theme.text : root.tint;
+    }
+
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => {
+            root.clicked();
+        }
+    }
+}
+
+// On/off switch.
+export component Switch inherits FocusScope {
+    in-out property <bool> checked;
+    in property <string> label;
+    callback toggled(bool);
+
+    focus-on-click: false;
+    width: 44px;
+    height: 26px;
+    accessible-role: switch;
+    accessible-label: root.label;
+    accessible-checkable: true;
+    accessible-checked: root.checked;
+    accessible-action-default => {
+        root.toggle();
+    }
+
+    function toggle() {
+        root.checked = !root.checked;
+        root.toggled(root.checked);
+    }
+
+    key-pressed(event) => {
+        if (event.text == Key.Space || event.text == Key.Return) {
+            root.toggle();
+            return accept;
+        }
+        reject
+    }
+
+    FocusRing {
+        visible-ring: root.has-focus;
+        radius: self.height / 2;
+    }
+
+    track := Rectangle {
+        border-radius: self.height / 2;
+        background: root.checked ? Theme.accent : Theme.border-strong;
+        animate background { duration: Theme.fast; }
+
+        knob := Rectangle {
+            width: 20px;
+            height: 20px;
+            y: 3px;
+            x: root.checked ? parent.width - self.width - 3px : 3px;
+            border-radius: self.height / 2;
+            background: #ffffff;
+            drop-shadow-blur: 3px;
+            drop-shadow-color: #00000040;
+            drop-shadow-offset-y: 1px;
+            animate x { duration: Theme.medium; easing: ease-out-quart; }
+        }
+    }
+
+    TouchArea {
+        mouse-cursor: pointer;
+        clicked => {
+            root.toggle();
+        }
+    }
+}
+
+// Mutually exclusive options in a pill. Left/Right arrows move the selection.
+export component Segmented inherits FocusScope {
+    in property <[string]> options;
+    in property <string> label;
+    in-out property <int> selected;
+    callback changed(int);
+
+    focus-on-click: false;
+    min-height: 36px;
+    accessible-role: radio-group;
+    accessible-label: root.label;
+    accessible-value: root.options[root.selected];
+
+    function select(i: int) {
+        if (i >= 0 && i < root.options.length && i != root.selected) {
+            root.selected = i;
+            root.changed(i);
+        }
+    }
+
+    key-pressed(event) => {
+        if (event.text == Key.LeftArrow) {
+            root.select(root.selected - 1);
+            return accept;
+        }
+        if (event.text == Key.RightArrow) {
+            root.select(root.selected + 1);
+            return accept;
+        }
+        reject
+    }
+
+    FocusRing {
+        visible-ring: root.has-focus;
+        radius: Theme.radius-md;
+    }
+
+    Rectangle {
+        border-radius: Theme.radius-md;
+        background: Theme.surface-raised;
+        opacity: root.enabled ? 1 : 0.45;
+
+        // Sliding thumb under the selected option.
+        Rectangle {
+            property <length> cell: (parent.width - 6px) / max(1, root.options.length);
+            x: 3px + self.cell * root.selected;
+            y: 3px;
+            width: self.cell;
+            height: parent.height - 6px;
+            border-radius: Theme.radius-md - 3px;
+            background: Theme.dark ? Theme.surface-pressed : Theme.surface;
+            border-width: 1px;
+            border-color: Theme.border-strong;
+            drop-shadow-blur: Theme.dark ? 0px : 4px;
+            drop-shadow-color: #0000001a;
+            drop-shadow-offset-y: 1px;
+            animate x { duration: Theme.medium; easing: ease-out-quart; }
+        }
+
+        HorizontalLayout {
+            padding: 3px;
+            for option[i] in root.options: TouchArea {
+                horizontal-stretch: 1;
+                enabled: root.enabled;
+                mouse-cursor: root.enabled ? pointer : default;
+                accessible-role: radio-button;
+                accessible-label: option;
+                accessible-checkable: true;
+                accessible-checked: i == root.selected;
+                accessible-action-default => {
+                    root.select(i);
+                }
+                clicked => {
+                    root.select(i);
+                }
+                Text {
+                    text: option;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                    font-size: Theme.font-small;
+                    font-weight: i == root.selected ? 600 : 500;
+                    color: i == root.selected ? Theme.text : parent.has-hover ? Theme.text : Theme.text-muted;
+                }
+            }
+        }
+    }
+}
+
+// Horizontal audio level meter. `level` is linear 0..1.
+export component Meter inherits Rectangle {
+    in property <float> level;
+    in property <bool> muted;
+    // Peak hold, driven by the caller.
+    in property <float> peak;
+
+    height: 6px;
+    border-radius: self.height / 2;
+    background: Theme.meter-track;
+    clip: true;
+    accessible-role: progress-indicator;
+    accessible-value-minimum: 0;
+    accessible-value-maximum: 100;
+    accessible-value: root.muted ? "muted" : "\{round(root.level * 100)}%";
+
+    fill := Rectangle {
+        x: 0;
+        width: root.muted ? 0 : parent.width * clamp(root.level, 0, 1);
+        border-radius: parent.border-radius;
+        clip: true;
+        animate width { duration: 70ms; }
+        // Full-width gradient revealed by the fill, so "hot" only shows near 0 dBFS.
+        Rectangle {
+            x: 0;
+            width: root.width;
+            background: @linear-gradient(90deg, Theme.accent 0%, Theme.accent 72%, Theme.meter-hot 92%);
+        }
+    }
+
+    if !root.muted && root.peak > 0.02: Rectangle {
+        x: (parent.width - self.width) * clamp(root.peak, 0, 1);
+        width: 2px;
+        background: root.peak > 0.9 ? Theme.meter-hot : Theme.text-muted;
+        animate x { duration: 120ms; }
+    }
+}
+
+// Small caption used as a section label.
+export component SectionLabel inherits Text {
+    font-size: Theme.font-caption;
+    font-weight: 600;
+    letter-spacing: 0.8px;
+    color: Theme.text-faint;
+}

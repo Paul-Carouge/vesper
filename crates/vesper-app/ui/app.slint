@@ -1,0 +1,779 @@
+// Vesper main window. The UI only renders state and emits intents: the backend
+// owns the truth and writes back the `in` properties.
+
+import { Theme, Icons } from "theme.slint";
+import { Icon, Card, Button, IconButton, Switch, Segmented, Meter, SectionLabel, FocusRing } from "components.slint";
+
+export { Theme }
+
+export enum SourceKind { none, screen, window }
+export enum VideoCodec { av1, hevc, h264 }
+export enum QualityPreset { performance, balanced, quality }
+
+// Elapsed time with fixed-width digit cells, so the clock does not jitter.
+component Clock inherits HorizontalLayout {
+    in property <int> seconds;
+    in property <brush> color;
+    property <int> h: Math.min(99, Math.floor(root.seconds / 3600));
+    property <int> m: Math.mod(Math.floor(root.seconds / 60), 60);
+    property <int> s: Math.mod(root.seconds, 60);
+    property <[int]> digits: [
+        Math.floor(h / 10),
+        Math.mod(h, 10),
+        -1,
+        Math.floor(m / 10),
+        Math.mod(m, 10),
+        -1,
+        Math.floor(s / 10),
+        Math.mod(s, 10)
+    ];
+
+    alignment: center;
+    for d in root.digits: Text {
+        width: d < 0 ? Theme.font-display * 0.32 : Theme.font-display * 0.6;
+        text: d < 0 ? ":" : "\{d}";
+        horizontal-alignment: center;
+        font-size: Theme.font-display;
+        font-weight: 300;
+        color: d < 0 ? Theme.text-faint : root.color;
+    }
+}
+
+component RecordButton inherits FocusScope {
+    in property <bool> recording;
+    callback toggle;
+
+    width: 88px;
+    height: 88px;
+    focus-on-click: false;
+    accessible-role: button;
+    accessible-label: root.recording ? "Stop recording" : "Start recording";
+    accessible-description: "Ctrl+R";
+    accessible-action-default => {
+        root.toggle();
+    }
+
+    key-pressed(event) => {
+        if (event.text == Key.Space || event.text == Key.Return) {
+            root.toggle();
+            return accept;
+        }
+        reject
+    }
+
+    // Soft halo that breathes while recording.
+    halo := Rectangle {
+        property <float> phase: root.recording ? (1 + Math.sin(animation-tick() / 1.6s * 360deg)) / 2 : 0;
+        width: parent.width + 14px + 10px * self.phase;
+        height: self.width;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        border-radius: self.width / 2;
+        background: Theme.rec-soft;
+        opacity: root.recording ? 0.5 + 0.5 * self.phase : touch.has-hover ? 0.7 : 0;
+        animate opacity { duration: Theme.medium; }
+    }
+
+    FocusRing {
+        visible-ring: root.has-focus;
+        radius: root.width / 2;
+        offset: 5px;
+    }
+
+    ring := Rectangle {
+        border-radius: self.width / 2;
+        background: Theme.surface;
+        border-width: 3px;
+        border-color: root.recording ? Theme.rec : Theme.border-strong;
+        animate border-color { duration: Theme.medium; }
+        drop-shadow-blur: 18px;
+        drop-shadow-offset-y: 6px;
+        drop-shadow-color: Theme.dark ? #00000066 : #1a1a2a22;
+    }
+
+    // Circle (idle) morphs into a rounded square (stop).
+    core := Rectangle {
+        property <length> size: root.recording ? 34px : touch.pressed ? 62px : 68px;
+        width: self.size;
+        height: self.size;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        border-radius: root.recording ? 9px : self.size / 2;
+        background: touch.has-hover ? Theme.rec.brighter(0.08) : Theme.rec;
+        animate width, height, border-radius { duration: Theme.medium; easing: ease-out-quart; }
+    }
+
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => {
+            root.toggle();
+        }
+    }
+}
+
+// A card row label with an optional secondary line.
+component Labeled inherits VerticalLayout {
+    in property <string> title;
+    in property <string> subtitle;
+    alignment: center;
+    spacing: 2px;
+    Text {
+        text: root.title;
+        font-size: Theme.font-body;
+        font-weight: 600;
+        color: Theme.text;
+        overflow: elide;
+    }
+    if root.subtitle != "": Text {
+        text: root.subtitle;
+        font-size: Theme.font-small;
+        color: Theme.text-muted;
+        overflow: elide;
+    }
+}
+
+component AudioRow inherits HorizontalLayout {
+    in property <string> name;
+    in property <string> icon;
+    in property <string> icon-muted;
+    in property <bool> muted;
+    in property <float> level;
+    in property <float> peak;
+    in property <bool> interactive: true;
+    callback toggle-mute;
+
+    spacing: Theme.space-md;
+    alignment: stretch;
+
+    IconButton {
+        icon: root.muted ? root.icon-muted : root.icon;
+        label: root.muted ? "Unmute \{root.name}" : "Mute \{root.name}";
+        active: root.muted;
+        active-tint: Theme.rec;
+        enabled: root.interactive;
+        clicked => {
+            root.toggle-mute();
+        }
+    }
+
+    VerticalLayout {
+        width: 92px;
+        alignment: center;
+        spacing: 1px;
+        Text {
+            text: root.name;
+            font-size: Theme.font-body;
+            font-weight: 500;
+            color: root.muted ? Theme.text-muted : Theme.text;
+            overflow: elide;
+        }
+        if root.muted: Text {
+            text: "Muted";
+            font-size: Theme.font-caption;
+            font-weight: 600;
+            color: Theme.rec;
+        }
+    }
+
+    VerticalLayout {
+        alignment: center;
+        horizontal-stretch: 1;
+        padding-right: Theme.space-xs;
+        Meter {
+            level: root.level;
+            peak: root.peak;
+            muted: root.muted;
+        }
+    }
+}
+
+component SettingGroup inherits VerticalLayout {
+    in property <string> label;
+    in property <string> hint;
+    spacing: Theme.space-sm;
+    SectionLabel {
+        text: root.label;
+    }
+    @children
+    if root.hint != "": Text {
+        text: root.hint;
+        font-size: Theme.font-small;
+        color: Theme.text-muted;
+        wrap: word-wrap;
+    }
+}
+
+export component AppWindow inherits Window {
+    // ---- Source -------------------------------------------------------
+    in property <SourceKind> source-kind: SourceKind.none;
+    /// Human-readable source, e.g. "DP-1" or "Firefox".
+    in property <string> source-name;
+    /// Extra detail shown under the source name, e.g. "2560 × 1440".
+    in property <string> source-detail;
+
+    // ---- Recording ----------------------------------------------------
+    in property <bool> recording;
+    in property <int> elapsed-seconds;
+
+    // ---- Replay buffer ------------------------------------------------
+    in-out property <bool> replay-enabled;
+    /// One of 30, 60, 120.
+    in-out property <int> replay-seconds: 30;
+
+    // ---- Audio --------------------------------------------------------
+    in-out property <bool> desktop-muted;
+    in-out property <bool> mic-muted;
+    /// Linear levels, 0..1.
+    in property <float> desktop-level;
+    in property <float> desktop-peak;
+    in property <float> mic-level;
+    in property <float> mic-peak;
+
+    // ---- Output settings ----------------------------------------------
+    in-out property <VideoCodec> codec: VideoCodec.av1;
+    in-out property <QualityPreset> quality: QualityPreset.balanced;
+    /// One of 30, 60, 120, 144.
+    in-out property <int> fps: 60;
+    in property <string> output-folder;
+
+    // ---- Status line --------------------------------------------------
+    in property <string> encoder: "VAAPI";
+    in property <string> resolution;
+    in property <float> measured-fps;
+    in property <int> dropped-frames;
+    /// Transient confirmation, e.g. "Replay saved". Empty hides it.
+    in property <string> notice;
+
+    in-out property <bool> settings-open;
+
+    // ---- Intents --------------------------------------------------------
+    callback pick-source();
+    callback start-recording();
+    callback stop-recording();
+    callback save-replay();
+    callback replay-changed(bool, int);
+    callback desktop-mute-changed(bool);
+    callback mic-mute-changed(bool);
+    callback output-settings-changed();
+    callback pick-output-folder();
+
+    property <string> codec-name: root.codec == VideoCodec.av1 ? "AV1" : root.codec == VideoCodec.hevc ? "HEVC" : "H.264";
+    property <[int]> replay-options: [30, 60, 120];
+    property <[int]> fps-options: [30, 60, 120, 144];
+
+    title: "Vesper";
+    preferred-width: 440px;
+    preferred-height: 740px;
+    min-width: 360px;
+    min-height: 520px;
+    background: Theme.window-bg;
+    default-font-size: Theme.font-body;
+    forward-focus: keys;
+
+    function toggle-recording() {
+        if (root.recording) {
+            root.stop-recording();
+        } else {
+            root.start-recording();
+        }
+    }
+
+    function open-settings() {
+        root.settings-open = true;
+        codec-picker.focus();
+    }
+
+    function close-settings() {
+        root.settings-open = false;
+        settings-button.focus();
+    }
+
+    function request-save-replay() {
+        if (root.replay-enabled) {
+            root.save-replay();
+        }
+    }
+
+    keys := FocusScope {
+        focus-on-tab-navigation: false;
+        focus-on-click: false;
+
+        key-pressed(event) => {
+            if (event.modifiers.control && (event.text == "r" || event.text == "R")) {
+                root.toggle-recording();
+                return accept;
+            }
+            if (event.modifiers.control && (event.text == "s" || event.text == "S")) {
+                root.request-save-replay();
+                return accept;
+            }
+            if (event.modifiers.control && event.text == ",") {
+                root.open-settings();
+                return accept;
+            }
+            if (event.text == Key.Escape && root.settings-open) {
+                root.close-settings();
+                return accept;
+            }
+            reject
+        }
+
+        // Scrolls only when the window is shorter than the content.
+        flick := Flickable {
+            content-width: self.width;
+            content-height: Math.max(self.height, main.min-height);
+            interactive: self.content-height > self.height;
+            main := VerticalLayout {
+                width: flick.width;
+                height: flick.content-height;
+                padding: 20px;
+                padding-top: Theme.space-md;
+                padding-bottom: Theme.space-lg;
+                spacing: Theme.space-lg;
+
+                // ---- Header ------------------------------------------------
+                HorizontalLayout {
+                    spacing: Theme.space-sm;
+                    alignment: stretch;
+                    Rectangle {
+                        width: 22px;
+                        VerticalLayout {
+                            alignment: center;
+                            Rectangle {
+                                width: 14px;
+                                height: 14px;
+                                x: 4px;
+                                border-radius: 7px;
+                                background: @linear-gradient(135deg, Theme.accent 0%, Theme.rec 100%);
+                            }
+                        }
+                    }
+                    Text {
+                        text: "Vesper";
+                        vertical-alignment: center;
+                        font-size: Theme.font-title;
+                        font-weight: 700;
+                        letter-spacing: 0.2px;
+                        color: Theme.text;
+                        horizontal-stretch: 1;
+                    }
+                    settings-button := IconButton {
+                        enabled: !root.settings-open;
+                        icon: Icons.sliders;
+                        label: "Output settings";
+                        active: root.settings-open;
+                        clicked => {
+                            root.open-settings();
+                        }
+                    }
+                }
+
+                // ---- Source ------------------------------------------------
+                Card {
+                    HorizontalLayout {
+                        padding: Theme.space-md;
+                        padding-left: Theme.space-md;
+                        spacing: Theme.space-md;
+                        Rectangle {
+                            width: 40px;
+                            height: 40px;
+                            border-radius: Theme.radius-md;
+                            background: root.source-kind == SourceKind.none ? Theme.surface-raised : Theme.accent-soft;
+                            Icon {
+                                data: root.source-kind == SourceKind.window ? Icons.window : Icons.monitor;
+                                tint: root.source-kind == SourceKind.none ? Theme.text-muted : Theme.accent;
+                            }
+                        }
+                        Labeled {
+                            horizontal-stretch: 1;
+                            title: root.source-kind == SourceKind.none ? "No source selected" : root.source-name;
+                            subtitle: root.source-kind == SourceKind.none
+                                ? "Pick a screen or a window to record"
+                                : root.source-detail != "" ? root.source-detail : root.source-kind == SourceKind.screen ? "Screen" : "Window";
+                            accessible-role: text;
+                            accessible-label: root.source-kind == SourceKind.none
+                                ? "No source selected"
+                                : (root.source-kind == SourceKind.screen ? "Screen: " : "Window: ") + root.source-name;
+                        }
+                        VerticalLayout {
+                            alignment: center;
+                            Button {
+                                text: root.source-kind == SourceKind.none ? "Choose" : "Change";
+                                kind: root.source-kind == SourceKind.none ? "primary" : "secondary";
+                                enabled: !root.recording && !root.settings-open;
+                                accessible-label: "Choose source";
+                                clicked => {
+                                    root.pick-source();
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // ---- Hero: record ------------------------------------------
+                VerticalLayout {
+                    vertical-stretch: 1;
+                    alignment: center;
+                    spacing: Theme.space-sm;
+
+                    // State pill
+                    HorizontalLayout {
+                        alignment: center;
+                        Rectangle {
+                            height: 24px;
+                            width: pill.preferred-width;
+                            border-radius: 12px;
+                            background: root.recording ? Theme.rec-soft : Theme.surface;
+                            border-width: 1px;
+                            border-color: root.recording ? transparent : Theme.border;
+                            animate background, border-color { duration: Theme.medium; }
+                            pill := HorizontalLayout {
+                                padding-left: 10px;
+                                padding-right: 12px;
+                                spacing: 6px;
+                                VerticalLayout {
+                                    alignment: center;
+                                    Rectangle {
+                                        width: 8px;
+                                        height: 8px;
+                                        border-radius: 4px;
+                                        background: root.recording ? Theme.rec : Theme.text-faint;
+                                        opacity: root.recording ? 0.35 + 0.65 * Math.abs(Math.sin(animation-tick() / 2s * 360deg)) : 1;
+                                    }
+                                }
+                                Text {
+                                    text: root.recording ? "REC" : root.source-kind == SourceKind.none ? "No source" : "Ready";
+                                    vertical-alignment: center;
+                                    font-size: Theme.font-caption;
+                                    font-weight: 700;
+                                    letter-spacing: root.recording ? 1.2px : 0.3px;
+                                    color: root.recording ? Theme.rec : Theme.text-muted;
+                                }
+                            }
+                        }
+                    }
+
+                    Clock {
+                        seconds: root.elapsed-seconds;
+                        color: root.recording ? Theme.text : Theme.text-faint;
+                        accessible-role: text;
+                        accessible-label: "Elapsed time";
+                    }
+
+                    HorizontalLayout {
+                        alignment: center;
+                        padding-top: 10px;
+                        padding-bottom: 10px;
+                        RecordButton {
+                            enabled: !root.settings-open;
+                            recording: root.recording;
+                            toggle => {
+                                root.toggle-recording();
+                            }
+                        }
+                    }
+
+                    Text {
+                        text: root.recording ? "Ctrl+R to stop" : "Ctrl+R to start recording";
+                        horizontal-alignment: center;
+                        font-size: Theme.font-small;
+                        color: Theme.text-faint;
+                    }
+                }
+
+                // ---- Replay buffer -----------------------------------------
+                Card {
+                    VerticalLayout {
+                        padding: Theme.space-lg;
+                        spacing: Theme.space-md;
+                        HorizontalLayout {
+                            spacing: Theme.space-md;
+                            Labeled {
+                                horizontal-stretch: 1;
+                                title: "Replay buffer";
+                                subtitle: root.replay-enabled
+                                    ? "Keeping the last \{root.replay-seconds < 60 ? root.replay-seconds + " s" : root.replay-seconds / 60 + " min"} in memory"
+                                    : "Off. Turn on to save moments after they happen";
+                            }
+                            VerticalLayout {
+                                alignment: center;
+                                Switch {
+                                    enabled: !root.settings-open;
+                                    label: "Replay buffer";
+                                    checked: root.replay-enabled;
+                                    toggled(on) => {
+                                        root.replay-enabled = on;
+                                        root.replay-changed(on, root.replay-seconds);
+                                    }
+                                }
+                            }
+                        }
+                        HorizontalLayout {
+                            spacing: Theme.space-sm;
+                            Segmented {
+                                enabled: !root.settings-open;
+                                horizontal-stretch: 1;
+                                label: "Replay length";
+                                options: ["30 s", "1 min", "2 min"];
+                                selected: root.replay-seconds >= 120 ? 2 : root.replay-seconds >= 60 ? 1 : 0;
+                                changed(i) => {
+                                    root.replay-seconds = root.replay-options[i];
+                                    root.replay-changed(root.replay-enabled, root.replay-seconds);
+                                }
+                            }
+                            Button {
+                                text: "Save replay";
+                                icon: Icons.save;
+                                enabled: root.replay-enabled && !root.settings-open;
+                                accessible-label: "Save replay";
+                                shortcut-hint: "Ctrl+S";
+                                clicked => {
+                                    root.request-save-replay();
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // ---- Audio -------------------------------------------------
+                Card {
+                    VerticalLayout {
+                        padding: Theme.space-lg;
+                        padding-top: Theme.space-md;
+                        padding-bottom: Theme.space-sm;
+                        spacing: 0px;
+                        SectionLabel {
+                            text: "AUDIO";
+                            height: 20px;
+                        }
+                        AudioRow {
+                            interactive: !root.settings-open;
+                            name: "Desktop";
+                            icon: Icons.speaker;
+                            icon-muted: Icons.speaker-off;
+                            muted: root.desktop-muted;
+                            level: root.desktop-level;
+                            peak: root.desktop-peak;
+                            toggle-mute => {
+                                root.desktop-muted = !root.desktop-muted;
+                                root.desktop-mute-changed(root.desktop-muted);
+                            }
+                        }
+                        AudioRow {
+                            interactive: !root.settings-open;
+                            name: "Microphone";
+                            icon: Icons.mic;
+                            icon-muted: Icons.mic-off;
+                            muted: root.mic-muted;
+                            level: root.mic-level;
+                            peak: root.mic-peak;
+                            toggle-mute => {
+                                root.mic-muted = !root.mic-muted;
+                                root.mic-mute-changed(root.mic-muted);
+                            }
+                        }
+                    }
+                }
+
+                // ---- Status line -------------------------------------------
+                HorizontalLayout {
+                    spacing: Theme.space-sm;
+                    padding-left: Theme.space-xs;
+                    padding-right: Theme.space-xs;
+                    Text {
+                        horizontal-stretch: 1;
+                        text: root.encoder + " " + root.codec-name + (root.resolution != "" ? "   ·   " + root.resolution : "") + "   ·   " + (root.recording ? "\{Math.round(root.measured-fps * 10) / 10}" : "\{root.fps}") + " fps";
+                        font-size: Theme.font-small;
+                        color: Theme.text-faint;
+                        overflow: elide;
+                        accessible-role: text;
+                    }
+                    if root.notice != "": Text {
+                        text: root.notice;
+                        font-size: Theme.font-small;
+                        font-weight: 600;
+                        color: Theme.accent;
+                    }
+                    if root.notice == "": Text {
+                        text: root.dropped-frames == 1 ? "1 dropped" : "\{root.dropped-frames} dropped";
+                        font-size: Theme.font-small;
+                        font-weight: root.dropped-frames > 0 ? 600 : 400;
+                        color: root.dropped-frames > 0 ? Theme.warn : Theme.text-faint;
+                    }
+                }
+            }
+        }
+
+        // Hints that more content is below when the window is very short.
+        Rectangle {
+            y: parent.height - self.height;
+            height: 40px;
+            visible: flick.interactive && -flick.content-y < flick.content-height - flick.height - 1px;
+            background: @linear-gradient(180deg, Theme.window-bg.transparentize(1) 0%, Theme.window-bg 100%);
+        }
+
+        // ---- Settings drawer --------------------------------------------
+        scrim := Rectangle {
+            visible: self.opacity > 0.01;
+            background: Theme.scrim;
+            opacity: root.settings-open ? 1 : 0;
+            animate opacity { duration: Theme.medium; }
+            TouchArea {
+                enabled: root.settings-open;
+                clicked => {
+                    root.close-settings();
+                }
+            }
+        }
+
+        drawer := Rectangle {
+            width: Math.min(parent.width - 32px, 380px);
+            x: root.settings-open ? parent.width - self.width : parent.width + 24px;
+            visible: root.settings-open || self.x < parent.width;
+            background: Theme.surface;
+            border-width: 1px;
+            border-color: Theme.border;
+            drop-shadow-blur: 32px;
+            drop-shadow-color: #00000055;
+            animate x { duration: Theme.medium; easing: ease-out-quart; }
+            accessible-role: groupbox;
+            accessible-label: "Output settings";
+
+            // Swallow clicks so they do not reach the scrim.
+            TouchArea { }
+
+            VerticalLayout {
+                padding: 20px;
+                padding-top: Theme.space-md;
+                spacing: 22px;
+
+                HorizontalLayout {
+                    Text {
+                        horizontal-stretch: 1;
+                        text: "Output";
+                        vertical-alignment: center;
+                        font-size: Theme.font-title;
+                        font-weight: 700;
+                        color: Theme.text;
+                    }
+                    IconButton {
+                        icon: Icons.close;
+                        label: "Close settings";
+                        clicked => {
+                            root.close-settings();
+                        }
+                    }
+                }
+
+                if root.recording: Rectangle {
+                    border-radius: Theme.radius-md;
+                    background: Theme.rec-soft;
+                    height: 36px;
+                    Text {
+                        text: "Locked while recording";
+                        font-size: Theme.font-small;
+                        font-weight: 600;
+                        color: Theme.rec;
+                    }
+                }
+
+                SettingGroup {
+                    label: "CODEC";
+                    hint: root.codec == VideoCodec.av1
+                        ? "Smallest files at a given quality. Needs a recent player."
+                        : root.codec == VideoCodec.hevc ? "Efficient and widely supported by hardware." : "Plays everywhere, larger files.";
+                    codec-picker := Segmented {
+                        label: "Codec";
+                        enabled: !root.recording;
+                        options: ["AV1", "HEVC", "H.264"];
+                        selected: root.codec == VideoCodec.av1 ? 0 : root.codec == VideoCodec.hevc ? 1 : 2;
+                        changed(i) => {
+                            root.codec = i == 0 ? VideoCodec.av1 : i == 1 ? VideoCodec.hevc : VideoCodec.h264;
+                            root.output-settings-changed();
+                        }
+                    }
+                }
+
+                SettingGroup {
+                    label: "QUALITY";
+                    Segmented {
+                        label: "Quality preset";
+                        enabled: !root.recording;
+                        options: ["Performance", "Balanced", "Quality"];
+                        selected: root.quality == QualityPreset.performance ? 0 : root.quality == QualityPreset.balanced ? 1 : 2;
+                        changed(i) => {
+                            root.quality = i == 0 ? QualityPreset.performance : i == 1 ? QualityPreset.balanced : QualityPreset.quality;
+                            root.output-settings-changed();
+                        }
+                    }
+                }
+
+                SettingGroup {
+                    label: "FRAME RATE";
+                    Segmented {
+                        label: "Frame rate";
+                        enabled: !root.recording;
+                        options: ["30", "60", "120", "144"];
+                        selected: root.fps >= 144 ? 3 : root.fps >= 120 ? 2 : root.fps >= 60 ? 1 : 0;
+                        changed(i) => {
+                            root.fps = root.fps-options[i];
+                            root.output-settings-changed();
+                        }
+                    }
+                }
+
+                SettingGroup {
+                    label: "OUTPUT FOLDER";
+                    HorizontalLayout {
+                        spacing: Theme.space-sm;
+                        Rectangle {
+                            horizontal-stretch: 1;
+                            height: Theme.control-height;
+                            border-radius: Theme.radius-md;
+                            background: Theme.surface-raised;
+                            HorizontalLayout {
+                                padding-left: Theme.space-md;
+                                padding-right: Theme.space-md;
+                                spacing: Theme.space-sm;
+                                Icon {
+                                    y: (parent.height - self.height) / 2;
+                                    width: 18px;
+                                    height: 18px;
+                                    data: Icons.folder;
+                                    tint: Theme.text-muted;
+                                }
+                                Text {
+                                    horizontal-stretch: 1;
+                                    text: root.output-folder;
+                                    vertical-alignment: center;
+                                    font-size: Theme.font-small;
+                                    color: Theme.text;
+                                    overflow: elide;
+                                }
+                            }
+                        }
+                        Button {
+                            text: "Browse";
+                            enabled: !root.recording;
+                            accessible-label: "Choose output folder";
+                            clicked => {
+                                root.pick-output-folder();
+                            }
+                        }
+                    }
+                }
+
+                Rectangle {
+                    vertical-stretch: 1;
+                }
+
+                Text {
+                    text: "Saved as MKV, which stays readable even if the app crashes.";
+                    font-size: Theme.font-small;
+                    color: Theme.text-faint;
+                    wrap: word-wrap;
+                }
+            }
+        }
+    }
+}
