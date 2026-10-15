@@ -123,7 +123,23 @@ pub struct Options {
     pub mix: Option<MixInput>,
     /// Processing before volume and encoding; `None` leaves samples as is.
     pub process: Option<Process>,
+    /// Told when the source is lost and when it is back, on the capture's
+    /// PipeWire thread.
+    pub on_state: Option<OnState>,
 }
+
+/// Where a running track's source is at, for [`Options::on_state`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TrackState {
+    /// Capturing again after a reconnection.
+    Running,
+    /// The source is gone (PipeWire restarted, device removed), for this
+    /// reason: reconnecting until it is back, recording silence meanwhile.
+    Reconnecting(String),
+}
+
+/// See [`Options::on_state`].
+pub type OnState = Box<dyn Fn(TrackState) + Send>;
 
 /// State shared with the encode thread.
 struct Shared {
@@ -178,9 +194,10 @@ impl AudioCapture {
             .spawn(move || encode_loop(enc, chunk_rx))?;
         let (stop, stop_rx) = ::pipewire::channel::channel();
         let (ready_tx, ready_rx) = mpsc::channel();
+        let on_state = options.on_state;
         let pw_thread = std::thread::Builder::new()
             .name("vesper-audio-pw".into())
-            .spawn(move || pw::run(source, chunk_tx, stop_rx, ready_tx))?;
+            .spawn(move || pw::run(source, chunk_tx, stop_rx, ready_tx, on_state))?;
         let capture = Self {
             shared,
             extradata,
@@ -518,21 +535,34 @@ impl<F: FnMut(EncodedPacket)> Encoder<F> {
 fn encode_loop(mut enc: Encoder<impl FnMut(EncodedPacket)>, rx: mpsc::Receiver<pw::Chunk>) {
     let mut timeline = Timeline::new(enc.anchor);
     let ch = usize::from(CHANNELS);
+    let mut stalled = false;
     loop {
         let (pad, skip, repeat, samples) = match rx.recv_timeout(STALL) {
             Ok(chunk) => {
+                stalled = false;
                 let (pad, skip, repeat) = timeline.place(chunk.start, chunk.samples.len() / ch);
                 (pad, skip, repeat, chunk.samples)
             }
             // Stalled source (no device, suspended): keep the track continuous.
             Err(RecvTimeoutError::Timeout) => {
+                stalled = true;
                 let (pad, _, _) = timeline.place(monotonic_now().saturating_sub(STALL), 0);
                 (pad, 0, 0, Vec::new())
+            }
+            // A stalled track lags by up to two `STALL`s: fill it up to the
+            // stop, so it ends with the video.
+            Err(RecvTimeoutError::Disconnected) if stalled => {
+                let (pad, _, _) = timeline.place(monotonic_now(), 0);
+                enc.push(&vec![0.0; pad * ch]);
+                break;
             }
             Err(RecvTimeoutError::Disconnected) => break,
         };
         if pad > 0 {
-            warn!("audio timeline gap: {pad} frames of silence inserted");
+            // A stall fills every `STALL`: not worth a line each time.
+            if !stalled {
+                warn!("audio timeline gap: {pad} frames of silence inserted");
+            }
             enc.push(&vec![0.0; pad * ch]);
         }
         for _ in 0..repeat {
@@ -712,6 +742,36 @@ mod tests {
             assert_eq!(w[1].pts - w[0].pts, Duration::from_millis(20));
         }
         assert!(packets[0].pts <= anchor);
+    }
+
+    #[test]
+    fn stalled_track_is_filled_up_to_the_stop() {
+        let anchor = monotonic_now();
+        let (chunk_tx, chunk_rx) = mpsc::channel();
+        chunk_tx
+            .send(pw::Chunk {
+                start: anchor,
+                samples: vec![0.0; FRAME * 2],
+            })
+            .unwrap();
+        // The source then stalls for 700 ms before the capture stops.
+        let stopper = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(700));
+            drop(chunk_tx);
+        });
+        let (tx, rx) = mpsc::channel();
+        let enc = Encoder::new(open_encoder().unwrap(), anchor, Arc::default(), move |p| {
+            tx.send(p).unwrap()
+        });
+        encode_loop(enc, chunk_rx);
+        stopper.join().unwrap();
+        let end = rx.iter().last().unwrap().pts + Duration::from_millis(20);
+        // Not `STALL` (or two) short of the stop.
+        assert!(
+            end >= anchor + Duration::from_millis(680),
+            "{:?}",
+            end - anchor
+        );
     }
 
     /// Decodes Opus packets back to channel 0's samples.

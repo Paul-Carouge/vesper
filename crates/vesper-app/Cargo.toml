@@ -14,6 +14,7 @@ dirs = "7"
 libc = "0.2"
 ashpd = { version = "0.13", default-features = false, features = ["async-io", "global_shortcuts", "file_chooser", "notification"] }
 futures-lite = "2"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # The version and features Slint's own tray already builds: no extra crate.
 ksni = { version = "0.3", default-features = false, features = ["async-io", "blocking"] }
 wayland-client = "0.31"

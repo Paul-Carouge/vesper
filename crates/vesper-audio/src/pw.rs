@@ -12,9 +12,9 @@ use pw::registry::GlobalObject;
 use pw::spa;
 use pw::spa::pod::Pod;
 use pw::types::ObjectType;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
-use crate::{CHANNELS, Error, SAMPLE_RATE, Source};
+use crate::{CHANNELS, Error, OnState, SAMPLE_RATE, Source, TrackState};
 
 /// Interleaved F32 samples whose first frame was captured at `start`
 /// (`CLOCK_MONOTONIC`).
@@ -96,22 +96,188 @@ fn quantum_ns(t: &pw::stream::Time, frames: usize) -> i128 {
     }
 }
 
+/// First wait before reconnecting; it doubles after each failed attempt.
+const BACKOFF_FIRST: Duration = Duration::from_millis(100);
+/// Longest wait between two reconnection attempts.
+const BACKOFF_MAX: Duration = Duration::from_secs(2);
+
+/// Waits between reconnection attempts: 100 ms, doubling up to 2 s.
+#[derive(Debug, PartialEq)]
+struct Backoff(Duration);
+
+impl Backoff {
+    fn new() -> Self {
+        Self(BACKOFF_FIRST)
+    }
+
+    /// The wait before the next attempt; the one after is twice as long.
+    fn next(&mut self) -> Duration {
+        let wait = self.0;
+        self.0 = (wait * 2).min(BACKOFF_MAX);
+        wait
+    }
+}
+
+/// How one connection to PipeWire is doing, seen from its callbacks.
+#[derive(Default)]
+struct Health {
+    /// Why the connection is lost, once it is.
+    lost: RefCell<Option<String>>,
+    /// The stream reached `Streaming`.
+    streamed: Cell<bool>,
+}
+
+impl Health {
+    /// Marks the connection lost (the first reason wins) and leaves the loop.
+    fn lose(&self, reason: String, mainloop: &pw::main_loop::MainLoopRc) {
+        let mut lost = self.lost.borrow_mut();
+        if lost.is_none() {
+            *lost = Some(reason);
+            mainloop.quit();
+        }
+    }
+}
+
 /// Streams `source` into `tx` until `stop` fires. Reports setup success on
 /// `ready` before streaming.
+///
+/// When the stream or PipeWire itself goes away (daemon restart, device
+/// removed), it reconnects with a backoff and reports the track's state on
+/// `on_state`; the encode thread fills the gap with silence meanwhile.
 pub fn run(
     source: Source,
     tx: mpsc::SyncSender<Chunk>,
     stop: pw::channel::Receiver<()>,
     ready: mpsc::Sender<Result<(), Error>>,
+    on_state: Option<OnState>,
 ) {
     pw::init();
     let mainloop = match pw::main_loop::MainLoopRc::new(None) {
         Ok(m) => m,
         Err(e) => return drop(ready.send(Err(e.into()))),
     };
-    let setup = (|| -> Result<_, Error> {
-        let context = pw::context::ContextRc::new(&mainloop, None)?;
+    let stopped = Rc::new(Cell::new(false));
+    let _stop = stop.attach(mainloop.loop_(), {
+        let (mainloop, stopped) = (mainloop.clone(), stopped.clone());
+        move |()| {
+            stopped.set(true);
+            mainloop.quit();
+        }
+    });
+    // Set while the track waits for its source to come back.
+    let reconnecting = Rc::new(Cell::new(false));
+    let on_state: Rc<dyn Fn(TrackState)> = match on_state {
+        Some(f) => Rc::new(f),
+        None => Rc::new(|_| {}),
+    };
+    let mut ready = Some(ready);
+    let mut backoff = Backoff::new();
+    loop {
+        let health = Rc::new(Health::default());
+        let running = {
+            let (on_state, reconnecting) = (on_state.clone(), reconnecting.clone());
+            let source = source.clone();
+            move || {
+                if reconnecting.replace(false) {
+                    info!("{source:?}: capturing again");
+                    on_state(TrackState::Running);
+                }
+            }
+        };
+        match Session::open(&mainloop, &source, tx.clone(), &health, running) {
+            Ok(session) => {
+                if let Some(ready) = ready.take() {
+                    let _ = ready.send(Ok(()));
+                }
+                // `run` would forget a loss reported before it.
+                if health.lost.borrow().is_none() {
+                    mainloop.run();
+                }
+                drop(session);
+            }
+            // The first attempt fails the start: the app leaves the track out.
+            Err(e) => match ready.take() {
+                Some(ready) => return drop(ready.send(Err(e))),
+                None => drop(health.lost.borrow_mut().replace(e.to_string())),
+            },
+        }
+        if stopped.get() {
+            return;
+        }
+        if health.streamed.get() {
+            backoff = Backoff::new();
+        }
+        let reason = health.lost.take().unwrap_or_else(|| "stream ended".into());
+        let wait = backoff.next();
+        // Warned once per outage: a removed device retries every 2 s.
+        if reconnecting.replace(true) {
+            debug!("{source:?}: {reason}; reconnecting in {wait:?}");
+        } else {
+            warn!("{source:?}: {reason}; reconnecting");
+            on_state(TrackState::Reconnecting(reason));
+        }
+        let timer = mainloop.loop_().add_timer({
+            let mainloop = mainloop.clone();
+            move |_| mainloop.quit()
+        });
+        let _ = timer.update_timer(Some(wait), None);
+        mainloop.run();
+        if stopped.get() {
+            return;
+        }
+    }
+}
+
+/// One connection to PipeWire and our capture stream on it. Dropping it
+/// disconnects.
+struct Session {
+    /// The app's links and their registry listener: our links go away with
+    /// their proxies.
+    links: Option<(pw::registry::Listener, Rc<RefCell<AppLinks>>)>,
+    listener: Option<pw::stream::StreamListener<mpsc::SyncSender<Chunk>>>,
+    stream: pw::stream::StreamRc,
+    _core_listener: pw::core::Listener,
+    _core: pw::core::CoreRc,
+    _context: pw::context::ContextRc,
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        // Listeners first: our own disconnect must not count as a loss.
+        self.links = None;
+        self.listener = None;
+        if let Err(e) = self.stream.disconnect() {
+            error!("pw_stream_disconnect failed: {e}");
+        }
+    }
+}
+
+impl Session {
+    /// Connects to PipeWire and starts the capture stream. Losing either
+    /// marks `health` lost and leaves `mainloop`; `running` is called each
+    /// time the stream streams.
+    fn open(
+        mainloop: &pw::main_loop::MainLoopRc,
+        source: &Source,
+        tx: mpsc::SyncSender<Chunk>,
+        health: &Rc<Health>,
+        running: impl Fn() + 'static,
+    ) -> Result<Self, Error> {
+        let context = pw::context::ContextRc::new(mainloop, None)?;
         let core = context.connect_rc(None)?;
+        let core_listener = core
+            .add_listener_local()
+            .error({
+                let (health, mainloop) = (health.clone(), mainloop.clone());
+                move |id, _, res, message| {
+                    // Only a lost connection is fatal: errors about other
+                    // objects (a link to a stream that just left) are not.
+                    if id == pw::core::PW_ID_CORE && res == -libc::EPIPE {
+                        health.lose(format!("PipeWire error {res}: {message}"), &mainloop);
+                    }
+                }
+            })
+            .register();
         let mut props = pw::properties::properties! {
             *pw::keys::MEDIA_TYPE => "Audio",
             *pw::keys::MEDIA_CATEGORY => "Capture",
@@ -148,8 +314,9 @@ pub fn run(
             .add_local_listener_with_user_data(tx)
             .state_changed({
                 let (app, core) = (app.clone(), core.clone());
+                let (health, mainloop) = (health.clone(), mainloop.clone());
                 move |stream, _, old, new| {
-                    info!("{name}: stream state {old:?} -> {new:?}");
+                    debug!("{name}: stream state {old:?} -> {new:?}");
                     // Our node id may only be known now: link the ports seen so far.
                     if let Some(app) = &app
                         && matches!(
@@ -159,9 +326,20 @@ pub fn run(
                     {
                         app.borrow_mut().update(&core, stream.node_id());
                     }
-                    if let pw::stream::StreamState::Error(e) = new {
-                        // The encode thread keeps the track going with silence.
-                        error!("{name}: stream error: {e}");
+                    // The encode thread keeps the track going with silence
+                    // until the reconnection.
+                    match new {
+                        pw::stream::StreamState::Streaming => {
+                            health.streamed.set(true);
+                            running();
+                        }
+                        pw::stream::StreamState::Error(e) => {
+                            health.lose(format!("stream error: {e}"), &mainloop);
+                        }
+                        pw::stream::StreamState::Unconnected => {
+                            health.lose("stream disconnected".into(), &mainloop);
+                        }
+                        _ => {}
                     }
                 }
             })
@@ -213,23 +391,14 @@ pub fn run(
             Some(app) => Some((AppLinks::watch(app, &core, &stream)?, app.clone())),
             None => None,
         };
-        Ok((context, core, stream, listener, links))
-    })();
-    let (_context, _core, stream, listener, links) = match setup {
-        Ok(s) => s,
-        Err(e) => return drop(ready.send(Err(e))),
-    };
-    let _stop = stop.attach(mainloop.loop_(), {
-        let mainloop = mainloop.clone();
-        move |()| mainloop.quit()
-    });
-    let _ = ready.send(Ok(()));
-    mainloop.run();
-    // Our links go away with their proxies.
-    drop(links);
-    drop(listener);
-    if let Err(e) = stream.disconnect() {
-        error!("pw_stream_disconnect failed: {e}");
+        Ok(Self {
+            links,
+            listener: Some(listener),
+            stream,
+            _core_listener: core_listener,
+            _core: core,
+            _context: context,
+        })
     }
 }
 
@@ -701,6 +870,14 @@ mod tests {
             buffer_start(true, now, 0, 20_000_000, rate, 1, 960),
             Duration::from_millis(9_980)
         );
+    }
+
+    #[test]
+    fn backoff_doubles_up_to_two_seconds() {
+        let mut b = Backoff::new();
+        let waits: Vec<_> = (0..7).map(|_| b.next().as_millis()).collect();
+        assert_eq!(waits, [100, 200, 400, 800, 1_600, 2_000, 2_000]);
+        assert_eq!(Backoff::new(), Backoff(BACKOFF_FIRST));
     }
 
     #[test]
