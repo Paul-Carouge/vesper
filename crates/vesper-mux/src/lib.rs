@@ -4,7 +4,8 @@
 //! Packet timestamps are `CLOCK_MONOTONIC` instants (see `vesper_core`); the
 //! muxer rebases them to the recording start. Clusters are closed every second
 //! and written straight to the file, so a recording cut short by a crash or a
-//! kill stays playable up to its last complete cluster (no cues, no duration).
+//! kill of the process stays playable up to its last complete cluster (no cues,
+//! no duration). There is no fsync: a power loss or kernel crash can lose more.
 //!
 //! Writes go through `write(2)` into the page cache and normally return in
 //! microseconds, but they can block under dirty-page writeback pressure (slow
@@ -92,6 +93,8 @@ pub struct Muxer {
     audio_tracks: usize,
     /// Video is dropped until the first keyframe so the file starts decodable.
     got_keyframe: bool,
+    /// Last written pts per stream, in its time base.
+    last_pts: Vec<i64>,
 }
 
 // SAFETY: the FFmpeg objects are owned by this struct and only used through
@@ -111,6 +114,13 @@ impl Muxer {
         if video.width == 0 || video.height == 0 || video.fps == 0 {
             return Err(Error("width, height and fps must be non-zero".into()));
         }
+        for a in audio {
+            if a.sample_rate == 0 || a.channels == 0 || !is_opus_head(&a.extradata) {
+                return Err(Error(
+                    "audio tracks need a sample rate, channels and an OpusHead".into(),
+                ));
+            }
+        }
         let cpath = CString::new(path.as_os_str().as_bytes())
             .map_err(|_| Error("path contains a NUL byte".into()))?;
         let mut m = Self {
@@ -120,6 +130,7 @@ impl Muxer {
             frame_ns: 1_000_000_000 / video.fps as i64,
             audio_tracks: audio.len(),
             got_keyframe: false,
+            last_pts: vec![i64::MIN; 1 + audio.len()],
         };
         // On error, `m` is dropped and frees whatever was created so far.
         unsafe {
@@ -161,6 +172,9 @@ impl Muxer {
                 (*par).sample_rate = a.sample_rate as c_int;
                 ff::av_channel_layout_default(&mut (*par).ch_layout, a.channels as c_int);
                 set_extradata(par, &a.extradata)?;
+                // Matroska's CodecDelay must equal Opus's pre-skip (OpusHead bytes 10-11).
+                (*par).initial_padding =
+                    u16::from_le_bytes([a.extradata[10], a.extradata[11]]) as c_int;
             }
 
             check(
@@ -169,6 +183,9 @@ impl Muxer {
             )?;
             // Hand each closed cluster to the OS at once: a kill loses at most ~1 s.
             (*m.ctx).flush_packets = 1;
+            // A stalled track must not make libavformat hold more than a
+            // cluster of the other tracks in memory (default: 10 s).
+            (*m.ctx).max_interleave_delta = 1_000_000;
             let mut opts = ptr::null_mut();
             ff::av_dict_set(
                 &mut opts,
@@ -236,7 +253,14 @@ impl Muxer {
             p.data = packet.data.as_ptr() as *mut u8;
             p.size = size;
             p.stream_index = stream as c_int;
-            p.pts = ff::av_rescale_q(pts_ns, NANOS, tb);
+            let pts = ff::av_rescale_q(pts_ns, NANOS, tb);
+            // libavformat rejects a timestamp going backwards (e.g. after a
+            // capture renegotiation): drop that packet, keep the recording.
+            if pts < self.last_pts[stream] {
+                return Ok(());
+            }
+            self.last_pts[stream] = pts;
+            p.pts = pts;
             p.dts = p.pts; // no B-frames (vesper-core contract)
             p.duration = ff::av_rescale_q(duration_ns, NANOS, tb);
             p.flags = if packet.keyframe {
@@ -281,4 +305,8 @@ impl Drop for Muxer {
         let _ = self.close();
         unsafe { ff::av_packet_free(&mut self.packet) };
     }
+}
+
+fn is_opus_head(extradata: &[u8]) -> bool {
+    extradata.len() >= 19 && extradata.starts_with(b"OpusHead")
 }
