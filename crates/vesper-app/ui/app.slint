@@ -2,9 +2,15 @@
 // owns the truth and writes back the `in` properties.
 
 import { Theme, Icons } from "theme.slint";
-import { Icon, Card, Button, IconButton, Switch, Segmented, Meter, SectionLabel, FocusRing } from "components.slint";
+import { Icon, Card, Button, IconButton, Switch, Segmented, Meter, SectionLabel, FocusRing, Slider, TextField } from "components.slint";
 
 export { Theme }
+
+export enum TrackKind { desktop, microphone, output, input, app }
+/// One audio track. `source` is the backend's id of what it records.
+export struct AudioTrack { name: string, source: string, kind: TrackKind, enabled: bool, muted: bool, volume-db: float }
+/// A source the "Add track" picker offers. `section` heads the first of a group.
+export struct SourceOption { label: string, source: string, kind: TrackKind, section: string, added: bool }
 
 export enum SourceKind { none, screen, window, game }
 /// A game connected through the Vulkan layer that may be captured.
@@ -155,23 +161,46 @@ component Labeled inherits VerticalLayout {
     }
 }
 
+// Labels of the audio tracks.
+global TrackText {
+    // "-3 dB", "+1.5 dB", "Silent" at the bottom of the range.
+    public pure function volume(db: float) -> string {
+        db <= -60 ? "Silent" : (db > 0 ? "+" : "") + "\{Math.round(db * 2) / 2} dB"
+    }
+
+    public pure function icon(kind: TrackKind, muted: bool) -> string {
+        kind == TrackKind.microphone || kind == TrackKind.input
+            ? (muted ? Icons.mic-off : Icons.mic)
+            : kind == TrackKind.app ? (muted ? Icons.app-off : Icons.app) : (muted ? Icons.speaker-off : Icons.speaker)
+    }
+
+    public pure function kind(kind: TrackKind) -> string {
+        kind == TrackKind.desktop ? "Desktop audio"
+            : kind == TrackKind.microphone ? "Microphone"
+            : kind == TrackKind.output ? "Output device"
+            : kind == TrackKind.input ? "Input device" : "Application"
+    }
+}
+
 component AudioRow inherits HorizontalLayout {
-    in property <string> name;
-    in property <string> icon;
-    in property <string> icon-muted;
-    in property <bool> muted;
+    in property <AudioTrack> track;
     in property <float> level;
     in property <float> peak;
     in property <bool> interactive: true;
+    /// Its settings are shown below it.
+    in property <bool> open;
     callback toggle-mute;
+    callback toggle-open;
+
+    property <bool> silent: root.track.muted || !root.track.enabled;
 
     spacing: Theme.space-md;
     alignment: stretch;
 
     IconButton {
-        icon: root.muted ? root.icon-muted : root.icon;
-        label: root.muted ? "Unmute \{root.name}" : "Mute \{root.name}";
-        active: root.muted;
+        icon: TrackText.icon(root.track.kind, root.track.muted);
+        label: root.track.muted ? "Unmute \{root.track.name}" : "Mute \{root.track.name}";
+        active: root.track.muted;
         active-tint: Theme.rec;
         enabled: root.interactive;
         clicked => {
@@ -180,21 +209,24 @@ component AudioRow inherits HorizontalLayout {
     }
 
     VerticalLayout {
-        width: 92px;
+        width: 112px;
         alignment: center;
         spacing: 1px;
         Text {
-            text: root.name;
+            text: root.track.name;
             font-size: Theme.font-body;
             font-weight: 500;
-            color: root.muted ? Theme.text-muted : Theme.text;
+            color: root.silent ? Theme.text-muted : Theme.text;
             overflow: elide;
         }
-        if root.muted: Text {
-            text: "Muted";
+        Text {
+            text: !root.track.enabled ? "Not recorded"
+                : root.track.muted ? "Muted"
+                : root.track.volume-db != 0 ? TrackText.volume(root.track.volume-db) : TrackText.kind(root.track.kind);
             font-size: Theme.font-caption;
-            font-weight: 600;
-            color: Theme.rec;
+            font-weight: root.track.muted && root.track.enabled ? 600 : 400;
+            color: root.track.muted && root.track.enabled ? Theme.rec : Theme.text-muted;
+            overflow: elide;
         }
     }
 
@@ -204,7 +236,89 @@ component AudioRow inherits HorizontalLayout {
         Meter {
             level: root.level;
             peak: root.peak;
-            muted: root.muted;
+            muted: root.silent;
+        }
+    }
+
+    IconButton {
+        icon: Icons.sliders;
+        label: "Settings of \{root.track.name}";
+        active: root.open;
+        enabled: root.interactive;
+        clicked => {
+            root.toggle-open();
+        }
+    }
+}
+
+// A source in the "Add track" picker.
+component SourceRow inherits FocusScope {
+    in property <SourceOption> option;
+    callback clicked;
+
+    focus-on-click: false;
+    height: 36px;
+    accessible-role: button;
+    accessible-label: root.option.added ? "\{root.option.label} (already a track)" : "Add \{root.option.label}";
+    accessible-enabled: root.enabled && !root.option.added;
+    accessible-action-default => {
+        if (root.enabled && !root.option.added) {
+            root.clicked();
+        }
+    }
+
+    key-pressed(event) => {
+        if (event.text == Key.Space || event.text == Key.Return) {
+            if (root.enabled && !root.option.added) { root.clicked(); }
+            return accept;
+        }
+        reject
+    }
+
+    FocusRing {
+        visible-ring: root.has-focus;
+        radius: Theme.radius-sm;
+    }
+
+    Rectangle {
+        border-radius: Theme.radius-sm;
+        background: touch.pressed ? Theme.surface-pressed : touch.has-hover ? Theme.surface-hover : transparent;
+        animate background { duration: Theme.fast; }
+    }
+
+    HorizontalLayout {
+        padding-left: Theme.space-sm;
+        padding-right: Theme.space-sm;
+        spacing: Theme.space-sm;
+        opacity: root.option.added ? 0.45 : 1;
+        Icon {
+            y: (parent.height - self.height) / 2;
+            width: 18px;
+            height: 18px;
+            data: TrackText.icon(root.option.kind, false);
+            tint: Theme.text-muted;
+        }
+        Text {
+            horizontal-stretch: 1;
+            text: root.option.label;
+            vertical-alignment: center;
+            font-size: Theme.font-body;
+            color: Theme.text;
+            overflow: elide;
+        }
+        if root.option.added: Text {
+            text: "Added";
+            vertical-alignment: center;
+            font-size: Theme.font-caption;
+            color: Theme.text-muted;
+        }
+    }
+
+    touch := TouchArea {
+        enabled: root.enabled && !root.option.added;
+        mouse-cursor: self.enabled ? pointer : default;
+        clicked => {
+            root.clicked();
         }
     }
 }
@@ -255,13 +369,17 @@ export component AppWindow inherits Window {
     in property <string> replay-memory;
 
     // ---- Audio --------------------------------------------------------
-    in-out property <bool> desktop-muted;
-    in-out property <bool> mic-muted;
-    /// Linear levels, 0..1.
-    in property <float> desktop-level;
-    in property <float> desktop-peak;
-    in property <float> mic-level;
-    in property <float> mic-peak;
+    in property <[AudioTrack]> tracks;
+    /// Linear levels of each track, 0..1.
+    in property <[float]> track-levels;
+    in property <[float]> track-peaks;
+    /// What "Add track" offers, kept current while the picker is open.
+    in property <[SourceOption]> source-options;
+    /// `source-options` lists applications.
+    in property <bool> apps-playing;
+    in property <int> max-tracks: 8;
+    /// A mix of all tracks as the files' first audio track.
+    in-out property <bool> audio-mix: true;
 
     // ---- Output settings ----------------------------------------------
     in-out property <VideoCodec> codec: VideoCodec.av1;
@@ -294,8 +412,15 @@ export component AppWindow inherits Window {
     callback stop-recording();
     callback save-replay();
     callback replay-changed(bool, int);
-    callback desktop-mute-changed(bool);
-    callback mic-mute-changed(bool);
+    callback track-mute-toggled(int);
+    callback track-volume-changed(int, float);
+    callback track-renamed(int, string);
+    callback track-enabled-changed(int, bool);
+    callback track-removed(int);
+    /// The picker opened or closed: the backend watches sources meanwhile.
+    callback track-picker-changed(bool);
+    callback track-added(SourceOption);
+    callback audio-mix-changed(bool);
     callback output-settings-changed();
     callback pick-output-folder();
     callback open-notice-file();
@@ -333,6 +458,33 @@ export component AppWindow inherits Window {
     // Open and Play only while idle: during a recording the stats keep the row.
     property <bool> notice-actions: root.notice-has-file && root.notice != "" && !root.active;
     property <string> fps-text: (root.recording ? "\{Math.round(root.measured-fps * 10) / 10}" : "\{root.fps}") + " fps";
+    // Audio card: the track whose settings are open (-1: none), and the picker.
+    property <int> open-track: -1;
+    property <bool> picking;
+
+    function set-picking(on: bool) {
+        root.picking = on;
+        root.open-track = -1;
+        root.track-picker-changed(on);
+    }
+
+    public function open-track-settings(i: int) {
+        root.picking = false;
+        root.open-track = i;
+    }
+
+    public function open-track-picker() {
+        if (!root.active && root.tracks.length < root.max-tracks) {
+            root.set-picking(true);
+        }
+    }
+
+    // Adding and removing tracks waits for the recording to end.
+    changed active => {
+        if (root.active && root.picking) {
+            root.set-picking(false);
+        }
+    }
 
     title: "Vesper";
     preferred-width: 440px;
@@ -755,34 +907,163 @@ export component AppWindow inherits Window {
                         spacing: Theme.space-xs;
                         HorizontalLayout {
                             padding-left: Theme.card-padding - Theme.space-xs;
+                            spacing: Theme.space-sm;
                             SectionLabel {
+                                horizontal-stretch: 1;
+                                vertical-alignment: center;
                                 text: "AUDIO";
                             }
-                        }
-                        AudioRow {
-                            interactive: !root.settings-open;
-                            name: "Desktop";
-                            icon: Icons.speaker;
-                            icon-muted: Icons.speaker-off;
-                            muted: root.desktop-muted;
-                            level: root.desktop-level;
-                            peak: root.desktop-peak;
-                            toggle-mute => {
-                                root.desktop-muted = !root.desktop-muted;
-                                root.desktop-mute-changed(root.desktop-muted);
+                            if !root.picking: Button {
+                                text: "Add track";
+                                icon: Icons.plus;
+                                kind: "ghost";
+                                small: true;
+                                enabled: !root.active && !root.settings-open && root.tracks.length < root.max-tracks;
+                                accessible-description: root.active ? "Locked while recording" : root.tracks.length >= root.max-tracks ? "At most \{root.max-tracks} tracks" : "";
+                                clicked => {
+                                    root.set-picking(true);
+                                }
+                            }
+                            if root.picking: Button {
+                                text: "Cancel";
+                                kind: "ghost";
+                                small: true;
+                                accessible-label: "Close the source list";
+                                clicked => {
+                                    root.set-picking(false);
+                                }
                             }
                         }
-                        AudioRow {
-                            interactive: !root.settings-open;
-                            name: "Microphone";
-                            icon: Icons.mic;
-                            icon-muted: Icons.mic-off;
-                            muted: root.mic-muted;
-                            level: root.mic-level;
-                            peak: root.mic-peak;
-                            toggle-mute => {
-                                root.mic-muted = !root.mic-muted;
-                                root.mic-mute-changed(root.mic-muted);
+                        if root.tracks.length == 0 && !root.picking: HorizontalLayout {
+                            padding-left: Theme.card-padding - Theme.space-xs;
+                            Text {
+                                height: Theme.control-height;
+                                text: "No audio is recorded.";
+                                vertical-alignment: center;
+                                font-size: Theme.font-small;
+                                color: Theme.text-muted;
+                            }
+                        }
+                        for track[i] in root.tracks: VerticalLayout {
+                            spacing: Theme.space-xs;
+                            AudioRow {
+                                interactive: !root.settings-open;
+                                track: track;
+                                level: root.track-levels[i];
+                                peak: root.track-peaks[i];
+                                open: root.open-track == i;
+                                toggle-mute => {
+                                    root.track-mute-toggled(i);
+                                }
+                                toggle-open => {
+                                    root.picking = false;
+                                    root.open-track = root.open-track == i ? -1 : i;
+                                }
+                            }
+                            // Settings of the open track, under its name.
+                            if root.open-track == i: VerticalLayout {
+                                padding-left: Theme.control-height + Theme.space-md;
+                                padding-bottom: Theme.space-sm;
+                                spacing: Theme.space-sm;
+                                accessible-role: groupbox;
+                                accessible-label: "Settings of \{track.name}";
+                                TextField {
+                                    text: track.name;
+                                    label: "Track name";
+                                    enabled: !root.active;
+                                    accepted(name) => {
+                                        root.track-renamed(i, name);
+                                    }
+                                }
+                                HorizontalLayout {
+                                    spacing: Theme.space-md;
+                                    Slider {
+                                        horizontal-stretch: 1;
+                                        label: "Volume of \{track.name}";
+                                        minimum: -60;
+                                        maximum: 12;
+                                        step: 1;
+                                        value: track.volume-db;
+                                        value-text: TrackText.volume(track.volume-db);
+                                        changed(db) => {
+                                            root.track-volume-changed(i, db);
+                                        }
+                                    }
+                                    Text {
+                                        width: 52px;
+                                        text: TrackText.volume(track.volume-db);
+                                        horizontal-alignment: right;
+                                        vertical-alignment: center;
+                                        font-size: Theme.font-small;
+                                        color: Theme.text-muted;
+                                    }
+                                }
+                                HorizontalLayout {
+                                    spacing: Theme.space-sm;
+                                    VerticalLayout {
+                                        alignment: center;
+                                        Switch {
+                                            label: "Record \{track.name}";
+                                            enabled: !root.active;
+                                            checked: track.enabled;
+                                            toggled(on) => {
+                                                root.track-enabled-changed(i, on);
+                                            }
+                                        }
+                                    }
+                                    Text {
+                                        horizontal-stretch: 1;
+                                        text: "Recorded";
+                                        vertical-alignment: center;
+                                        font-size: Theme.font-small;
+                                        color: Theme.text-muted;
+                                    }
+                                    Button {
+                                        text: "Remove";
+                                        kind: "ghost";
+                                        small: true;
+                                        enabled: !root.active;
+                                        accessible-label: "Remove \{track.name}";
+                                        clicked => {
+                                            root.open-track = -1;
+                                            root.track-removed(i);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        // The source picker: one tap adds a track.
+                        if root.picking: VerticalLayout {
+                            padding-left: Theme.card-padding - Theme.space-xs - Theme.space-sm;
+                            padding-bottom: Theme.space-xs;
+                            spacing: 2px;
+                            accessible-role: list;
+                            accessible-label: "Sources";
+                            for option in root.source-options: VerticalLayout {
+                                spacing: 2px;
+                                if option.section != "": SectionLabel {
+                                    x: Theme.space-sm;
+                                    height: 24px;
+                                    vertical-alignment: bottom;
+                                    text: option.section;
+                                }
+                                SourceRow {
+                                    option: option;
+                                    clicked => {
+                                        root.set-picking(false);
+                                        root.track-added(option);
+                                    }
+                                }
+                            }
+                            if !root.apps-playing: HorizontalLayout {
+                                padding-left: Theme.space-sm;
+                                padding-top: Theme.space-xs;
+                                Text {
+                                    text: "Applications show up here while they play audio.";
+                                    font-size: Theme.font-small;
+                                    color: Theme.text-muted;
+                                    wrap: word-wrap;
+                                }
                             }
                         }
                     }
@@ -1001,6 +1282,31 @@ export component AppWindow inherits Window {
                             changed(i) => {
                                 root.fps = root.fps-options[i];
                                 root.output-settings-changed();
+                            }
+                        }
+                    }
+
+                    SettingGroup {
+                        label: "AUDIO";
+                        hint: "Each track is saved separately, for editing. The mix comes first, so players that play one track play everything.";
+                        HorizontalLayout {
+                            spacing: Theme.space-md;
+                            Labeled {
+                                horizontal-stretch: 1;
+                                title: "Mix of all tracks";
+                                subtitle: "Added when two or more tracks record";
+                            }
+                            VerticalLayout {
+                                alignment: center;
+                                Switch {
+                                    label: "Mix of all tracks";
+                                    enabled: !root.active;
+                                    checked: root.audio-mix;
+                                    toggled(on) => {
+                                        root.audio-mix = on;
+                                        root.audio-mix-changed(on);
+                                    }
+                                }
                             }
                         }
                     }

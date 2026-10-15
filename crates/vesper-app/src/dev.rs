@@ -171,10 +171,9 @@ pub fn apply(ui: &AppWindow) {
                         });
                     });
                 }
-                "muted" => {
-                    ui.set_mic_muted(true);
-                    ui.invoke_mic_mute_changed(true);
-                }
+                "muted" => ui.invoke_track_mute_toggled(1),
+                "track-open" => ui.invoke_open_track_settings(0),
+                "track-picker" => ui.invoke_open_track_picker(),
                 "tab" => press_key(&ui, Key::Tab.into(), false),
                 "esc" => press_key(&ui, Key::Escape.into(), false),
                 other => match other.strip_prefix("ctrl+") {
@@ -250,6 +249,27 @@ fn look(ui: &AppWindow, step: &str) -> bool {
             ui.set_measured_fps(59.9);
             ui.set_rec_state(crate::RecState::Stopping);
             ui.set_elapsed_seconds(83);
+        }
+        "tracks-look" => {
+            use crate::recorder::Track;
+            use vesper_audio::Source;
+            let tracks = [
+                Track::new("Desktop", Source::Desktop),
+                Track::new("Microphone", Source::Microphone),
+                Track {
+                    volume_db: -6.0,
+                    ..Track::new("Firefox", Source::App("Firefox".into()))
+                },
+                Track {
+                    muted: true,
+                    ..Track::new("Headset", Source::Output("alsa_output.usb".into()))
+                },
+            ];
+            crate::audio::show_tracks(ui, &tracks);
+            let levels = [0.62, 0.35, 0.48, 0.0];
+            let model = |v: &[f32]| std::rc::Rc::new(slint::VecModel::from(v.to_vec())).into();
+            ui.set_track_levels(model(&levels));
+            ui.set_track_peaks(model(&levels.map(|l: f32| (l + 0.12).min(1.0))));
         }
         "replay-on" => ui.set_replay_enabled(true),
         "replay-off" => ui.set_replay_enabled(false),

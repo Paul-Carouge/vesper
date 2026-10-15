@@ -14,8 +14,9 @@
 //!   tick encodes the parked frame, or repeats the last picture when the
 //!   compositor sent none (Wayland sends frames on damage only), so the file
 //!   has exactly `fps` frames per second. Packets go straight to the sinks.
-//! - Audio threads (`vesper-audio`, two per source): Opus packets of the
-//!   desktop and microphone tracks go to the same sinks, behind a mutex.
+//! - Audio threads (`vesper-audio`, two per track): Opus packets of each
+//!   audio track, and of the mix of them all, go to the same sinks, behind a
+//!   mutex. The mix is encoded on whichever track thread completes a block.
 //! - Replay threads: each saved replay is muxed on its own thread from a
 //!   snapshot of the ring (shared packet data, no copy).
 
@@ -30,7 +31,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use vesper_audio::{AudioCapture, CHANNELS, SAMPLE_RATE, Source};
+use vesper_audio::{AudioCapture, CHANNELS, Mix, Options, SAMPLE_RATE, Source};
 use vesper_capture::Capture;
 use vesper_core::{Codec, EncodedPacket, VideoFrame};
 use vesper_encode::{Encoder, RateControl};
@@ -61,8 +62,10 @@ pub struct Settings {
     pub quality: u32,
     /// Bitrate cap per pixel per frame; scaled by the captured size and `fps`.
     pub max_bits_per_pixel: f64,
-    pub desktop_muted: bool,
-    pub mic_muted: bool,
+    /// Audio tracks, disabled ones included (indices match the UI's).
+    pub tracks: Vec<Track>,
+    /// Put a mix of the tracks first, for players that play one track only.
+    pub mix: bool,
     /// Record the game these frames come from instead of a portal source.
     pub game: Option<GameFrames>,
 }
@@ -153,12 +156,77 @@ pub enum Event {
     Stopped(Option<String>),
 }
 
-/// Audio captures and mute state, shared with the UI thread. One lock, so a
-/// mute toggled while the picker is open applies once the captures start.
+/// Most audio tracks a recording has, the mix aside.
+pub const MAX_TRACKS: usize = 8;
+
+/// Name of the mix in the files.
+const MIX_NAME: &str = "Mix";
+
+/// One audio track as the user set it up.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Track {
+    pub name: String,
+    pub source: Source,
+    /// Recorded at all.
+    pub enabled: bool,
+    pub muted: bool,
+    /// See `vesper_audio::db_to_gain`.
+    pub volume_db: f32,
+}
+
+impl Track {
+    pub fn new(name: &str, source: Source) -> Self {
+        Self {
+            name: name.to_owned(),
+            source,
+            enabled: true,
+            muted: false,
+            volume_db: 0.0,
+        }
+    }
+}
+
+/// Audio tracks and their captures, shared with the UI thread. One lock, so
+/// a mute toggled while the picker is open applies once the captures start.
 #[derive(Default)]
 struct Audio {
-    running: Vec<(Source, AudioCapture)>,
-    muted: Vec<Source>,
+    /// The tracks, kept current by the UI (mute, volume, name).
+    tracks: Vec<Track>,
+    mix: bool,
+    /// Set when `tracks` changed shape: the audio restarts once nothing records.
+    changed: bool,
+    /// Running captures with their index in `tracks`, in file order.
+    running: Vec<(usize, AudioCapture)>,
+    /// First in the files when set.
+    mixer: Option<Mix>,
+}
+
+impl Audio {
+    /// Number of audio streams in a file.
+    fn streams(&self) -> usize {
+        usize::from(self.mixer.is_some()) + self.running.len()
+    }
+
+    /// Audio stream descriptions for a new file, with the current names.
+    fn file_tracks(&self) -> Vec<AudioTrack> {
+        let track = |name: &str, extradata: &[u8]| AudioTrack {
+            name: name.to_owned(),
+            sample_rate: SAMPLE_RATE,
+            channels: u32::from(CHANNELS),
+            extradata: extradata.to_vec(),
+        };
+        let mix = self.mixer.iter().map(|m| track(MIX_NAME, m.extradata()));
+        let tracks = self.running.iter().map(|(i, capture)| {
+            let name = self.tracks.get(*i).map_or("", |t| t.name.as_str());
+            track(name, capture.extradata())
+        });
+        mix.chain(tracks).collect()
+    }
+
+    fn track(&mut self, index: usize) -> (Option<&mut Track>, Option<&AudioCapture>) {
+        let capture = self.running.iter().find(|(i, _)| *i == index);
+        (self.tracks.get_mut(index), capture.map(|(_, c)| c))
+    }
 }
 
 type AudioSources = Arc<Mutex<Audio>>;
@@ -210,15 +278,11 @@ impl Pipeline {
             replay,
             ..Control::default()
         }));
-        let audio = AudioSources::default();
-        for (source, muted) in [
-            (Source::Desktop, settings.desktop_muted),
-            (Source::Microphone, settings.mic_muted),
-        ] {
-            if muted {
-                lock(&audio).muted.push(source);
-            }
-        }
+        let audio = Arc::new(Mutex::new(Audio {
+            tracks: settings.tracks.clone(),
+            mix: settings.mix,
+            ..Audio::default()
+        }));
         let started = Arc::new(AtomicBool::new(false));
         let on_event: OnEvent = Arc::new(on_event);
         let (ctl, started_flag, sources) = (control.clone(), started.clone(), audio.clone());
@@ -232,9 +296,7 @@ impl Pipeline {
                 .unwrap_or_else(|_| Err("Internal error: the recorder crashed".into()));
                 lock(&ctl).ended = true;
                 // After a panic, the audio captures (mic included) must not keep running.
-                // Taken under the lock, dropped outside it (their flush writes to the sinks).
-                let running = std::mem::take(&mut lock(&sources).running);
-                drop(running);
+                stop_audio(&sources);
                 on_event(Event::Stopped(result.err()));
             })?;
         Ok(Self {
@@ -281,27 +343,51 @@ impl Pipeline {
         self.request(|c| c.save = Some(folder))
     }
 
-    /// Mutes a track (it records silence).
-    pub fn set_muted(&self, source: Source, muted: bool) {
+    /// Mutes track `index` (it records silence), live.
+    pub fn set_muted(&self, index: usize, muted: bool) {
         let mut audio = lock(&self.audio);
-        audio.muted.retain(|s| *s != source);
-        if muted {
-            audio.muted.push(source);
+        let (track, capture) = audio.track(index);
+        if let Some(t) = track {
+            t.muted = muted;
         }
-        for (s, capture) in &audio.running {
-            if *s == source {
-                capture.set_muted(muted);
-            }
+        if let Some(c) = capture {
+            c.set_muted(muted);
         }
     }
 
-    /// Recent peak of a track, linear 0..=1; 0 when it does not run.
-    pub fn peak(&self, source: Source) -> f32 {
+    /// Sets the volume of track `index`, live.
+    pub fn set_volume(&self, index: usize, db: f32) {
+        let mut audio = lock(&self.audio);
+        let (track, capture) = audio.track(index);
+        if let Some(t) = track {
+            t.volume_db = db;
+        }
+        if let Some(c) = capture {
+            c.set_volume_db(db);
+        }
+    }
+
+    /// Renames track `index`: files created from now on carry the new name.
+    pub fn set_name(&self, index: usize, name: &str) {
+        if let Some(t) = lock(&self.audio).tracks.get_mut(index) {
+            t.name = name.to_owned();
+        }
+    }
+
+    /// Replaces the tracks (added, removed, enabled) or the mix setting. The
+    /// audio restarts on the next frame, or once the recording ends.
+    pub fn set_tracks(&self, tracks: Vec<Track>, mix: bool) {
+        let mut audio = lock(&self.audio);
+        (audio.tracks, audio.mix, audio.changed) = (tracks, mix, true);
+    }
+
+    /// Recent peak of track `index`, linear 0..=1; 0 when it does not run.
+    pub fn peak(&self, index: usize) -> f32 {
         let audio = lock(&self.audio);
         audio
             .running
             .iter()
-            .find(|(s, _)| *s == source)
+            .find(|(i, _)| *i == index)
             .map_or(0.0, |(_, capture)| capture.peak())
     }
 
@@ -457,40 +543,88 @@ fn interleave((video, audio): Snapshot) -> Vec<(usize, EncodedPacket)> {
     all
 }
 
-/// Starts the desktop and microphone captures. A source that fails to start
-/// is left out of the files (e.g. no microphone).
-fn start_audio(sources: &AudioSources, sinks: &SharedSinks) -> Vec<AudioTrack> {
-    let mut tracks = Vec::new();
-    for source in [Source::Desktop, Source::Microphone] {
-        let (index, sinks) = (tracks.len(), sinks.clone());
-        let capture = AudioCapture::start(source, move |packet| {
-            let mut s = lock(&sinks);
-            if let Some(r) = s.rec.as_mut()
-                && let Err(e) = r.mux.write_audio(index, &packet)
-            {
-                log!("{source:?} audio: {e}");
-            }
-            if let Some(ring) = s.ring.as_mut() {
-                ring.push_audio(index, packet);
-            }
-        });
-        match capture {
-            Ok(capture) => {
-                // Started outside the lock (it blocks until PipeWire is
-                // ready); mute applied under it, so no toggle is missed.
-                let mut audio = lock(sources);
-                capture.set_muted(audio.muted.contains(&source));
-                tracks.push(AudioTrack {
-                    sample_rate: SAMPLE_RATE,
-                    channels: u32::from(CHANNELS),
-                    extradata: capture.extradata().to_vec(),
-                });
-                audio.running.push((source, capture));
-            }
-            Err(e) => log!("running without {source:?} audio: {e}"),
+/// Writes an audio packet of file stream `index` (the video aside) to the sinks.
+fn write_audio(sinks: &SharedSinks, index: usize, packet: EncodedPacket) {
+    let mut s = lock(sinks);
+    if let Some(r) = s.rec.as_mut()
+        && let Err(e) = r.mux.write_audio(index, &packet)
+    {
+        log!("audio track {index}: {e}");
+    }
+    if let Some(ring) = s.ring.as_mut() {
+        ring.push_audio(index, packet);
+    }
+}
+
+/// Starts the enabled tracks and their mix. A track that fails to start is
+/// left out of the files (e.g. no microphone); the mix needs two tracks.
+fn start_audio(sources: &AudioSources, sinks: &SharedSinks) {
+    let (tracks, mix) = {
+        let mut audio = lock(sources);
+        audio.changed = false;
+        (audio.tracks.clone(), audio.mix)
+    };
+    let enabled: Vec<usize> = (0..tracks.len()).filter(|&i| tracks[i].enabled).collect();
+    // One clock for every track, so the mix lines their samples up.
+    let anchor = monotonic_now();
+    let mut mixer = None;
+    if mix && enabled.len() >= 2 {
+        let sinks = sinks.clone();
+        match Mix::start(anchor, move |packet| write_audio(&sinks, 0, packet)) {
+            Ok(m) => mixer = Some(m),
+            Err(e) => log!("recording without the mix: {e}"),
         }
     }
-    tracks
+    // Every input exists before any track runs.
+    let mut inputs: Vec<_> = enabled
+        .iter()
+        .map(|_| mixer.as_ref().map(Mix::input))
+        .collect();
+    let first = usize::from(mixer.is_some());
+    let mut running = Vec::new();
+    for (input, &i) in inputs.iter_mut().zip(&enabled) {
+        let track = &tracks[i];
+        let (index, sinks) = (first + running.len(), sinks.clone());
+        let options = Options {
+            anchor,
+            muted: track.muted,
+            volume_db: track.volume_db,
+            mix: input.take(),
+            // Seam for per-track processing (noise suppression, compressor...).
+            process: None,
+        };
+        match AudioCapture::start(track.source.clone(), options, move |packet| {
+            write_audio(&sinks, index, packet)
+        }) {
+            Ok(capture) => running.push((i, capture)),
+            Err(e) => log!("running without the {:?} track: {e}", track.name),
+        }
+    }
+    // A mix of one track would be a copy of it.
+    if running.len() < 2 {
+        drop(mixer.take());
+    }
+    // Started outside the lock (it blocks until PipeWire is ready); the
+    // latest mute and volume applied under it, so no change is missed.
+    let mut audio = lock(sources);
+    for (i, capture) in &running {
+        if let Some(t) = audio.tracks.get(*i) {
+            capture.set_muted(t.muted);
+            capture.set_volume_db(t.volume_db);
+        }
+    }
+    (audio.running, audio.mixer) = (running, mixer);
+}
+
+/// Stops the captures, then the mix: their last packets go to the sinks, so
+/// never call it holding the sinks lock.
+fn stop_audio(sources: &AudioSources) {
+    let (running, mixer) = {
+        let mut audio = lock(sources);
+        (std::mem::take(&mut audio.running), audio.mixer.take())
+    };
+    drop(running);
+    drop(mixer);
 }
 
 fn run(
@@ -522,17 +656,16 @@ fn run(
         }
     };
     let sinks = SharedSinks::default();
-    let audio = start_audio(sources, &sinks);
+    start_audio(sources, &sinks);
     started.store(true, Ordering::Relaxed);
-    let result = pump(settings, &slot, control, &sinks, &audio, on_event);
+    let result = pump(settings, &slot, control, &sinks, sources, on_event);
     drop(capture);
     if let Some(game) = &settings.game {
         game.detach(&slot);
     }
     // Stopping the audio flushes its last packets into the sinks, so do it
     // before closing, without holding the sinks lock the audio threads need.
-    let running = std::mem::take(&mut lock(sources).running);
-    drop(running);
+    stop_audio(sources);
     let rec = lock(&sinks).rec.take();
     if let Some(r) = rec {
         on_event(Event::Finished(r.finish(result.clone().err())));
@@ -640,15 +773,16 @@ fn save_replay(
     video: Option<&Video>,
     sinks: &SharedSinks,
     control: &Mutex<Control>,
-    audio: &[AudioTrack],
+    sources: &AudioSources,
     on_event: &OnEvent,
 ) {
+    let audio = lock(sources).file_tracks();
     let snapshot = lock(sinks).ring.as_ref().map(Ring::snapshot);
     let (Some(video), Some(snapshot)) = (video, snapshot) else {
         on_event(Event::ReplaySaved(Err("The replay buffer is empty".into())));
         return;
     };
-    let (track, audio, event) = (video.track.clone(), audio.to_vec(), on_event.clone());
+    let (track, event) = (video.track.clone(), on_event.clone());
     let spawned = std::thread::Builder::new()
         .name("vesper-replay".into())
         .spawn(move || {
@@ -674,7 +808,7 @@ fn pump(
     slot: &Mutex<Slot>,
     control: &Mutex<Control>,
     sinks: &SharedSinks,
-    audio: &[AudioTrack],
+    sources: &AudioSources,
     on_event: &OnEvent,
 ) -> Result<(), String> {
     let fps = settings.fps;
@@ -752,19 +886,28 @@ fn pump(
             }
             (record, stop, c.replay, c.save.take())
         };
+        // New tracks: restart the audio, and its part of the replay buffer
+        // (the old tracks' packets do not match the new files' streams).
+        let changed = lock(sources).changed;
+        if changed && lock(sinks).rec.is_none() {
+            log!("audio tracks changed: restarting the audio");
+            stop_audio(sources);
+            start_audio(sources, sinks);
+            let streams = lock(sources).streams();
+            if let Some(ring) = lock(sinks).ring.as_mut() {
+                ring.audio = vec![VecDeque::new(); streams];
+            }
+        }
+        let streams = lock(sources).streams();
         {
             let mut s = lock(sinks);
             match replay {
                 None => s.ring = None,
-                Some(span) => {
-                    s.ring
-                        .get_or_insert_with(|| Ring::new(span, audio.len()))
-                        .span = span
-                }
+                Some(span) => s.ring.get_or_insert_with(|| Ring::new(span, streams)).span = span,
             }
         }
         if let Some(folder) = save {
-            save_replay(folder, video.as_ref(), sinks, control, audio, on_event);
+            save_replay(folder, video.as_ref(), sinks, control, sources, on_event);
         }
         // While nothing records, follow a lasting size change with a new
         // encoder (and an empty replay buffer: its packets need the old one).
@@ -789,8 +932,9 @@ fn pump(
                 }
             }
             (k, first, last_size) = (0, true, None);
+            let streams = lock(sources).streams();
             if let Some(ring) = lock(sinks).ring.as_mut() {
-                *ring = Ring::new(ring.span, audio.len());
+                *ring = Ring::new(ring.span, streams);
             }
         }
         let Some(v) = &mut video else {
@@ -803,7 +947,8 @@ fn pump(
         }
         let pts = v.start + frame_offset(k, fps);
         if let Some(folder) = record {
-            match create_file(&folder, "Vesper", pts, &v.track, audio) {
+            let audio = lock(sources).file_tracks();
+            match create_file(&folder, "Vesper", pts, &v.track, &audio) {
                 Ok((mut mux, path)) => {
                     log!("recording to {}", path.display());
                     v.enc.force_keyframe();

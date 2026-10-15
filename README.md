@@ -14,7 +14,7 @@ A fast, bloat-free screen recorder for desktop and gaming, written in Rust. An a
    **Game capture** (Vulkan, incl. Proton): an implicit Vulkan layer (`vesper-vklayer`, opt-in with the *Game capture* switch in the settings) copies each presented image into exported DMA-BUFs and sends them over `/tmp/vesper-<uid>/capture.sock` to `vesper-gamecapture`. The socket is in `/tmp`, not `$XDG_RUNTIME_DIR`, because Proton games run inside the Steam Linux Runtime container (pressure-vessel). That container replaces `$XDG_RUNTIME_DIR` with its own tmpfs but shares the host's `/tmp`. Game only, at the game's frame rate, no portal.
 2. **Conversion**: RGB to NV12 on the GPU (VA-VPP).
 3. **Encoding**: VAAPI hardware encode (AV1 / HEVC / H.264). Prototype with `cros-codecs`, fall back to `ffmpeg-next`.
-4. **Audio**: PipeWire desktop monitor + microphone as separate tracks, Opus.
+4. **Audio**: up to 8 PipeWire tracks (desktop, microphone, a device by node name, or an application's streams, followed as they come and go), each its own named Opus track, plus an optional mix of them all as the first track. Volume and mute per track, applied live.
 5. **Container**: MKV (crash-safe), optional remux to MP4.
 
 ## Game capture layer: what it does when installed
@@ -36,7 +36,7 @@ Risks and limits: anti-cheats (EAC, BattlEye) may flag or reject unknown Vulkan 
 ## Done
 
 - Record a screen, a window or a game (Vulkan layer), constant frame rate, AV1 / HEVC / H.264 with constant-quality presets.
-- Two audio tracks (desktop, mic), drift-corrected.
+- Up to 8 named audio tracks (desktop, mic, devices, applications) with volume and mute, plus a mix track, sample-aligned and drift-corrected.
 - Global hotkeys (GlobalShortcuts portal).
 - Replay buffer: ring buffer of encoded packets, save the last N seconds.
 - Slint UI, tray icon, start with the session.
@@ -79,7 +79,7 @@ With a tray, closing the window keeps Vesper running in the background, with the
 
 Every feature below must keep recording quality, game performance and compatibility intact: nothing on the game's render path, compositing and encoding on the GPU, audio processing off the PipeWire real-time thread.
 
-1. **Audio**: multiple tracks (devices, per-application capture, optional mix track), built-in filters per track (noise suppression, expander, compressor, de-esser, limiter, high-pass, gain).
+1. **Audio**: built-in filters per track (noise suppression, expander, compressor, de-esser, limiter, high-pass, gain).
 2. **VST3 plugins** per track, hosted out of process so a crashing plugin can't take a recording down.
 3. **Scenes and profiles**: sources composited on the GPU (VA-VPP / Vulkan) into the encoded picture, saved per profile.
 4. **Overlays**: images, text, webcam, and optional browser sources, on the same GPU compositor.

@@ -1,8 +1,11 @@
-//! Desktop and microphone audio capture through PipeWire, encoded to Opus.
+//! Audio capture through PipeWire (desktop, microphone, a device, or an
+//! application's streams), encoded to Opus.
 //!
 //! [`AudioCapture::start`] runs one PipeWire stream (its own thread) and one
 //! encode thread per source. Packets carry `CLOCK_MONOTONIC` pts like the
-//! video frames, so the muxer can put both on one time base.
+//! video frames, so the muxer can put both on one time base. Tracks started
+//! with the same anchor are sample-aligned, so a [`Mix`] can sum them.
+//! [`NodeWatch`] lists the devices and applications that can be recorded.
 //!
 //! Timestamps come from a sample counter anchored at the start time, so a
 //! track has no gaps. Each PipeWire buffer is also placed on the monotonic
@@ -15,6 +18,8 @@
 //! and per 480 frames (~2000 ppm ceiling up to 480-frame buffers, ~977 ppm at
 //! 1024, ~488 ppm at 2048).
 
+mod mix;
+mod nodes;
 mod pw;
 
 use std::sync::Arc;
@@ -30,8 +35,15 @@ use ffmpeg_next as ffmpeg;
 use tracing::{error, warn};
 use vesper_core::EncodedPacket;
 
+pub use mix::{Mix, MixInput};
+pub use nodes::{Node, NodeWatch};
+
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// Per-track processing of each 20 ms block (interleaved stereo F32), run on
+/// the encode thread before the volume and the encoder.
+pub type Process = Box<dyn FnMut(&mut [f32]) + Send>;
 
 /// Output sample rate of every track.
 pub const SAMPLE_RATE: u32 = 48_000;
@@ -57,21 +69,76 @@ const DRIFT_ALPHA: f64 = 1.0 / 32.0;
 /// With no buffer for this long, the source is stalled: fill with silence.
 const STALL: Duration = Duration::from_millis(250);
 
-/// Which audio to record.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Lowest volume: at or below it a track is silent.
+pub const MIN_DB: f32 = -60.0;
+/// Highest volume.
+pub const MAX_DB: f32 = 12.0;
+
+/// Linear gain of a volume in dB, clamped to `MIN_DB..=MAX_DB`; `MIN_DB` is silence.
+pub fn db_to_gain(db: f32) -> f32 {
+    if db.is_nan() || db <= MIN_DB {
+        0.0
+    } else {
+        10f32.powf(db.min(MAX_DB) / 20.0)
+    }
+}
+
+/// Which audio to record. Devices are named by their PipeWire `node.name`,
+/// which stays the same across reboots.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Source {
-    /// Monitor of the default output device.
+    /// Monitor of the default output device (follows the default).
     Desktop,
-    /// Default input device.
+    /// Default input device (follows the default).
     Microphone,
+    /// Monitor of this output device (sink).
+    Output(String),
+    /// This input device (source).
+    Input(String),
+    /// Every playback stream of this application (`application.name`, or
+    /// `application.process.binary`), including streams it opens later.
+    App(String),
+}
+
+impl Source {
+    /// Whether it records an input (its buffers were captured in the past)
+    /// rather than playback (heard after the output's delay).
+    fn is_input(&self) -> bool {
+        matches!(self, Self::Microphone | Self::Input(_))
+    }
+}
+
+/// How a capture starts.
+pub struct Options {
+    /// `CLOCK_MONOTONIC` start of the track's timeline. Tracks meant to be
+    /// mixed share it: their samples then line up one to one.
+    pub anchor: Duration,
+    pub muted: bool,
+    /// Volume in dB, see [`db_to_gain`].
+    pub volume_db: f32,
+    /// Also feeds this mix with the track's samples, after volume.
+    pub mix: Option<MixInput>,
+    /// Processing before volume and encoding; `None` leaves samples as is.
+    pub process: Option<Process>,
 }
 
 /// State shared with the encode thread.
-#[derive(Default)]
 struct Shared {
     muted: AtomicBool,
+    /// `f32` bits of the linear gain.
+    gain: AtomicU32,
     /// `f32` bits of the last window's peak.
     peak: AtomicU32,
+}
+
+impl Default for Shared {
+    fn default() -> Self {
+        Self {
+            muted: AtomicBool::new(false),
+            gain: AtomicU32::new(1f32.to_bits()),
+            peak: AtomicU32::new(0),
+        }
+    }
 }
 
 /// A running audio capture. Dropping it stops the capture.
@@ -88,27 +155,24 @@ impl AudioCapture {
     /// one Opus packet per 20 ms, without gaps, until the capture stops.
     pub fn start(
         source: Source,
+        options: Options,
         on_packet: impl FnMut(EncodedPacket) + Send + 'static,
     ) -> Result<Self> {
-        let anchor = monotonic_now();
         let encoder = open_encoder()?;
-        // SAFETY: the opened encoder owns valid extradata of that size.
-        let extradata = unsafe {
-            let ctx = encoder.as_ptr();
-            if (*ctx).extradata.is_null() {
-                return Err("libopus produced no OpusHead".into());
-            }
-            std::slice::from_raw_parts((*ctx).extradata, (*ctx).extradata_size as usize).to_vec()
-        };
+        let extradata = opus_head(&encoder)?;
         let shared = Arc::new(Shared::default());
+        shared.muted.store(options.muted, Ordering::Relaxed);
+        shared
+            .gain
+            .store(db_to_gain(options.volume_db).to_bits(), Ordering::Relaxed);
         // ~1 s of buffers at the default quantum.
         let (chunk_tx, chunk_rx) = mpsc::sync_channel(50);
+        let mut enc = Encoder::new(encoder, options.anchor, shared.clone(), on_packet);
+        enc.process = options.process;
+        enc.mix = options.mix;
         let encode_thread = std::thread::Builder::new()
             .name("vesper-audio-enc".into())
-            .spawn({
-                let shared = shared.clone();
-                move || encode_loop(encoder, anchor, chunk_rx, &shared, on_packet)
-            })?;
+            .spawn(move || encode_loop(enc, chunk_rx))?;
         let (stop, stop_rx) = ::pipewire::channel::channel();
         let (ready_tx, ready_rx) = mpsc::channel();
         let pw_thread = std::thread::Builder::new()
@@ -129,6 +193,13 @@ impl AudioCapture {
     /// Muted tracks keep producing packets, of silence.
     pub fn set_muted(&self, muted: bool) {
         self.shared.muted.store(muted, Ordering::Relaxed);
+    }
+
+    /// Volume in dB, see [`db_to_gain`]. Ramped over the next 20 ms.
+    pub fn set_volume_db(&self, db: f32) {
+        self.shared
+            .gain
+            .store(db_to_gain(db).to_bits(), Ordering::Relaxed);
     }
 
     /// Peak level of the last ~33 ms, linear 0..=1 (0 while muted).
@@ -161,6 +232,18 @@ impl Drop for AudioCapture {
     }
 }
 
+/// The encoder's `OpusHead`.
+fn opus_head(encoder: &encoder::Audio) -> Result<Vec<u8>> {
+    // SAFETY: the opened encoder owns valid extradata of that size.
+    unsafe {
+        let ctx = encoder.as_ptr();
+        if (*ctx).extradata.is_null() {
+            return Err("libopus produced no OpusHead".into());
+        }
+        Ok(std::slice::from_raw_parts((*ctx).extradata, (*ctx).extradata_size as usize).to_vec())
+    }
+}
+
 fn open_encoder() -> Result<encoder::Audio> {
     let codec = encoder::find_by_name("libopus").ok_or("FFmpeg has no libopus encoder")?;
     let mut ctx = codec::Context::new_with_codec(codec).encoder().audio()?;
@@ -178,7 +261,8 @@ fn open_encoder() -> Result<encoder::Audio> {
     Ok(encoder)
 }
 
-pub(crate) fn monotonic_now() -> Duration {
+/// Now on `CLOCK_MONOTONIC`, the clock of every pts.
+pub fn monotonic_now() -> Duration {
     let mut ts = libc::timespec {
         tv_sec: 0,
         tv_nsec: 0,
@@ -254,34 +338,86 @@ impl Timeline {
     }
 }
 
+/// Ramps the gain of interleaved stereo `samples` from `from` to `to` over
+/// the block, so a volume change or a mute does not click.
+fn apply_gain(samples: &mut [f32], from: f32, to: f32) {
+    if from == to {
+        if to != 1.0 {
+            samples.iter_mut().for_each(|s| *s *= to);
+        }
+        return;
+    }
+    let ch = usize::from(CHANNELS);
+    let frames = samples.len() / ch;
+    for (i, frame) in samples.chunks_mut(ch).enumerate() {
+        let g = from + (to - from) * (i + 1) as f32 / frames as f32;
+        frame.iter_mut().for_each(|s| *s *= g);
+    }
+}
+
 /// Feeds samples to the encoder 20 ms at a time and tracks the peak.
-struct Encoder<'a, F> {
+struct Encoder<F> {
     encoder: encoder::Audio,
     frame: frame::Audio,
     pending: Vec<f32>,
+    /// The 20 ms block being processed.
+    block: Vec<f32>,
     /// Frames sent to the encoder, the frame pts in 1/48000 s.
     sent: i64,
     anchor: Duration,
-    shared: &'a Shared,
+    shared: Arc<Shared>,
+    /// Gain reached at the end of the last block.
+    gain: f32,
+    process: Option<Process>,
+    mix: Option<MixInput>,
     peak: f32,
     peak_samples: usize,
     on_packet: F,
 }
 
-impl<F: FnMut(EncodedPacket)> Encoder<'_, F> {
+impl<F: FnMut(EncodedPacket)> Encoder<F> {
+    fn new(encoder: encoder::Audio, anchor: Duration, shared: Arc<Shared>, on_packet: F) -> Self {
+        let mut frame = frame::Audio::new(Sample::F32(Type::Packed), FRAME, ChannelLayout::STEREO);
+        frame.set_rate(SAMPLE_RATE);
+        Self {
+            encoder,
+            frame,
+            pending: Vec::new(),
+            block: Vec::with_capacity(FRAME * usize::from(CHANNELS)),
+            sent: 0,
+            anchor,
+            gain: f32::from_bits(shared.gain.load(Ordering::Relaxed)),
+            shared,
+            process: None,
+            mix: None,
+            peak: 0.0,
+            peak_samples: 0,
+            on_packet,
+        }
+    }
+
     fn push(&mut self, samples: &[f32]) {
         self.pending.extend_from_slice(samples);
         let len = FRAME * usize::from(CHANNELS);
         while self.pending.len() >= len {
-            let muted = self.shared.muted.load(Ordering::Relaxed);
+            self.block.clear();
+            self.block.extend(self.pending.drain(..len));
+            // The DSP seam: a no-op unless a processor was given.
+            if let Some(process) = &mut self.process {
+                process(&mut self.block);
+            }
+            let gain = if self.shared.muted.load(Ordering::Relaxed) {
+                0.0
+            } else {
+                f32::from_bits(self.shared.gain.load(Ordering::Relaxed))
+            };
+            apply_gain(&mut self.block, self.gain, gain);
+            self.gain = gain;
+            if let Some(mix) = &self.mix {
+                mix.push(&self.block);
+            }
             let out = self.frame.data_mut(0);
-            for (dst, src) in out
-                .as_chunks_mut::<4>()
-                .0
-                .iter_mut()
-                .zip(self.pending.drain(..len))
-            {
-                let s = if muted { 0.0 } else { src };
+            for (dst, &s) in out.as_chunks_mut::<4>().0.iter_mut().zip(&self.block) {
                 dst.copy_from_slice(&s.to_le_bytes());
                 self.peak = self.peak.max(s.abs());
                 self.peak_samples += 1;
@@ -329,26 +465,8 @@ impl<F: FnMut(EncodedPacket)> Encoder<'_, F> {
     }
 }
 
-fn encode_loop(
-    encoder: encoder::Audio,
-    anchor: Duration,
-    rx: mpsc::Receiver<pw::Chunk>,
-    shared: &Shared,
-    on_packet: impl FnMut(EncodedPacket),
-) {
-    let mut timeline = Timeline::new(anchor);
-    let mut enc = Encoder {
-        encoder,
-        frame: frame::Audio::new(Sample::F32(Type::Packed), FRAME, ChannelLayout::STEREO),
-        pending: Vec::new(),
-        sent: 0,
-        anchor,
-        shared,
-        peak: 0.0,
-        peak_samples: 0,
-        on_packet,
-    };
-    enc.frame.set_rate(SAMPLE_RATE);
+fn encode_loop(mut enc: Encoder<impl FnMut(EncodedPacket)>, rx: mpsc::Receiver<pw::Chunk>) {
+    let mut timeline = Timeline::new(enc.anchor);
     let ch = usize::from(CHANNELS);
     loop {
         let (pad, skip, repeat, samples) = match rx.recv_timeout(STALL) {
@@ -514,14 +632,10 @@ mod tests {
     #[test]
     fn encoder_emits_continuous_20ms_packets_with_head() {
         let encoder = open_encoder().unwrap();
-        let head = unsafe {
-            let ctx = encoder.as_ptr();
-            std::slice::from_raw_parts((*ctx).extradata, (*ctx).extradata_size as usize).to_vec()
-        };
+        let head = opus_head(&encoder).unwrap();
         assert_eq!(&head[..8], b"OpusHead");
         assert_eq!(head[9], CHANNELS as u8);
         let (tx, rx) = mpsc::channel();
-        let shared = Shared::default();
         let anchor = Duration::from_secs(10);
         let (chunk_tx, chunk_rx) = mpsc::channel();
         // 1 s of a full-scale square wave, in odd-sized chunks.
@@ -538,9 +652,10 @@ mod tests {
                 .unwrap();
         }
         drop(chunk_tx);
-        encode_loop(encoder, anchor, chunk_rx, &shared, move |p| {
+        let enc = Encoder::new(encoder, anchor, Arc::default(), move |p| {
             tx.send(p).unwrap()
         });
+        encode_loop(enc, chunk_rx);
         let packets: Vec<_> = rx.iter().collect();
         assert!(packets.len() >= 50, "{} packets", packets.len());
         for w in packets.windows(2) {
@@ -549,25 +664,70 @@ mod tests {
         assert!(packets[0].pts <= anchor);
     }
 
+    fn test_encoder(shared: &Arc<Shared>) -> Encoder<impl FnMut(EncodedPacket)> {
+        Encoder::new(
+            open_encoder().unwrap(),
+            Duration::ZERO,
+            shared.clone(),
+            |_| {},
+        )
+    }
+
+    fn peak(shared: &Shared) -> f32 {
+        f32::from_bits(shared.peak.load(Ordering::Relaxed))
+    }
+
     #[test]
     fn muted_track_reports_zero_peak() {
-        let shared = Shared::default();
-        let mut enc = Encoder {
-            encoder: open_encoder().unwrap(),
-            frame: frame::Audio::new(Sample::F32(Type::Packed), FRAME, ChannelLayout::STEREO),
-            pending: Vec::new(),
-            sent: 0,
-            anchor: Duration::ZERO,
-            shared: &shared,
-            peak: 0.0,
-            peak_samples: 0,
-            on_packet: |_| {},
-        };
-        enc.frame.set_rate(SAMPLE_RATE);
+        let shared = Arc::new(Shared::default());
+        let mut enc = test_encoder(&shared);
         enc.push(&vec![0.75; PEAK_WINDOW * 2 * 2]);
-        assert_eq!(f32::from_bits(shared.peak.load(Ordering::Relaxed)), 0.75);
+        assert_eq!(peak(&shared), 0.75);
         shared.muted.store(true, Ordering::Relaxed);
-        enc.push(&vec![0.75; PEAK_WINDOW * 2 * 2]);
-        assert_eq!(f32::from_bits(shared.peak.load(Ordering::Relaxed)), 0.0);
+        // The first muted block ramps down; the windows after it are silent.
+        enc.push(&vec![0.75; PEAK_WINDOW * 2 * 4]);
+        assert_eq!(peak(&shared), 0.0);
+    }
+
+    #[test]
+    fn volume_converts_db_and_clamps() {
+        assert_eq!(db_to_gain(0.0), 1.0);
+        assert!((db_to_gain(-6.0) - 0.501).abs() < 1e-3);
+        assert!((db_to_gain(12.0) - 3.981).abs() < 1e-3);
+        assert_eq!(db_to_gain(40.0), db_to_gain(MAX_DB));
+        assert_eq!(db_to_gain(MIN_DB), 0.0);
+        assert_eq!(db_to_gain(-200.0), 0.0);
+        assert_eq!(db_to_gain(f32::NAN), 0.0);
+    }
+
+    #[test]
+    fn gain_ramps_over_the_block_then_holds() {
+        let mut block = vec![1.0; 8];
+        apply_gain(&mut block, 1.0, 0.0);
+        assert_eq!(block, [0.75, 0.75, 0.5, 0.5, 0.25, 0.25, 0.0, 0.0]);
+        let mut block = vec![0.5; 4];
+        apply_gain(&mut block, 2.0, 2.0);
+        assert_eq!(block, [1.0; 4]);
+    }
+
+    #[test]
+    fn volume_and_process_apply_before_the_encoder() {
+        let shared = Arc::new(Shared::default());
+        shared
+            .gain
+            .store(db_to_gain(-6.0).to_bits(), Ordering::Relaxed);
+        let mut enc = test_encoder(&shared);
+        // Ramps from 1.0 towards -6 dB during the first block only.
+        enc.push(&vec![0.5; FRAME * 2]);
+        enc.process = Some(Box::new(|s: &mut [f32]| {
+            s.iter_mut().for_each(|x| *x *= 2.0)
+        }));
+        enc.push(&vec![0.5; PEAK_WINDOW * 2 * 2]);
+        // 0.5 doubled by the processor, then -6 dB.
+        assert!(
+            (peak(&shared) - db_to_gain(-6.0)).abs() < 1e-4,
+            "{}",
+            peak(&shared)
+        );
     }
 }

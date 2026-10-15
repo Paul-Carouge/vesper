@@ -7,7 +7,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use vesper_audio::{MAX_DB, MIN_DB, Source};
+
 use crate::outputs::{Kind, SourceLabel};
+use crate::recorder::{MAX_TRACKS, Track};
 use crate::{AppWindow, QualityPreset, SourceKind, VideoCodec};
 
 /// Process names (`/proc/<pid>/comm`) the user allowed game capture for. Not
@@ -28,8 +31,9 @@ pub struct Prefs {
     pub fps: i32,
     pub replay_enabled: bool,
     pub replay_seconds: i32,
-    pub desktop_muted: bool,
-    pub mic_muted: bool,
+    pub tracks: Vec<Track>,
+    /// A mix of all tracks as the first audio track.
+    pub audio_mix: bool,
     pub output_folder: String,
     /// Record a game (Vulkan layer) instead of a portal source.
     pub game_source: bool,
@@ -45,8 +49,8 @@ impl Prefs {
             fps: ui.get_fps(),
             replay_enabled: ui.get_replay_enabled(),
             replay_seconds: ui.get_replay_seconds(),
-            desktop_muted: ui.get_desktop_muted(),
-            mic_muted: ui.get_mic_muted(),
+            tracks: crate::audio::tracks_from_ui(ui),
+            audio_mix: ui.get_audio_mix(),
             output_folder: ui.get_output_folder().into(),
             game_source: ui.get_source_kind() == SourceKind::Game,
             allowed_games: ALLOWED_GAMES.lock().unwrap().clone(),
@@ -60,8 +64,8 @@ impl Prefs {
         ui.set_fps(self.fps);
         ui.set_replay_enabled(self.replay_enabled);
         ui.set_replay_seconds(self.replay_seconds);
-        ui.set_desktop_muted(self.desktop_muted);
-        ui.set_mic_muted(self.mic_muted);
+        crate::audio::show_tracks(ui, &self.tracks);
+        ui.set_audio_mix(self.audio_mix);
         ui.set_output_folder(self.output_folder.as_str().into());
         if self.game_source {
             ui.set_source_kind(SourceKind::Game);
@@ -74,7 +78,13 @@ impl Prefs {
     }
 
     /// `self` with the valid settings of `text` applied.
+    ///
+    /// Audio tracks: any `tracks` or `track` line replaces the list. Without
+    /// them (settings of a version with fixed desktop and microphone tracks),
+    /// the old `desktop_muted` and `mic_muted` apply to `self`'s tracks.
     pub fn parse(mut self, text: &str) -> Self {
+        let mut tracks: Option<Vec<Track>> = None;
+        let (mut desktop_muted, mut mic_muted) = (None, None);
         for line in text.lines() {
             let Some((key, value)) = line.split_once('=') else {
                 continue;
@@ -86,8 +96,20 @@ impl Prefs {
                 "fps" => set(&mut self.fps, choice(value, &FPS)),
                 "replay" => set(&mut self.replay_enabled, flag(value)),
                 "replay_seconds" => set(&mut self.replay_seconds, choice(value, &REPLAY_SECONDS)),
-                "desktop_muted" => set(&mut self.desktop_muted, flag(value)),
-                "mic_muted" => set(&mut self.mic_muted, flag(value)),
+                "desktop_muted" => desktop_muted = flag(value),
+                "mic_muted" => mic_muted = flag(value),
+                "tracks" => {
+                    tracks.get_or_insert_default();
+                }
+                "track" => {
+                    let list = tracks.get_or_insert_default();
+                    if let Some(track) = parse_track(value)
+                        && list.len() < MAX_TRACKS
+                    {
+                        list.push(track);
+                    }
+                }
+                "audio_mix" => set(&mut self.audio_mix, flag(value)),
                 "output_folder" if Path::new(value).is_absolute() => {
                     self.output_folder = value.to_owned();
                 }
@@ -99,6 +121,18 @@ impl Prefs {
                 }
                 "tray_notice_shown" => set(&mut self.tray_notice_shown, flag(value)),
                 _ => {}
+            }
+        }
+        match tracks {
+            Some(tracks) => self.tracks = tracks,
+            None => {
+                for track in &mut self.tracks {
+                    match track.source {
+                        Source::Desktop => set(&mut track.muted, desktop_muted),
+                        Source::Microphone => set(&mut track.muted, mic_muted),
+                        _ => {}
+                    }
+                }
             }
         }
         self
@@ -119,10 +153,15 @@ impl Prefs {
         };
         let mut text = format!(
             "# Vesper settings, rewritten on every change.\n\
-             codec={codec}\nquality={quality}\nfps={}\nreplay={}\nreplay_seconds={}\n\
-             desktop_muted={}\nmic_muted={}\n",
-            self.fps, self.replay_enabled, self.replay_seconds, self.desktop_muted, self.mic_muted
+             codec={codec}\nquality={quality}\nfps={}\nreplay={}\nreplay_seconds={}\n",
+            self.fps, self.replay_enabled, self.replay_seconds
         );
+        // Marks the list as saved, even empty.
+        text += "tracks=\n";
+        for track in self.tracks.iter().filter(|t| valid_track(t)) {
+            text += &format!("track={}\n", serialize_track(track));
+        }
+        text += &format!("audio_mix={}\n", self.audio_mix);
         // A line break would split the line: keep the default folder instead.
         if self.output_folder != default_folder && !self.output_folder.contains(['\n', '\r']) {
             text += &format!("output_folder={}\n", self.output_folder);
@@ -184,6 +223,82 @@ fn quality(value: &str) -> Option<QualityPreset> {
         "quality" => Some(QualityPreset::Quality),
         _ => None,
     }
+}
+
+/// The desktop and microphone tracks of a first launch.
+pub fn default_tracks() -> Vec<Track> {
+    vec![
+        Track::new("Desktop", Source::Desktop),
+        Track::new("Microphone", Source::Microphone),
+    ]
+}
+
+/// How a source is saved: `desktop`, `microphone`, `output:<node.name>`,
+/// `input:<node.name>` or `app:<application>`.
+pub fn audio_source_id(source: &Source) -> String {
+    match source {
+        Source::Desktop => "desktop".into(),
+        Source::Microphone => "microphone".into(),
+        Source::Output(node) => format!("output:{node}"),
+        Source::Input(node) => format!("input:{node}"),
+        Source::App(app) => format!("app:{app}"),
+    }
+}
+
+pub fn audio_source_from_id(id: &str) -> Option<Source> {
+    // Fields are `|`-separated, one per line.
+    let named = |name: &str, source: fn(String) -> Source| {
+        (!name.is_empty() && !name.contains('|') && !name.chars().any(char::is_control))
+            .then(|| source(name.to_owned()))
+    };
+    match id.split_once(':') {
+        None if id == "desktop" => Some(Source::Desktop),
+        None if id == "microphone" => Some(Source::Microphone),
+        Some(("output", node)) => named(node, Source::Output),
+        Some(("input", node)) => named(node, Source::Input),
+        Some(("app", app)) => named(app, Source::App),
+        _ => None,
+    }
+}
+
+/// A track name: 1 to 64 characters, one line, no outer spaces.
+pub fn valid_track_name(name: &str) -> bool {
+    (1..=64).contains(&name.chars().count())
+        && name == name.trim()
+        && !name.chars().any(char::is_control)
+}
+
+fn valid_track(track: &Track) -> bool {
+    valid_track_name(&track.name)
+        && audio_source_from_id(&audio_source_id(&track.source)).as_ref() == Some(&track.source)
+}
+
+/// `enabled|muted|volume_db|source|name`, the name last: it may hold a `|`.
+fn serialize_track(track: &Track) -> String {
+    format!(
+        "{}|{}|{}|{}|{}",
+        track.enabled,
+        track.muted,
+        track.volume_db,
+        audio_source_id(&track.source),
+        track.name
+    )
+}
+
+fn parse_track(value: &str) -> Option<Track> {
+    let mut fields = value.splitn(5, '|');
+    let enabled = flag(fields.next()?)?;
+    let muted = flag(fields.next()?)?;
+    let volume_db: f32 = fields.next()?.trim().parse().ok()?;
+    let source = audio_source_from_id(fields.next()?)?;
+    let name = fields.next()?;
+    (volume_db.is_finite() && valid_track_name(name)).then(|| Track {
+        name: name.to_owned(),
+        source,
+        enabled,
+        muted,
+        volume_db: volume_db.clamp(MIN_DB, MAX_DB),
+    })
 }
 
 /// A process name as the kernel reports it: 1 to 15 bytes, one line.
@@ -289,8 +404,8 @@ mod tests {
             fps: 60,
             replay_enabled: true,
             replay_seconds: 30,
-            desktop_muted: false,
-            mic_muted: false,
+            tracks: default_tracks(),
+            audio_mix: true,
             output_folder: DEFAULT.into(),
             game_source: false,
             allowed_games: Vec::new(),
@@ -305,8 +420,27 @@ mod tests {
             fps: 144,
             replay_enabled: false,
             replay_seconds: 120,
-            desktop_muted: true,
-            mic_muted: true,
+            tracks: vec![
+                Track {
+                    muted: true,
+                    volume_db: -3.5,
+                    ..Track::new("Game | voice", Source::App("Elden Ring".into()))
+                },
+                Track {
+                    enabled: false,
+                    volume_db: 12.0,
+                    ..Track::new(
+                        "Headset",
+                        Source::Output("alsa_output.usb-x.analog-stereo".into()),
+                    )
+                },
+                Track::new("Mic", Source::Input("alsa_input.pci-0000_0c_00.6".into())),
+                Track {
+                    muted: true,
+                    ..Track::new("Desktop", Source::Desktop)
+                },
+            ],
+            audio_mix: false,
             output_folder: "/mnt/clips/my folder = 2".into(),
             game_source: true,
             allowed_games: vec!["Game.exe".into(), "a=b c".into()],
@@ -340,12 +474,11 @@ mod tests {
     #[test]
     fn missing_keys_keep_defaults() {
         assert_eq!(defaults().parse(""), defaults());
-        let prefs = defaults().parse("fps=120\nmic_muted=true\n");
+        let prefs = defaults().parse("fps=120\n");
         assert_eq!(
             prefs,
             Prefs {
                 fps: 120,
-                mic_muted: true,
                 ..defaults()
             }
         );
@@ -371,6 +504,78 @@ mod tests {
             defaults().parse(&prefs.serialize(DEFAULT)).allowed_games,
             ["ok"]
         );
+    }
+
+    #[test]
+    fn old_mute_flags_migrate_to_the_default_tracks() {
+        let old = "codec=av1\ndesktop_muted=true\nmic_muted=false\n";
+        let prefs = defaults().parse(old);
+        assert_eq!(prefs.tracks.len(), 2);
+        assert!(prefs.tracks[0].muted && prefs.tracks[0].source == Source::Desktop);
+        assert!(!prefs.tracks[1].muted && prefs.tracks[1].source == Source::Microphone);
+        assert!(prefs.audio_mix);
+        // Saved again, the tracks are written and the old keys are gone.
+        let text = prefs.serialize(DEFAULT);
+        assert!(!text.contains("desktop_muted") && !text.contains("mic_muted"));
+        assert_eq!(defaults().parse(&text), prefs);
+        // The old keys no longer apply once tracks are saved.
+        assert!(!defaults().parse(&format!("{text}mic_muted=true\n")).tracks[1].muted);
+    }
+
+    #[test]
+    fn an_empty_track_list_stays_empty() {
+        let prefs = Prefs {
+            tracks: Vec::new(),
+            ..defaults()
+        };
+        assert_eq!(defaults().parse(&prefs.serialize(DEFAULT)).tracks, []);
+    }
+
+    #[test]
+    fn bad_tracks_are_ignored() {
+        let text = "track=true|false|0|desktop|Desktop\n\
+                    track=yes|false|0|desktop|A\n\
+                    track=true|false|loud|desktop|B\n\
+                    track=true|false|NaN|desktop|C\n\
+                    track=true|false|0|speaker|D\n\
+                    track=true|false|0|app:|E\n\
+                    track=true|false|0|desktop|\n\
+                    track=true|false|0|desktop| padded \n\
+                    track=true|false|99|input:mic|Loud\n";
+        let tracks = defaults().parse(text).tracks;
+        let names: Vec<_> = tracks.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["Desktop", "Loud"]);
+        // Out of range volumes are clamped.
+        assert_eq!(tracks[1].volume_db, MAX_DB);
+        // No more than MAX_TRACKS.
+        let many = "track=true|false|0|desktop|D\n".repeat(MAX_TRACKS + 3);
+        assert_eq!(defaults().parse(&many).tracks.len(), MAX_TRACKS);
+        // A name that cannot be saved is left out.
+        let prefs = Prefs {
+            tracks: vec![Track::new("a\nfps=30", Source::Desktop)],
+            ..defaults()
+        };
+        let back = defaults().parse(&prefs.serialize(DEFAULT));
+        assert_eq!((back.tracks.len(), back.fps), (0, 60));
+    }
+
+    #[test]
+    fn audio_source_ids_round_trip() {
+        for source in [
+            Source::Desktop,
+            Source::Microphone,
+            Source::Output("alsa_output.pci-0000_0c_00.4.analog-stereo".into()),
+            Source::Input("easyeffects_source".into()),
+            Source::App("Firefox:Nightly".into()),
+        ] {
+            assert_eq!(
+                audio_source_from_id(&audio_source_id(&source)),
+                Some(source)
+            );
+        }
+        assert_eq!(audio_source_from_id("app:a|b"), None);
+        assert_eq!(audio_source_from_id("output:"), None);
+        assert_eq!(audio_source_from_id("Desktop"), None);
     }
 
     #[test]

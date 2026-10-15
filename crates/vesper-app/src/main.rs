@@ -1,14 +1,15 @@
 //! Vesper desktop app: the Slint UI and the video recording backend.
 //!
-//! Recording and the replay buffer (video + desktop and microphone audio)
-//! live in `recorder`. Audio sources only run while one of them does, so the
-//! meters rest at 0 otherwise.
+//! Recording and the replay buffer (video + audio tracks) live in
+//! `recorder`. Audio sources only run while one of them does, so the meters
+//! rest at 0 otherwise. The Audio card is wired in `audio`.
 
 /// Minimal stderr logger, enough until a real backend brings `tracing`.
 macro_rules! log {
     ($($arg:tt)*) => { eprintln!("[vesper] {}", format_args!($($arg)*)) };
 }
 
+mod audio;
 mod autostart;
 mod desktop;
 #[cfg(debug_assertions)]
@@ -32,10 +33,8 @@ use std::time::{Duration, Instant};
 
 use slint::ComponentHandle;
 use slint::winit_030::WinitWindowAccessor;
-use vesper_audio::Source;
 
 use game::GameSource;
-use meter::MeterState;
 use outputs::SourceLabel;
 use prefs::Prefs;
 use recorder::{Event, Pipeline, Settings};
@@ -131,6 +130,7 @@ fn main() -> Result<(), slint::PlatformError> {
         ui.set_output_folder(folder.to_string_lossy().as_ref().into());
     }
     ui.set_replay_enabled(true);
+    audio::show_tracks(&ui, &prefs::default_tracks());
     Prefs::load(Prefs::from_ui(&ui)).apply(&ui);
     // The entry may have been removed elsewhere (e.g. System Settings).
     ui.set_autostart(autostart::enabled());
@@ -224,20 +224,7 @@ fn main() -> Result<(), slint::PlatformError> {
         }
     });
 
-    let tick = slint::Timer::default();
-    let weak = ui.as_weak();
-    let rec = recording.clone();
-    let (mut desktop, mut mic) = (MeterState::default(), MeterState::default());
-    tick.start(slint::TimerMode::Repeated, METER_TICK, move || {
-        let Some(ui) = weak.upgrade() else { return };
-        let peak = |source| rec.borrow().as_ref().map_or(0.0, |r| r.peak(source));
-        desktop.feed(peak(Source::Desktop), METER_TICK);
-        mic.feed(peak(Source::Microphone), METER_TICK);
-        ui.set_desktop_level(desktop.level);
-        ui.set_desktop_peak(desktop.peak);
-        ui.set_mic_level(mic.level);
-        ui.set_mic_peak(mic.peak);
-    });
+    let _meters = audio::start_meters(&ui, &recording);
 
     #[cfg(debug_assertions)]
     dev::apply(&ui);
@@ -374,28 +361,8 @@ fn wire_callbacks(ui: &AppWindow, recording: &Shared, games: &Games) {
         }
     });
 
-    // Applied live while recording; the next recording reads the UI state.
-    let weak = ui.as_weak();
-    let rec = recording.clone();
-    ui.on_desktop_mute_changed(move |muted| {
-        if let Some(r) = rec.borrow().as_ref() {
-            r.set_muted(Source::Desktop, muted);
-        }
-        if let Some(ui) = weak.upgrade() {
-            Prefs::from_ui(&ui).save();
-        }
-    });
-
-    let weak = ui.as_weak();
-    let rec = recording.clone();
-    ui.on_mic_mute_changed(move |muted| {
-        if let Some(r) = rec.borrow().as_ref() {
-            r.set_muted(Source::Microphone, muted);
-        }
-        if let Some(ui) = weak.upgrade() {
-            Prefs::from_ui(&ui).save();
-        }
-    });
+    // Mute and volume apply live; the next recording reads the UI state.
+    audio::wire(ui, recording);
 
     let weak = ui.as_weak();
     ui.on_output_settings_changed(move || {
@@ -773,8 +740,8 @@ fn settings(ui: &AppWindow, games: &Games) -> Settings {
         fps: ui.get_fps().max(1) as u32,
         quality: quality(ui.get_codec(), ui.get_quality()),
         max_bits_per_pixel: max_bits_per_pixel(ui.get_codec(), ui.get_quality()),
-        desktop_muted: ui.get_desktop_muted(),
-        mic_muted: ui.get_mic_muted(),
+        tracks: audio::tracks_from_ui(ui),
+        mix: ui.get_audio_mix(),
     }
 }
 
@@ -939,16 +906,22 @@ fn max_bits_per_pixel(codec: VideoCodec, quality: QualityPreset) -> f64 {
     }
 }
 
-/// Settings of the debug `--record` path: HEVC, balanced, 60 fps.
+/// Settings of the debug `--record` path: HEVC, balanced, 60 fps, with the
+/// saved audio tracks.
 #[cfg(debug_assertions)]
 fn default_settings() -> Settings {
+    let saved = Prefs::load(Prefs {
+        tracks: prefs::default_tracks(),
+        audio_mix: true,
+        ..Prefs::default()
+    });
     Settings {
         codec: vesper_core::Codec::Hevc,
         fps: 60,
         quality: quality(VideoCodec::Hevc, QualityPreset::Balanced),
         max_bits_per_pixel: max_bits_per_pixel(VideoCodec::Hevc, QualityPreset::Balanced),
-        desktop_muted: false,
-        mic_muted: false,
+        tracks: saved.tracks,
+        mix: saved.audio_mix,
         game: None,
     }
 }
