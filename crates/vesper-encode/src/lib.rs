@@ -40,6 +40,9 @@ pub enum RateControl {
     Bitrate(u64),
     /// Constant QP. Range depends on the codec: 0-51 for H.264/HEVC, 0-255 for AV1.
     ConstantQp(u32),
+    /// Constant quality capped at `max_bitrate` bits per second (VAAPI QVBR).
+    /// `quality` is on the QP scale of [`RateControl::ConstantQp`]; lower is better.
+    Quality { quality: u32, max_bitrate: u64 },
 }
 
 #[derive(Debug)]
@@ -347,32 +350,47 @@ impl Encoder {
                 ff::av_buffer_ref(ff::av_buffersink_get_hw_frames_ctx(self.sink)),
                 "sink frames",
             )?;
-            match rate {
+            // VA quality level; radeonsi reads it as bit fields: 1 = set, 2-3 = preset
+            // (speed, balanced, quality, high quality), 16 = VBAQ. Measured on
+            // VCN 5: "quality" + VBAQ (21) needs 15-30% fewer bits than the
+            // driver default for the same VMAF, but HEVC/H.264 then encode only
+            // ~550 Mpx/s, so faster pixel rates use "balanced" + VBAQ (19).
+            // AV1 runs at the same speed with any level.
+            // shortcut: radeonsi meaning only; other drivers (Intel: 1-7) read it differently, check the VA vendor if they matter.
+            let px_rate = u64::from(self.width) * u64::from(self.height) * u64::from(fps);
+            enc.compression_level = if codec == Codec::Av1 || px_rate <= 300_000_000 {
+                21
+            } else {
+                19
+            };
+            let mode = match rate {
                 RateControl::Bitrate(bps) => {
                     enc.bit_rate = bps as i64;
-                    check(
-                        ff::av_opt_set(
-                            self.enc.cast(),
-                            c"rc_mode".as_ptr(),
-                            c"VBR".as_ptr(),
-                            ff::AV_OPT_SEARCH_CHILDREN,
-                        ),
-                        "rc_mode",
-                    )?;
+                    c"VBR"
                 }
                 RateControl::ConstantQp(qp) => {
                     enc.global_quality = qp as c_int;
-                    check(
-                        ff::av_opt_set(
-                            self.enc.cast(),
-                            c"rc_mode".as_ptr(),
-                            c"CQP".as_ptr(),
-                            ff::AV_OPT_SEARCH_CHILDREN,
-                        ),
-                        "rc_mode",
-                    )?;
+                    c"CQP"
                 }
-            }
+                RateControl::Quality {
+                    quality,
+                    max_bitrate,
+                } => {
+                    enc.global_quality = quality as c_int;
+                    enc.bit_rate = max_bitrate as i64;
+                    enc.rc_max_rate = max_bitrate as i64;
+                    c"QVBR"
+                }
+            };
+            check(
+                ff::av_opt_set(
+                    self.enc.cast(),
+                    c"rc_mode".as_ptr(),
+                    mode.as_ptr(),
+                    ff::AV_OPT_SEARCH_CHILDREN,
+                ),
+                "rc_mode",
+            )?;
             check(
                 ff::avcodec_open2(self.enc, c, ptr::null_mut()),
                 "open encoder",

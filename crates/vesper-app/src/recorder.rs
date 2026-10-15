@@ -57,8 +57,10 @@ const RESIZE_AFTER: Duration = Duration::from_secs(1);
 pub struct Settings {
     pub codec: Codec,
     pub fps: u32,
-    /// Target bitrate per pixel per frame; scaled by the captured size and `fps`.
-    pub bits_per_pixel: f64,
+    /// Constant-quality target, see [`RateControl::Quality`].
+    pub quality: u32,
+    /// Bitrate cap per pixel per frame; scaled by the captured size and `fps`.
+    pub max_bits_per_pixel: f64,
     pub desktop_muted: bool,
     pub mic_muted: bool,
     /// Record the game these frames come from instead of a portal source.
@@ -550,14 +552,17 @@ impl Video {
     fn open(settings: &Settings, first: &VideoFrame) -> Result<Self, String> {
         let (width, height, fps) = (first.width, first.height, settings.fps);
         let bitrate =
-            (f64::from(width) * f64::from(height) * f64::from(fps) * settings.bits_per_pixel)
+            (f64::from(width) * f64::from(height) * f64::from(fps) * settings.max_bits_per_pixel)
                 as u64;
         let enc = Encoder::new(
             settings.codec,
             width,
             height,
             fps,
-            RateControl::Bitrate(bitrate),
+            RateControl::Quality {
+                quality: settings.quality,
+                max_bitrate: bitrate,
+            },
         )
         .map_err(|e| format!("Could not open the encoder: {e}"))?;
         let track = VideoTrack {
@@ -567,7 +572,10 @@ impl Video {
             fps,
             extradata: enc.extradata().to_vec(),
         };
-        log!("encoding {width}x{height} at {bitrate} bit/s");
+        log!(
+            "encoding {width}x{height} at quality {}, max {bitrate} bit/s",
+            settings.quality
+        );
         // The grid starts now, not at the frame's own pts: opening the encoder
         // takes a while, and a producer clock off by seconds must not stall
         // or burst the ticks. The first frame gets this pts.
