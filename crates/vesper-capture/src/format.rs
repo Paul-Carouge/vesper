@@ -291,6 +291,24 @@ mod tests {
         // The size is a range choice: its default must be read, not dropped.
         assert_eq!(info.size.map(|r| (r.width, r.height)), Some((1920, 1080)));
 
+        // A fixated server format wraps its size in a `Choice::None`.
+        let size = Rectangle {
+            width: 3840,
+            height: 2160,
+        };
+        let server = serialize(Object {
+            type_: sys::SPA_TYPE_OBJECT_Format,
+            id: sys::SPA_PARAM_Format,
+            properties: vec![Property::new(
+                sys::SPA_FORMAT_VIDEO_size,
+                Value::Choice(ChoiceValue::Rectangle(Choice(
+                    ChoiceFlags::empty(),
+                    ChoiceEnum::None(size),
+                ))),
+            )],
+        });
+        assert_eq!(parse_format(&server).unwrap().size, Some(size));
+
         let fixed = parse_format(&enum_format(VideoFormat::BGRA, &[MOD_LINEAR])).unwrap();
         assert_eq!(fixed.modifiers, vec![MOD_LINEAR]);
         assert!(!fixed.dont_fixate);
