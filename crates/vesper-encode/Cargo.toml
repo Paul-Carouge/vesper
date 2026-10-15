@@ -6,3 +6,4 @@ edition.workspace = true
 [dependencies]
 vesper-core.workspace = true
 ffmpeg-next.workspace = true
+tracing = "0.1"
