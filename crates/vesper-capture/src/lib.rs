@@ -17,6 +17,9 @@ use futures_lite::future::block_on;
 use tracing::warn;
 use vesper_core::VideoFrame;
 
+/// How long dropping a [`Capture`] waits for the portal to close its session.
+const CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -36,7 +39,8 @@ pub struct SourceInfo {
 pub struct Capture {
     restore_token: Option<String>,
     source: SourceInfo,
-    session: Session<Screencast>,
+    /// Taken by `drop` to close it.
+    session: Option<Session<Screencast>>,
     control: ::pipewire::channel::Sender<pw::Msg>,
     thread: Option<JoinHandle<()>>,
 }
@@ -48,7 +52,8 @@ impl Capture {
     /// the PipeWire thread: keep it short, e.g. send the frame to a channel. It gets one final `Err` when
     /// the capture ends on its own (source closed, stream error, no DMA-BUF);
     /// no frame follows. Dropping the `Capture` from `on_frame` is allowed,
-    /// but blocks the PipeWire loop while the D-Bus session closes.
+    /// but blocks the PipeWire loop while the D-Bus session closes (at most
+    /// [`CLOSE_TIMEOUT`]).
     /// Blocks until the user picks a source.
     pub fn start(
         restore_token: Option<&str>,
@@ -65,7 +70,7 @@ impl Capture {
         let capture = Self {
             restore_token,
             source,
-            session,
+            session: Some(session),
             control,
             thread: Some(thread),
         };
@@ -99,8 +104,22 @@ impl Drop for Capture {
         {
             warn!("pipewire thread panicked");
         }
-        if let Err(e) = block_on(self.session.close()) {
-            warn!("closing the screencast session failed: {e}");
+        // A hung portal must not hold up the caller (finishing a file,
+        // quitting): the session closes on its own thread, waited on a while.
+        let Some(session) = self.session.take() else {
+            return;
+        };
+        let (done_tx, done) = std::sync::mpsc::channel();
+        let closing = std::thread::Builder::new()
+            .name("vesper-portal-close".into())
+            .spawn(move || {
+                if let Err(e) = block_on(session.close()) {
+                    warn!("closing the screencast session failed: {e}");
+                }
+                let _ = done_tx.send(());
+            });
+        if closing.is_ok() && done.recv_timeout(CLOSE_TIMEOUT).is_err() {
+            warn!("the portal did not close the screencast session in time");
         }
     }
 }

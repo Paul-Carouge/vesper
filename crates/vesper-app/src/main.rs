@@ -26,7 +26,7 @@ mod shortcuts;
 mod tray;
 
 use std::cell::RefCell;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -861,6 +861,7 @@ fn on_recorder_event(ui: &AppWindow, generation: u64, event: Event) {
             log!("audio track {name:?}: {reason}");
             flash_notice(ui, &format!("{name}: reconnecting…"));
         }
+        Event::AudioMissing(text) => flash_notice(ui, &text),
         Event::AudioTrack(name, TrackState::Running) => {
             flash_notice(ui, &format!("{name}: audio is back"));
         }
@@ -959,9 +960,42 @@ impl From<VideoCodec> for vesper_core::Codec {
     }
 }
 
+/// A short sentence for the common failures (the raw error is logged);
+/// other text as is.
+fn friendly(error: &str) -> String {
+    let has = |s: &str| error.contains(s);
+    let text = if has("No space left on device") || has("File too large") {
+        "The disk is full"
+    } else if has("Read-only file system") {
+        "The output folder is read-only"
+    } else if has("Could not create") && has("Permission denied") {
+        "Vesper cannot write to the output folder"
+    } else if has("Could not create") && (has("File exists") || has("Not a directory")) {
+        "The output folder is not a folder"
+    } else if has("Could not create") && has("No such file or directory") {
+        "The output folder is missing"
+    } else if has("Could not open the encoder") {
+        "The video encoder (VAAPI) is unavailable"
+    } else if has("Portal request was cancelled") {
+        "No source was picked"
+    } else {
+        return error.to_owned();
+    };
+    log!("{error}");
+    // A recording cut short: name the partial file.
+    let saved = error
+        .split_once("(saved up to there: ")
+        .and_then(|(_, rest)| rest.strip_suffix(')'));
+    match saved.and_then(|path| Path::new(path).file_name()) {
+        Some(name) => format!("{text}: {} saved up to there", name.to_string_lossy()),
+        None => text.to_owned(),
+    }
+}
+
 /// Shows a short confirmation in the status line, and as a notification
 /// while the window is hidden in the tray.
 fn flash_notice(ui: &AppWindow, text: &str) {
+    let text = &friendly(text);
     if !ui.window().is_visible() {
         desktop::notify("Vesper".into(), text.into(), None);
     }
@@ -1021,6 +1055,7 @@ fn announce_saved(ui: &AppWindow, title: &str, file: PathBuf) {
 
 /// A failed save: the error as the notice, and a notification in the background.
 fn announce_failure(ui: &AppWindow, title: &str, error: &str) {
+    let error = &friendly(error);
     if !window_focused(ui) {
         desktop::notify(title.to_owned(), error.to_owned(), None);
     }
@@ -1068,6 +1103,39 @@ fn default_output_folder() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn common_failures_read_as_short_sentences() {
+        for (raw, text) in [
+            (
+                "write packet: No space left on device (saved up to there: /v/a.mkv)",
+                "The disk is full: a.mkv saved up to there",
+            ),
+            (
+                "Could not create /v/a.mkv: open output file: Read-only file system",
+                "The output folder is read-only",
+            ),
+            (
+                "Could not create /v/Vesper: Permission denied (os error 13)",
+                "Vesper cannot write to the output folder",
+            ),
+            (
+                "Could not create /v/Vesper: File exists (os error 17)",
+                "The output folder is not a folder",
+            ),
+            (
+                "Could not open the encoder: no VAAPI device",
+                "The video encoder (VAAPI) is unavailable",
+            ),
+            (
+                "Could not start the capture: Portal request was cancelled",
+                "No source was picked",
+            ),
+            ("No game to record yet", "No game to record yet"),
+        ] {
+            assert_eq!(friendly(raw), text);
+        }
+    }
 
     #[test]
     fn ui_codec_maps_to_core_codec() {

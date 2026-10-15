@@ -2,10 +2,11 @@
 //! as `key=value` lines. Unknown keys, missing keys and bad values are
 //! ignored: those settings keep their defaults. Written atomically.
 
-use std::io::Write;
+use std::collections::HashSet;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use vesper_audio::{MAX_DB, MIN_DB, Source};
 
@@ -87,6 +88,8 @@ impl Prefs {
         // The track the next `filter` lines belong to: the last one read, if valid.
         let mut last_track: Option<usize> = None;
         let (mut desktop_muted, mut mic_muted) = (None, None);
+        // Duplicate check in O(1): a huge allow list must not stall startup.
+        let mut allowed: HashSet<String> = self.allowed_games.iter().cloned().collect();
         for line in text.lines() {
             let Some((key, value)) = line.split_once('=') else {
                 continue;
@@ -128,9 +131,7 @@ impl Prefs {
                     self.output_folder = value.to_owned();
                 }
                 "game_source" => set(&mut self.game_source, flag(value)),
-                "allow_game"
-                    if valid_game(value) && !self.allowed_games.iter().any(|g| g == value) =>
-                {
+                "allow_game" if valid_game(value) && allowed.insert(value.to_owned()) => {
                     self.allowed_games.push(value.to_owned());
                 }
                 "tray_notice_shown" => set(&mut self.tray_notice_shown, flag(value)),
@@ -197,7 +198,7 @@ impl Prefs {
     /// file keeps the defaults.
     pub fn load(defaults: Self) -> Self {
         let Some(path) = path() else { return defaults };
-        match std::fs::read(&path) {
+        match read_capped(&path) {
             Ok(bytes) => defaults.parse(&String::from_utf8_lossy(&bytes)),
             Err(e) => {
                 if e.kind() != std::io::ErrorKind::NotFound {
@@ -406,16 +407,53 @@ pub fn clear_source() {
     }
 }
 
+/// Most of the settings file read; the rest is ignored. Real files are a few
+/// KB: this only bounds a corrupt or hostile one.
+const MAX_SETTINGS_SIZE: u64 = 1 << 20;
+
+/// `path`'s first [`MAX_SETTINGS_SIZE`] bytes, cut after the last full line.
+fn read_capped(path: &Path) -> std::io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)?
+        .take(MAX_SETTINGS_SIZE + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_SETTINGS_SIZE {
+        log!(
+            "{} is larger than {MAX_SETTINGS_SIZE} bytes: the rest is ignored",
+            path.display()
+        );
+        bytes.truncate(MAX_SETTINGS_SIZE as usize);
+        let end = bytes.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+        bytes.truncate(end);
+    }
+    Ok(bytes)
+}
+
 /// Writes a temporary file next to `path`, then renames it over `path`: a
 /// process crash leaves either the old or the new file, never half of one.
 /// No fsync: it would block the UI thread, and settings are cheap to lose.
 pub fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    static WRITES: AtomicU64 = AtomicU64::new(0);
     let dir = path.parent().ok_or(std::io::ErrorKind::NotFound)?;
     std::fs::create_dir_all(dir)?;
-    let tmp = path.with_extension("tmp");
-    let mut file = std::fs::File::create(&tmp)?;
-    file.write_all(bytes)?;
-    std::fs::rename(&tmp, path)
+    // One temporary file per writer (threads, a second instance), so a
+    // writer never renames another one's half-written file.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos();
+    let n = WRITES.fetch_add(1, Ordering::Relaxed);
+    let tmp = path.with_extension(format!("tmp.{}.{n}.{nanos:x}", std::process::id()));
+    let written = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .and_then(|mut file| file.write_all(bytes))
+        .and_then(|()| std::fs::rename(&tmp, path));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written
 }
 
 #[cfg(test)]
@@ -730,5 +768,130 @@ mod tests {
         assert_eq!(defaults().parse(&text), changed());
         assert!(!path.with_extension("tmp").exists());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+    // --- robustness (audit) ---
+
+    #[test]
+    fn hostile_files_never_panic_and_keep_defaults() {
+        let base = defaults();
+        let mut junk: Vec<String> = vec![
+            String::new(),
+            "\0\0\0".into(),
+            "=".into(),
+            "====\n====\n".into(),
+            "fps=\nreplay_seconds=\n".into(),
+            "track=|||||\ntrack=true|true|NaN|desktop|x\ntrack=true|true|inf|desktop|x\n".into(),
+            "track=true|true|-1e999|desktop|x\n".into(),
+            "output_folder=\n".into(),
+            "output_folder=relative/path\n".into(),
+            "allow_game=\nallow_game= \nallow_game=\u{0}\n".into(),
+            "\u{feff}fps=30\n".into(),
+        ];
+        // Binary garbage, as the lossy UTF-8 decoding in `load` would give it.
+        let mut x = 0x2545_F491_4F6C_DD1Du64;
+        for len in [1usize, 16, 4096, 1 << 20] {
+            let bytes: Vec<u8> = (0..len)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    x as u8
+                })
+                .collect();
+            junk.push(String::from_utf8_lossy(&bytes).into_owned());
+        }
+        for text in &junk {
+            let got = base.clone().parse(text);
+            // Out-of-range or non-finite values never get through.
+            assert!(FPS.contains(&got.fps));
+            assert!(REPLAY_SECONDS.contains(&got.replay_seconds));
+            assert!(got.tracks.len() <= MAX_TRACKS);
+            for t in &got.tracks {
+                assert!(t.volume_db.is_finite() && (MIN_DB..=MAX_DB).contains(&t.volume_db));
+            }
+            assert!(Path::new(&got.output_folder).is_absolute());
+        }
+    }
+
+    #[test]
+    fn a_huge_allow_list_does_not_stall_startup() {
+        // 40k distinct names (a ~600 KB file) must parse in well under a second.
+        // `parse` checks every new name against the whole list (quadratic).
+        let text: String = (0..40_000).map(|i| format!("allow_game=g{i}\n")).collect();
+        let t = std::time::Instant::now();
+        let got = defaults().parse(&text);
+        let took = t.elapsed();
+        assert_eq!(got.allowed_games.len(), 40_000);
+        assert!(
+            took < std::time::Duration::from_secs(1),
+            "parse took {took:?}"
+        );
+    }
+
+    /// Settings are rewritten on every change from the UI thread, and a
+    /// second instance (no session bus: the guard is off) or a stray `--record`
+    /// can write at once. A temporary file shared by the writers would make
+    /// a reader see a mix of them: truncated or interleaved content.
+    #[test]
+    fn concurrent_writers_never_tear_the_file() {
+        let dir = std::env::temp_dir().join(format!("vesper-prefs-race-{}", std::process::id()));
+        let path = dir.join("settings");
+        write_atomically(&path, &[b'0'; 64 * 1024]).unwrap();
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let torn = std::thread::scope(|s| {
+            for w in 1..=4u8 {
+                let (path, stop) = (&path, &stop);
+                s.spawn(move || {
+                    let payload = vec![b'0' + w; 64 * 1024];
+                    while !stop.load(Ordering::Relaxed) {
+                        let _ = write_atomically(path, &payload);
+                    }
+                });
+            }
+            let mut torn = None;
+            let end = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            while std::time::Instant::now() < end && torn.is_none() {
+                if let Ok(bytes) = std::fs::read(&path)
+                    && (bytes.len() != 64 * 1024 || bytes.iter().any(|b| *b != bytes[0]))
+                {
+                    torn = Some(bytes.len());
+                }
+            }
+            stop.store(true, Ordering::Relaxed);
+            torn
+        });
+        std::fs::remove_dir_all(dir).unwrap();
+        assert_eq!(torn, None, "a reader saw a torn settings file");
+    }
+
+    #[test]
+    fn a_huge_settings_file_is_read_up_to_the_cap() {
+        let dir = std::env::temp_dir().join(format!("vesper-prefs-big-{}", std::process::id()));
+        let path = dir.join("settings");
+        let line = "allow_game=some_game\n";
+        let text = line.repeat(2 * MAX_SETTINGS_SIZE as usize / line.len());
+        write_atomically(&path, format!("fps=30\n{text}").as_bytes()).unwrap();
+        let bytes = read_capped(&path).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+        assert!(bytes.len() as u64 <= MAX_SETTINGS_SIZE);
+        // Cut after a full line: every line read is whole.
+        assert!(bytes.ends_with(b"\n"));
+        assert_eq!(defaults().parse(&String::from_utf8_lossy(&bytes)).fps, 30);
+    }
+
+    #[test]
+    fn unwritable_settings_dir_reports_an_error() {
+        // Not root-proof (root ignores modes): checks the error path only when it applies.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("vesper-prefs-ro-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let result = write_atomically(&dir.join("settings"), b"fps=30\n");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let denied = std::fs::File::create(dir.join("probe")).is_err();
+        std::fs::remove_dir_all(&dir).unwrap();
+        if denied {
+            assert!(result.is_err());
+        }
     }
 }

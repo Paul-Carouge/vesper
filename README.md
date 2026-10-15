@@ -68,6 +68,8 @@ Vesper looks for the layer next to its binary, then in `../lib/vesper/`; the set
 
 Settings are kept in `~/.config/vesper/settings`.
 
+Failure-injection lab (disk full, game crash, portal or PipeWire gone...): `scripts/robustness/go <name> <scenario>.sh` runs a scenario against a debug build in a private user/mount/pid namespace with its own D-Bus, PipeWire (no real device) and headless gamescope; see `scripts/robustness/run.sh`.
+
 ## Background and tray
 
 Vesper shows an icon in the system tray (StatusNotifierItem, as on KDE Plasma). A left click shows or hides the window; its menu starts or stops a recording, saves the replay (while the replay buffer runs), turns the replay buffer on or off, and quits. A red dot marks a recording in progress.

@@ -47,6 +47,10 @@ const STATS_PERIOD: Duration = Duration::from_millis(500);
 /// the packet whose pre-skip covers the start.
 const AUDIO_MARGIN: Duration = Duration::from_millis(100);
 
+/// Audio kept in the replay buffer past its last video packet (desktop
+/// audio is stamped ahead of real time by its playback delay).
+const AUDIO_LEAD: Duration = Duration::from_secs(1);
+
 /// A recording request waiting this long for a first frame fails (e.g. the
 /// game quit), so the UI does not stay in `starting`.
 const FIRST_FRAME_TIMEOUT: Duration = if cfg!(test) {
@@ -88,6 +92,9 @@ struct GameRoute {
     slot: Mutex<Option<(Arc<Mailbox>, u32)>>,
     /// Weak: the capture's frame callback holds this route.
     capture: OnceLock<Weak<GameCapture>>,
+    /// Tests: the game is gone, without a capture server.
+    #[cfg(test)]
+    gone: AtomicBool,
 }
 
 impl GameFrames {
@@ -109,6 +116,19 @@ impl GameFrames {
             Some(slot) => slot.park(event),
             None => drop(event),
         }
+    }
+
+    /// Whether no game is captured any more: it disconnected (quit or
+    /// crashed), or sent no frame for 3 s without a swapchain (the server
+    /// then drops it, though still connected), and none replaced it yet. A
+    /// paused game that keeps its swapchain stays captured: not gone.
+    fn gone(&self) -> bool {
+        #[cfg(test)]
+        if self.0.gone.load(Ordering::Relaxed) {
+            return true;
+        }
+        let capture = self.0.capture.get().and_then(Weak::upgrade);
+        capture.is_some_and(|c| c.captured().is_none())
     }
 
     /// Never called under the slot lock: dropping the upgraded capture may
@@ -166,6 +186,9 @@ pub enum Event {
     ReplaySaved(Result<PathBuf, String>),
     /// The audio track of this name lost its source, or has it back.
     AudioTrack(String, TrackState),
+    /// Some audio tracks or the mix could not start: what is left out, for
+    /// a notice.
+    AudioMissing(String),
     /// The pipeline ended, with the error that ended it if any. A recording
     /// still running then is lost only if the pipeline crashed.
     Stopped(Option<String>),
@@ -176,6 +199,9 @@ pub const MAX_TRACKS: usize = 8;
 
 /// Most filters a track has.
 pub const MAX_FILTERS: usize = 16;
+
+/// A recording whose file (or folder) was deleted: nothing was saved.
+const DELETED: &str = "The recording file was deleted while recording";
 
 /// Name of the mix in the files.
 const MIX_NAME: &str = "Mix";
@@ -564,8 +590,11 @@ struct Recording {
 
 impl Recording {
     fn finish(self, error: Option<String>) -> Result<PathBuf, String> {
-        let finished = self.mux.finish().map_err(|e| e.to_string());
-        match error.or(finished.err()) {
+        let finished = self.mux.finish();
+        if finished.as_ref().is_err_and(vesper_mux::Error::is_deleted) {
+            return Err(DELETED.into());
+        }
+        match error.or(finished.err().map(|e| e.to_string())) {
             None => Ok(self.path),
             Some(e) => Err(format!("{e} (saved up to there: {})", self.path.display())),
         }
@@ -624,6 +653,15 @@ impl Ring {
     }
 
     fn push_video(&mut self, p: EncodedPacket) {
+        // Back after a gap longer than the span (the game was gone): a replay
+        // must not join the old packets to the new ones across that hole.
+        if self
+            .video
+            .back()
+            .is_some_and(|last| p.pts.saturating_sub(last.pts) > self.span)
+        {
+            *self = Ring::new(self.span, self.audio.len());
+        }
         // A replay must start decodable.
         if self.video.is_empty() && !p.keyframe {
             return;
@@ -645,7 +683,10 @@ impl Ring {
     }
 
     fn push_audio(&mut self, track: usize, p: EncodedPacket) {
-        if !self.video.is_empty()
+        // Bounded while no video comes (the game is gone): only the
+        // audio that goes with the video kept.
+        let latest = self.video.back().map(|v| v.pts + AUDIO_LEAD);
+        if latest.is_some_and(|t| p.pts <= t)
             && let Some(t) = self.audio.get_mut(track)
         {
             t.push_back(p);
@@ -714,11 +755,15 @@ fn start_audio(sources: &AudioSources, sinks: &SharedSinks, on_event: &OnEvent) 
     // One clock for every track, so the mix lines their samples up.
     let anchor = monotonic_now();
     let mut mixer = None;
+    let mut mix_failed = false;
     if mix && enabled.len() >= 2 {
         let sinks = sinks.clone();
         match Mix::start(anchor, move |packet| write_audio(&sinks, 0, packet)) {
             Ok(m) => mixer = Some(m),
-            Err(e) => log!("recording without the mix: {e}"),
+            Err(e) => {
+                log!("recording without the mix: {e}");
+                mix_failed = true;
+            }
         }
     }
     // Every input exists before any track runs.
@@ -730,6 +775,7 @@ fn start_audio(sources: &AudioSources, sinks: &SharedSinks, on_event: &OnEvent) 
     let first = Arc::new(AtomicUsize::new(usize::from(mixer.is_some())));
     let mut running = Vec::new();
     let mut controls = Vec::new();
+    let mut failed = Vec::new();
     for (input, &i) in inputs.iter_mut().zip(&enabled) {
         let track = &tracks[i];
         let (index, sinks) = (StreamIndex::new(&first, running.len()), sinks.clone());
@@ -757,13 +803,20 @@ fn start_audio(sources: &AudioSources, sinks: &SharedSinks, on_event: &OnEvent) 
                 running.push((i, capture));
                 controls.push((i, control));
             }
-            Err(e) => log!("running without the {:?} track: {e}", track.name),
+            Err(e) => {
+                log!("running without the {:?} track: {e}", track.name);
+                failed.push(track.name.as_str());
+            }
         }
     }
     // A mix of one track would be a copy of it.
-    if running.len() < 2 && mixer.take().is_some() {
+    let dropped = running.len() < 2 && mixer.take().is_some();
+    if dropped {
         // The tracks move up one stream: before any file or replay uses them.
         first.store(0, Ordering::Relaxed);
+    }
+    if let Some(text) = missing_audio(&failed, mix_failed || dropped) {
+        on_event(Event::AudioMissing(text));
     }
     // Started outside the lock (it blocks until PipeWire is ready); the
     // latest mute and volume applied under it, so no change is missed.
@@ -776,6 +829,19 @@ fn start_audio(sources: &AudioSources, sinks: &SharedSinks, on_event: &OnEvent) 
         }
     }
     (audio.running, audio.mixer, audio.filters) = (running, mixer, controls);
+}
+
+/// One notice for the tracks that could not start, and a lost mix.
+fn missing_audio(failed: &[&str], no_mix: bool) -> Option<String> {
+    match (failed, no_mix) {
+        ([], false) => None,
+        ([], true) => Some("Recording without the mix track".to_owned()),
+        ([one], _) => Some(format!("Recording without the audio track {one}")),
+        (many, _) => Some(format!(
+            "Recording without the audio tracks {}",
+            many.join(", ")
+        )),
+    }
 }
 
 /// Empties the ring's audio and sizes it for the running streams.
@@ -833,7 +899,6 @@ fn run(
     let sinks = SharedSinks::default();
     started.store(true, Ordering::Relaxed);
     let result = pump(settings, slot, control, &sinks, sources, on_event);
-    drop(capture);
     if let Some(game) = &settings.game {
         game.detach(slot);
     }
@@ -844,6 +909,8 @@ fn run(
     if let Some(r) = rec {
         on_event(Event::Finished(r.finish(result.clone().err())));
     }
+    // Last: closing the portal session may hang, the file is safe by now.
+    drop(capture);
     result
 }
 
@@ -1006,6 +1073,8 @@ fn pump(
     slot.poke();
     let mut window = (monotonic_now(), 0u32);
     let mut error = None;
+    // Ticks were skipped because the game was gone: its return starts a GOP.
+    let mut was_gone = false;
 
     loop {
         match &video {
@@ -1183,10 +1252,23 @@ fn pump(
             }
             last_size = Some((f.width, f.height));
         }
+        // The game quit or crashed: no frozen picture, so the replay
+        // buffer keeps the seconds before it. A recording keeps its frame
+        // rate until the UI stops it (its stop needs a packet).
+        let recording = lock(sinks).rec.is_some();
+        let gone =
+            frame.is_none() && !recording && settings.game.as_ref().is_some_and(GameFrames::gone);
         let packets = match frame {
             Some(mut frame) => {
+                if std::mem::take(&mut was_gone) {
+                    v.enc.force_keyframe();
+                }
                 frame.pts = pts;
                 v.enc.encode(frame)
+            }
+            None if gone => {
+                was_gone = true;
+                Ok(Vec::new())
             }
             None => v.enc.repeat(pts),
         };
@@ -1382,6 +1464,17 @@ pub fn clear_restore_token() {
     }
 }
 
+/// vesper-encode's GPU test-pattern producer: synthetic game frames for the
+/// pipeline tests below (skipped without a VAAPI GPU).
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../../vesper-encode/tests/common/mod.rs"]
+mod producer;
+
+#[cfg(test)]
+#[path = "recorder_gpu_tests.rs"]
+mod gpu_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1539,6 +1632,60 @@ mod tests {
     }
 
     #[test]
+    fn ring_keeps_its_content_while_video_stops() {
+        // The game crashed at 4 s: audio goes on, video does not.
+        let mut ring = filled(3, 4000);
+        let before = (ring.video.clone(), ring.audio[0].len());
+        for ms in (4100..60_000).step_by(100) {
+            ring.push_audio(0, packet(ms, false));
+        }
+        assert!(
+            ring.video
+                .iter()
+                .map(|p| p.pts)
+                .eq(before.0.iter().map(|p| p.pts))
+        );
+        let last = ring.audio[0].back().unwrap().pts;
+        assert_eq!(last, Duration::from_millis(4000) + AUDIO_LEAD);
+        assert_eq!(ring.audio[0].len(), before.1 + 10);
+    }
+
+    #[test]
+    fn ring_restarts_after_a_gap_longer_than_its_span() {
+        // The game was gone from 4 s to 60 s, then comes back.
+        let mut ring = filled(3, 4000);
+        ring.push_video(packet(60_000, false));
+        assert!(ring.video.is_empty(), "waits for a keyframe");
+        ring.push_audio(0, packet(60_000, false));
+        assert!(ring.audio[0].is_empty());
+        ring.push_video(packet(60_100, true));
+        ring.push_audio(0, packet(60_100, false));
+        assert_eq!(ring.video.len(), 1);
+        assert_eq!(ring.audio[0].len(), 1);
+        // A short pause keeps the ring.
+        let mut ring = filled(3, 4000);
+        ring.push_video(packet(6000, false));
+        assert_eq!(ring.video.back().unwrap().pts, Duration::from_millis(6000));
+    }
+
+    #[test]
+    fn missing_audio_is_one_short_notice() {
+        assert_eq!(missing_audio(&[], false), None);
+        assert_eq!(
+            missing_audio(&[], true).as_deref(),
+            Some("Recording without the mix track")
+        );
+        assert_eq!(
+            missing_audio(&["Mic"], true).as_deref(),
+            Some("Recording without the audio track Mic")
+        );
+        assert_eq!(
+            missing_audio(&["Mic", "Game"], false).as_deref(),
+            Some("Recording without the audio tracks Mic, Game")
+        );
+    }
+
+    #[test]
     fn ring_snapshot_is_in_pts_order() {
         let ring = filled(3, 4000);
         let snap = interleave(ring.snapshot());
@@ -1572,5 +1719,148 @@ mod tests {
         let ts = local_timestamp();
         assert_eq!(ts.len(), 19, "{ts}");
         assert!(!ts.contains(':') && !ts.contains('/'), "{ts}");
+    }
+
+    // --- robustness (audit): the pipeline state machine without GPU or
+    // PipeWire (a game route nobody feeds, no audio tracks) ---
+
+    use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+
+    fn settings() -> Settings {
+        Settings {
+            codec: Codec::Hevc,
+            fps: 60,
+            quality: 28,
+            max_bits_per_pixel: 0.1,
+            tracks: Vec::new(),
+            mix: false,
+            game: Some(GameFrames::default()),
+        }
+    }
+
+    fn start(
+        replay: Option<Duration>,
+        record: Option<PathBuf>,
+        settings: Settings,
+    ) -> (Pipeline, Receiver<Event>) {
+        let (tx, rx) = mpsc::channel();
+        let p = Pipeline::start(settings, replay, record, move |e| drop(tx.send(e))).unwrap();
+        (p, rx)
+    }
+
+    /// Next event within `secs`, or a failure naming what hung.
+    fn next(rx: &Receiver<Event>, secs: u64) -> Event {
+        match rx.recv_timeout(Duration::from_secs(secs)) {
+            Ok(e) => e,
+            Err(RecvTimeoutError::Timeout) => panic!("no event within {secs} s: pipeline hung"),
+            Err(RecvTimeoutError::Disconnected) => panic!("pipeline ended without Stopped"),
+        }
+    }
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("vesper-rec-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn quitting_an_idle_pipeline_is_prompt_and_clean() {
+        let (p, rx) = start(Some(Duration::from_secs(30)), None, settings());
+        assert!(p.record(temp_dir("quit")), "pipeline accepts requests");
+        let t = std::time::Instant::now();
+        p.join();
+        assert!(
+            t.elapsed() < Duration::from_secs(2),
+            "join took {:?}",
+            t.elapsed()
+        );
+        // The pending recording request never started: no file, no Finished
+        // (it ends as "No frame was captured", which the UI ignores on quit).
+        assert!(matches!(next(&rx, 2), Event::Stopped(_)));
+    }
+
+    #[test]
+    fn a_dead_capture_ends_the_pipeline_and_refuses_new_requests() {
+        let s = settings();
+        let route = s.game.clone().unwrap();
+        let (p, rx) = start(Some(Duration::from_secs(30)), None, s);
+        // The game capture server died: its last event is an error. Pushed
+        // until the pipeline has attached and reports it (a push before
+        // that is dropped).
+        let mut stopped = None;
+        for _ in 0..100 {
+            route.push(Err("boom".into()));
+            if let Ok(e) = rx.recv_timeout(Duration::from_millis(50)) {
+                stopped = Some(e);
+                break;
+            }
+        }
+        match stopped {
+            Some(Event::Stopped(Some(e))) => assert!(e.contains("boom"), "{e}"),
+            other => panic!("{other:?}"),
+        }
+        // The UI must start a new pipeline: requests report the end.
+        assert!(!p.record(temp_dir("dead")));
+        assert!(!p.save_replay(temp_dir("dead")));
+        assert!(!p.set_replay(None));
+        p.join();
+    }
+
+    #[test]
+    fn a_recording_without_frames_fails_instead_of_waiting_forever() {
+        let dir = temp_dir("noframe");
+        let (p, rx) = start(None, Some(dir.clone()), settings());
+        match next(&rx, FIRST_FRAME_TIMEOUT.as_secs() + 3) {
+            Event::Finished(Err(e)) => assert!(e.contains("No frame"), "{e}"),
+            other => panic!("{other:?}"),
+        }
+        // Nothing runs any more: the pipeline ends on its own, cleanly.
+        assert!(matches!(next(&rx, 3), Event::Stopped(None)));
+        assert!(
+            !dir.exists(),
+            "no folder or file for a recording that never started"
+        );
+        p.join();
+    }
+
+    #[test]
+    fn saving_an_empty_replay_buffer_reports_it() {
+        let (p, rx) = start(Some(Duration::from_secs(30)), None, settings());
+        assert!(p.save_replay(temp_dir("empty")));
+        match next(&rx, 3) {
+            Event::ReplaySaved(Err(e)) => assert!(e.contains("empty"), "{e}"),
+            other => panic!("{other:?}"),
+        }
+        p.join();
+    }
+
+    #[test]
+    fn unusable_output_folders_are_reported_with_their_path() {
+        let video = VideoTrack {
+            codec: Codec::Hevc,
+            width: 64,
+            height: 64,
+            fps: 30,
+            extradata: Vec::new(),
+        };
+        // A file where the folder should be.
+        let base = temp_dir("badfolder");
+        std::fs::create_dir_all(&base).unwrap();
+        let file = base.join("not-a-folder");
+        std::fs::write(&file, b"x").unwrap();
+        let err = create_file(&file, "Vesper", Duration::ZERO, &video, &[])
+            .err()
+            .unwrap();
+        assert!(err.contains("not-a-folder"), "{err}");
+        // The header cannot be written (HEVC needs its parameter sets): the
+        // reserved, empty file must not stay behind.
+        let folder = base.join("clips");
+        let err = create_file(&folder, "Vesper", Duration::ZERO, &video, &[])
+            .err()
+            .unwrap();
+        assert!(err.contains("Could not create"), "{err}");
+        let left: Vec<_> = std::fs::read_dir(&folder).unwrap().collect();
+        assert!(left.is_empty(), "left behind: {left:?}");
+        std::fs::remove_dir_all(base).unwrap();
     }
 }
