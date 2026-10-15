@@ -28,8 +28,12 @@ use crate::{CHANNELS, MAX_FRAMES, SAMPLE_RATE};
 /// Name of the host binary.
 pub const HOST_BIN: &str = "vesper-vst-host";
 
-/// Longest a block waits for the host before going out dry.
+/// Longest the plugins of a chain may take on one block, together: when
+/// it is spent, the remaining plugins' blocks go out dry.
 pub const DEADLINE: Duration = Duration::from_millis(8);
+/// Most parameters taken from a plugin, and longest names (chars).
+pub const MAX_PARAMS: usize = 4096;
+pub const MAX_NAME: usize = 256;
 /// Blocks in a row the host may leave unanswered before it is restarted.
 const STUCK_BLOCKS: u32 = 3;
 /// Longest latency followed, frames (1 s); longer goes out dry.
@@ -62,23 +66,51 @@ impl HostCommand {
     }
 
     /// `vesper-vst-host` next to the running binary (a build tree), else in
-    /// `../lib/vesper/` (a package), else from `PATH`.
+    /// `../lib/vesper/` (a package). Never from `PATH`: when it is in
+    /// neither, plugins fail with "not installed".
     pub fn installed() -> Self {
         let dir = std::env::current_exe()
             .ok()
-            .and_then(|exe| Some(exe.parent()?.to_owned()));
-        let found = dir.and_then(|dir| {
-            [dir.join(HOST_BIN), dir.join("../lib/vesper").join(HOST_BIN)]
-                .into_iter()
-                .find(|p| p.is_file())
-        });
-        Self::new(found.unwrap_or_else(|| HOST_BIN.into()))
+            .and_then(|exe| Some(exe.parent()?.to_owned()))
+            .unwrap_or_default();
+        let next = dir.join(HOST_BIN);
+        let lib = dir.join("../lib/vesper").join(HOST_BIN);
+        Self::new(if !next.is_file() && lib.is_file() {
+            lib
+        } else {
+            next
+        })
     }
 
+    /// Whether the host binary exists.
+    pub fn exists(&self) -> bool {
+        self.program.is_file()
+    }
+
+    /// The host command, started so it never outlives Vesper (killed when
+    /// the spawning thread exits) and is the first process the kernel kills
+    /// when out of memory.
     pub(crate) fn command(&self) -> Command {
         let mut cmd = Command::new(&self.program);
         cmd.envs(self.env.iter().map(|(k, v)| (k, v)))
             .stdin(Stdio::null());
+        let parent = std::process::id() as libc::pid_t;
+        // SAFETY: only async-signal-safe calls between fork and exec.
+        unsafe {
+            cmd.pre_exec(move || {
+                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+                // Vesper died before the prctl: nobody would kill us.
+                if libc::getppid() != parent {
+                    libc::_exit(1);
+                }
+                let fd = libc::open(c"/proc/self/oom_score_adj".as_ptr(), libc::O_WRONLY);
+                if fd >= 0 {
+                    libc::write(fd, b"1000".as_ptr().cast(), 4);
+                    libc::close(fd);
+                }
+                Ok(())
+            });
+        }
         cmd
     }
 
@@ -96,12 +128,27 @@ impl HostCommand {
                 if libc::dup2(s, SOCKET_FD) < 0 || libc::dup2(m, SHM_FD) < 0 {
                     return Err(io::Error::last_os_error());
                 }
-                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+                close_others(SHM_FD as u32 + 1);
                 Ok(())
             });
         }
         cmd.spawn()
     }
+}
+
+/// Marks every fd from `first` close-on-exec: the host inherits nothing
+/// else of Vesper. Async-signal-safe. (Close-on-exec, not closed: std's
+/// exec-error pipe must stay open until the exec.)
+pub(crate) fn close_others(first: u32) {
+    // SAFETY: a plain syscall (CLOSE_RANGE_CLOEXEC, Linux 5.11).
+    unsafe {
+        libc::syscall(
+            libc::SYS_close_range,
+            first,
+            u32::MAX,
+            libc::CLOSE_RANGE_CLOEXEC,
+        )
+    };
 }
 
 fn dup_high(fd: BorrowedFd) -> io::Result<OwnedFd> {
@@ -232,6 +279,10 @@ impl Instance {
 
     /// Sets parameter `index` of [`View::params`] (normalized, clamped).
     pub fn set_param(&self, index: usize, value: f64) {
+        // `clamp` lets NaN through.
+        if !value.is_finite() {
+            return;
+        }
         let value = value.clamp(0.0, 1.0);
         let id = {
             let mut view = self.inner.view();
@@ -363,6 +414,9 @@ impl Supervisor {
     }
 
     fn start(&mut self, sidecar: &Sidecar) -> Result<Host, StartError> {
+        if !self.host.exists() {
+            return Err(StartError::Plugin(format!("{HOST_BIN} not installed")));
+        }
         let host_err = |what: &str, e: io::Error| StartError::Host(format!("{what}: {e}"));
         let (ours, theirs) = UnixStream::pair().map_err(|e| host_err("socket", e))?;
         let child = self
@@ -388,13 +442,17 @@ impl Supervisor {
             controller: sidecar.controller.clone(),
         });
         let reply = request(&mut host, &load, LOAD_TIMEOUT).map_err(|e| {
+            if e.kind() == io::ErrorKind::InvalidInput {
+                // Would fail the same way every time.
+                return StartError::Plugin("saved state too big".into());
+            }
             StartError::Host(match host.child.try_wait() {
                 Ok(Some(status)) => format!("host died while loading ({status})"),
                 _ => format!("loading: {e}"),
             })
         })?;
         let (name, params) = match reply {
-            Msg::Loaded { name, params, .. } => (name, params),
+            Msg::Loaded { name, params, .. } => sanitize(name, params),
             Msg::Error(e) => return Err(StartError::Plugin(e)),
             other => return Err(StartError::Host(format!("unexpected answer {other:?}"))),
         };
@@ -464,11 +522,55 @@ impl Supervisor {
     }
 }
 
-/// Sends `msg` and reads the answer within `timeout`.
+/// What a host says of its plugin, bounded: it is not trusted.
+fn sanitize(name: String, mut params: Vec<Param>) -> (String, Vec<Param>) {
+    let cut = |s: String| s.chars().take(MAX_NAME).collect::<String>();
+    let unit = |v: f64| {
+        if v.is_finite() {
+            v.clamp(0.0, 1.0)
+        } else {
+            0.0
+        }
+    };
+    params.truncate(MAX_PARAMS);
+    let params = params
+        .into_iter()
+        .map(|p| Param {
+            title: cut(p.title),
+            units: cut(p.units),
+            default: unit(p.default),
+            value: unit(p.value),
+            ..p
+        })
+        .collect();
+    (cut(name), params)
+}
+
+/// Sends `msg` and reads the answer, all within `timeout`.
 fn request(host: &mut Host, msg: &Msg, timeout: Duration) -> io::Result<Msg> {
-    host.socket.set_read_timeout(Some(timeout))?;
     protocol::write(&mut &host.socket, msg)?;
-    protocol::read(&mut &host.socket)
+    protocol::read(&mut Deadline {
+        socket: &host.socket,
+        until: Instant::now() + timeout,
+    })
+}
+
+/// Reads with one deadline for all the reads of a message.
+struct Deadline<'a> {
+    socket: &'a UnixStream,
+    until: Instant,
+}
+
+impl io::Read for Deadline<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let left = self
+            .until
+            .checked_duration_since(Instant::now())
+            .filter(|d| !d.is_zero())
+            .ok_or(io::ErrorKind::TimedOut)?;
+        self.socket.set_read_timeout(Some(left))?;
+        (&mut &*self.socket).read(buf)
+    }
 }
 
 /// A plugin instance in a track's chain. Never waits for its host longer
@@ -487,7 +589,7 @@ pub struct Vst3Filter {
 }
 
 impl Vst3Filter {
-    fn block(&mut self, buf: &mut [f32]) {
+    fn block(&mut self, buf: &mut [f32], deadline: Instant) {
         let n = buf.len();
         let frames = self.ring.len() / CHANNELS;
         for (src, dst) in buf.chunks(CHANNELS).zip(self.dry.chunks_mut(CHANNELS)) {
@@ -500,7 +602,7 @@ impl Vst3Filter {
         let inner = &*self.instance.inner;
         let wet =
             inner.ready.load(Ordering::Acquire) && !inner.in_use.swap(true, Ordering::Acquire) && {
-                let wet = exchange(inner, buf);
+                let wet = exchange(inner, buf, deadline);
                 inner.in_use.store(false, Ordering::Release);
                 wet
             };
@@ -513,8 +615,9 @@ impl Vst3Filter {
     }
 }
 
-/// Runs one block through the host: true with the answer in `buf`.
-fn exchange(inner: &Inner, buf: &mut [f32]) -> bool {
+/// Runs one block through the host by `deadline`: true with the answer
+/// in `buf`.
+fn exchange(inner: &Inner, buf: &mut [f32], deadline: Instant) -> bool {
     let shm = &inner.shm;
     let h = shm.header();
     let req = h.req.load(Ordering::Relaxed);
@@ -523,18 +626,25 @@ fn exchange(inner: &Inner, buf: &mut [f32]) -> bool {
         inner.late.fetch_add(1, Ordering::Relaxed);
         return false;
     }
+    if Instant::now() >= deadline {
+        // Plugins earlier in the chain spent the block's time: not this
+        // host's fault.
+        return false;
+    }
     shm.write_input(buf);
     h.frames
         .store((buf.len() / CHANNELS) as u32, Ordering::Relaxed);
     let req = req.wrapping_add(1);
     h.req.store(req, Ordering::Release);
     futex_wake(&h.req);
-    let deadline = Instant::now() + DEADLINE;
     loop {
         let done = load(&h.done);
         if done == req {
             shm.read_output(buf);
             inner.late.store(0, Ordering::Relaxed);
+            if h.failed.load(Ordering::Relaxed) != 0 {
+                return false;
+            }
             // A diverging plugin's NaN would stick in every filter state
             // downstream, the mix's included: that block goes out dry.
             return buf.iter().all(|s| s.is_finite());
@@ -550,8 +660,10 @@ fn exchange(inner: &Inner, buf: &mut [f32]) -> bool {
 
 impl Filter for Vst3Filter {
     fn process(&mut self, buf: &mut [f32]) {
+        // One budget for every plugin of the chain's block.
+        let deadline = vesper_dsp::block_start().unwrap_or_else(Instant::now) + DEADLINE;
         for block in buf.chunks_mut(MAX_FRAMES * CHANNELS) {
-            self.block(block);
+            self.block(block, deadline);
         }
     }
 
@@ -576,8 +688,10 @@ pub struct Registry {
 impl Registry {
     /// Instances keep their settings in `dir` (see [`crate::sidecar`]).
     pub fn new(dir: impl Into<PathBuf>, host: HostCommand) -> Self {
+        let dir = dir.into();
+        sidecar::clean_temporary(&dir);
         Self {
-            dir: dir.into(),
+            dir,
             host,
             open: Mutex::default(),
         }
@@ -600,11 +714,8 @@ impl Registry {
 
     /// A new instance of `plugin`: writes its settings, returns its id.
     pub fn add(&self, plugin: &PluginInfo) -> io::Result<u32> {
-        let open = self.open();
-        let taken = sidecar::ids(&self.dir);
-        let id = (1..)
-            .find(|id| !taken.contains(id) && !open.contains_key(id))
-            .expect("a free id");
+        let _open = self.open();
+        let id = sidecar::next_id(&self.dir)?;
         Sidecar {
             path: plugin.path.clone(),
             cid: plugin.cid,
@@ -622,18 +733,6 @@ impl Registry {
             i.inner.removed.store(true, Ordering::Release);
         }
         let _ = std::fs::remove_file(sidecar::file(&self.dir, id));
-    }
-
-    /// Removes every instance but `keep` (settings left by removed filters).
-    pub fn retain(&self, keep: &[u32]) {
-        let stale = sidecar::ids(&self.dir)
-            .into_iter()
-            .chain(self.open().keys().copied())
-            .filter(|id| !keep.contains(id))
-            .collect::<Vec<_>>();
-        for id in stale {
-            self.remove(id);
-        }
     }
 
     /// Saves every running instance's state (see [`Instance::persist`]).
@@ -677,5 +776,67 @@ fn build(id: u32, channels: usize) -> Option<Box<dyn Filter + Send>> {
             warn!("VST3 plugin {id} cannot start: {e}");
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+
+    use super::*;
+
+    #[test]
+    fn host_answers_are_bounded() {
+        let p = Param {
+            id: 1,
+            title: "t".repeat(10_000),
+            units: "u".repeat(300),
+            steps: 0,
+            default: f64::NAN,
+            value: f64::INFINITY,
+        };
+        let many = vec![p; MAX_PARAMS + 10];
+        let (name, params) = sanitize("n".repeat(1_000), many);
+        assert_eq!(name.chars().count(), MAX_NAME);
+        assert_eq!(params.len(), MAX_PARAMS);
+        assert_eq!(params[0].title.chars().count(), MAX_NAME);
+        assert_eq!(params[0].units.chars().count(), MAX_NAME);
+        assert_eq!((params[0].default, params[0].value), (0.0, 0.0));
+        let odd = Param {
+            value: 2.0,
+            default: -1.0,
+            ..params[0].clone()
+        };
+        let (_, odd) = sanitize(String::new(), vec![odd]);
+        assert_eq!((odd[0].default, odd[0].value), (0.0, 1.0));
+    }
+
+    #[test]
+    fn requests_have_one_deadline() {
+        let (a, b) = UnixStream::pair().unwrap();
+        // A peer that trickles a length, then nothing.
+        let t = std::thread::spawn(move || {
+            for byte in [8u8, 0, 0] {
+                (&b).write_all(&[byte]).unwrap();
+                std::thread::sleep(Duration::from_millis(60));
+            }
+            std::thread::sleep(Duration::from_millis(300));
+        });
+        let start = Instant::now();
+        let mut r = Deadline {
+            socket: &a,
+            until: start + Duration::from_millis(100),
+        };
+        let e = protocol::read(&mut r).unwrap_err();
+        assert!(
+            start.elapsed() < Duration::from_millis(200),
+            "{:?}",
+            start.elapsed()
+        );
+        assert!(matches!(
+            e.kind(),
+            io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+        ));
+        t.join().unwrap();
     }
 }

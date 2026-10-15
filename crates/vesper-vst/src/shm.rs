@@ -22,6 +22,8 @@ pub struct Header {
     pub frames: AtomicU32,
     /// The plugin's latency at its last block, frames.
     pub latency: AtomicU32,
+    /// Non-zero: the plugin failed the last block, its output is not valid.
+    pub failed: AtomicU32,
 }
 
 /// Where the buffers start: the header, padded to a cache line.
@@ -49,7 +51,12 @@ impl Shm {
     /// A new region for blocks of up to `max_frames` frames of `channels`.
     pub fn create(channels: usize, max_frames: usize) -> io::Result<Self> {
         // SAFETY: a valid C string; the fd is ours.
-        let fd = unsafe { libc::memfd_create(c"vesper-vst".as_ptr(), libc::MFD_CLOEXEC) };
+        let fd = unsafe {
+            libc::memfd_create(
+                c"vesper-vst".as_ptr(),
+                libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
+            )
+        };
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -58,6 +65,13 @@ impl Shm {
         let samples = channels * max_frames;
         // SAFETY: a valid fd. A new memfd reads as zeros.
         if unsafe { libc::ftruncate(fd.as_raw_fd(), size(samples) as libc::off_t) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // A host shrinking the region would make Vesper's next access to
+        // the mapping a SIGBUS: the size is sealed.
+        let seals = libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_SEAL;
+        // SAFETY: a valid fd.
+        if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_ADD_SEALS, seals) } != 0 {
             return Err(io::Error::last_os_error());
         }
         Self::map(fd, channels, max_frames)
@@ -209,6 +223,17 @@ mod tests {
         assert_eq!(b.header().frames.load(Ordering::Acquire), 16);
         let fd = a.as_fd().try_clone_to_owned().unwrap();
         assert!(Shm::map(fd, 2, 32).is_err(), "size mismatch");
+    }
+
+    #[test]
+    fn region_size_is_sealed() {
+        let a = Shm::create(2, 16).unwrap();
+        let fd = a.as_fd().as_raw_fd();
+        for len in [0, 1 << 20] {
+            // SAFETY: a valid fd.
+            assert_ne!(unsafe { libc::ftruncate(fd, len) }, 0, "{len}");
+        }
+        a.write_input(&[1.0; 32]);
     }
 
     #[test]

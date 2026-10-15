@@ -168,6 +168,23 @@ struct Open {
     _module: Module,
 }
 
+/// Terminates the initialized parts of a plugin whose load failed.
+struct Terminate {
+    parts: Vec<ComPtr<IPluginBase>>,
+    armed: bool,
+}
+
+impl Drop for Terminate {
+    fn drop(&mut self) {
+        if self.armed {
+            for p in self.parts.iter().rev() {
+                // SAFETY: each part was initialized and is still alive.
+                unsafe { p.terminate() };
+            }
+        }
+    }
+}
+
 /// Channels of an arrangement (one bit per speaker).
 fn channels(arr: SpeakerArrangement) -> usize {
     arr.count_ones() as usize
@@ -189,6 +206,10 @@ impl Plugin for Vst3 {
             if component.initialize(context.as_ptr()) != kResultOk {
                 return Err("the plugin failed to initialize".into());
             }
+            let mut terminate = Terminate {
+                parts: component.cast::<IPluginBase>().into_iter().collect(),
+                armed: true,
+            };
             // Its controller: the component itself, or a separate class.
             let mut separate = false;
             let controller = component.cast::<IEditController>().or_else(|| {
@@ -203,6 +224,9 @@ impl Plugin for Vst3 {
                 separate = true;
                 Some(c)
             });
+            if let Some(c) = controller.as_ref().filter(|_| separate) {
+                terminate.parts.extend(c.cast::<IPluginBase>());
+            }
             if let Some(c) = &controller {
                 if separate
                     && let (Some(a), Some(b)) = (
@@ -291,12 +315,14 @@ impl Plugin for Vst3 {
                 .collect();
             let audio_side = com::Audio::new(
                 processor,
+                component.clone(),
                 host.latency_changed.clone(),
                 l,
                 &buses_in,
                 &buses_out,
             );
             let name = class_name(&module, &l.cid).unwrap_or_else(|| "VST3 plugin".into());
+            terminate.armed = false;
             self.loaded = Some(Open {
                 component,
                 controller,

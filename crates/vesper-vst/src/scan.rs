@@ -6,8 +6,10 @@
 
 use std::io::Read;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
+use std::sync::mpsc;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use tracing::warn;
@@ -69,9 +71,11 @@ impl PluginInfo {
 /// The standard Linux VST3 folders: `~/.vst3`, `/usr/lib/vst3`,
 /// `/usr/local/lib/vst3`.
 pub fn default_dirs() -> Vec<PathBuf> {
-    let home = std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".vst3"));
+    let home = dirs::home_dir().map(|h| h.join(".vst3"));
     home.into_iter()
         .chain(["/usr/lib/vst3".into(), "/usr/local/lib/vst3".into()])
+        // A relative $HOME would scan wherever Vesper was started.
+        .filter(|d: &PathBuf| d.is_absolute())
         .collect()
 }
 
@@ -116,6 +120,10 @@ fn mtime(path: &Path) -> u64 {
 /// Lists the effects of every bundle in `dirs`, through `cache`.
 pub fn scan(host: &HostCommand, dirs: &[PathBuf], cache: &Path) -> Vec<PluginInfo> {
     // Cache lines: path bytes (hex), mtime, then a scan line or nothing.
+    if !host.exists() {
+        warn!("cannot list VST3 plugins: {:?} not installed", host.program);
+        return Vec::new();
+    }
     let old = std::fs::read_to_string(cache).unwrap_or_default();
     let cached = |path: &Path, mtime: u64| -> Option<Vec<String>> {
         let key = format!("{}\t{mtime}\t", hex(path.as_os_str().as_bytes()));
@@ -159,27 +167,37 @@ pub fn scan(host: &HostCommand, dirs: &[PathBuf], cache: &Path) -> Vec<PluginInf
 
 /// Runs `host --scan path`: its stdout lines, or why it failed.
 fn scan_one(host: &HostCommand, path: &Path) -> Result<Vec<String>, String> {
-    let mut child = host
-        .command()
-        .arg("--scan")
-        .arg(path)
-        .stdout(Stdio::piped())
+    let mut cmd = host.command();
+    cmd.arg("--scan").arg(path).stdout(Stdio::piped());
+    // SAFETY: an async-signal-safe syscall between fork and exec.
+    unsafe {
+        cmd.pre_exec(|| {
+            crate::client::close_others(3);
+            Ok(())
+        });
+    }
+    let mut child = cmd
         .spawn()
         .map_err(|e| format!("cannot start {:?}: {e}", host.program))?;
     let mut stdout = child.stdout.take().expect("piped");
-    let reader = std::thread::spawn(move || {
+    let (tx, rx) = mpsc::channel();
+    // Detached: a helper the plugin started may keep the pipe open.
+    std::thread::spawn(move || {
         let mut out = Vec::new();
         let _ = stdout.read_to_end(&mut out);
-        out
+        let _ = tx.send(out);
     });
     let status = wait_timeout(&mut child, SCAN_TIMEOUT);
-    let out = reader.join().unwrap_or_default();
     match status {
-        Some(s) if s.success() => Ok(String::from_utf8(out)
-            .map_err(|_| "not UTF-8".to_owned())?
-            .lines()
-            .map(str::to_owned)
-            .collect()),
+        Some(s) if s.success() => {
+            let out = rx
+                .recv_timeout(Duration::from_secs(1))
+                .map_err(|_| "output not closed".to_owned())?;
+            Ok(String::from_utf8_lossy(&out)
+                .lines()
+                .map(str::to_owned)
+                .collect())
+        }
         Some(s) => Err(format!("scan failed ({s})")),
         None => Err("scan timed out".into()),
     }

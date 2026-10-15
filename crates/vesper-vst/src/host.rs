@@ -43,8 +43,9 @@ pub trait Plugin {
 pub trait Processor: Send {
     /// Processes one block of interleaved samples (the channel count given
     /// to [`Plugin::load`]), with the parameter changes since the last one.
-    /// An empty block only hands over parameter changes.
-    fn process(&mut self, input: &[f32], output: &mut [f32], changes: &[(u32, f64)]);
+    /// An empty block only hands over parameter changes. False when the
+    /// plugin failed the block: Vesper then uses the dry signal.
+    fn process(&mut self, input: &[f32], output: &mut [f32], changes: &[(u32, f64)]) -> bool;
     /// Current latency, frames.
     fn latency(&self) -> u32;
 }
@@ -133,6 +134,10 @@ pub fn serve_on(mut plugin: impl Plugin, socket: UnixStream, shm: OwnedFd) -> io
                     std::thread::sleep(Duration::from_millis(1));
                 }
                 Some(match plugin.state() {
+                    // Room for the tag and the two lengths.
+                    Ok((c, d)) if c.len() + d.len() > protocol::MAX_MESSAGE - 16 => {
+                        Msg::Error("state too big".into())
+                    }
                     Ok((component, controller)) => Msg::State {
                         component,
                         controller,
@@ -194,7 +199,7 @@ impl Audio {
                 if changes.is_empty() {
                     futex_wait(&h.req, done, Duration::from_millis(100));
                 } else {
-                    self.processor.process(&[], &mut [], &changes);
+                    let _ = self.processor.process(&[], &mut [], &changes);
                     self.applied
                         .fetch_add(changes.len() as u64, Ordering::Release);
                 }
@@ -207,9 +212,11 @@ impl Audio {
                 .min(shm.samples());
             shm.read_input(&mut input[..samples]);
             self.changes(&mut changes);
-            self.processor
+            let ok = self
+                .processor
                 .process(&input[..samples], &mut output[..samples], &changes);
             shm.write_output(&output[..samples]);
+            h.failed.store(u32::from(!ok), Ordering::Relaxed);
             h.latency.store(self.processor.latency(), Ordering::Relaxed);
             h.done.store(req, Ordering::Release);
             futex_wake(&h.done);

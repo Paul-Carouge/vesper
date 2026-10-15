@@ -5,8 +5,10 @@
 //! Modes: `gain` (output = input delayed by `VESPER_FAKE_LATENCY` frames,
 //! times the gain parameter, 0.5 by default), `slow` (gain, then 50 ms per
 //! block after `VESPER_FAKE_AFTER` blocks), `crash` (aborts after that
-//! many blocks), `nan` (NaN output after that many blocks), `fail`
-//! (refuses to load).
+//! many blocks), `nan` (NaN output after that many blocks), `broken`
+//! (fails blocks after that many), `fail` (refuses to load), `shrink`
+//! (tries to truncate the audio region; named "sealed" when refused),
+//! `bigstate` (a state over the message limit).
 
 #![allow(dead_code)]
 
@@ -54,6 +56,13 @@ impl Plugin for Fake {
         if self.mode == "fail" {
             return Err("no stereo bus".into());
         }
+        let mut name = "Fake";
+        if self.mode == "shrink" {
+            // SAFETY: fd 4 is the audio region Vesper handed over.
+            if unsafe { libc::ftruncate(vesper_vst::host::SHM_FD, 0) } != 0 {
+                name = "sealed";
+            }
+        }
         if let Ok(bytes) = load.component.as_slice().try_into() {
             self.gain = f64::from_le_bytes(bytes);
         }
@@ -74,7 +83,7 @@ impl Plugin for Fake {
             latency: self.latency as u32,
             line: std::iter::repeat_n(0.0, samples).collect(),
         };
-        Ok(("Fake".into(), vec![param], Box::new(proc)))
+        Ok((name.into(), vec![param], Box::new(proc)))
     }
 
     fn set_param(&mut self, id: u32, value: f64) {
@@ -84,6 +93,9 @@ impl Plugin for Fake {
     }
 
     fn state(&mut self) -> Result<(Vec<u8>, Vec<u8>), String> {
+        if self.mode == "bigstate" {
+            return Ok((vec![0; vesper_vst::protocol::MAX_MESSAGE], Vec::new()));
+        }
         Ok((self.gain.to_le_bytes().to_vec(), Vec::new()))
     }
 }
@@ -98,7 +110,7 @@ struct FakeProcessor {
 }
 
 impl Processor for FakeProcessor {
-    fn process(&mut self, input: &[f32], output: &mut [f32], changes: &[(u32, f64)]) {
+    fn process(&mut self, input: &[f32], output: &mut [f32], changes: &[(u32, f64)]) -> bool {
         for &(id, value) in changes {
             if id == 0 {
                 self.gain = value as f32;
@@ -111,7 +123,11 @@ impl Processor for FakeProcessor {
                 "crash" => std::process::abort(),
                 "nan" => {
                     output.fill(f32::NAN);
-                    return;
+                    return true;
+                }
+                "broken" => {
+                    output.fill(0.0);
+                    return false;
                 }
                 _ => {}
             }
@@ -120,6 +136,7 @@ impl Processor for FakeProcessor {
             self.line.push_back(*i);
             *o = self.line.pop_front().unwrap() * self.gain;
         }
+        true
     }
 
     fn latency(&self) -> u32 {

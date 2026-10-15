@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+dirs = "7"
 libc = "0.2"
 tracing = "0.1"
 vesper-dsp.workspace = true

@@ -86,6 +86,9 @@ impl IComponentHandlerTrait for HostApp {
     }
 }
 
+/// Largest state a stream holds: what one message can carry.
+const MAX_STREAM: usize = vesper_vst::protocol::MAX_MESSAGE;
+
 /// An in-memory IBStream, for states.
 pub struct MemoryStream {
     data: RefCell<Vec<u8>>,
@@ -141,6 +144,9 @@ impl IBStreamTrait for MemoryStream {
 
     unsafe fn write(&self, buffer: *mut c_void, n: int32, written: *mut int32) -> tresult {
         let n = n.max(0) as usize;
+        if self.pos.get().saturating_add(n) > MAX_STREAM {
+            return kResultFalse;
+        }
         // SAFETY: the plugin's buffer holds `n` bytes.
         let src = unsafe { std::slice::from_raw_parts(buffer.cast::<u8>(), n) };
         let mut data = self.data.borrow_mut();
@@ -164,8 +170,8 @@ impl IBStreamTrait for MemoryStream {
             IBStream_::IStreamSeekMode_::kIBSeekEnd => self.data.borrow().len() as int64,
             _ => return kInvalidArgument,
         };
-        let new = base + pos;
-        if new < 0 {
+        let new = base.saturating_add(pos);
+        if new < 0 || new as u64 > MAX_STREAM as u64 {
             return kInvalidArgument;
         }
         self.pos.set(new as usize);
@@ -332,6 +338,7 @@ impl Bus {
 /// The plugin's audio side, on the host's audio thread.
 pub struct Audio {
     processor: ComPtr<IAudioProcessor>,
+    component: ComPtr<IComponent>,
     latency_changed: Flag,
     latency: u32,
     changes: ComWrapper<ParamChanges>,
@@ -366,6 +373,7 @@ fn buffers(buses: &mut [Bus]) -> Vec<AudioBusBuffers> {
 impl Audio {
     pub fn new(
         processor: ComPtr<IAudioProcessor>,
+        component: ComPtr<IComponent>,
         latency_changed: Flag,
         load: &Load,
         ins: &[usize],
@@ -389,6 +397,7 @@ impl Audio {
             in_buffers: buffers(&mut inputs),
             out_buffers: buffers(&mut outputs),
             processor,
+            component,
             latency_changed,
             latency,
             changes,
@@ -401,7 +410,7 @@ impl Audio {
 }
 
 impl Processor for Audio {
-    fn process(&mut self, input: &[f32], output: &mut [f32], changes: &[(u32, f64)]) {
+    fn process(&mut self, input: &[f32], output: &mut [f32], changes: &[(u32, f64)]) -> bool {
         // Vesper's side is stereo (checked at load).
         let frames = input.len() / 2;
         let main = &mut self.inputs[0].data;
@@ -414,7 +423,10 @@ impl Processor for Audio {
         }
         for (b, buf) in self.inputs.iter().zip(&mut self.in_buffers).skip(1) {
             // Side-chains and other extra inputs: silent.
-            buf.silenceFlags = (1u64 << b.data.len()) - 1;
+            buf.silenceFlags = match b.data.len() {
+                n @ 0..64 => (1u64 << n) - 1,
+                _ => u64::MAX,
+            };
         }
         self.changes.set(changes);
         let mut data = ProcessData {
@@ -435,18 +447,27 @@ impl Processor for Audio {
         let ok = unsafe { self.processor.process(&mut data) } == kResultOk;
         let out = &self.outputs[0].data;
         for (i, f) in output.as_chunks_mut::<2>().0.iter_mut().enumerate() {
-            (f[0], f[1]) = match (ok, out.len()) {
-                (false, _) => (input[2 * i], input[2 * i + 1]),
-                (true, 2) => (out[0][i], out[1][i]),
-                (true, _) => (out[0][i], out[0][i]),
+            (f[0], f[1]) = if out.len() == 2 {
+                (out[0][i], out[1][i])
+            } else {
+                (out[0][i], out[0][i])
             };
         }
         self.context.projectTimeSamples += frames as i64;
         self.context.continousTimeSamples += frames as i64;
         if take(&self.latency_changed) {
-            // SAFETY: a plain call.
-            self.latency = unsafe { self.processor.getLatencySamples() };
+            // The spec's way to apply a new latency: deactivate, reactivate.
+            // SAFETY: plain calls, between two blocks.
+            unsafe {
+                self.processor.setProcessing(0);
+                self.component.setActive(0);
+                self.component.setActive(1);
+                self.processor.setProcessing(1);
+                self.latency = self.processor.getLatencySamples();
+            }
         }
+        // A failed block goes out dry on Vesper's side.
+        ok
     }
 
     fn latency(&self) -> u32 {

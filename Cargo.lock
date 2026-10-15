@@ -5190,6 +5190,7 @@ dependencies = [
 name = "vesper-vst"
 version = "0.1.0"
 dependencies = [
+ "dirs",
  "libc",
  "tracing",
  "vesper-dsp",

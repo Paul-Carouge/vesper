@@ -178,6 +178,77 @@ fn non_finite_output_goes_out_dry() {
 }
 
 #[test]
+fn host_cannot_shrink_the_audio_region() {
+    let dir = temp_dir("shrink");
+    let reg = common::registry(&dir, "shrink", 0, 0);
+    let id = reg.add(&fake_plugin()).unwrap();
+    let inst = reg.instance(id).unwrap();
+    wait_for("the host", || running(&inst));
+    // Its truncate was refused (else this process would die of SIGBUS here).
+    assert_eq!(inst.view().name, "sealed");
+    let mut f = inst.filter();
+    let (i, o, _) = run(&mut f, 0, 3, Duration::ZERO);
+    assert!(is_wet(&i, &o, 0, 0.5));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn failed_blocks_go_out_dry() {
+    let dir = temp_dir("broken");
+    let reg = common::registry(&dir, "broken", 32, 2);
+    let id = reg.add(&fake_plugin()).unwrap();
+    let inst = reg.instance(id).unwrap();
+    wait_for("the host", || running(&inst));
+    let mut f = inst.filter();
+    run(&mut f, 0, 2, Duration::ZERO);
+    assert_eq!(f.latency(), 32);
+    // Dry, delayed like the plugin, not the zeros it wrote.
+    let (i, o, _) = run(&mut f, 0, 3, Duration::ZERO);
+    assert!(is_wet(&i, &o, 32, 1.0));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn state_over_the_message_limit_is_refused_not_fatal() {
+    let dir = temp_dir("bigstate");
+    let reg = common::registry(&dir, "bigstate", 0, 0);
+    let id = reg.add(&fake_plugin()).unwrap();
+    let inst = reg.instance(id).unwrap();
+    wait_for("the host", || running(&inst));
+    let pid = inst.pid();
+    let before = std::fs::read(sidecar::file(&dir, id)).unwrap();
+    reg.persist_all();
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(inst.pid(), pid, "same host");
+    assert!(running(&inst));
+    assert_eq!(std::fs::read(sidecar::file(&dir, id)).unwrap(), before);
+    // A saved state too big to send fails for good, without retries.
+    let s = sidecar::Sidecar {
+        component: vec![0; vesper_vst::protocol::MAX_MESSAGE],
+        ..sidecar::Sidecar::load(&dir, id).unwrap()
+    };
+    s.save(&dir, 500).unwrap();
+    let big = reg.instance(500).unwrap();
+    wait_for("the failure", || {
+        big.view().status == Status::Failed("saved state too big".into())
+    });
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn missing_host_binary_fails_the_plugin() {
+    let dir = temp_dir("nohost");
+    let reg = vesper_vst::Registry::new(&dir, vesper_vst::HostCommand::new("/nonexistent/host"));
+    let id = reg.add(&fake_plugin()).unwrap();
+    let inst = reg.instance(id).unwrap();
+    wait_for("the failure", || {
+        inst.view().status == Status::Failed("vesper-vst-host not installed".into())
+    });
+    assert!(reg.scan().is_empty());
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
 fn plugin_that_cannot_load_is_marked_failed() {
     let dir = temp_dir("fail");
     let reg = common::registry(&dir, "fail", 0, 0);
@@ -216,13 +287,15 @@ fn state_is_saved_beside_the_settings_and_restored() {
     let inst = reg.instance(id).unwrap();
     wait_for("the host", || running(&inst));
     assert_eq!(inst.view().params[0].value, 0.75);
-    // Removing the filter deletes its file; stale files are cleaned up.
+    // Only an explicit removal deletes a file: other instances' files, even
+    // ones no filter list names, stay; a new instance never takes an old id.
     let other = reg.add(&fake_plugin()).unwrap();
-    assert_ne!(other, id);
-    reg.retain(&[id]);
-    assert_eq!(sidecar::ids(&dir), [id]);
+    assert!(other > id);
+    std::fs::copy(sidecar::file(&dir, id), sidecar::file(&dir, 99)).unwrap();
+    drop(common::registry(&dir, "gain", 0, 0));
     reg.remove(id);
-    assert!(sidecar::ids(&dir).is_empty());
+    assert_eq!(sidecar::ids(&dir).len(), 2);
+    assert!(reg.add(&fake_plugin()).unwrap() > 99);
     std::fs::remove_dir_all(&dir).unwrap();
 }
 

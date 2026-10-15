@@ -875,6 +875,8 @@ export component AppWindow inherits Window {
     callback filter-moved(int, int, int);
     callback filter-removed(int, int);
     callback filter-added(int, string);
+    // "Add filter" opened: the plugin list is refreshed.
+    callback filter-menu-opened();
     /// Replaces the track's filters with the voice chain.
     callback filter-voice-preset(int);
     callback audio-mix-changed(bool);
@@ -1592,6 +1594,9 @@ export component AppWindow inherits Window {
                                         accessible-label: root.adding-filter ? "Close the filter list" : "Add filter";
                                         clicked => {
                                             root.adding-filter = !root.adding-filter;
+                                            if (root.adding-filter) {
+                                                root.filter-menu-opened();
+                                            }
                                         }
                                     }
                                 }

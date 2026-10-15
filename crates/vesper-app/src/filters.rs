@@ -14,6 +14,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap};
 use std::rc::Rc;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use slint::{ComponentHandle, Model, ModelRc, VecModel};
@@ -275,7 +276,7 @@ fn save(ui: &AppWindow) {
 }
 
 /// Forgets the plugin instances of `rows` (their settings file goes too).
-fn forget_plugins(rows: impl IntoIterator<Item = FilterRow>) {
+pub(crate) fn forget_plugins(rows: impl IntoIterator<Item = FilterRow>) {
     if let Some(r) = vesper_vst::global() {
         rows.into_iter()
             .filter_map(|row| plugin_id(&row.kind))
@@ -283,20 +284,30 @@ fn forget_plugins(rows: impl IntoIterator<Item = FilterRow>) {
     }
 }
 
-/// Lists the installed plugins in the background, then offers them.
+/// A plugin scan is running.
+static SCANNING: AtomicBool = AtomicBool::new(false);
+
+/// Lists the installed plugins in the background, then offers them. Run
+/// when "Add filter" opens (unchanged bundles come from the cache), not at
+/// startup: no plugin code runs unless plugins are wanted.
 fn scan_plugins(ui: &AppWindow) {
     let Some(registry) = vesper_vst::global() else {
         return;
     };
+    if SCANNING.swap(true, Ordering::AcqRel) {
+        return;
+    }
     let weak = ui.as_weak();
     let scan = std::thread::Builder::new()
         .name("vst3-scan".into())
         .spawn(move || {
             let found = registry.scan();
             *PLUGINS.lock().unwrap_or_else(|e| e.into_inner()) = found;
+            SCANNING.store(false, Ordering::Release);
             let _ = weak.upgrade_in_event_loop(|ui| show_kinds(&ui));
         });
     if let Err(e) = scan {
+        SCANNING.store(false, Ordering::Release);
         log!("cannot scan the VST3 plugins: {e}");
     }
 }
@@ -325,22 +336,14 @@ fn refresh_plugins(ui: &AppWindow, seen: &mut HashMap<u32, u64>) {
     }
 }
 
-/// Ids of the plugin instances of every track.
-fn plugin_ids(ui: &AppWindow) -> Vec<u32> {
-    ui.get_tracks()
-        .iter()
-        .flat_map(|t| t.filters.iter().collect::<Vec<_>>())
-        .filter_map(|row| plugin_id(&row.kind))
-        .collect()
-}
-
 pub fn wire(ui: &AppWindow, rec: &Shared) {
     show_kinds(ui);
-    scan_plugins(ui);
-    // Settings files of plugins whose track was removed.
-    if let Some(r) = vesper_vst::global() {
-        r.retain(&plugin_ids(ui));
-    }
+    let weak = ui.as_weak();
+    ui.on_filter_menu_opened(move || {
+        if let Some(ui) = weak.upgrade() {
+            scan_plugins(&ui);
+        }
+    });
     let weak = ui.as_weak();
     let seen = RefCell::new(HashMap::new());
     let plugin_timer = slint::Timer::default();
@@ -614,6 +617,38 @@ mod tests {
         assert_eq!(from_rows(&rows), filters);
         assert_eq!(new_filter("gain"), FilterSpec::default_for("gain"));
         assert_eq!(new_filter("vst3-plugin:99"), None);
+    }
+
+    #[test]
+    fn forgetting_plugin_rows_deletes_only_their_settings() {
+        let dir = std::env::temp_dir().join(format!("vesper-app-vst-{}", std::process::id()));
+        let reg = vesper_vst::install(vesper_vst::Registry::new(
+            &dir,
+            vesper_vst::HostCommand::new("/nonexistent/vesper-vst-host"),
+        ))
+        .unwrap();
+        let plugin = PluginInfo {
+            path: "/nowhere/A.vst3".into(),
+            cid: [1; 16],
+            name: "A".into(),
+            vendor: String::new(),
+            category: "Fx".into(),
+        };
+        let (a, b) = (reg.add(&plugin).unwrap(), reg.add(&plugin).unwrap());
+        let track_rows = rows(&[
+            TrackFilter {
+                enabled: true,
+                spec: FilterSpec::Vst3 { id: a },
+            },
+            TrackFilter {
+                enabled: true,
+                spec: FilterSpec::Gain { db: 0.0 },
+            },
+        ]);
+        forget_plugins(track_rows.iter());
+        assert!(!vesper_vst::sidecar::file(&dir, a).exists());
+        assert!(vesper_vst::sidecar::file(&dir, b).exists());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

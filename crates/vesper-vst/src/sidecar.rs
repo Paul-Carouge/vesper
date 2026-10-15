@@ -1,10 +1,16 @@
 //! A plugin instance's settings, kept next to the settings file rather than
 //! in it (states can be big): `<dir>/<id>.conf`, `key=value` lines, the
 //! states in base64. The filter list only holds `vst3:id=<id>`.
+//!
+//! The folder is private (0700, files 0600): states may hold anything a
+//! plugin keeps (license keys, sample paths). Ids are never reused, so a
+//! late write of a removed instance cannot land on a new one.
 
 use std::ffi::OsStr;
-use std::io;
+use std::fs::{DirBuilder, OpenOptions};
+use std::io::{self, Write};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -84,11 +90,62 @@ impl Sidecar {
 
     /// Writes the file atomically (a crash leaves the old one).
     pub fn save(&self, dir: &Path, id: u32) -> io::Result<()> {
-        std::fs::create_dir_all(dir)?;
-        let tmp = dir.join(format!(".{id}.conf.tmp"));
-        std::fs::write(&tmp, self.text()?)?;
-        std::fs::rename(tmp, file(dir, id))
+        write_private(dir, &format!("{id}.conf"), &self.text()?)
     }
+}
+
+/// Creates `dir` private (0700), or makes it so.
+fn private_dir(dir: &Path) -> io::Result<()> {
+    DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+}
+
+/// Writes `dir/name` (0600) through a synced temporary file.
+fn write_private(dir: &Path, name: &str, data: &[u8]) -> io::Result<()> {
+    private_dir(dir)?;
+    let tmp = dir.join(format!(".{name}.tmp"));
+    let mut f = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&tmp)?;
+    f.write_all(data)?;
+    f.sync_all()?;
+    std::fs::rename(tmp, dir.join(name))
+}
+
+/// Deletes the temporary files a crash left in `dir`.
+pub fn clean_temporary(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with('.') && name.ends_with(".tmp") {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
+}
+
+/// A new instance id: above every id ever handed out in `dir` (a counter
+/// kept in `dir/next-id`) and every settings file there.
+pub fn next_id(dir: &Path) -> io::Result<u32> {
+    let counter = std::fs::read_to_string(dir.join("next-id"))
+        .ok()
+        .and_then(|t| t.trim().parse::<u32>().ok())
+        .unwrap_or(1);
+    let above_files = ids(dir)
+        .into_iter()
+        .max()
+        .map_or(1, |m| m.saturating_add(1));
+    let id = counter.max(above_files).max(1);
+    if id == u32::MAX {
+        return Err(io::Error::other("no instance id left"));
+    }
+    write_private(dir, "next-id", format!("{}\n", id + 1).as_bytes())?;
+    Ok(id)
 }
 
 pub fn hex(bytes: &[u8]) -> String {
@@ -205,6 +262,33 @@ mod tests {
             ..s
         };
         assert!(bad_path.save(&dir, 14).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn files_are_private_and_ids_never_reused() {
+        let dir = std::env::temp_dir().join(format!("vesper-vst-private-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let s = Sidecar {
+            path: "/a.vst3".into(),
+            ..Sidecar::default()
+        };
+        let a = next_id(&dir).unwrap();
+        s.save(&dir, a).unwrap();
+        assert_eq!(mode(&dir), 0o700);
+        assert_eq!(mode(&file(&dir, a)), 0o600);
+        std::fs::remove_file(file(&dir, a)).unwrap();
+        let b = next_id(&dir).unwrap();
+        assert!(b > a, "{a} reused");
+        // A settings file above the counter (copied in) is not clobbered.
+        s.save(&dir, b + 10).unwrap();
+        assert_eq!(next_id(&dir).unwrap(), b + 11);
+        // Leftovers of a crash mid-save.
+        std::fs::write(dir.join(".3.conf.tmp"), "x").unwrap();
+        clean_temporary(&dir);
+        assert!(!dir.join(".3.conf.tmp").exists());
+        assert!(file(&dir, b + 10).exists());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

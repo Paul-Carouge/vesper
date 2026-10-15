@@ -27,8 +27,10 @@ mod limiter;
 mod live;
 mod spec;
 
+use std::cell::Cell;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 
 pub use live::{LiveChain, LiveControl, live};
 pub use spec::{FilterSpec, MAX_PARAMS, ParseError};
@@ -78,6 +80,17 @@ fn external(id: u32, channels: usize) -> Box<dyn Filter + Send> {
         .get()
         .and_then(|build| build(id, channels))
         .unwrap_or_else(|| Box::new(PassThrough))
+}
+
+thread_local! {
+    static BLOCK_START: Cell<Option<Instant>> = const { Cell::new(None) };
+}
+
+/// When the [`Chain`] block running on this thread started; None outside
+/// [`Chain::process`]. Lets hosted plugins share one time budget per block
+/// instead of each taking its own.
+pub fn block_start() -> Option<Instant> {
+    BLOCK_START.with(Cell::get)
 }
 
 /// A filter that changes nothing.
@@ -131,6 +144,7 @@ impl Chain {
     /// Non-finite input samples become 0: a NaN would stick in the filters'
     /// states until a reset.
     pub fn process(&mut self, buf: &mut [f32]) {
+        let outer = BLOCK_START.replace(Some(Instant::now()));
         for s in buf.iter_mut().filter(|s| !s.is_finite()) {
             *s = 0.0;
         }
@@ -149,6 +163,7 @@ impl Chain {
                 .reduction
                 .store(reduction.to_bits(), Ordering::Relaxed);
         }
+        BLOCK_START.set(outer);
     }
 
     /// Prepares the calling thread to run the chain: call it once on the
