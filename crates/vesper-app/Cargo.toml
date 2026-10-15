@@ -10,7 +10,12 @@ path = "src/main.rs"
 [dependencies]
 slint = "1.18"
 dirs = "7"
+libc = "0.2"
 vesper-core.workspace = true
+vesper-capture.workspace = true
+vesper-encode.workspace = true
+vesper-mux.workspace = true
+vesper-audio.workspace = true
 
 [build-dependencies]
 slint-build = "1.18"

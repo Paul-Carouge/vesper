@@ -4973,9 +4973,14 @@ name = "vesper-app"
 version = "0.1.0"
 dependencies = [
  "dirs",
+ "libc",
  "slint",
  "slint-build",
+ "vesper-audio",
+ "vesper-capture",
  "vesper-core",
+ "vesper-encode",
+ "vesper-mux",
 ]
 
 [[package]]

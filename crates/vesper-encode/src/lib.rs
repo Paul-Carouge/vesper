@@ -108,6 +108,8 @@ pub struct Encoder {
     sink: *mut ff::AVFilterContext,
     enc: *mut ff::AVCodecContext,
     filtered: Frame,
+    /// Last NV12 surface sent to the encoder, kept for [`Encoder::repeat`].
+    last: Frame,
     packet: *mut ff::AVPacket,
     /// Imported VA surfaces by producer `buffer_id`, valid for `generation`.
     imports: HashMap<u32, Frame>,
@@ -145,6 +147,7 @@ impl Encoder {
             sink: ptr::null_mut(),
             enc: ptr::null_mut(),
             filtered: Frame::new()?,
+            last: Frame::new()?,
             packet: ptr::null_mut(),
             imports: HashMap::new(),
             generation: None,
@@ -439,9 +442,33 @@ impl Encoder {
             }
             drop(frame);
             let ret = ff::avcodec_send_frame(self.enc, self.filtered.0);
-            ff::av_frame_unref(self.filtered.0);
+            // Keep the NV12 surface (not the producer's buffer) for `repeat`.
+            ff::av_frame_unref(self.last.0);
+            ff::av_frame_move_ref(self.last.0, self.filtered.0);
             check(ret, "send frame to encoder")?;
             self.started = true;
+        }
+        self.drain()
+    }
+
+    /// Encodes the last picture again with a new `pts`, without a new
+    /// capture: keeps the frame rate constant when the source sends no frame
+    /// (Wayland only sends frames on damage). Fails before the first `encode`.
+    pub fn repeat(&mut self, pts: Duration) -> Result<Vec<EncodedPacket>, Error> {
+        let pts = i64::try_from(pts.as_nanos()).map_err(|_| Error("pts overflow".into()))?;
+        unsafe {
+            if (*self.last.0).buf[0].is_null() {
+                return Err(Error("no frame to repeat".into()));
+            }
+            // Reuses `filtered` as a second reference to the same surface.
+            check(
+                ff::av_frame_ref(self.filtered.0, self.last.0),
+                "ref last frame",
+            )?;
+            (*self.filtered.0).pts = pts;
+            let ret = ff::avcodec_send_frame(self.enc, self.filtered.0);
+            ff::av_frame_unref(self.filtered.0);
+            check(ret, "send frame to encoder")?;
         }
         self.drain()
     }
@@ -452,6 +479,7 @@ impl Encoder {
         if !self.started {
             return Ok(Vec::new());
         }
+        unsafe { ff::av_frame_unref(self.last.0) };
         let ret = unsafe { ff::avcodec_send_frame(self.enc, ptr::null()) };
         if ret != ff::AVERROR_EOF {
             check(ret, "flush encoder")?;
@@ -489,6 +517,7 @@ impl Encoder {
 impl Drop for Encoder {
     fn drop(&mut self) {
         self.imports.clear();
+        unsafe { ff::av_frame_unref(self.last.0) };
         unsafe {
             ff::avcodec_free_context(&mut self.enc);
             ff::avfilter_graph_free(&mut self.graph);
