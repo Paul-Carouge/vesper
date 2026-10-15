@@ -23,7 +23,9 @@ Installing is an explicit opt-in (`install.sh`, removed with `install.sh --unins
 
 - It adds `TRANSFER_SRC` to swapchain image usage (only when the surface supports it) and enables the export extensions the driver lists (`VK_KHR_external_memory_fd`, `VK_EXT_external_memory_dma_buf`, `VK_KHR_external_semaphore_fd`, `VK_EXT_image_drm_format_modifier` and their dependencies). If the driver rejects either change, the app's original request is retried unchanged.
 - After the first capturable swapchain (640x360 or larger), it starts one background thread that tries to connect to Vesper once per second.
-- No GPU memory is allocated and no frame is copied until Vesper selects the game. Vesper only captures Steam games (`SteamGameId`/`SteamAppId` set) and games the user allowed; it identifies them through the kernel (`SO_PEERCRED`), same user only.
+- No GPU memory is allocated and no frame is copied until Vesper selects the game. Vesper only captures Steam games (`SteamAppId` set) and games the user allowed; it identifies them through the kernel (`SO_PEERCRED`), same user only.
+
+Consent prevents accidental captures (a launcher, a tool, the wrong window). It is not a barrier against malicious code running under your account: with the layer installed, any process of this account can serve the socket and read Vulkan apps' frames without a portal prompt. The allow list is keyed on the process name as the kernel reports it (`/proc/<pid>/comm`, 15 characters), so never allow generic names such as `java`, `python3`, `game.exe` or `launcher.exe`; keying on the executable path is a follow-up.
 
 Escape hatches: a built-in blocklist keeps compositors, browsers, Electron apps, Steam, gamescope, OBS and Vesper itself a pure pass-through; `VESPER_CAPTURE_DISABLE=1` (e.g. `VESPER_CAPTURE_DISABLE=1 %command%` in Steam) stops the loader from loading the layer for one launch; `install.sh --uninstall` removes it.
 

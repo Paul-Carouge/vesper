@@ -50,10 +50,30 @@ const BLOCKLIST: &[&str] = &[
     "spotify",
     "signal-desktop",
     "obsidian",
+    // Windows launchers and embedded browsers, under Wine/Proton.
+    "battle.net.exe",
+    "eadesktop.exe",
+    "upc.exe",
+    "ubisoftconnect.exe",
+    "epicgameslauncher.exe",
+    "qtwebengineprocess.exe",
+    "cefsharp.browsersubprocess.exe",
+    "steamwebhelper.exe",
+    "steam.exe",
 ];
 
+/// Longest process name the kernel keeps (`comm`, TASK_COMM_LEN - 1).
+const COMM_LEN: usize = 15;
+
+/// `name` comes from `/proc/self/comm`: at most 15 bytes, so long entries
+/// (e.g. `epicgameslauncher.exe` -> `EpicGamesLaunch`) match on their first
+/// 15 bytes, ignoring case.
 fn is_blocked(name: &str) -> bool {
-    BLOCKLIST.iter().any(|b| b.eq_ignore_ascii_case(name))
+    let name = name.as_bytes();
+    BLOCKLIST.iter().any(|b| {
+        let b = &b.as_bytes()[..b.len().min(COMM_LEN)];
+        b.eq_ignore_ascii_case(name)
+    })
 }
 
 /// Pure pass-through for this process (blocklisted).
@@ -556,6 +576,12 @@ mod tests {
         assert!(is_blocked("Discord"));
         assert!(!is_blocked("vkcube"));
         assert!(!is_blocked("eldenring.exe"));
+        // Wine processes: the .exe name, cut to 15 bytes.
+        assert!(is_blocked("Battle.net.exe"));
+        assert!(is_blocked("EpicGamesLaunch"));
+        assert!(is_blocked("steamwebhelper."));
+        assert!(is_blocked("CefSharp.Browse"));
+        assert!(!is_blocked("EpicGames"));
     }
 
     #[test]

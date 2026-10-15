@@ -430,15 +430,25 @@ pub fn process_name() -> String {
 }
 
 /// Whether `environ` (NUL-separated `KEY=VALUE`) marks a Steam game:
-/// `SteamGameId` or `SteamAppId` set to something other than empty or 0.
+/// `SteamAppId` set to something other than empty or 0. `SteamGameId` alone
+/// also marks non-Steam shortcuts, so it does not count.
 pub fn is_steam_game(environ: &[u8]) -> bool {
     environ.split(|b| *b == 0).any(|kv| {
         let Some(eq) = kv.iter().position(|b| *b == b'=') else {
             return false;
         };
         let (k, v) = (&kv[..eq], &kv[eq + 1..]);
-        (k == b"SteamGameId" || k == b"SteamAppId") && !v.is_empty() && v != b"0"
+        k == b"SteamAppId" && !v.is_empty() && v != b"0"
     })
+}
+
+/// Whether `fd` is a dma-buf (lives on the dma-buf pseudo filesystem).
+pub fn is_dmabuf(fd: BorrowedFd) -> bool {
+    const DMA_BUF_MAGIC: libc::c_long = 0x444d_4142;
+    let mut st: libc::statfs = unsafe { zeroed() };
+    unsafe {
+        libc::fstatfs(fd.as_raw_fd(), &mut st) == 0 && st.f_type as libc::c_long == DMA_BUF_MAGIC
+    }
 }
 
 /// Whether `fd` is a sync_file (an anonymous inode named `sync_file`).
@@ -525,11 +535,16 @@ mod tests {
 
     #[test]
     fn detects_steam_games() {
-        assert!(is_steam_game(b"HOME=/h\0SteamGameId=1245620\0"));
+        assert!(is_steam_game(b"HOME=/h\0SteamAppId=1245620\0"));
         assert!(is_steam_game(b"SteamAppId=570"));
-        assert!(!is_steam_game(b"SteamGameId=0\0SteamAppId=\0"));
-        assert!(!is_steam_game(b"XSteamGameId=5\0SteamGameIdX=5\0"));
+        // Non-Steam shortcuts only get SteamGameId.
+        assert!(!is_steam_game(b"SteamGameId=12345678901234\0"));
+        assert!(!is_steam_game(b"SteamAppId=0\0SteamAppId=\0"));
+        assert!(!is_steam_game(b"XSteamAppId=5\0SteamAppIdX=5\0"));
         assert!(!is_steam_game(b""));
+        assert!(!is_dmabuf(
+            std::fs::File::open("/dev/null").unwrap().as_fd()
+        ));
     }
 
     #[test]

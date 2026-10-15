@@ -301,17 +301,21 @@ impl Device {
             if !sc.capturable {
                 continue;
             }
-            // Also when the swapchain that held the slot went away.
-            if sc.announced != conn || *OWNER.locked() == (0, 0) {
-                let msg = Msg::Swapchain {
-                    width: sc.extent.width,
-                    height: sc.extent.height,
-                };
-                if !ipc::send(&msg, None) {
-                    continue;
+            {
+                // Held from check to set: two devices must not both announce.
+                let mut owner = OWNER.locked();
+                // Also when the swapchain that held the slot went away.
+                if sc.announced != conn || *owner == (0, 0) {
+                    let msg = Msg::Swapchain {
+                        width: sc.extent.width,
+                        height: sc.extent.height,
+                    };
+                    if !ipc::send(&msg, None) {
+                        continue;
+                    }
+                    sc.announced = conn;
+                    *owner = (self.key, h.as_raw());
                 }
-                sc.announced = conn;
-                *OWNER.locked() = (self.key, h.as_raw());
             }
             if !owner_is(self.key, *h) {
                 // Another swapchain took over: free this one's ring.

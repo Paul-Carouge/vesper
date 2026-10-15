@@ -3,11 +3,12 @@
 //! [`GameCapture::start`] listens on `$XDG_RUNTIME_DIR/vesper/capture.sock`.
 //! Every Vulkan process with the layer installed connects while the server
 //! runs and reports its swapchain size. The server captures one game at a
-//! time and only with consent: Steam games (`SteamGameId`/`SteamAppId` in
-//! their environment) are allowed, others wait for [`GameCapture::allow`].
-//! Among allowed games it keeps the captured one until it exits, picks the
-//! newest otherwise, or follows [`GameCapture::select`]. Other games stay
-//! dormant (pure pass-through).
+//! time and only with consent: Steam games (`SteamAppId` in their
+//! environment) are allowed, others wait for [`GameCapture::allow`]. Among
+//! allowed games it keeps the captured one while it sends frames (a game
+//! silent for 3 s gives way to a newer one), picks the newest otherwise, or
+//! follows [`GameCapture::select`]. Other games stay dormant (pure
+//! pass-through).
 //!
 //! Peers are identified by the kernel (`SO_PEERCRED`), never by what they
 //! claim: same user only, process name and environment read from `/proc`.
@@ -47,6 +48,11 @@ const MAX_PENDING: usize = 16;
 const MAX_SIZE: u32 = 16384;
 /// A client must say `Hello` within this time after connecting.
 const HELLO_TIMEOUT: Duration = Duration::from_secs(1);
+/// The captured game loses its priority after this long without a frame
+/// (frozen, stopped, or done presenting).
+const STALE_AFTER: Duration = Duration::from_secs(3);
+/// Messages read from one client per poll round, so none can starve others.
+const MAX_MESSAGES_PER_ROUND: usize = 64;
 
 /// Whether a game may be captured.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -153,8 +159,11 @@ impl GameCapture {
         self.wake();
     }
 
-    /// Allows capturing games with this process name ([`Game::exe`]). The
-    /// app persists its allow list and calls this at startup.
+    /// Allows capturing games with this process name ([`Game::exe`], the
+    /// kernel's 15-byte `comm`). The app persists its allow list and calls
+    /// this at startup. Never allow generic names (`java`, `python3`,
+    /// `game.exe`, `launcher.exe`): any process could carry them.
+    // shortcut: keyed on the 15-byte comm; key on the executable path (/proc/<pid>/exe) once the app has an allow-list UI.
     pub fn allow(&self, exe: &str) {
         let mut allowed = self.shared.allowed.lock().unwrap();
         if !allowed.iter().any(|e| e == exe) {
@@ -209,6 +218,8 @@ struct Client {
     steam: bool,
     hello: bool,
     since: Instant,
+    /// Last frame, or the `Start` that asked for frames.
+    last_frame: Instant,
     width: u32,
     height: u32,
     /// Order of its first non-empty `Swapchain` message, for auto-selection.
@@ -239,8 +250,10 @@ struct Server {
     started: Option<Arc<OwnedFd>>,
     announce_seq: u64,
     pool_generation: u32,
-    /// `protocol::is_sync_file`; replaced in tests (no GPU to make one).
+    /// `protocol::is_sync_file` / `protocol::is_dmabuf`; replaced in tests
+    /// (no GPU to make them).
     is_sync_file: fn(BorrowedFd) -> bool,
+    is_dmabuf: fn(BorrowedFd) -> bool,
 }
 
 /// What selection needs to know about a client.
@@ -250,24 +263,36 @@ struct Candidate {
     /// Said hello and has a swapchain.
     ready: bool,
     seq: u64,
+    /// Captured but sent no frame for `STALE_AFTER`, or its process is gone.
+    stale: bool,
 }
 
 /// Picks the client to capture. Only allowed clients qualify. The current
-/// one is kept while it lives (games recreate their swapchain on resize or
-/// focus changes); otherwise the selected pid, or the newest ready client.
+/// one is kept while it sends frames (games recreate their swapchain on
+/// resize or focus changes); a stale one is kept only if it is still the
+/// newest ready game (long loading screens must not flip). Otherwise the
+/// selected pid, or the newest ready client.
 fn choose(clients: &[Candidate], select: Option<u32>, current: Option<usize>) -> Option<usize> {
     let ok = |i: usize| {
         let c = &clients[i];
-        c.allowed && (c.ready || Some(i) == current)
+        c.allowed && (c.ready || (Some(i) == current && !c.stale))
     };
     match select {
         Some(pid) => (0..clients.len()).find(|&i| clients[i].pid == pid && ok(i)),
-        None => current.filter(|&i| ok(i)).or_else(|| {
+        None => current.filter(|&i| ok(i) && !clients[i].stale).or_else(|| {
             (0..clients.len())
-                .filter(|&i| ok(i))
+                .filter(|&i| ok(i) && clients[i].ready)
                 .max_by_key(|&i| clients[i].seq)
         }),
     }
+}
+
+/// Whether a process still exists.
+fn alive(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    unsafe { libc::kill(pid, 0) == 0 || *libc::__errno_location() != libc::ESRCH }
 }
 
 /// Size of a dma-buf (or any seekable fd), without taking ownership.
@@ -327,6 +352,7 @@ impl Server {
             announce_seq: 0,
             pool_generation: 0,
             is_sync_file: protocol::is_sync_file,
+            is_dmabuf: protocol::is_dmabuf,
         }
     }
 
@@ -342,6 +368,8 @@ impl Server {
                 .iter()
                 .filter(|c| !c.hello)
                 .map(|c| (c.since + HELLO_TIMEOUT).saturating_duration_since(Instant::now()))
+                // While capturing, re-check staleness every second.
+                .chain(self.started.as_ref().map(|_| Duration::from_secs(1)))
                 .min()
                 .map_or(-1, |d| d.as_millis() as i32 + 1);
             if unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, timeout) } < 0 {
@@ -419,6 +447,7 @@ impl Server {
             steam,
             hello: false,
             since: Instant::now(),
+            last_frame: Instant::now(),
             width: 0,
             height: 0,
             announced: 0,
@@ -428,7 +457,7 @@ impl Server {
 
     /// Reads all queued messages. False when the client is gone or broken.
     fn read_client(&mut self, i: usize) -> bool {
-        loop {
+        for _ in 0..MAX_MESSAGES_PER_ROUND {
             let sock = self.clients[i].sock.clone();
             match protocol::recv(sock.as_fd(), true) {
                 Ok(Some((msg, fd))) => {
@@ -445,6 +474,8 @@ impl Server {
                 }
             }
         }
+        // More is queued: poll reports it again next round.
+        true
     }
 
     /// Handles one message. False drops the client (protocol violation).
@@ -493,6 +524,11 @@ impl Server {
                     let _ = protocol::send(c.sock.as_fd(), &Msg::Stop, None, true);
                     return true;
                 }
+                if !(self.is_dmabuf)(fd.as_fd()) {
+                    warn!("{} ({}): buffer fd is not a dma-buf", c.exe, c.pid);
+                    return false;
+                }
+                // Size from lseek only once the fd is known to be a dma-buf.
                 if let Err(e) =
                     validate_buffer(c, index, width, height, fourcc, &planes, fd.as_fd())
                 {
@@ -539,6 +575,7 @@ impl Server {
                     let _ = protocol::send(c.sock.as_fd(), &Msg::Stop, None, true);
                     return true;
                 }
+                c.last_frame = Instant::now();
                 if !known {
                     release(c);
                     return true;
@@ -628,6 +665,11 @@ impl Server {
     fn remove_client(&mut self, i: usize) {
         let c = self.clients.remove(i);
         debug!("game disconnected: {} ({})", c.exe, c.pid);
+        let mut select = self.shared.select.lock().unwrap();
+        if *select == Some(c.pid) {
+            *select = None;
+        }
+        drop(select);
         self.pending.retain(|p| !Arc::ptr_eq(&p.sock, &c.sock));
         if self
             .started
@@ -645,20 +687,23 @@ impl Server {
     /// Starts the chosen game and stops the previous one.
     fn reselect(&mut self) {
         let select = *self.shared.select.lock().unwrap();
-        let candidates: Vec<_> = self
-            .clients
-            .iter()
-            .map(|c| Candidate {
-                pid: c.pid,
-                allowed: c.hello && self.allowed(c),
-                ready: c.hello && c.width > 0 && c.height > 0,
-                seq: c.announced,
-            })
-            .collect();
         let current = self
             .started
             .as_ref()
             .and_then(|s| self.clients.iter().position(|c| Arc::ptr_eq(&c.sock, s)));
+        let candidates: Vec<_> = self
+            .clients
+            .iter()
+            .enumerate()
+            .map(|(i, c)| Candidate {
+                pid: c.pid,
+                allowed: c.hello && self.allowed(c),
+                ready: c.hello && c.width > 0 && c.height > 0,
+                seq: c.announced,
+                stale: Some(i) == current
+                    && (c.last_frame.elapsed() > STALE_AFTER || !alive(c.pid)),
+            })
+            .collect();
         let want = choose(&candidates, select, current);
         if want == current {
             return;
@@ -679,6 +724,7 @@ impl Server {
             match protocol::send(c.sock.as_fd(), &start, None, true) {
                 Ok(()) => {
                     c.ring = None;
+                    c.last_frame = Instant::now();
                     self.started = Some(c.sock.clone());
                 }
                 Err(e) => warn!("starting game capture failed: {e}"),
@@ -730,6 +776,7 @@ mod tests {
             allowed,
             ready,
             seq,
+            stale: false,
         }
     }
 
@@ -755,6 +802,42 @@ mod tests {
         assert_eq!(choose(&view, None, Some(2)), Some(2));
         // ...but an explicit selection moves it.
         assert_eq!(choose(&view, Some(2), Some(0)), Some(1));
+    }
+
+    #[test]
+    fn stale_capture_gives_way() {
+        let stale = |mut c: Candidate| {
+            c.stale = true;
+            c
+        };
+        // A frozen older game yields to a newer ready one...
+        let view = [stale(cand(1, true, true, 5)), cand(2, true, true, 7)];
+        assert_eq!(choose(&view, None, Some(0)), Some(1));
+        // ...but stays when it is still the newest (long loading screen).
+        let view = [cand(1, true, true, 5), stale(cand(2, true, true, 7))];
+        assert_eq!(choose(&view, None, Some(1)), Some(1));
+        // A stale game without a swapchain is dropped.
+        let view = [stale(cand(1, true, false, 5))];
+        assert_eq!(choose(&view, None, Some(0)), None);
+        // Never to a game without consent.
+        let view = [stale(cand(1, true, true, 5)), cand(2, false, true, 7)];
+        assert_eq!(choose(&view, None, Some(0)), Some(0));
+    }
+
+    #[test]
+    fn checks_process_liveness() {
+        assert!(alive(std::process::id()));
+        assert!(!alive(u32::MAX));
+    }
+
+    #[test]
+    fn forgets_selection_when_the_game_leaves() {
+        let (mut s, _rx) = server();
+        let (i, _layer) = connect(&mut s, "game.exe", true);
+        let pid = s.clients[i].pid;
+        *s.shared.select.lock().unwrap() = Some(pid);
+        s.remove_client(i);
+        assert_eq!(*s.shared.select.lock().unwrap(), None);
     }
 
     fn pair() -> (OwnedFd, OwnedFd) {
@@ -790,12 +873,13 @@ mod tests {
             stop: AtomicBool::new(false),
         });
         let (tx, rx) = mpsc::channel();
-        let s = Server::new(
+        let mut s = Server::new(
             shared,
             listener,
             wake,
             Box::new(move |f| drop(tx.send(f.unwrap()))),
         );
+        s.is_dmabuf = |_| true;
         (s, rx)
     }
 
