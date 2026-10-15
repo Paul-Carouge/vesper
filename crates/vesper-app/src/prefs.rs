@@ -72,7 +72,9 @@ impl Prefs {
         self
     }
 
-    pub fn serialize(&self) -> String {
+    /// The folder is left out while it is `default_folder`, so a later
+    /// default (e.g. a moved `XDG_VIDEOS_DIR`) still applies.
+    pub fn serialize(&self, default_folder: &str) -> String {
         let codec = match self.codec {
             VideoCodec::Av1 => "av1",
             VideoCodec::Hevc => "hevc",
@@ -90,7 +92,7 @@ impl Prefs {
             self.fps, self.replay_enabled, self.replay_seconds, self.desktop_muted, self.mic_muted
         );
         // A line break would split the line: keep the default folder instead.
-        if !self.output_folder.contains(['\n', '\r']) {
+        if self.output_folder != default_folder && !self.output_folder.contains(['\n', '\r']) {
             text += &format!("output_folder={}\n", self.output_folder);
         }
         text
@@ -113,7 +115,9 @@ impl Prefs {
 
     pub fn save(&self) {
         let Some(path) = path() else { return };
-        if let Err(e) = write_atomically(&path, self.serialize().as_bytes()) {
+        let default_folder = crate::default_output_folder().unwrap_or_default();
+        let text = self.serialize(&default_folder.to_string_lossy());
+        if let Err(e) = write_atomically(&path, text.as_bytes()) {
             log!("could not save {}: {e}", path.display());
         }
     }
@@ -157,20 +161,22 @@ fn path() -> Option<PathBuf> {
 }
 
 /// Writes a temporary file next to `path`, then renames it over `path`: a
-/// crash leaves either the old or the new file, never half of one.
+/// process crash leaves either the old or the new file, never half of one.
+/// No fsync: it would block the UI thread, and settings are cheap to lose.
 fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let dir = path.parent().ok_or(std::io::ErrorKind::NotFound)?;
     std::fs::create_dir_all(dir)?;
     let tmp = path.with_extension("tmp");
     let mut file = std::fs::File::create(&tmp)?;
     file.write_all(bytes)?;
-    file.sync_all()?;
     std::fs::rename(&tmp, path)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const DEFAULT: &str = "/home/u/Videos/Vesper";
 
     fn defaults() -> Prefs {
         Prefs {
@@ -181,7 +187,7 @@ mod tests {
             replay_seconds: 30,
             desktop_muted: false,
             mic_muted: false,
-            output_folder: "/home/u/Videos/Vesper".into(),
+            output_folder: DEFAULT.into(),
         }
     }
 
@@ -201,9 +207,22 @@ mod tests {
     #[test]
     fn round_trip() {
         for prefs in [defaults(), changed()] {
-            assert_eq!(defaults().parse(&prefs.serialize()), prefs);
+            assert_eq!(defaults().parse(&prefs.serialize(DEFAULT)), prefs);
         }
-        assert_eq!(changed().parse(&defaults().serialize()), defaults());
+        let back = changed().parse(&defaults().serialize(DEFAULT));
+        assert_eq!(
+            back,
+            Prefs {
+                output_folder: changed().output_folder,
+                ..defaults()
+            }
+        );
+    }
+
+    #[test]
+    fn default_folder_is_not_written() {
+        assert!(!defaults().serialize(DEFAULT).contains("output_folder"));
+        assert!(changed().serialize(DEFAULT).contains("output_folder="));
     }
 
     #[test]
@@ -242,10 +261,10 @@ mod tests {
             ..defaults()
         };
         assert_eq!(
-            changed().parse(&prefs.serialize()).output_folder,
+            changed().parse(&prefs.serialize(DEFAULT)).output_folder,
             changed().output_folder
         );
-        assert_eq!(defaults().parse(&prefs.serialize()).fps, 60);
+        assert_eq!(defaults().parse(&prefs.serialize(DEFAULT)).fps, 60);
     }
 
     #[test]
@@ -253,7 +272,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("vesper-prefs-{}", std::process::id()));
         let path = dir.join("settings");
         write_atomically(&path, b"fps=30\n").unwrap();
-        write_atomically(&path, changed().serialize().as_bytes()).unwrap();
+        write_atomically(&path, changed().serialize(DEFAULT).as_bytes()).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         assert_eq!(defaults().parse(&text), changed());
         assert!(!path.with_extension("tmp").exists());

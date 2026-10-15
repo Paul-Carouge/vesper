@@ -35,7 +35,7 @@ install -Dm644 crates/vesper-app/data/io.github.PaulCarouge.Vesper.desktop \
     ~/.local/share/applications/io.github.PaulCarouge.Vesper.desktop
 ```
 
-If `~/.local/bin` is not in the session `PATH`, set `Exec=` to the full path. Default global shortcuts: Alt+F9 starts or stops recording, Alt+F10 saves the replay. KDE asks to confirm them on first launch; change them later in System Settings > Shortcuts.
+If `~/.local/bin` is not in the session `PATH`, set `Exec=` to the full path. Without the desktop file, global shortcuts are off (the in-window ones still work). The saved source is forgotten once after updating to this version, since it is now tied to the app id: pick it again. Default global shortcuts: Alt+F9 starts or stops recording, Alt+F10 saves the replay. KDE asks to confirm them on first launch; change them later in System Settings > Shortcuts.
 
 Settings are kept in `~/.config/vesper/settings`.
 

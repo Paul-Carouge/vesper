@@ -43,7 +43,12 @@ const METER_TICK: Duration = Duration::from_millis(33);
 slint::include_modules!();
 
 fn main() -> Result<(), slint::PlatformError> {
-    register_app_id();
+    if let Err(e) = futures_lite::future::block_on(shortcuts::register_app_id()) {
+        log!(
+            "could not register the app id with the portal (is {}.desktop installed? see README): {e}",
+            shortcuts::APP_ID
+        );
+    }
     #[cfg(debug_assertions)]
     if let Some(seconds) = dev::record_seconds() {
         dev::record(seconds, default_settings());
@@ -289,23 +294,6 @@ fn wire_global_shortcuts(ui: &AppWindow) {
             });
         },
     );
-}
-
-/// The id the portals know Vesper by. KDE refuses global shortcuts without
-/// one, and keys the screencast restore token to it.
-const APP_ID: &str = "io.github.PaulCarouge.Vesper";
-
-/// Registers `APP_ID` for this host (non-Flatpak) process. It must precede
-/// every other portal call on the shared connection.
-fn register_app_id() {
-    let registered = APP_ID
-        .parse()
-        .and_then(|id| futures_lite::future::block_on(ashpd::register_host_app(id)));
-    if let Err(e) = registered {
-        log!(
-            "could not register the app id with the portal (is {APP_ID}.desktop installed? see README): {e}"
-        );
-    }
 }
 
 /// Encoder settings from the UI.

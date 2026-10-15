@@ -13,6 +13,17 @@ use ashpd::desktop::global_shortcuts::{GlobalShortcuts, NewShortcut, Shortcut};
 use futures_lite::StreamExt;
 use futures_lite::future::block_on;
 
+/// The id the portals know Vesper by. KDE refuses global shortcuts without
+/// one, and keys the screencast restore token to it.
+pub const APP_ID: &str = "io.github.PaulCarouge.Vesper";
+
+/// Registers `APP_ID` for this host (non-Flatpak) process. It must precede
+/// every other portal call on the shared connection, and be repeated when the
+/// portal restarts: the portal process keeps it per connection.
+pub async fn register_app_id() -> ashpd::Result<()> {
+    ashpd::register_host_app(APP_ID.parse()?).await
+}
+
 /// What a global shortcut does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
@@ -78,6 +89,8 @@ async fn run(on_bound: &impl Fn(Action, String), on_activated: &impl Fn(Action))
         }
         // Let the new portal finish starting. The thread runs nothing else.
         std::thread::sleep(Duration::from_secs(1));
+        // The new portal process forgot the id. A failure shows in the bind.
+        let _ = register_app_id().await;
     }
 }
 
