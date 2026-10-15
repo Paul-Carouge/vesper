@@ -10,9 +10,6 @@ use pipewire::spa::pod::{
 use pipewire::spa::sys;
 use pipewire::spa::utils::{Choice, ChoiceEnum, ChoiceFlags, Fraction, Id, Rectangle};
 
-/// `DRM_FORMAT_MOD_LINEAR`.
-pub const MOD_LINEAR: u64 = 0;
-
 const fn fourcc(code: &[u8; 4]) -> u32 {
     u32::from_le_bytes(*code)
 }
@@ -120,8 +117,8 @@ fn serialize(obj: Object) -> Vec<u8> {
         .into_inner()
 }
 
-/// Builds an `EnumFormat` pod. No modifier means shared memory; one modifier
-/// is a fixated choice; several let the server pick.
+/// Builds a DMA-BUF `EnumFormat` pod. One modifier is a fixated choice;
+/// several let the server pick. `modifiers` must not be empty.
 pub fn enum_format(format: VideoFormat, modifiers: &[u64]) -> Vec<u8> {
     let range =
         |default, min, max| Value::Choice(ChoiceValue::Rectangle(range_choice(default, min, max)));
@@ -165,7 +162,7 @@ pub fn enum_format(format: VideoFormat, modifiers: &[u64]) -> Vec<u8> {
         ),
     ];
     match modifiers {
-        [] => {}
+        [] => unreachable!("DMA-BUF formats always carry modifiers"),
         [m] => properties.push(Property {
             key: sys::SPA_FORMAT_VIDEO_modifier,
             flags: PropertyFlags::MANDATORY,
@@ -201,14 +198,8 @@ fn range_choice<T: pipewire::spa::pod::CanonicalFixedSizedPod>(
     )
 }
 
-/// The `Buffers` param: DMA-BUF only, or MemFd for the shared-memory fallback
-/// (MemPtr has no fd to hand out).
-pub fn buffers_param(dmabuf: bool) -> Vec<u8> {
-    let data_type = if dmabuf {
-        sys::SPA_DATA_DmaBuf
-    } else {
-        sys::SPA_DATA_MemFd
-    };
+/// The `Buffers` param: DMA-BUF only.
+pub fn buffers_param() -> Vec<u8> {
     serialize(Object {
         type_: sys::SPA_TYPE_OBJECT_ParamBuffers,
         id: sys::SPA_PARAM_Buffers,
@@ -217,7 +208,7 @@ pub fn buffers_param(dmabuf: bool) -> Vec<u8> {
             Value::Choice(ChoiceValue::Int(Choice(
                 ChoiceFlags::empty(),
                 ChoiceEnum::Flags {
-                    default: 1 << data_type,
+                    default: 1 << sys::SPA_DATA_DmaBuf,
                     flags: vec![],
                 },
             ))),
@@ -290,6 +281,7 @@ mod tests {
 
     #[test]
     fn enum_format_round_trips() {
+        const MOD_LINEAR: u64 = 0;
         let mods = [0x0200_0000_0000_0001, MOD_LINEAR];
         let info = parse_format(&enum_format(VideoFormat::BGRx, &mods)).unwrap();
         assert_eq!(info.formats, vec![VideoFormat::BGRx]);
@@ -299,8 +291,5 @@ mod tests {
         let fixed = parse_format(&enum_format(VideoFormat::BGRA, &[MOD_LINEAR])).unwrap();
         assert_eq!(fixed.modifiers, vec![MOD_LINEAR]);
         assert!(!fixed.dont_fixate);
-
-        let shm = parse_format(&enum_format(VideoFormat::BGRA, &[])).unwrap();
-        assert!(shm.modifiers.is_empty());
     }
 }

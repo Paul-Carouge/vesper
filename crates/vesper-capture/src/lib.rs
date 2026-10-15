@@ -30,11 +30,12 @@ pub struct Capture {
 impl Capture {
     /// Opens the portal picker (skipped when `restore_token` is still valid)
     /// and starts streaming. `on_frame` runs on the PipeWire thread: keep it
-    /// short, e.g. send the frame to a channel. Blocks until the user picks a
-    /// source.
+    /// short, e.g. send the frame to a channel. It gets one final `Err` when
+    /// the capture ends on its own (source closed, stream error, no DMA-BUF);
+    /// no frame follows. Blocks until the user picks a source.
     pub fn start(
         restore_token: Option<&str>,
-        on_frame: impl FnMut(VideoFrame) + Send + 'static,
+        on_frame: impl FnMut(Result<VideoFrame>) + Send + 'static,
     ) -> Result<Self> {
         let (session, node_id, fd, restore_token) = block_on(open_portal(restore_token))?;
         let (control, rx) = ::pipewire::channel::channel();
@@ -84,11 +85,12 @@ async fn open_portal(
     let cursor = if proxy
         .available_cursor_modes()
         .await?
-        .contains(CursorMode::Metadata)
+        .contains(CursorMode::Embedded)
     {
-        CursorMode::Metadata
-    } else {
         CursorMode::Embedded
+    } else {
+        warn!("portal cannot embed the cursor: recording without it");
+        CursorMode::Hidden
     };
     let session = proxy.create_session(Default::default()).await?;
     let result = async {

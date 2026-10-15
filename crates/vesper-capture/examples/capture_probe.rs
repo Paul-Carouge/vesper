@@ -19,18 +19,26 @@ fn main() -> vesper_capture::Result<()> {
         .or_else(|| std::env::var("VESPER_RESTORE_TOKEN").ok());
 
     let (tx, rx) = mpsc::sync_channel(4);
-    let capture = Capture::start(token.as_deref(), move |frame| {
+    let capture = Capture::start(token.as_deref(), move |event| match event {
         // Full channel: drop the frame, which returns its buffer to PipeWire.
-        let _ = tx.try_send(frame);
+        Ok(frame) => drop(tx.try_send(Ok(frame))),
+        Err(e) => drop(tx.send(Err(e))),
     })?;
     println!("capture started");
 
     let end = Instant::now() + Duration::from_secs(5);
     let mut window = (Instant::now(), 0u32);
+    let mut total = 0u32;
     while let Some(left) = end.checked_duration_since(Instant::now()) {
-        let Ok(frame) = rx.recv_timeout(left) else {
-            continue;
+        let frame = match rx.recv_timeout(left) {
+            Ok(Ok(frame)) => frame,
+            Ok(Err(e)) => {
+                println!("capture ended: {e}");
+                break;
+            }
+            Err(_) => continue,
         };
+        total += 1;
         window.1 += 1;
         let elapsed = window.0.elapsed();
         if elapsed >= Duration::from_secs(1) {
@@ -49,6 +57,7 @@ fn main() -> vesper_capture::Result<()> {
             window = (Instant::now(), 0);
         }
     }
+    println!("{total} frames in total");
     match capture.restore_token() {
         Some(t) => println!("restore token: {t}"),
         None => println!("no restore token"),

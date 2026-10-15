@@ -15,7 +15,7 @@ use tracing::{error, info, warn};
 use vesper_core::{DmaBufPlane, ReleaseGuard, VideoFrame};
 
 use crate::Error;
-use crate::format::{self, MOD_LINEAR};
+use crate::format;
 
 /// A `pw_buffer` pointer sent back to the PipeWire thread.
 pub struct BufferPtr(pub *mut pw_buffer);
@@ -154,6 +154,20 @@ struct State<F> {
     generation: Rc<Cell<u32>>,
     next_buffer_id: u32,
     tx: pw::channel::Sender<Msg>,
+    mainloop: MainLoopRc,
+    ended: bool,
+}
+
+impl<F: FnMut(Result<VideoFrame, Error>)> State<F> {
+    /// Tells the caller the capture ended (once) and stops the loop.
+    fn end(&mut self, reason: String) {
+        if !self.ended {
+            self.ended = true;
+            error!("capture ended: {reason}");
+            (self.on_frame)(Err(reason.into()));
+            self.mainloop.quit();
+        }
+    }
 }
 
 fn update_params(stream: &pw::stream::Stream, pods: &[Vec<u8>]) {
@@ -163,7 +177,11 @@ fn update_params(stream: &pw::stream::Stream, pods: &[Vec<u8>]) {
     }
 }
 
-fn on_format<F>(stream: &pw::stream::Stream, state: &mut State<F>, pod: &Pod) {
+fn on_format<F: FnMut(Result<VideoFrame, Error>)>(
+    stream: &pw::stream::Stream,
+    state: &mut State<F>,
+    pod: &Pod,
+) {
     let Some(info) = format::parse_format(pod.as_bytes()) else {
         warn!("ignoring a non raw-video format");
         return;
@@ -188,20 +206,16 @@ fn on_format<F>(stream: &pw::stream::Stream, state: &mut State<F>, pod: &Pod) {
         update_params(stream, &pods);
         return;
     }
-    let dmabuf = !info.modifiers.is_empty();
-    let modifier = info.modifiers.first().copied().unwrap_or(MOD_LINEAR);
-    if dmabuf {
-        info!(
-            "negotiated DMA-BUF {}x{} {spa_format:?} modifier {modifier:#x}",
-            size.width, size.height
-        );
-    } else {
-        warn!(
-            "DMA-BUF negotiation failed: falling back to MemFd shared memory \
-             ({}x{} {spa_format:?}). Frames are in system RAM, not GPU memory.",
-            size.width, size.height
-        );
-    }
+    let Some(&modifier) = info.modifiers.first() else {
+        return state.end(format!(
+            "DMA-BUF negotiation failed: the server picked {spa_format:?} without a \
+             modifier, and the encoder only imports DMA-BUF"
+        ));
+    };
+    info!(
+        "negotiated DMA-BUF {}x{} {spa_format:?} modifier {modifier:#x}",
+        size.width, size.height
+    );
     state.format = Some(Negotiated {
         width: size.width,
         height: size.height,
@@ -210,7 +224,7 @@ fn on_format<F>(stream: &pw::stream::Stream, state: &mut State<F>, pod: &Pod) {
     });
     update_params(
         stream,
-        &[format::buffers_param(dmabuf), format::header_meta_param()],
+        &[format::buffers_param(), format::header_meta_param()],
     );
 }
 
@@ -247,14 +261,10 @@ unsafe fn build_frame<F>(buffer: *mut pw_buffer, state: &State<F>) -> Option<Vid
         {
             return None;
         }
-        let offset = match data.type_ {
-            spa_sys::SPA_DATA_DmaBuf => chunk.offset,
-            spa_sys::SPA_DATA_MemFd => chunk.offset + data.mapoffset,
-            other => {
-                warn!("unexpected buffer data type {other}");
-                return None;
-            }
-        };
+        if data.type_ != spa_sys::SPA_DATA_DmaBuf {
+            warn!("skipping a non DMA-BUF buffer (data type {})", data.type_);
+            return None;
+        }
         // Planes may share one BO: dup an fd per plane anyway.
         // SAFETY: the fd is open while the buffer is dequeued.
         let fd: OwnedFd = unsafe { BorrowedFd::borrow_raw(data.fd as i32) }
@@ -263,7 +273,7 @@ unsafe fn build_frame<F>(buffer: *mut pw_buffer, state: &State<F>) -> Option<Vid
             .ok()?;
         planes.push(DmaBufPlane {
             fd,
-            offset,
+            offset: chunk.offset,
             stride: chunk.stride as u32,
         });
     }
@@ -296,7 +306,7 @@ pub fn run<F>(
     rx: pw::channel::Receiver<Msg>,
     ready: std::sync::mpsc::Sender<Result<(), Error>>,
 ) where
-    F: FnMut(VideoFrame) + 'static,
+    F: FnMut(Result<VideoFrame, Error>) + 'static,
 {
     pw::init();
     let mainloop = match MainLoopRc::new(None) {
@@ -312,16 +322,19 @@ pub fn run<F>(
                 .into_iter()
                 .filter(|(f, _)| format::spa_to_drm(*f).is_some())
                 .collect();
-            if supported.is_empty() {
-                return Err("screencast node offers no supported RGB format".into());
-            }
-            // DMA-BUF offers first, in the server's order; shared memory last.
-            let dmabuf = supported
+            let offer: Vec<_> = supported
                 .iter()
                 .filter(|(_, mods)| !mods.is_empty())
-                .map(|(f, mods)| format::enum_format(*f, mods));
-            let shm = supported.iter().map(|(f, _)| format::enum_format(*f, &[]));
-            dmabuf.chain(shm).collect()
+                .map(|(f, mods)| format::enum_format(*f, mods))
+                .collect();
+            if offer.is_empty() {
+                return Err(
+                    "screencast node offers no RGB DMA-BUF format with modifiers \
+                            (the encoder only imports DMA-BUF)"
+                        .into(),
+                );
+            }
+            offer
         };
         let stream = StreamRc::new(
             core.clone(),
@@ -340,10 +353,19 @@ pub fn run<F>(
             generation: generation.clone(),
             next_buffer_id: 0,
             tx,
+            mainloop: mainloop.clone(),
+            ended: false,
         };
         let listener = stream
             .add_local_listener_with_user_data(state)
-            .state_changed(|_, _, old, new| info!("stream state {old:?} -> {new:?}"))
+            .state_changed(|_, state, old, new| {
+                info!("stream state {old:?} -> {new:?}");
+                match new {
+                    pw::stream::StreamState::Error(e) => state.end(format!("stream error: {e}")),
+                    pw::stream::StreamState::Unconnected => state.end("source closed".into()),
+                    _ => {}
+                }
+            })
             .param_changed(|stream, state, id, pod| {
                 if let Some(pod) = pod
                     && id == ParamType::Format.as_raw()
@@ -381,7 +403,7 @@ pub fn run<F>(
                 // SAFETY: `newest` is dequeued and not requeued.
                 match unsafe { build_frame(newest, state) } {
                     // The buffer goes back from the frame's ReleaseGuard.
-                    Some(frame) => (state.on_frame)(frame),
+                    Some(frame) => (state.on_frame)(Ok(frame)),
                     None => unsafe { stream.queue_raw_buffer(newest) },
                 }
             })
@@ -395,7 +417,7 @@ pub fn run<F>(
         )?;
         Ok((context, core, stream, listener, generation))
     })();
-    let (_context, _core, stream, _listener, generation) = match setup {
+    let (_context, _core, stream, listener, generation) = match setup {
         Ok(s) => s,
         Err(e) => return drop(ready.send(Err(e))),
     };
@@ -413,6 +435,8 @@ pub fn run<F>(
     });
     let _ = ready.send(Ok(()));
     mainloop.run();
+    // A normal stop is not an end of capture to report.
+    drop(listener);
     if let Err(e) = stream.disconnect() {
         warn!("pw_stream_disconnect failed: {e}");
     }
