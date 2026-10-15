@@ -8,8 +8,10 @@
 # only there), unshare with user namespaces, gamescope, vkcube, pipewire,
 # wireplumber, dbus-run-session, ffmpeg/ffprobe, a Vulkan GPU with VAAPI.
 #
-# Everything runs in a private user+mount+pid namespace (uid 0 inside, so the
-# capture socket is /tmp/vesper-0, never the real /tmp/vesper-<uid>), with its
+# Everything runs in a private user+mount+network+pid namespace (uid 0 inside,
+# so the capture socket is /tmp/vesper-0, never the real /tmp/vesper-<uid>;
+# no network but loopback, so the session's abstract X11 and D-Bus sockets are
+# out of reach) on a private /tmp (X locks, sockets), with its
 # own D-Bus session, PipeWire and WirePlumber (ALSA/V4L2/BlueZ monitors
 # disabled: no real device is ever opened), its own XDG directories under
 # $VESPER_LAB_DATA (default /tmp/vesper-lab-<uid>) and a headless gamescope as
@@ -18,7 +20,20 @@
 # scenario ends. Scenarios: s* shutdown/storage, a* audio, e* encoder, f* hostile
 # clients, l* layer and game churn, p* prefs/instances.
 HERE=$(dirname "$(readlink -f "$0")")
-export HERE
-mkdir -p /tmp/vesper-0
-chmod 700 /tmp/vesper-0
-exec unshare -Urmpf --mount-proc --kill-child bash -c 'mount -t tmpfs tmpfs /tmp/.X11-unix && mount -t tmpfs -o mode=0700 tmpfs /tmp/vesper-0 && dbus-run-session -- bash "$HERE/session.sh" "$@"' x "$@"
+DATA=${VESPER_LAB_DATA:-/tmp/vesper-lab-$(id -u)}
+mkdir -p "$DATA"
+export HERE DATA
+# Inside: the real /tmp stays reachable on /mnt only to bind back the lab data
+# and the checkout when they live under /tmp; everything else gets a fresh /tmp.
+exec unshare -Urmnpf --mount-proc --kill-child bash -c '
+set -e
+ip link set lo up
+mount --bind /tmp /mnt
+mount -t tmpfs tmpfs /tmp
+mkdir -m 1777 /tmp/.X11-unix
+mkdir -m 0700 /tmp/vesper-0
+for p in "$DATA" "$(readlink -f "$HERE/../..")"; do
+  case $p in /tmp/*) mkdir -p "$p"; mount --bind "/mnt${p#/tmp}" "$p" ;; esac
+done
+set +e
+dbus-run-session -- bash "$HERE/session.sh" "$@"' x "$@"

@@ -4,7 +4,7 @@
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 R=$(cd "$HERE/../.." && pwd)
 LABROOT=$HERE
-DATA=${VESPER_LAB_DATA:-/tmp/vesper-lab-$(id -u)}
+DATA=${DATA:-/tmp/vesper-lab-$(id -u)}
 L=$DATA/${LAB:-main}
 export HERE R L LABROOT
 export XDG_RUNTIME_DIR=/tmp/lab-${LAB:-main}-run XDG_CONFIG_HOME=$L/cfg XDG_DATA_HOME=$L/data XDG_CACHE_HOME=$L/cache HOME=$L/home
@@ -31,7 +31,8 @@ context.objects = [
   { factory = adapter args = { factory.name = support.null-audio-sink node.name = labsink2 node.description = labsink2 media.class = Audio/Sink object.linked = true audio.position = [ FL FR ] } }
 ]
 J
-unset WAYLAND_DISPLAY DISPLAY
+# Never the session's display, nor its X cookie.
+unset WAYLAND_DISPLAY DISPLAY XAUTHORITY
 export VESPER=$R/target/debug/vesper
 cat > $L/layers/vesper_capture.json <<J
 {"file_format_version":"1.2.0","layer":{"name":"VK_LAYER_VESPER_capture","type":"GLOBAL","library_path":"$R/target/debug/libvesper_vklayer.so","api_version":"1.4.0","implementation_version":"1","description":"lab","disable_environment":{"VESPER_CAPTURE_DISABLE":"1"}}}

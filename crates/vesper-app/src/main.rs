@@ -26,7 +26,7 @@ mod shortcuts;
 mod tray;
 
 use std::cell::RefCell;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -982,10 +982,13 @@ fn friendly(error: &str) -> String {
         return error.to_owned();
     };
     log!("{error}");
-    if has("(saved up to there") {
-        format!("{text}: recording saved up to there")
-    } else {
-        text.to_owned()
+    // A recording cut short: name the partial file.
+    let saved = error
+        .split_once("(saved up to there: ")
+        .and_then(|(_, rest)| rest.strip_suffix(')'));
+    match saved.and_then(|path| Path::new(path).file_name()) {
+        Some(name) => format!("{text}: {} saved up to there", name.to_string_lossy()),
+        None => text.to_owned(),
     }
 }
 
@@ -1106,7 +1109,7 @@ mod tests {
         for (raw, text) in [
             (
                 "write packet: No space left on device (saved up to there: /v/a.mkv)",
-                "The disk is full: recording saved up to there",
+                "The disk is full: a.mkv saved up to there",
             ),
             (
                 "Could not create /v/a.mkv: open output file: Read-only file system",

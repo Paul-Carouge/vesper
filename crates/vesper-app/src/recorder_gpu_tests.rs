@@ -270,3 +270,86 @@ fn a_game_pause_and_resize_keep_the_recording_continuous() {
     p.join();
     std::fs::remove_dir_all(out).unwrap();
 }
+
+/// The game goes away while only the replay buffer runs: no frozen frames
+/// fill it, the seconds before stay; back after longer than the span, the
+/// replay holds only the new frames, from a keyframe, with no hole.
+#[test]
+fn a_gone_game_neither_freezes_nor_ages_the_replay() {
+    let Some(rig) = Rig::new() else { return };
+    let out = dir("gone");
+    let (tx, rx) = mpsc::channel();
+    let span = Duration::from_secs(2);
+    let p = Pipeline::start(settings(&rig.route), Some(span), None, move |e| {
+        drop(tx.send(e))
+    })
+    .unwrap();
+    std::thread::sleep(Duration::from_millis(1500));
+    rig.paused.store(true, Ordering::Relaxed);
+    rig.route.0.gone.store(true, Ordering::Relaxed);
+    std::thread::sleep(Duration::from_secs(3));
+    assert!(p.save_replay(out.clone()));
+    let path = match event(&rx) {
+        Some(Event::ReplaySaved(Ok(path))) => path,
+        None => return,
+        other => panic!("{other:?}"),
+    };
+    let (n, key, last) = inspect(&path);
+    // At most the ~1.5 s of game before it went, no 3 s of repeats after.
+    assert!(key && n <= 50, "{n} packets, key {key}");
+    assert!(
+        last < 1.8,
+        "ends at {last:.2} s: repeats after the game left"
+    );
+
+    rig.route.0.gone.store(false, Ordering::Relaxed);
+    rig.paused.store(false, Ordering::Relaxed);
+    std::thread::sleep(Duration::from_secs(1));
+    assert!(p.save_replay(out.clone()));
+    let path = match event(&rx) {
+        Some(Event::ReplaySaved(Ok(path))) => path,
+        other => panic!("{other:?}"),
+    };
+    let (n, key, last) = inspect(&path);
+    // Only the second since the return: ~30 packets over ~1 s, no hole.
+    assert!(key, "starts mid-GOP");
+    assert!((20..=40).contains(&n), "{n} packets");
+    assert!(last < 1.3, "spans {last:.2} s: old packets across the gap");
+    p.join();
+    std::fs::remove_dir_all(out).unwrap();
+}
+
+/// A recording keeps its constant frame rate while the game is gone, until
+/// it is stopped (its stop needs a packet).
+#[test]
+fn a_recording_keeps_repeating_while_the_game_is_gone() {
+    let Some(rig) = Rig::new() else { return };
+    let out = dir("gonerec");
+    let (tx, rx) = mpsc::channel();
+    let p = Pipeline::start(settings(&rig.route), None, Some(out.clone()), move |e| {
+        drop(tx.send(e))
+    })
+    .unwrap();
+    if !matches!(event(&rx), Some(Event::Started)) {
+        return;
+    }
+    let started = Instant::now();
+    std::thread::sleep(Duration::from_secs(1));
+    rig.paused.store(true, Ordering::Relaxed);
+    rig.route.0.gone.store(true, Ordering::Relaxed);
+    std::thread::sleep(Duration::from_secs(2));
+    p.stop_recording();
+    let path = match event(&rx) {
+        Some(Event::Finished(Ok(path))) => path,
+        other => panic!("{other:?}"),
+    };
+    let wall = started.elapsed().as_secs_f64();
+    let (n, _, last) = inspect(&path);
+    assert!(
+        (last - wall).abs() < 0.6,
+        "file {last:.2} s, wall {wall:.2} s"
+    );
+    assert!(n as f64 > wall * 28.0, "{n} packets in {wall:.2} s");
+    p.join();
+    std::fs::remove_dir_all(out).unwrap();
+}

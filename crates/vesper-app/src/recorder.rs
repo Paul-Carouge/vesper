@@ -92,6 +92,9 @@ struct GameRoute {
     slot: Mutex<Option<(Arc<Mailbox>, u32)>>,
     /// Weak: the capture's frame callback holds this route.
     capture: OnceLock<Weak<GameCapture>>,
+    /// Tests: the game is gone, without a capture server.
+    #[cfg(test)]
+    gone: AtomicBool,
 }
 
 impl GameFrames {
@@ -115,9 +118,15 @@ impl GameFrames {
         }
     }
 
-    /// Whether the game being captured disconnected (quit or crashed) and
-    /// none replaced it yet. A paused game stays connected: not gone.
+    /// Whether no game is captured any more: it disconnected (quit or
+    /// crashed), or sent no frame for 3 s without a swapchain (the server
+    /// then drops it, though still connected), and none replaced it yet. A
+    /// paused game that keeps its swapchain stays captured: not gone.
     fn gone(&self) -> bool {
+        #[cfg(test)]
+        if self.0.gone.load(Ordering::Relaxed) {
+            return true;
+        }
         let capture = self.0.capture.get().and_then(Weak::upgrade);
         capture.is_some_and(|c| c.captured().is_none())
     }
@@ -644,6 +653,15 @@ impl Ring {
     }
 
     fn push_video(&mut self, p: EncodedPacket) {
+        // Back after a gap longer than the span (the game was gone): a replay
+        // must not join the old packets to the new ones across that hole.
+        if self
+            .video
+            .back()
+            .is_some_and(|last| p.pts.saturating_sub(last.pts) > self.span)
+        {
+            *self = Ring::new(self.span, self.audio.len());
+        }
         // A replay must start decodable.
         if self.video.is_empty() && !p.keyframe {
             return;
@@ -797,17 +815,7 @@ fn start_audio(sources: &AudioSources, sinks: &SharedSinks, on_event: &OnEvent) 
         // The tracks move up one stream: before any file or replay uses them.
         first.store(0, Ordering::Relaxed);
     }
-    // One notice for everything left out.
-    let missing = match (failed.as_slice(), mix_failed || dropped) {
-        ([], false) => None,
-        ([], true) => Some("Recording without the mix track".to_owned()),
-        ([one], _) => Some(format!("Recording without the audio track {one}")),
-        (many, _) => Some(format!(
-            "Recording without the audio tracks {}",
-            many.join(", ")
-        )),
-    };
-    if let Some(text) = missing {
+    if let Some(text) = missing_audio(&failed, mix_failed || dropped) {
         on_event(Event::AudioMissing(text));
     }
     // Started outside the lock (it blocks until PipeWire is ready); the
@@ -821,6 +829,19 @@ fn start_audio(sources: &AudioSources, sinks: &SharedSinks, on_event: &OnEvent) 
         }
     }
     (audio.running, audio.mixer, audio.filters) = (running, mixer, controls);
+}
+
+/// One notice for the tracks that could not start, and a lost mix.
+fn missing_audio(failed: &[&str], no_mix: bool) -> Option<String> {
+    match (failed, no_mix) {
+        ([], false) => None,
+        ([], true) => Some("Recording without the mix track".to_owned()),
+        ([one], _) => Some(format!("Recording without the audio track {one}")),
+        (many, _) => Some(format!(
+            "Recording without the audio tracks {}",
+            many.join(", ")
+        )),
+    }
 }
 
 /// Empties the ring's audio and sizes it for the running streams.
@@ -1052,6 +1073,8 @@ fn pump(
     slot.poke();
     let mut window = (monotonic_now(), 0u32);
     let mut error = None;
+    // Ticks were skipped because the game was gone: its return starts a GOP.
+    let mut was_gone = false;
 
     loop {
         match &video {
@@ -1229,17 +1252,22 @@ fn pump(
             }
             last_size = Some((f.width, f.height));
         }
+        // The game quit or crashed: no frozen picture, so the replay
+        // buffer keeps the seconds before it. A recording keeps its frame
+        // rate until the UI stops it (its stop needs a packet).
+        let recording = lock(sinks).rec.is_some();
+        let gone =
+            frame.is_none() && !recording && settings.game.as_ref().is_some_and(GameFrames::gone);
         let packets = match frame {
             Some(mut frame) => {
+                if std::mem::take(&mut was_gone) {
+                    v.enc.force_keyframe();
+                }
                 frame.pts = pts;
                 v.enc.encode(frame)
             }
-            // The game quit or crashed: no frozen picture, so the replay
-            // buffer keeps the seconds before it. A recording keeps its
-            // frame rate until the UI stops it (its stop needs a packet).
-            None if lock(sinks).rec.is_none()
-                && settings.game.as_ref().is_some_and(GameFrames::gone) =>
-            {
+            None if gone => {
+                was_gone = true;
                 Ok(Vec::new())
             }
             None => v.enc.repeat(pts),
@@ -1623,6 +1651,41 @@ mod tests {
     }
 
     #[test]
+    fn ring_restarts_after_a_gap_longer_than_its_span() {
+        // The game was gone from 4 s to 60 s, then comes back.
+        let mut ring = filled(3, 4000);
+        ring.push_video(packet(60_000, false));
+        assert!(ring.video.is_empty(), "waits for a keyframe");
+        ring.push_audio(0, packet(60_000, false));
+        assert!(ring.audio[0].is_empty());
+        ring.push_video(packet(60_100, true));
+        ring.push_audio(0, packet(60_100, false));
+        assert_eq!(ring.video.len(), 1);
+        assert_eq!(ring.audio[0].len(), 1);
+        // A short pause keeps the ring.
+        let mut ring = filled(3, 4000);
+        ring.push_video(packet(6000, false));
+        assert_eq!(ring.video.back().unwrap().pts, Duration::from_millis(6000));
+    }
+
+    #[test]
+    fn missing_audio_is_one_short_notice() {
+        assert_eq!(missing_audio(&[], false), None);
+        assert_eq!(
+            missing_audio(&[], true).as_deref(),
+            Some("Recording without the mix track")
+        );
+        assert_eq!(
+            missing_audio(&["Mic"], true).as_deref(),
+            Some("Recording without the audio track Mic")
+        );
+        assert_eq!(
+            missing_audio(&["Mic", "Game"], false).as_deref(),
+            Some("Recording without the audio tracks Mic, Game")
+        );
+    }
+
+    #[test]
     fn ring_snapshot_is_in_pts_order() {
         let ring = filled(3, 4000);
         let snap = interleave(ring.snapshot());
@@ -1721,11 +1784,19 @@ mod tests {
         let s = settings();
         let route = s.game.clone().unwrap();
         let (p, rx) = start(Some(Duration::from_secs(30)), None, s);
-        // The game capture server died: its last event is an error.
-        std::thread::sleep(Duration::from_millis(100));
-        route.push(Err("boom".into()));
-        match next(&rx, 3) {
-            Event::Stopped(Some(e)) => assert!(e.contains("boom"), "{e}"),
+        // The game capture server died: its last event is an error. Pushed
+        // until the pipeline has attached and reports it (a push before
+        // that is dropped).
+        let mut stopped = None;
+        for _ in 0..100 {
+            route.push(Err("boom".into()));
+            if let Ok(e) = rx.recv_timeout(Duration::from_millis(50)) {
+                stopped = Some(e);
+                break;
+            }
+        }
+        match stopped {
+            Some(Event::Stopped(Some(e))) => assert!(e.contains("boom"), "{e}"),
             other => panic!("{other:?}"),
         }
         // The UI must start a new pipeline: requests report the end.

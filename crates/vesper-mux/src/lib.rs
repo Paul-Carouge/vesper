@@ -112,6 +112,9 @@ pub struct Muxer {
     last_pts: Vec<i64>,
     /// The output file, opened again to notice it being deleted: writes to
     /// an unlinked file succeed, and `finish` would claim it was saved.
+    /// shortcut: on NFS a file deleted while open is "silly-renamed"
+    /// (`.nfsXXXX`) and keeps a link, so the deletion goes unnoticed there;
+    /// also compare the path's inode at finish if NFS output matters.
     file: Option<File>,
 }
 

@@ -1,11 +1,14 @@
 # Helpers for scenarios (sourced). Runs inside run.sh's namespaces.
-# start_game <name> : gamescope headless + vkcube; sets GS (gamescope pid)
+# start_game <name> : gamescope headless + vkcube; sets GS (gamescope pid).
+# $L/run/display-<name> gets gamescope's Xwayland DISPLAY (see game_display).
 start_game() {
   local size=${2:-1280x720}
-  gamescope --backend headless -W ${size%x*} -H ${size#*x} -- env SteamAppId=1 vkcube --width ${size%x*} --height ${size#*x} > $L/log/game-$1.log 2>&1 &
+  gamescope --backend headless -W ${size%x*} -H ${size#*x} -- bash -c 'echo "$DISPLAY" > "$0"; exec env SteamAppId=1 vkcube --width "$1" --height "$2"' $L/run/display-$1 ${size%x*} ${size#*x} > $L/log/game-$1.log 2>&1 &
   GS=$!
   sleep 5
 }
+# game_display <name>: the DISPLAY gamescope gave its game (never a hardcoded one)
+game_display() { cat $L/run/display-$1; }
 # kill the vkcube client only (the game crash)
 kill_game_client() { kill -9 $(pgrep -x vkcube) 2>/dev/null; }
 stop_game() { kill $GS 2>/dev/null; wait $GS 2>/dev/null; }

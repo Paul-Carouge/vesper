@@ -80,6 +80,7 @@ fn random_msg(r: &mut Rng) -> Msg {
         },
         2 => Msg::Start {
             modifiers: (0..r.below(80)).map(|_| r.next()).collect(),
+            fps: r.edge32(),
         },
         3 => Msg::Stop,
         4 => Msg::Buffer {
@@ -165,7 +166,7 @@ fn decode_survives_mutated_valid_messages() {
             if let Ok(m) = Msg::decode(&b) {
                 // Whatever decodes stays within the documented bounds.
                 match m {
-                    Msg::Start { modifiers } => assert!(modifiers.len() <= 64),
+                    Msg::Start { modifiers, .. } => assert!(modifiers.len() <= 64),
                     Msg::Buffer { planes, .. } => assert!((1..=4).contains(&planes.len())),
                     Msg::Hello { exe, .. } => assert!(exe.len() <= 256 * 3),
                     _ => {}
@@ -271,7 +272,7 @@ fn server(real_checks: bool) -> (Server, mpsc::Receiver<VideoFrame>) {
         games: Mutex::new(Vec::new()),
         select: Mutex::new(None),
         allowed: Mutex::new(Vec::new()),
-        active: AtomicBool::new(true),
+        fps: AtomicU32::new(60),
         stop: AtomicBool::new(false),
     });
     let (tx, rx) = mpsc::channel();
