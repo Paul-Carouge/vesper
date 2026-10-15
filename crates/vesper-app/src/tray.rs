@@ -3,7 +3,7 @@
 //! click goes to the `on_command` callback, which must hand it to the UI
 //! thread. The UI pushes its state back with [`Tray::set`].
 
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
 
 use ksni::blocking::{Handle, TrayMethods};
 use ksni::menu::{CheckmarkItem, StandardItem};
@@ -138,7 +138,11 @@ impl ksni::Tray for Item {
 
 /// The registered tray item. Cheap to clone; it goes away with the process.
 #[derive(Clone)]
-pub struct Tray(Handle<Item>);
+pub struct Tray {
+    handle: Handle<Item>,
+    /// To the `vesper-tray` thread, which applies the latest state.
+    states: mpsc::Sender<State>,
+}
 
 impl Tray {
     /// Registers the item with the StatusNotifierWatcher. Fails when the
@@ -153,17 +157,34 @@ impl Tray {
             icon: app_icon().into_iter().collect(),
             on_command: Arc::new(on_command),
         };
-        item.spawn().map(Self)
+        let handle = item.spawn()?;
+        // `update` waits on the D-Bus service, which a slow watcher may
+        // stall: never on the UI thread.
+        let (states, rx) = mpsc::channel::<State>();
+        let h = handle.clone();
+        let spawned = std::thread::Builder::new()
+            .name("vesper-tray".into())
+            .spawn(move || {
+                while let Ok(mut state) = rx.recv() {
+                    // Only the latest state matters.
+                    state = rx.try_iter().last().unwrap_or(state);
+                    h.update(|item| item.state = state);
+                }
+            });
+        if let Err(e) = spawned {
+            log!("tray: could not start its thread, its menu stays as is: {e}");
+        }
+        Ok(Self { handle, states })
     }
 
     /// Removes the item now, so it does not linger while the app finishes.
     pub fn shutdown(&self) {
-        self.0.shutdown().wait();
+        self.handle.shutdown().wait();
     }
 
-    /// Shows `state`; `ksni` only signals the properties that changed.
+    /// Shows `state` soon; `ksni` only signals the properties that changed.
     pub fn set(&self, state: State) {
-        self.0.update(|item| item.state = state);
+        let _ = self.states.send(state);
     }
 }
 

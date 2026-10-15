@@ -34,8 +34,6 @@ pub struct Prefs {
     /// Record a game (Vulkan layer) instead of a portal source.
     pub game_source: bool,
     pub allowed_games: Vec<String>,
-    /// "Start with the session" (the autostart entry). Never on by default.
-    pub autostart: bool,
     pub tray_notice_shown: bool,
 }
 
@@ -52,7 +50,6 @@ impl Prefs {
             output_folder: ui.get_output_folder().into(),
             game_source: ui.get_source_kind() == SourceKind::Game,
             allowed_games: ALLOWED_GAMES.lock().unwrap().clone(),
-            autostart: ui.get_autostart(),
             tray_notice_shown: TRAY_NOTICE_SHOWN.load(Ordering::Relaxed),
         }
     }
@@ -73,7 +70,6 @@ impl Prefs {
             .lock()
             .unwrap()
             .clone_from(&self.allowed_games);
-        ui.set_autostart(self.autostart);
         TRAY_NOTICE_SHOWN.store(self.tray_notice_shown, Ordering::Relaxed);
     }
 
@@ -101,7 +97,6 @@ impl Prefs {
                 {
                     self.allowed_games.push(value.to_owned());
                 }
-                "autostart" => set(&mut self.autostart, flag(value)),
                 "tray_notice_shown" => set(&mut self.tray_notice_shown, flag(value)),
                 _ => {}
             }
@@ -133,8 +128,8 @@ impl Prefs {
             text += &format!("output_folder={}\n", self.output_folder);
         }
         text += &format!(
-            "game_source={}\nautostart={}\ntray_notice_shown={}\n",
-            self.game_source, self.autostart, self.tray_notice_shown
+            "game_source={}\ntray_notice_shown={}\n",
+            self.game_source, self.tray_notice_shown
         );
         for game in self.allowed_games.iter().filter(|g| valid_game(g)) {
             text += &format!("allow_game={game}\n");
@@ -299,7 +294,6 @@ mod tests {
             output_folder: DEFAULT.into(),
             game_source: false,
             allowed_games: Vec::new(),
-            autostart: false,
             tray_notice_shown: false,
         }
     }
@@ -316,7 +310,6 @@ mod tests {
             output_folder: "/mnt/clips/my folder = 2".into(),
             game_source: true,
             allowed_games: vec!["Game.exe".into(), "a=b c".into()],
-            autostart: true,
             tray_notice_shown: true,
         }
     }

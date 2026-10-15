@@ -74,6 +74,8 @@ const GAMES_TICK: Duration = Duration::from_millis(500);
 slint::include_modules!();
 
 fn main() -> Result<(), slint::PlatformError> {
+    // First, before any thread starts, so they all inherit the blocked mask.
+    handle_quit_signals();
     // Started with the session: stay in the tray (when there is one).
     let background = std::env::args().skip(1).any(|a| a == "--background");
     if let Err(e) = futures_lite::future::block_on(shortcuts::register_app_id()) {
@@ -101,7 +103,7 @@ fn main() -> Result<(), slint::PlatformError> {
     let ui = AppWindow::new()?;
     // Before anything starts: a second launch only shows the first window.
     let weak = ui.as_weak();
-    let _instance = match instance::claim(move || {
+    let instance = match instance::claim(!background, move || {
         let _ = weak.upgrade_in_event_loop(|ui| {
             let _ = ui.show();
             ui.invoke_tray_state_changed();
@@ -109,7 +111,7 @@ fn main() -> Result<(), slint::PlatformError> {
     }) {
         instance::Claim::First(conn) => conn,
         instance::Claim::Running => {
-            log!("Vesper is already running: showing its window");
+            log!("Vesper is already running");
             return Ok(());
         }
     };
@@ -247,6 +249,9 @@ fn main() -> Result<(), slint::PlatformError> {
     // Hiding the window does not end the loop: only Quit, Ctrl+Q, or closing
     // the window without a tray does.
     let result = slint::run_event_loop_until_quit();
+    if let Some(conn) = instance {
+        instance::release(conn);
+    }
     let _ = ui.hide();
     if let Some(tray) = tray {
         tray.shutdown();
@@ -476,6 +481,46 @@ fn wire_callbacks(ui: &AppWindow, recording: &Shared, games: &Games) {
     });
 }
 
+/// SIGTERM (the session ends) and SIGINT take the Quit path, so a recording
+/// is finalized and replays being saved finish. A second one exits at once.
+/// The signals are blocked in every thread and taken by a `sigwait` thread.
+fn handle_quit_signals() {
+    // SAFETY: plain libc calls on a local, initialized signal set.
+    let set = unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGTERM);
+        libc::sigaddset(&mut set, libc::SIGINT);
+        libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+        set
+    };
+    let spawned = std::thread::Builder::new()
+        .name("vesper-signals".into())
+        .spawn(move || {
+            let mut quitting = false;
+            loop {
+                let mut signal = 0;
+                // SAFETY: `set` is initialized; `signal` outlives the call.
+                if unsafe { libc::sigwait(&set, &mut signal) } != 0 {
+                    continue;
+                }
+                log!("signal {signal}: quitting");
+                let queued = !quitting
+                    && slint::invoke_from_event_loop(|| {
+                        let _ = slint::quit_event_loop();
+                    })
+                    .is_ok();
+                if !queued {
+                    std::process::exit(128 + signal);
+                }
+                quitting = true;
+            }
+        });
+    if let Err(e) = spawned {
+        log!("could not start the signal thread: {e}");
+    }
+}
+
 /// Registers the tray icon; `None` when the session has no tray. Its clicks
 /// take the same paths as the window's buttons, on the UI thread.
 fn spawn_tray(ui: &AppWindow) -> Option<Tray> {
@@ -562,10 +607,7 @@ fn wire_background(ui: &AppWindow, tray: Option<&Tray>) {
         let Some(ui) = weak.upgrade() else { return };
         log!("autostart-changed: {on}");
         match autostart::set(on) {
-            Ok(()) => {
-                ui.set_autostart(on);
-                Prefs::from_ui(&ui).save();
-            }
+            Ok(()) => ui.set_autostart(on),
             Err(e) => {
                 log!("autostart entry: {e}");
                 flash_notice(&ui, &format!("Could not change autostart: {e}"));
@@ -986,7 +1028,8 @@ fn announce_failure(ui: &AppWindow, title: &str, error: &str) {
     if !window_focused(ui) {
         desktop::notify(title.to_owned(), error.to_owned(), None);
     }
-    flash_notice(ui, error);
+    // Not `flash_notice`: it would send a second, untitled notification.
+    show_notice(ui, error, None);
 }
 
 /// Shows the output folder's name, and its parent with the home folder as `~`.

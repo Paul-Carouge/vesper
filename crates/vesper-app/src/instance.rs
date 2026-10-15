@@ -26,14 +26,15 @@ impl Instance {
 pub enum Claim {
     /// This is the only instance; keep the connection for its lifetime.
     First(Option<Connection>),
-    /// Another instance runs and was asked to show its window.
+    /// Another instance runs (and was asked to show its window, if `show`).
     Running,
 }
 
-/// Claims the name, serving `on_show` (called on a D-Bus thread). Without a
-/// session bus, runs anyway, unguarded.
-pub fn claim(on_show: impl Fn() + Send + Sync + 'static) -> Claim {
-    match block_on(try_claim(Box::new(on_show))) {
+/// Claims the name, serving `on_show` (called on a D-Bus thread). When it is
+/// taken, asks its owner to show its window if `show`. Without a session bus,
+/// runs anyway, unguarded.
+pub fn claim(show: bool, on_show: impl Fn() + Send + Sync + 'static) -> Claim {
+    match block_on(try_claim(show, Box::new(on_show))) {
         Ok(claim) => claim,
         Err(e) => {
             log!("single instance check failed ({e}); running anyway");
@@ -42,7 +43,14 @@ pub fn claim(on_show: impl Fn() + Send + Sync + 'static) -> Claim {
     }
 }
 
-async fn try_claim(on_show: Box<dyn Fn() + Send + Sync>) -> ashpd::zbus::Result<Claim> {
+/// Gives the name up, so a new launch is not sent to an exiting instance.
+pub fn release(conn: Connection) {
+    if let Err(e) = block_on(conn.release_name(APP_ID)) {
+        log!("could not release {APP_ID}: {e}");
+    }
+}
+
+async fn try_claim(show: bool, on_show: Box<dyn Fn() + Send + Sync>) -> ashpd::zbus::Result<Claim> {
     let conn = Connection::session().await?;
     // Served before the name is taken, so a Show never finds it missing.
     conn.object_server().at(PATH, Instance { on_show }).await?;
@@ -54,9 +62,10 @@ async fn try_claim(on_show: Box<dyn Fn() + Send + Sync>) -> ashpd::zbus::Result<
             Ok(Claim::First(Some(conn)))
         }
         Ok(_) | Err(ashpd::zbus::Error::NameTaken) => {
-            if let Err(e) = conn
-                .call_method(Some(APP_ID), PATH, Some(APP_ID), "Show", &())
-                .await
+            if show
+                && let Err(e) = conn
+                    .call_method(Some(APP_ID), PATH, Some(APP_ID), "Show", &())
+                    .await
             {
                 log!("could not show the running instance: {e}");
             }
