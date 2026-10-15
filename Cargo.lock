@@ -4979,6 +4979,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "vesper-audio"
+version = "0.1.0"
+dependencies = [
+ "ffmpeg-next",
+ "libc",
+ "pipewire",
+ "tracing",
+ "tracing-subscriber",
+ "vesper-core",
+]
+
+[[package]]
 name = "vesper-capture"
 version = "0.1.0"
 dependencies = [
