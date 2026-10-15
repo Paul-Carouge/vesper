@@ -12,6 +12,7 @@ vesper-capture = { path = "crates/vesper-capture" }
 vesper-encode = { path = "crates/vesper-encode" }
 vesper-mux = { path = "crates/vesper-mux" }
 vesper-audio = { path = "crates/vesper-audio" }
+vesper-gamecapture = { path = "crates/vesper-gamecapture" }
 ffmpeg-next = { version = "9.0.0", default-features = false, features = ["codec", "format", "filter"] }
 
 [profile.release]
