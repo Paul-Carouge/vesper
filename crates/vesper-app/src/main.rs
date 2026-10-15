@@ -86,6 +86,8 @@ fn main() -> Result<(), slint::PlatformError> {
         .with_writer(std::io::stderr)
         .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
         .init();
+    // Before any track or chain: they may hold VST3 plugins.
+    filters::install_plugins();
     // Started with the session: stay in the tray (when there is one).
     let background = std::env::args().skip(1).any(|a| a == "--background");
     if let Err(e) = futures_lite::future::block_on(shortcuts::register_app_id()) {

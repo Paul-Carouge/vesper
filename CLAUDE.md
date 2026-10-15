@@ -11,6 +11,8 @@ Fast, bloat-free screen recorder in Rust. See README.md for goals, architecture 
 - `crates/vesper-encode`: VAAPI hardware encoding.
 - `crates/vesper-mux`: Matroska (MKV) muxing of encoded video and Opus audio.
 - `crates/vesper-audio`: PipeWire capture (desktop, microphone, devices, applications), mixing, Opus encoding (libopus via ffmpeg-next).
+- `crates/vesper-vst`: VST3 effects in a track's filter chain, each run by its own host process (shared-memory audio with a deadline, Unix socket control, supervisor with restarts), plugin scanning and per-instance settings files.
+- `crates/vesper-vst-host`: the `vesper-vst-host` binary (VST3 hosting through the `vst3` bindings). Plugins only ever load in this process.
 - `crates/vesper-app`: the `vesper` binary and the Slint UI.
 
 ## Target machine

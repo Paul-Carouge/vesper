@@ -14,7 +14,7 @@ A fast, bloat-free screen recorder for desktop and gaming, written in Rust. An a
    **Game capture** (Vulkan, incl. Proton): an implicit Vulkan layer (`vesper-vklayer`, opt-in with the *Game capture* switch in the settings) copies each presented image into exported DMA-BUFs and sends them over `/tmp/vesper-<uid>/capture.sock` to `vesper-gamecapture`. The socket is in `/tmp`, not `$XDG_RUNTIME_DIR`, because Proton games run inside the Steam Linux Runtime container (pressure-vessel). That container replaces `$XDG_RUNTIME_DIR` with its own tmpfs but shares the host's `/tmp`. Game only, at the game's frame rate, no portal.
 2. **Conversion**: RGB to NV12 on the GPU (VA-VPP).
 3. **Encoding**: VAAPI hardware encode (AV1 / HEVC / H.264). Prototype with `cros-codecs`, fall back to `ffmpeg-next`.
-4. **Audio**: up to 8 PipeWire tracks (desktop, microphone, a device by node name, or an application's streams, followed as they come and go), each its own named Opus track, plus an optional mix of them all as the first track. Volume and mute per track, applied live. Built-in filters per track (`vesper-dsp`) run on the track's encode thread, never on PipeWire's real-time thread: parameter changes are lock-free, a new filter list is built off that thread and handed over without a lock or an allocation. A filter's delay (noise suppression 20 ms, limiter lookahead) is removed from the track's timeline, so tracks stay in sync with the video and with each other. The mix goes through a true-peak limiter (-1 dBTP).
+4. **Audio**: up to 8 PipeWire tracks (desktop, microphone, a device by node name, or an application's streams, followed as they come and go), each its own named Opus track, plus an optional mix of them all as the first track. Volume and mute per track, applied live. Built-in filters per track (`vesper-dsp`) run on the track's encode thread, never on PipeWire's real-time thread: parameter changes are lock-free, a new filter list is built off that thread and handed over without a lock or an allocation. A filter's delay (noise suppression 20 ms, limiter lookahead) is removed from the track's timeline, so tracks stay in sync with the video and with each other. The mix goes through a true-peak limiter (-1 dBTP). VST3 effects run in the same chains, each in its own host process (see *VST3 plugins*).
 5. **Container**: MKV (crash-safe), optional remux to MP4.
 
 ## Game capture layer: what it does when installed
@@ -38,6 +38,7 @@ Risks and limits: anti-cheats (EAC, BattlEye) may flag or reject unknown Vulkan 
 - Record a screen, a window or a game (Vulkan layer), constant frame rate, AV1 / HEVC / H.264 with constant-quality presets.
 - Up to 8 named audio tracks (desktop, mic, devices, applications) with volume and mute, plus a mix track, sample-aligned and drift-corrected. The desktop and microphone devices are chosen in the settings (system default or a specific device, never silently replaced when unplugged), and any track's source can be changed after it was added.
 - Built-in filters per track (noise suppression, expander, compressor, de-esser, limiter, high-pass, gain), changed live, with a one-click voice preset and gain reduction meters.
+- VST3 effects per track, hosted out of process: a plugin that crashes or stalls leaves its track dry, never the recording down.
 - Global hotkeys (GlobalShortcuts portal).
 - Replay buffer: ring buffer of encoded packets, save the last N seconds.
 - Slint UI, tray icon, start with the session.
@@ -52,7 +53,7 @@ Arch (and CachyOS): the package builds the last commit of this checkout (uncommi
 cd packaging/arch && makepkg -si
 ```
 
-It installs `/usr/bin/vesper`, the desktop file, the icon and the game capture layer in `/usr/lib/vesper/`. The layer stays off: only the settings switch enables it, per user. Uninstall with `sudo pacman -R vesper-git`. Turn the switch off first: otherwise your per-user copy of the layer stays installed and keeps loading into Vulkan apps; remove it by hand with `rm ~/.local/share/vulkan/implicit_layer.d/vesper_capture.json ~/.local/share/vesper/libvesper_vklayer.so`. Each `makepkg` rewrites `pkgver=` in the PKGBUILD (normal for a -git package): `git checkout packaging/arch/PKGBUILD` before committing.
+It installs `/usr/bin/vesper`, the desktop file, the icon, and the game capture layer and the VST3 plugin host (`vesper-vst-host`) in `/usr/lib/vesper/`. The layer stays off: only the settings switch enables it, per user. Uninstall with `sudo pacman -R vesper-git`. Turn the switch off first: otherwise your per-user copy of the layer stays installed and keeps loading into Vulkan apps; remove it by hand with `rm ~/.local/share/vulkan/implicit_layer.d/vesper_capture.json ~/.local/share/vesper/libvesper_vklayer.so`. Each `makepkg` rewrites `pkgver=` in the PKGBUILD (normal for a -git package): `git checkout packaging/arch/PKGBUILD` before committing.
 
 Manual alternative, in your home:
 
@@ -60,15 +61,29 @@ Manual alternative, in your home:
 cargo build --release
 install -Dm755 target/release/vesper ~/.local/bin/vesper
 install -Dm644 target/release/libvesper_vklayer.so ~/.local/lib/vesper/libvesper_vklayer.so
+install -Dm755 target/release/vesper-vst-host ~/.local/lib/vesper/vesper-vst-host
 install -Dm644 crates/vesper-app/data/io.github.PaulCarouge.Vesper.desktop -t ~/.local/share/applications/
 install -Dm644 crates/vesper-app/data/io.github.PaulCarouge.Vesper.svg -t ~/.local/share/icons/hicolor/scalable/apps/
 ```
 
-Vesper looks for the layer next to its binary, then in `../lib/vesper/`; the settings switch installs that copy (build with `cargo build --release` at the workspace root, not `-p vesper-app`, so the layer is built too). If `~/.local/bin` is not in the session `PATH`, set `Exec=` to the full path. Without the desktop file, global shortcuts and desktop notifications (sent when a recording or replay is saved, or fails, while the window is in the background) are off; the in-window shortcuts still work. The saved source is forgotten once after updating to this version, since it is now tied to the app id: pick it again. Default global shortcuts: Alt+F9 starts or stops recording, Alt+F10 saves the replay. KDE asks to confirm them on first launch; change them later in System Settings > Shortcuts.
+Vesper looks for the layer and the plugin host next to its binary, then in `../lib/vesper/`; the settings switch installs that copy (build with `cargo build --release` at the workspace root, not `-p vesper-app`, so the layer is built too). If `~/.local/bin` is not in the session `PATH`, set `Exec=` to the full path. Without the desktop file, global shortcuts and desktop notifications (sent when a recording or replay is saved, or fails, while the window is in the background) are off; the in-window shortcuts still work. The saved source is forgotten once after updating to this version, since it is now tied to the app id: pick it again. Default global shortcuts: Alt+F9 starts or stops recording, Alt+F10 saves the replay. KDE asks to confirm them on first launch; change them later in System Settings > Shortcuts.
 
 Settings are kept in `~/.config/vesper/settings`.
 
 Failure-injection lab (disk full, game crash, portal or PipeWire gone...): `scripts/robustness/go <name> <scenario>.sh` runs a scenario against a debug build in a private user/mount/pid namespace with its own D-Bus, PipeWire (no real device) and headless gamescope; see `scripts/robustness/run.sh`.
+
+## VST3 plugins
+
+*Add filter* lists the VST3 effects installed in `~/.vst3`, `/usr/lib/vst3` and `/usr/local/lib/vst3` (vendor sub-folders included), after the built-in filters. They are enabled, removed and reordered like the built-in ones, and changed live while recording.
+
+- **Out of process.** Each plugin instance runs in its own `vesper-vst-host` process. Audio goes through shared memory: the track's encode thread hands each 20 ms block to the host, wakes it with a futex and waits at most 8 ms for the answer, without allocating. Control (load, parameters, state) goes over a Unix socket. If the host is late, still starting, crashed or was killed, or the plugin outputs NaN or infinity, the block goes out dry, delayed by the plugin's latency so the track stays in place; the filter's title says *bypassed* with the reason. The host is restarted with a growing delay (0.5 s, doubling, up to 30 s; reset after 30 s of normal running), with the plugin's last saved state and the parameters set since. Three late blocks in a row count as a stall. A host also dies with Vesper.
+- **Latency.** The latency a plugin reports (also when it changes it) is removed from the track's timeline like the built-in filters' (noise suppression, limiter lookahead): tracks stay in sync. Up to 1 s is followed; a plugin that reports more is bypassed.
+- **Scanning.** Each bundle is opened by its own host process (10 s limit), so a plugin that crashes on load is only skipped. Results, failures included, are cached by the module's modification time in `~/.config/vesper/vst3/scan-cache`.
+- **Settings.** The filter list in `~/.config/vesper/settings` only holds `vst3:id=<n>`. Each instance's plugin path, class id and state (component and controller, base64) are in `~/.config/vesper/vst3/<n>.conf`, saved when its settings are. Removing the filter deletes that file; files of filters whose track was removed are deleted at the next start.
+- **Parameters** are shown as generic sliders (0-100 % of the plugin's normalized range), the first eight in the card, the others behind *More settings*. Read-only, hidden and program-change parameters are left out.
+- **Limits.** Effects with a mono or stereo main bus only (side-chain inputs get silence); 48 kHz, 32-bit float; no MIDI. No plugin editor window yet: plugin GUIs (X11 embedding through Xwayland, or Wayland) are a follow-up, as are plain-value parameter labels (`-6 dB` instead of a percentage) and parameter changes made inside a plugin's own GUI. A plugin that needs the host's `IMessage` objects to link its processor and controller may lose that link.
+
+The host uses the `vst3` crate (bindings generated from the VST3 SDK headers, MIT or Apache-2.0); the VST3 SDK itself is MIT-licensed since version 3.8.
 
 ## Background and tray
 
@@ -82,7 +97,7 @@ With a tray, closing the window keeps Vesper running in the background, with the
 
 Every feature below must keep recording quality, game performance and compatibility intact: nothing on the game's render path, compositing and encoding on the GPU, audio processing off the PipeWire real-time thread.
 
-1. **VST3 plugins** per track, hosted out of process so a crashing plugin can't take a recording down.
+1. **VST3 plugin editors**: the plugins' own windows, next to the generic sliders.
 2. **Scenes and profiles**: sources composited on the GPU (VA-VPP / Vulkan) into the encoded picture, saved per profile.
 3. **Overlays**: images, text, webcam, and optional browser sources, on the same GPU compositor.
 4. **Streaming** to YouTube and Twitch (RTMP / SRT), sharing the recording's encode when settings match.

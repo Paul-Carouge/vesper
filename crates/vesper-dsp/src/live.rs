@@ -46,12 +46,10 @@ impl Drop for Exchange {
 pub fn live(specs: &[FilterSpec], channels: usize) -> (LiveChain, LiveControl) {
     let (chain, control) = Chain::new(specs, channels);
     let exchange = Arc::new(Exchange::default());
-    let latency = chain.latency();
     (
         LiveChain {
             chain: Box::new(chain),
             exchange: exchange.clone(),
-            latency,
             warm: false,
         },
         LiveControl {
@@ -66,7 +64,6 @@ pub fn live(specs: &[FilterSpec], channels: usize) -> (LiveChain, LiveControl) {
 pub struct LiveChain {
     chain: Box<Chain>,
     exchange: Arc<Exchange>,
-    latency: usize,
     warm: bool,
 }
 
@@ -88,17 +85,17 @@ impl LiveChain {
         if ex.trash.load(Ordering::Acquire).is_null()
             && let Some(new) = Exchange::take(&ex.incoming)
         {
-            self.latency = new.latency();
             let old = std::mem::replace(&mut self.chain, new);
             ex.trash.store(Box::into_raw(old), Ordering::Release);
         }
         self.chain.process(buf);
     }
 
-    /// Delay of the running chain, in frames: it changes when a new chain
-    /// is taken.
+    /// Delay of the running chain after its last block, in frames: it
+    /// changes when a new chain is taken, or when a hosted plugin changes
+    /// its own (see [`crate::Filter::latency`]).
     pub fn latency(&self) -> usize {
-        self.latency
+        self.chain.latency()
     }
 }
 

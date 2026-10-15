@@ -75,6 +75,8 @@ package() {
   # Only the library: the per-user settings switch is the only way to enable
   # it, so no manifest in /usr/share/vulkan/implicit_layer.d/.
   install -Dm644 target/release/libvesper_vklayer.so -t "$pkgdir/usr/lib/vesper/"
+  # VST3 plugin host, started by Vesper (one process per plugin instance).
+  install -Dm755 target/release/vesper-vst-host -t "$pkgdir/usr/lib/vesper/"
   install -Dm644 crates/vesper-app/data/io.github.PaulCarouge.Vesper.desktop \
     -t "$pkgdir/usr/share/applications/"
   install -Dm644 crates/vesper-app/data/io.github.PaulCarouge.Vesper.svg \

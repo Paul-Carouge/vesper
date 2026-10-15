@@ -1,0 +1,18 @@
+[package]
+name = "vesper-vst-host"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "vesper-vst-host"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"
+# Bindings generated from the VST3 SDK headers (MIT OR Apache-2.0; the SDK
+# itself is MIT since 3.8). No build script, no C++.
+vst3 = "0.3.0"
+vesper-vst.workspace = true
+
+[dev-dependencies]
+vesper-dsp.workspace = true
