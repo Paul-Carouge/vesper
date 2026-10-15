@@ -10,7 +10,8 @@
 //!   frame in a one-slot mailbox. A frame it replaces is released at once:
 //!   the compositor may send more frames than the recording's `fps`.
 //! - Pipeline thread (here): opens the capture (blocks on the portal picker),
-//!   then ticks on an absolute `CLOCK_MONOTONIC` grid `start + k / fps`. Each
+//!   sleeps until the first frame (or a request), starts the audio, then
+//!   ticks on an absolute `CLOCK_MONOTONIC` grid `start + k / fps`. Each
 //!   tick encodes the parked frame, or repeats the last picture when the
 //!   compositor sent none (Wayland sends frames on damage only), so the file
 //!   has exactly `fps` frames per second. Packets go straight to the sinks.
@@ -27,7 +28,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -79,7 +80,7 @@ pub struct GameFrames(Arc<GameRoute>);
 
 #[derive(Debug, Default)]
 struct GameRoute {
-    slot: Mutex<Option<Arc<Mutex<Slot>>>>,
+    slot: Mutex<Option<Arc<Mailbox>>>,
     /// Weak: the capture's frame callback holds this route.
     capture: OnceLock<Weak<GameCapture>>,
 }
@@ -96,7 +97,7 @@ impl GameFrames {
     pub fn push(&self, event: Result<VideoFrame, String>) {
         let slot = lock(&self.0.slot).clone();
         match slot {
-            Some(slot) => park(&slot, event),
+            Some(slot) => slot.park(event),
             None => drop(event),
         }
     }
@@ -109,14 +110,14 @@ impl GameFrames {
         }
     }
 
-    fn attach(&self, slot: &Arc<Mutex<Slot>>) {
+    fn attach(&self, slot: &Arc<Mailbox>) {
         let old = lock(&self.0.slot).replace(slot.clone());
         drop(old);
         self.set_active(true);
     }
 
     /// Detaches `slot`, unless a newer pipeline replaced it already.
-    fn detach(&self, slot: &Arc<Mutex<Slot>>) {
+    fn detach(&self, slot: &Arc<Mailbox>) {
         let mut current = lock(&self.0.slot);
         if current.as_ref().is_some_and(|s| Arc::ptr_eq(s, slot)) {
             *current = None;
@@ -137,6 +138,9 @@ pub enum Event {
     Source(crate::outputs::SourceLabel),
     /// A recording started: its file exists.
     Started,
+    /// The audio tracks started (on the first frame) or restarted: their
+    /// peaks move from now on.
+    AudioStarted,
     /// Sent while recording.
     Stats {
         width: u32,
@@ -285,6 +289,8 @@ type OnEvent = Arc<dyn Fn(Event) + Send + Sync>;
 
 pub struct Pipeline {
     control: Arc<Mutex<Control>>,
+    /// Woken on requests while the pipeline waits for its first frame.
+    mailbox: Arc<Mailbox>,
     /// Set once the capture runs: a recording may exist from then on.
     started: Arc<AtomicBool>,
     audio: AudioSources,
@@ -312,14 +318,16 @@ impl Pipeline {
             ..Audio::default()
         }));
         let started = Arc::new(AtomicBool::new(false));
+        let mailbox = Arc::new(Mailbox::default());
         let on_event: OnEvent = Arc::new(on_event);
         let (ctl, started_flag, sources) = (control.clone(), started.clone(), audio.clone());
+        let slot = mailbox.clone();
         let thread = std::thread::Builder::new()
             .name("vesper-recorder".into())
             .spawn(move || {
                 // A panic must still end in `Stopped`, or the UI stays stuck.
                 let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                    run(&settings, &ctl, &started_flag, &sources, &on_event)
+                    run(&settings, &slot, &ctl, &started_flag, &sources, &on_event)
                 }))
                 .unwrap_or_else(|_| Err("Internal error: the recorder crashed".into()));
                 lock(&ctl).ended = true;
@@ -329,6 +337,7 @@ impl Pipeline {
             })?;
         Ok(Self {
             control,
+            mailbox,
             started,
             audio,
             thread,
@@ -341,7 +350,10 @@ impl Pipeline {
         if !c.ended {
             f(&mut c);
         }
-        !c.ended
+        let running = !c.ended;
+        drop(c);
+        self.mailbox.poke();
+        running
     }
 
     /// Whether the capture started (the portal picker is closed).
@@ -437,6 +449,11 @@ impl Pipeline {
         (audio.tracks, audio.mix, audio.changed) = (tracks, mix, true);
     }
 
+    /// Whether audio tracks run, so their peaks may move.
+    pub fn audio_running(&self) -> bool {
+        !lock(&self.audio).running.is_empty()
+    }
+
     /// Recent peak of track `index`, linear 0..=1; 0 when it does not run.
     pub fn peak(&self, index: usize) -> f32 {
         let audio = lock(&self.audio);
@@ -467,23 +484,64 @@ impl Pipeline {
 /// Mailbox between the capture thread (PipeWire or game) and the pipeline
 /// thread.
 #[derive(Debug, Default)]
-pub struct Slot {
-    frame: Option<VideoFrame>,
-    ended: Option<String>,
+struct Mailbox {
+    slot: Mutex<Slot>,
+    /// Signalled on a frame, the capture's end, or a request.
+    wake: Condvar,
 }
 
-/// Parks the newest frame; the one it replaces is released outside the lock.
-fn park(slot: &Mutex<Slot>, event: Result<VideoFrame, String>) {
-    let mut s = lock(slot);
-    let old = match event {
-        Ok(frame) => s.frame.replace(frame),
-        Err(e) => {
-            s.ended = Some(e);
-            s.frame.take()
-        }
-    };
-    drop(s);
-    drop(old);
+#[derive(Debug, Default)]
+struct Slot {
+    frame: Option<VideoFrame>,
+    ended: Option<String>,
+    /// A request came in: [`Mailbox::wait`] returns.
+    poked: bool,
+}
+
+impl Mailbox {
+    /// Parks the newest frame; the one it replaces is released outside the lock.
+    fn park(&self, event: Result<VideoFrame, String>) {
+        let mut s = lock(&self.slot);
+        let old = match event {
+            Ok(frame) => s.frame.replace(frame),
+            Err(e) => {
+                s.ended = Some(e);
+                s.frame.take()
+            }
+        };
+        drop(s);
+        self.wake.notify_one();
+        drop(old);
+    }
+
+    /// The parked frame and the capture's end, if any.
+    fn take(&self) -> (Option<VideoFrame>, Option<String>) {
+        let mut s = lock(&self.slot);
+        (s.frame.take(), s.ended.take())
+    }
+
+    /// Wakes [`Mailbox::wait`]: a request needs the pipeline thread.
+    fn poke(&self) {
+        lock(&self.slot).poked = true;
+        self.wake.notify_one();
+    }
+
+    /// Sleeps until a frame, the capture's end, a request, or `timeout`.
+    fn wait(&self, timeout: Option<Duration>) {
+        let idle = |s: &mut Slot| s.frame.is_none() && s.ended.is_none() && !s.poked;
+        let s = lock(&self.slot);
+        let mut s = match timeout {
+            None => self
+                .wake
+                .wait_while(s, idle)
+                .unwrap_or_else(PoisonError::into_inner),
+            Some(t) => {
+                let waited = self.wake.wait_timeout_while(s, t, idle);
+                waited.unwrap_or_else(PoisonError::into_inner).0
+            }
+        };
+        s.poked = false;
+    }
 }
 
 /// An open recording.
@@ -712,6 +770,14 @@ fn start_audio(sources: &AudioSources, sinks: &SharedSinks, on_event: &OnEvent) 
     (audio.running, audio.mixer, audio.filters) = (running, mixer, controls);
 }
 
+/// Empties the ring's audio and sizes it for the running streams.
+fn reset_ring_audio(sources: &AudioSources, sinks: &SharedSinks) {
+    let streams = lock(sources).streams();
+    if let Some(ring) = lock(sinks).ring.as_mut() {
+        ring.audio = vec![VecDeque::new(); streams];
+    }
+}
+
 /// Stops the captures, then the mix: their last packets go to the sinks, so
 /// never call it holding the sinks lock.
 fn stop_audio(sources: &AudioSources) {
@@ -726,21 +792,25 @@ fn stop_audio(sources: &AudioSources) {
 
 fn run(
     settings: &Settings,
+    slot: &Arc<Mailbox>,
     control: &Mutex<Control>,
     started: &AtomicBool,
     sources: &AudioSources,
     on_event: &OnEvent,
 ) -> Result<(), String> {
-    let slot = Arc::new(Mutex::new(Slot::default()));
     let capture = match &settings.game {
         Some(game) => {
-            game.attach(&slot);
+            game.attach(slot);
             None
         }
         None => {
             let s = slot.clone();
-            let capture = Capture::start(load_restore_token().as_deref(), move |event| {
-                park(&s, event.map_err(|e| e.to_string()));
+            // Twice the recording rate, not once: a compositor pacing frames
+            // at exactly `fps` with a phase close to our ticks' would leave
+            // some ticks without a new frame (a repeat, then a skipped one).
+            let max_fps = settings.fps.saturating_mul(2);
+            let capture = Capture::start(load_restore_token().as_deref(), max_fps, move |event| {
+                s.park(event.map_err(|e| e.to_string()));
             })
             .map_err(|e| format!("Could not start the capture: {e}"))?;
             if let Some(token) = capture.restore_token()
@@ -753,12 +823,11 @@ fn run(
         }
     };
     let sinks = SharedSinks::default();
-    start_audio(sources, &sinks, on_event);
     started.store(true, Ordering::Relaxed);
-    let result = pump(settings, &slot, control, &sinks, sources, on_event);
+    let result = pump(settings, slot, control, &sinks, sources, on_event);
     drop(capture);
     if let Some(game) = &settings.game {
-        game.detach(&slot);
+        game.detach(slot);
     }
     // Stopping the audio flushes its last packets into the sinks, so do it
     // before closing, without holding the sinks lock the audio threads need.
@@ -902,7 +971,7 @@ fn save_replay(
 /// Ticks until neither a recording nor the replay buffer needs the pipeline.
 fn pump(
     settings: &Settings,
-    slot: &Mutex<Slot>,
+    slot: &Mailbox,
     control: &Mutex<Control>,
     sinks: &SharedSinks,
     sources: &AudioSources,
@@ -920,23 +989,33 @@ fn pump(
     // A source size other than the encoder's, and since when.
     let mut new_size: Option<((u32, u32), Duration)> = None;
     // Since when a recording request waits for a first frame.
-    let mut waiting_since = None;
-    let mut deadline = monotonic_now();
+    let mut waiting_since: Option<Duration> = None;
+    // Set by every encoded tick, read once `video` exists.
+    let mut deadline = Duration::ZERO;
     let mut window = (monotonic_now(), 0u32);
     let mut error = None;
 
     loop {
-        sleep_until(deadline);
-        let (frame, ended) = {
-            let mut s = lock(slot);
-            (s.frame.take(), s.ended.take())
-        };
+        match &video {
+            Some(_) => sleep_until(deadline),
+            // No frame yet (e.g. no game): sleep until one, or a request.
+            None => slot.wait(
+                waiting_since.map(|t| (t + FIRST_FRAME_TIMEOUT).saturating_sub(monotonic_now())),
+            ),
+        }
+        let (frame, ended) = slot.take();
         if let Some(e) = ended {
             error = Some(format!("Capture ended: {e}"));
             break;
         }
         let mut first = video.is_none() && frame.is_some();
         if let (None, Some(f)) = (&video, &frame) {
+            // Audio starts with the first frame: before it, the ring and a
+            // recording would drop its packets anyway. Before the encoder
+            // opens, so the tracks cover the first video tick.
+            start_audio(sources, sinks, on_event);
+            reset_ring_audio(sources, sinks);
+            on_event(Event::AudioStarted);
             match Video::open(settings, f) {
                 Ok(v) => video = Some(v),
                 Err(e) => {
@@ -985,15 +1064,15 @@ fn pump(
         };
         // New tracks: restart the audio, and its part of the replay buffer
         // (the old tracks' packets do not match the new files' streams).
+        // Before the first frame, the audio has not started: it reads the
+        // new tracks when it does.
         let changed = lock(sources).changed;
-        if changed && lock(sinks).rec.is_none() {
+        if changed && video.is_some() && lock(sinks).rec.is_none() {
             log!("audio tracks changed: restarting the audio");
             stop_audio(sources);
             start_audio(sources, sinks, on_event);
-            let streams = lock(sources).streams();
-            if let Some(ring) = lock(sinks).ring.as_mut() {
-                ring.audio = vec![VecDeque::new(); streams];
-            }
+            reset_ring_audio(sources, sinks);
+            on_event(Event::AudioStarted);
         }
         let streams = lock(sources).streams();
         {
@@ -1035,8 +1114,6 @@ fn pump(
             }
         }
         let Some(v) = &mut video else {
-            // Waiting for the first frame: poll once per interval.
-            deadline += frame_offset(1, fps);
             continue;
         };
         if !first {
@@ -1290,6 +1367,28 @@ mod tests {
         // No drift from rounding a 16.67 ms interval.
         assert_eq!(frame_offset(1, 60).as_nanos(), 16_666_666);
         assert_eq!(frame_offset(2, 60).as_nanos(), 33_333_333);
+    }
+
+    #[test]
+    fn mailbox_wait_ends_on_a_request_an_end_or_the_timeout() {
+        let mailbox = Arc::new(Mailbox::default());
+        let t = monotonic_now();
+        mailbox.wait(Some(Duration::from_millis(20)));
+        assert!(monotonic_now() - t >= Duration::from_millis(20));
+
+        let m = mailbox.clone();
+        let poker = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            m.poke();
+        });
+        mailbox.wait(None);
+        poker.join().unwrap();
+        // The request is consumed: no busy loop afterwards.
+        assert!(!lock(&mailbox.slot).poked);
+
+        mailbox.park(Err("gone".into()));
+        mailbox.wait(None);
+        assert_eq!(mailbox.take().1.as_deref(), Some("gone"));
     }
 
     #[test]

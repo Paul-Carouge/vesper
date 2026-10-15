@@ -181,6 +181,7 @@ struct State<F> {
     on_frame: F,
     /// Our `EnumFormat` offer, reused when fixating a modifier.
     offer: Vec<Vec<u8>>,
+    max_fps: u32,
     format: Option<Negotiated>,
     generation: Rc<Cell<u32>>,
     next_buffer_id: u32,
@@ -234,7 +235,11 @@ fn on_format<F: FnMut(Result<VideoFrame, Error>)>(
             info.modifiers[0],
             info.modifiers.len()
         );
-        let mut pods = vec![format::enum_format(spa_format, &info.modifiers[..1])];
+        let mut pods = vec![format::enum_format(
+            spa_format,
+            &info.modifiers[..1],
+            state.max_fps,
+        )];
         pods.extend(state.offer.iter().cloned());
         update_params(stream, &pods);
         return;
@@ -333,11 +338,13 @@ unsafe fn build_frame<F>(buffer: *mut pw_buffer, state: &State<F>) -> Option<Vid
     })
 }
 
-/// Connects to the portal's PipeWire remote and streams `node_id` until a
-/// `Msg::Stop` arrives. Reports setup success on `ready` before streaming.
+/// Connects to the portal's PipeWire remote and streams `node_id`, at most
+/// `max_fps` frames per second, until a `Msg::Stop` arrives. Reports setup
+/// success on `ready` before streaming.
 pub fn run<F>(
     fd: OwnedFd,
     node_id: u32,
+    max_fps: u32,
     on_frame: F,
     tx: pw::channel::Sender<Msg>,
     rx: pw::channel::Receiver<Msg>,
@@ -390,7 +397,7 @@ pub fn run<F>(
             let offer: Vec<_> = supported
                 .iter()
                 .filter(|(_, mods)| !mods.is_empty())
-                .map(|(f, mods)| format::enum_format(*f, mods))
+                .map(|(f, mods)| format::enum_format(*f, mods, max_fps))
                 .collect();
             if offer.is_empty() {
                 return Err(
@@ -413,6 +420,7 @@ pub fn run<F>(
         let state = State {
             on_frame,
             offer: offer.clone(),
+            max_fps,
             format: None,
             generation: generation.clone(),
             next_buffer_id: 0,

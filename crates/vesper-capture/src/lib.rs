@@ -43,7 +43,8 @@ pub struct Capture {
 
 impl Capture {
     /// Opens the portal picker (skipped when `restore_token` is still valid)
-    /// and starts streaming. `on_frame` runs on the PipeWire thread: keep it
+    /// and starts streaming, at most `max_fps` frames per second (the
+    /// compositor may send fewer: frames come on damage). `on_frame` runs on the PipeWire thread: keep it
     /// short, e.g. send the frame to a channel. It gets one final `Err` when
     /// the capture ends on its own (source closed, stream error, no DMA-BUF);
     /// no frame follows. Dropping the `Capture` from `on_frame` is allowed,
@@ -51,6 +52,7 @@ impl Capture {
     /// Blocks until the user picks a source.
     pub fn start(
         restore_token: Option<&str>,
+        max_fps: u32,
         on_frame: impl FnMut(Result<VideoFrame>) + Send + 'static,
     ) -> Result<Self> {
         let (session, node_id, fd, restore_token, source) = block_on(open_portal(restore_token))?;
@@ -59,7 +61,7 @@ impl Capture {
         let tx = control.clone();
         let thread = std::thread::Builder::new()
             .name("vesper-pipewire".into())
-            .spawn(move || pw::run(fd, node_id, on_frame, tx, rx, ready_tx))?;
+            .spawn(move || pw::run(fd, node_id, max_fps, on_frame, tx, rx, ready_tx))?;
         let capture = Self {
             restore_token,
             source,

@@ -119,8 +119,13 @@ fn serialize(obj: Object) -> Vec<u8> {
 }
 
 /// Builds a DMA-BUF `EnumFormat` pod. One modifier is a fixated choice;
-/// several let the server pick. `modifiers` must not be empty.
-pub fn enum_format(format: VideoFormat, modifiers: &[u64]) -> Vec<u8> {
+/// several let the server pick. `modifiers` must not be empty. `max_fps`
+/// caps `maxFramerate`, so the compositor sends no more frames than that.
+pub fn enum_format(format: VideoFormat, modifiers: &[u64], max_fps: u32) -> Vec<u8> {
+    let max_fps = Fraction {
+        num: max_fps.max(1),
+        denom: 1,
+    };
     let range =
         |default, min, max| Value::Choice(ChoiceValue::Rectangle(range_choice(default, min, max)));
     let mut properties = vec![
@@ -159,6 +164,14 @@ pub fn enum_format(format: VideoFormat, modifiers: &[u64]) -> Vec<u8> {
                     num: 1000,
                     denom: 1,
                 },
+            ))),
+        ),
+        Property::new(
+            sys::SPA_FORMAT_VIDEO_maxFramerate,
+            Value::Choice(ChoiceValue::Fraction(range_choice(
+                max_fps,
+                Fraction { num: 1, denom: 1 },
+                max_fps,
             ))),
         ),
     ];
@@ -284,7 +297,7 @@ mod tests {
     fn enum_format_round_trips() {
         const MOD_LINEAR: u64 = 0;
         let mods = [0x0200_0000_0000_0001, MOD_LINEAR];
-        let info = parse_format(&enum_format(VideoFormat::BGRx, &mods)).unwrap();
+        let info = parse_format(&enum_format(VideoFormat::BGRx, &mods, 60)).unwrap();
         assert_eq!(info.formats, vec![VideoFormat::BGRx]);
         assert_eq!(info.modifiers, mods);
         assert!(info.dont_fixate);
@@ -309,8 +322,33 @@ mod tests {
         });
         assert_eq!(parse_format(&server).unwrap().size, Some(size));
 
-        let fixed = parse_format(&enum_format(VideoFormat::BGRA, &[MOD_LINEAR])).unwrap();
+        let fixed = parse_format(&enum_format(VideoFormat::BGRA, &[MOD_LINEAR], 60)).unwrap();
         assert_eq!(fixed.modifiers, vec![MOD_LINEAR]);
         assert!(!fixed.dont_fixate);
+    }
+
+    #[test]
+    fn enum_format_caps_the_max_framerate() {
+        let pod = enum_format(VideoFormat::BGRx, &[0], 60);
+        let Ok((_, Value::Object(obj))) = PodDeserializer::deserialize_any_from(&pod) else {
+            panic!("not an object");
+        };
+        let max = obj
+            .properties
+            .into_iter()
+            .find(|p| p.key == sys::SPA_FORMAT_VIDEO_maxFramerate)
+            .map(|p| p.value);
+        let Some(Value::Choice(ChoiceValue::Fraction(Choice(
+            _,
+            ChoiceEnum::Range { default, min, max },
+        )))) = max
+        else {
+            panic!("no maxFramerate range: {max:?}");
+        };
+        let fps = |f: Fraction| (f.num, f.denom);
+        assert_eq!(
+            (fps(default), fps(min), fps(max)),
+            ((60, 1), (1, 1), (60, 1))
+        );
     }
 }

@@ -722,6 +722,9 @@ export component AppWindow inherits Window {
     in property <bool> tray-available;
     callback autostart-changed(bool);
     callback quit();
+    // Restarts the level meters, which stop while nothing moves them or the
+    // window is hidden.
+    callback meters-wake();
     // The tray mirrors these.
     callback tray-state-changed();
     changed rec-state => {
