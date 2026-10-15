@@ -2,8 +2,8 @@
 //!
 //! Threads:
 //! - PipeWire thread (`vesper-capture`): `on_frame` only parks the newest
-//!   frame in a one-slot mailbox. A frame it replaces is dropped at once
-//!   (released to PipeWire) and counted as dropped.
+//!   frame in a one-slot mailbox. A frame it replaces is released at once:
+//!   the compositor may send more frames than the recording's `fps`.
 //! - Recorder thread (here): opens the capture (blocks on the portal picker),
 //!   then ticks on an absolute `CLOCK_MONOTONIC` grid `start + k / fps`. Each
 //!   tick encodes the parked frame, or repeats the last picture when the
@@ -12,9 +12,13 @@
 //! - Audio threads (`vesper-audio`, two per source): Opus packets of the
 //!   desktop and microphone tracks go to the same muxer, behind a mutex.
 
+use std::fs::OpenOptions;
+use std::io::ErrorKind;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -49,7 +53,7 @@ pub enum Event {
         elapsed: Duration,
         /// Frames written per wall-clock second over the last period.
         fps: f32,
-        /// Captured frames replaced by a newer one before a tick took them.
+        /// Ticks skipped because encoding fell more than a frame behind.
         dropped: u64,
     },
     /// The recording ended. On a mid-recording error the file is still
@@ -67,8 +71,15 @@ struct Audio {
 
 type AudioSources = Arc<Mutex<Audio>>;
 
+/// Locks, ignoring poisoning: a panicked holder must not take the UI down.
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 pub struct Recorder {
     stop: Arc<AtomicBool>,
+    /// Set before `Event::Started` is sent: an output may exist from then on.
+    started: Arc<AtomicBool>,
     audio: AudioSources,
     thread: JoinHandle<()>,
 }
@@ -86,21 +97,32 @@ impl Recorder {
             (Source::Microphone, settings.mic_muted),
         ] {
             if muted {
-                audio.lock().unwrap().muted.push(source);
+                lock(&audio).muted.push(source);
             }
         }
-        let (flag, sources) = (stop.clone(), audio.clone());
+        let started = Arc::new(AtomicBool::new(false));
+        let (flag, started_flag, sources) = (stop.clone(), started.clone(), audio.clone());
         let thread = std::thread::Builder::new()
             .name("vesper-recorder".into())
             .spawn(move || {
-                let result = run(&settings, &flag, &sources, &mut on_event);
+                // A panic must still end in `Finished`, or the UI stays stuck.
+                let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                    run(&settings, &flag, &started_flag, &sources, &mut on_event)
+                }))
+                .unwrap_or_else(|_| Err("Internal error: the recorder crashed".into()));
                 on_event(Event::Finished(result));
             })?;
         Ok(Self {
             stop,
+            started,
             audio,
             thread,
         })
+    }
+
+    /// Whether the capture started (the portal picker is closed).
+    pub fn started(&self) -> bool {
+        self.started.load(Ordering::Relaxed)
     }
 
     /// Asks the recording to end; `Event::Finished` follows within a frame
@@ -111,7 +133,7 @@ impl Recorder {
 
     /// Mutes a track (it records silence).
     pub fn set_muted(&self, source: Source, muted: bool) {
-        let mut audio = self.audio.lock().unwrap();
+        let mut audio = lock(&self.audio);
         audio.muted.retain(|s| *s != source);
         if muted {
             audio.muted.push(source);
@@ -125,7 +147,7 @@ impl Recorder {
 
     /// Recent peak of a track, linear 0..=1; 0 when it does not run.
     pub fn peak(&self, source: Source) -> f32 {
-        let audio = self.audio.lock().unwrap();
+        let audio = lock(&self.audio);
         audio
             .running
             .iter()
@@ -144,7 +166,6 @@ impl Recorder {
 #[derive(Default)]
 struct Slot {
     frame: Option<VideoFrame>,
-    dropped: u64,
     ended: Option<String>,
 }
 
@@ -159,7 +180,7 @@ fn start_audio(sources: &AudioSources, mux: &SharedMuxer) -> Vec<AudioTrack> {
         let (index, mux) = (tracks.len(), mux.clone());
         let capture = AudioCapture::start(source, move |packet| {
             // Packets before the muxer exists are before the start anyway.
-            if let Some(m) = mux.lock().unwrap().as_mut()
+            if let Some(m) = lock(&mux).as_mut()
                 && let Err(e) = m.write_audio(index, &packet)
             {
                 log!("{source:?} audio: {e}");
@@ -169,7 +190,7 @@ fn start_audio(sources: &AudioSources, mux: &SharedMuxer) -> Vec<AudioTrack> {
             Ok(capture) => {
                 // Started outside the lock (it blocks until PipeWire is
                 // ready); mute applied under it, so no toggle is missed.
-                let mut audio = sources.lock().unwrap();
+                let mut audio = lock(sources);
                 capture.set_muted(audio.muted.contains(&source));
                 tracks.push(AudioTrack {
                     sample_rate: SAMPLE_RATE,
@@ -187,13 +208,14 @@ fn start_audio(sources: &AudioSources, mux: &SharedMuxer) -> Vec<AudioTrack> {
 fn run(
     settings: &Settings,
     stop: &AtomicBool,
+    started: &AtomicBool,
     sources: &AudioSources,
     on_event: &mut impl FnMut(Event),
 ) -> Result<PathBuf, String> {
     let slot = Arc::new(Mutex::new(Slot::default()));
     let s = slot.clone();
     let capture = Capture::start(load_restore_token().as_deref(), move |event| {
-        let mut slot = s.lock().unwrap();
+        let mut slot = lock(&s);
         let old = match event {
             Ok(frame) => slot.frame.replace(frame),
             Err(e) => {
@@ -201,7 +223,6 @@ fn run(
                 slot.frame.take()
             }
         };
-        slot.dropped += u64::from(old.is_some());
         drop(slot);
         // Released outside the lock.
         drop(old);
@@ -214,11 +235,12 @@ fn run(
     }
     let mux = SharedMuxer::default();
     let audio = start_audio(sources, &mux);
+    started.store(true, Ordering::Relaxed);
     on_event(Event::Started);
     let result = record(settings, &slot, stop, &mux, sources, &audio, on_event);
     drop(capture);
     // Normally done by `record`; covers its early returns.
-    let running = std::mem::take(&mut sources.lock().unwrap().running);
+    let running = std::mem::take(&mut lock(sources).running);
     drop(running);
     result
 }
@@ -254,9 +276,13 @@ impl Output {
         .map_err(|e| format!("Could not open the encoder: {e}"))?;
         std::fs::create_dir_all(&settings.folder)
             .map_err(|e| format!("Could not create {}: {e}", settings.folder.display()))?;
-        let path = settings
-            .folder
-            .join(format!("Vesper {}.mkv", local_timestamp()));
+        let path = reserve_path(&settings.folder, &format!("Vesper {}", local_timestamp()))
+            .map_err(|e| {
+                format!(
+                    "Could not create a file in {}: {e}",
+                    settings.folder.display()
+                )
+            })?;
         let track = VideoTrack {
             codec: settings.codec,
             width,
@@ -268,9 +294,11 @@ impl Output {
         // takes a while, and a producer clock off by seconds must not stall
         // or burst the ticks. The first frame gets this pts.
         let start = monotonic_now();
-        let mux = Muxer::create(&path, start, track, audio)
-            .map_err(|e| format!("Could not create {}: {e}", path.display()))?;
-        *shared.lock().unwrap() = Some(mux);
+        let mux = Muxer::create(&path, start, track, audio).map_err(|e| {
+            let _ = std::fs::remove_file(&path);
+            format!("Could not create {}: {e}", path.display())
+        })?;
+        *lock(shared) = Some(mux);
         log!("recording to {} at {bitrate} bit/s", path.display());
         Ok(Self {
             enc,
@@ -283,13 +311,32 @@ impl Output {
     }
 
     fn write(&mut self, packets: Vec<EncodedPacket>) -> Result<(), String> {
-        let mut mux = self.mux.lock().unwrap();
+        let mut mux = lock(&self.mux);
         let mux = mux.as_mut().ok_or("muxer already closed")?;
         for p in &packets {
             mux.write_video(p).map_err(|e| e.to_string())?;
         }
         Ok(())
     }
+}
+
+/// Creates `<folder>/<stem>.mkv`, or `<stem> (2).mkv`, `(3)`... if taken, so
+/// two recordings in the same second (or another instance) never overwrite
+/// each other. The muxer then reopens the reserved, empty file.
+fn reserve_path(folder: &Path, stem: &str) -> std::io::Result<PathBuf> {
+    for n in 1..1000 {
+        let name = match n {
+            1 => format!("{stem}.mkv"),
+            n => format!("{stem} ({n}).mkv"),
+        };
+        let path = folder.join(name);
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(_) => return Ok(path),
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(ErrorKind::AlreadyExists.into())
 }
 
 /// Offset of frame `k` from the start: exact multiples of `1 / fps`.
@@ -309,8 +356,9 @@ fn record(
     let fps = settings.fps;
     let mut out: Option<Output> = None;
     let mut k = 0u64;
-    let mut dropped_base = 0;
     let mut skipped = 0;
+    // Last capture size the encoder could not take, logged once per change.
+    let mut bad_size = None;
     let mut deadline = monotonic_now();
     let mut window = (monotonic_now(), 0u32);
     let mut error = None;
@@ -320,9 +368,9 @@ fn record(
         if stop.load(Ordering::Relaxed) {
             break;
         }
-        let (frame, ended, dropped) = {
-            let mut s = slot.lock().unwrap();
-            (s.frame.take(), s.ended.take(), s.dropped)
+        let (frame, ended) = {
+            let mut s = lock(slot);
+            (s.frame.take(), s.ended.take())
         };
         if let Some(e) = ended {
             error = Some(format!("Capture ended: {e}"));
@@ -334,18 +382,30 @@ fn record(
                 deadline += frame_offset(1, fps);
                 continue;
             }
-            (None, Some(mut frame)) => {
-                dropped_base = dropped;
-                Output::open(settings, &frame, mux, audio).and_then(|o| {
-                    let o = out.insert(o);
-                    frame.pts = o.start;
-                    let packets = o.enc.encode(frame).map_err(|e| e.to_string())?;
-                    o.write(packets)
-                })
-            }
+            (None, Some(mut frame)) => Output::open(settings, &frame, mux, audio).and_then(|o| {
+                let o = out.insert(o);
+                frame.pts = o.start;
+                let packets = o.enc.encode(frame).map_err(|e| e.to_string())?;
+                o.write(packets)
+            }),
             (Some(o), frame) => {
                 k += 1;
                 let pts = o.start + frame_offset(k, fps);
+                // shortcut: a resized source (e.g. a resized window) keeps the
+                // last picture; scale or restart the encoder to follow it.
+                let frame = frame.filter(|f| {
+                    let size = (f.width, f.height);
+                    let fits = size == (o.width, o.height);
+                    if !fits && bad_size != Some(size) {
+                        log!(
+                            "source is now {}x{}: holding the last picture",
+                            size.0,
+                            size.1
+                        );
+                    }
+                    bad_size = (!fits).then_some(size);
+                    fits
+                });
                 let packets = match frame {
                     Some(mut frame) => {
                         frame.pts = pts;
@@ -387,7 +447,7 @@ fn record(
                 } else {
                     window.1 as f32 / span.as_secs_f32()
                 },
-                dropped: dropped - dropped_base + skipped,
+                dropped: skipped,
             });
             window = (now, 0);
         }
@@ -400,9 +460,9 @@ fn record(
     let flushed = flushed.and_then(|p| o.write(p));
     // Stopping the audio flushes its last packets into the muxer, so do it
     // before closing, without holding the muxer lock the audio threads need.
-    let running = std::mem::take(&mut sources.lock().unwrap().running);
+    let running = std::mem::take(&mut lock(sources).running);
     drop(running);
-    let mux = o.mux.lock().unwrap().take();
+    let mux = lock(&o.mux).take();
     let finished = mux.map_or(Ok(()), |m| m.finish().map_err(|e| e.to_string()));
     match error.or(flushed.err()).or(finished.err()) {
         None => Ok(o.path),
@@ -472,7 +532,16 @@ pub fn load_restore_token() -> Option<String> {
 fn save_restore_token(token: &str) -> std::io::Result<()> {
     let path = token_path().ok_or(std::io::ErrorKind::NotFound)?;
     std::fs::create_dir_all(path.parent().unwrap_or(Path::new("/")))?;
-    std::fs::write(path, token)
+    // Private: the token lets anyone running as this user record the source.
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    // `mode` only applies on creation; fix older files too.
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    std::io::Write::write_all(&mut file, token.as_bytes())
 }
 
 /// Forgets the source so the next recording opens the portal picker.
@@ -505,6 +574,19 @@ mod tests {
         sleep_until(t);
         assert!(monotonic_now() >= t);
         sleep_until(Duration::ZERO); // past: returns at once
+    }
+
+    #[test]
+    fn reserve_path_never_reuses_a_file() {
+        let dir = std::env::temp_dir().join(format!("vesper-reserve-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = reserve_path(&dir, "Vesper t").unwrap();
+        let b = reserve_path(&dir, "Vesper t").unwrap();
+        let c = reserve_path(&dir, "Vesper t").unwrap();
+        assert_eq!(a, dir.join("Vesper t.mkv"));
+        assert_eq!(b, dir.join("Vesper t (2).mkv"));
+        assert_eq!(c, dir.join("Vesper t (3).mkv"));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

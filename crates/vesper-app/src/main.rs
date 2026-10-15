@@ -82,10 +82,10 @@ fn main() -> Result<(), slint::PlatformError> {
     dev::apply(&ui);
 
     let result = ui.run();
-    // Closing the window mid-recording still finalizes the file. While
-    // `starting`, the thread may wait on the portal picker: exit without it.
+    // Closing the window mid-recording still finalizes the file. Before the
+    // capture started, the thread may wait on the portal picker: exit without it.
     if let Some(rec) = recording.take()
-        && ui.get_rec_state() != RecState::Starting
+        && rec.started()
     {
         rec.join();
     }
@@ -119,6 +119,10 @@ fn wire_callbacks(ui: &AppWindow, recording: &Recording) {
     ui.on_start_recording(move || {
         let Some(ui) = weak.upgrade() else { return };
         if ui.get_rec_state() != RecState::Idle {
+            return;
+        }
+        if ui.get_output_folder().is_empty() {
+            flash_notice(&ui, "Choose an output folder first");
             return;
         }
         let settings = Settings {
