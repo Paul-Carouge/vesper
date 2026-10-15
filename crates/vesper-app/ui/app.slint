@@ -473,7 +473,9 @@ component FilterCard inherits Rectangle {
             spacing: Theme.space-xs;
             opacity: root.filter.enabled ? 1 : 0.6;
             // Gain reduction, laid out like a parameter. Purely visual (a
-            // 30 Hz value), like the level meters.
+            // 30 Hz value), like the level meters. Unlike them it shows the
+            // filter's own (already smoothed) dB, without peak hold, and keeps
+            // its 70 ms `animate`: it only shows while a track's filters are open.
             if root.filter.meters && root.filter.enabled: HorizontalLayout {
                 spacing: Theme.space-sm;
                 height: 24px;
@@ -722,6 +724,9 @@ export component AppWindow inherits Window {
     in property <bool> tray-available;
     callback autostart-changed(bool);
     callback quit();
+    // Restarts the level meters, which stop while nothing moves them or the
+    // window is hidden.
+    callback meters-wake();
     // The tray mirrors these.
     callback tray-state-changed();
     changed rec-state => {

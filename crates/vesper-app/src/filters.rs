@@ -332,8 +332,10 @@ pub fn feed_reductions(ui: &AppWindow, rec: &Shared, model: &VecModel<f32>) {
             _ => 0.0,
         };
         running += usize::from(row.enabled);
-        // Resting meters cost nothing.
-        if (model.row_data(j).unwrap_or_default() - value).abs() >= 0.05 {
+        // Resting meters cost nothing; reaching 0 always shows, so the meters
+        // timer sees them at rest.
+        let shown = model.row_data(j).unwrap_or_default();
+        if (shown - value).abs() >= 0.05 || (shown == 0.0) != (value == 0.0) {
             model.set_row_data(j, value);
         }
     }

@@ -117,6 +117,7 @@ fn main() -> Result<(), slint::PlatformError> {
         let _ = weak.upgrade_in_event_loop(|ui| {
             let _ = ui.show();
             ui.invoke_tray_state_changed();
+            ui.invoke_meters_wake();
         });
     }) {
         instance::Claim::First(conn) => conn,
@@ -243,6 +244,7 @@ fn main() -> Result<(), slint::PlatformError> {
     if !(background && tray.is_some()) {
         ui.show()?;
         ui.invoke_tray_state_changed();
+        ui.invoke_meters_wake();
     }
     // Hiding the window does not end the loop: only Quit, Ctrl+Q, or closing
     // the window without a tray does.
@@ -514,6 +516,7 @@ fn spawn_tray(ui: &AppWindow) -> Option<Tray> {
                     ui.show()
                 };
                 ui.invoke_tray_state_changed();
+                ui.invoke_meters_wake();
             }
             tray::Command::ToggleRecording => ui.invoke_global_toggle_recording(),
             tray::Command::SaveReplay => ui.invoke_global_save_replay(),
@@ -799,6 +802,7 @@ fn on_recorder_event(ui: &AppWindow, generation: u64, event: Event) {
             prefs::save_source(&label);
         }
         Event::Source(_) => {}
+        Event::AudioStarted => ui.invoke_meters_wake(),
         Event::Started => {
             ui.set_rec_state(RecState::Recording);
             ui.set_elapsed_seconds(0);

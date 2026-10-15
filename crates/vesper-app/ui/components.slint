@@ -370,7 +370,8 @@ export component Meter inherits Rectangle {
         width: root.muted ? 0 : parent.width * clamp(root.level, 0, 1);
         border-radius: parent.border-radius;
         clip: true;
-        animate width { duration: 70ms; }
+        // No `animate`: the levels are smoothed in Rust (meter.rs) and only
+        // change by a visible step, so a resting meter costs no frame.
         // Full-width gradient revealed by the fill, so "hot" only shows near 0 dBFS.
         Rectangle {
             x: 0;
@@ -383,7 +384,6 @@ export component Meter inherits Rectangle {
         x: (parent.width - self.width) * clamp(root.peak, 0, 1);
         width: 2px;
         background: root.peak > 0.9 ? Theme.meter-hot : Theme.text-muted;
-        animate x { duration: 120ms; }
     }
 }
 

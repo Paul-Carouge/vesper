@@ -11,9 +11,9 @@ use std::time::Duration;
 use slint::{ComponentHandle, Model, ModelRc, VecModel};
 use vesper_audio::{MAX_DB, MIN_DB, Node, NodeWatch, Source};
 
-use crate::meter::MeterState;
+use crate::meter::{MeterState, visible_change};
 use crate::prefs::{self, Prefs};
-use crate::recorder::{MAX_TRACKS, Track};
+use crate::recorder::{MAX_TRACKS, Pipeline, Track};
 use crate::{AppWindow, AudioTrack, METER_TICK, Shared, SourceOption, TrackKind};
 
 /// Volume changes are saved once the slider rests this long.
@@ -264,11 +264,14 @@ pub fn wire(ui: &AppWindow, rec: &Shared) {
     });
 }
 
-/// Feeds the meters from the pipeline's peaks at ~30 Hz. Keep the timer.
-pub fn start_meters(ui: &AppWindow, rec: &Shared) -> slint::Timer {
-    let tick = slint::Timer::default();
+/// Feeds the meters from the pipeline's peaks at ~30 Hz. The timer stops
+/// once no audio runs and the meters rest, or the window is hidden;
+/// `meters-wake` restarts it. Keep the timer.
+pub fn start_meters(ui: &AppWindow, rec: &Shared) -> Rc<slint::Timer> {
+    let tick = Rc::new(slint::Timer::default());
     let weak = ui.as_weak();
     let rec = rec.clone();
+    let this = Rc::downgrade(&tick);
     let mut meters: Vec<MeterState> = Vec::new();
     let (levels, peaks) = (Rc::new(VecModel::default()), Rc::new(VecModel::default()));
     ui.set_track_levels(levels.clone().into());
@@ -285,14 +288,32 @@ pub fn start_meters(ui: &AppWindow, rec: &Shared) -> slint::Timer {
         }
         crate::filters::feed_reductions(&ui, &rec, &reductions);
         let rec = rec.borrow();
+        let audio = rec.as_ref().is_some_and(Pipeline::audio_running);
         for (i, meter) in meters.iter_mut().enumerate() {
-            let before = *meter;
             meter.feed(rec.as_ref().map_or(0.0, |r| r.peak(i)), METER_TICK);
-            // Resting meters cost nothing.
-            if *meter != before {
+            // Only visible steps redraw.
+            if visible_change(levels.row_data(i).unwrap_or_default(), meter.level) {
                 levels.set_row_data(i, meter.level);
+            }
+            if visible_change(peaks.row_data(i).unwrap_or_default(), meter.peak) {
                 peaks.set_row_data(i, meter.peak);
             }
+        }
+        let rested = !audio
+            && meters.iter().all(|m| m.level == 0.0 && m.peak == 0.0)
+            && reductions.iter().all(|r| r == 0.0);
+        if (rested || !ui.window().is_visible())
+            && let Some(tick) = this.upgrade()
+        {
+            tick.stop();
+        }
+    });
+    let t = Rc::downgrade(&tick);
+    ui.on_meters_wake(move || {
+        if let Some(t) = t.upgrade()
+            && !t.running()
+        {
+            t.restart();
         }
     });
     tick
