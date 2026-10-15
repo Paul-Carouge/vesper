@@ -12,7 +12,9 @@ macro_rules! log {
 #[cfg(debug_assertions)]
 mod dev;
 mod meter;
+mod prefs;
 mod recorder;
+mod shortcuts;
 
 use std::cell::RefCell;
 use std::path::PathBuf;
@@ -24,7 +26,9 @@ use slint::ComponentHandle;
 use vesper_audio::Source;
 
 use meter::MeterState;
+use prefs::Prefs;
 use recorder::{Event, Pipeline, Settings};
+use shortcuts::Action;
 
 /// The last started pipeline; it may have ended since.
 type Shared = Rc<RefCell<Option<Pipeline>>>;
@@ -39,6 +43,12 @@ const METER_TICK: Duration = Duration::from_millis(33);
 slint::include_modules!();
 
 fn main() -> Result<(), slint::PlatformError> {
+    if let Err(e) = futures_lite::future::block_on(shortcuts::register_app_id()) {
+        log!(
+            "could not register the app id with the portal (is {}.desktop installed? see README): {e}",
+            shortcuts::APP_ID
+        );
+    }
     #[cfg(debug_assertions)]
     if let Some(seconds) = dev::record_seconds() {
         dev::record(seconds, default_settings());
@@ -67,6 +77,7 @@ fn main() -> Result<(), slint::PlatformError> {
         ui.set_output_folder(folder.to_string_lossy().as_ref().into());
     }
     ui.set_replay_enabled(true);
+    Prefs::load(Prefs::from_ui(&ui)).apply(&ui);
     update_replay_memory(&ui);
     if recorder::load_restore_token().is_some() {
         ui.set_source_kind(SourceKind::Screen);
@@ -75,6 +86,7 @@ fn main() -> Result<(), slint::PlatformError> {
 
     let recording = Shared::default();
     wire_callbacks(&ui, &recording);
+    wire_global_shortcuts(&ui);
     // The replay buffer runs from launch (may open the picker once).
     if ui.get_replay_enabled()
         && let Err(e) = start_pipeline(&ui, &recording, None)
@@ -196,6 +208,7 @@ fn wire_callbacks(ui: &AppWindow, recording: &Shared) {
         let Some(ui) = weak.upgrade() else { return };
         log!("replay-changed: enabled={enabled} seconds={seconds}");
         update_replay_memory(&ui);
+        Prefs::from_ui(&ui).save();
         let applied = rec
             .borrow()
             .as_ref()
@@ -210,17 +223,25 @@ fn wire_callbacks(ui: &AppWindow, recording: &Shared) {
     });
 
     // Applied live while recording; the next recording reads the UI state.
+    let weak = ui.as_weak();
     let rec = recording.clone();
     ui.on_desktop_mute_changed(move |muted| {
         if let Some(r) = rec.borrow().as_ref() {
             r.set_muted(Source::Desktop, muted);
         }
+        if let Some(ui) = weak.upgrade() {
+            Prefs::from_ui(&ui).save();
+        }
     });
 
+    let weak = ui.as_weak();
     let rec = recording.clone();
     ui.on_mic_mute_changed(move |muted| {
         if let Some(r) = rec.borrow().as_ref() {
             r.set_muted(Source::Microphone, muted);
+        }
+        if let Some(ui) = weak.upgrade() {
+            Prefs::from_ui(&ui).save();
         }
     });
 
@@ -234,11 +255,45 @@ fn wire_callbacks(ui: &AppWindow, recording: &Shared) {
             ui.get_fps()
         );
         update_replay_memory(&ui);
+        Prefs::from_ui(&ui).save();
     });
 
     ui.on_pick_output_folder(|| {
         log!("pick-output-folder: would open the FileChooser portal");
     });
+}
+
+/// Global shortcuts take the same path as the in-window ones, minus the
+/// settings-open guard. The hints show the keys the user bound.
+fn wire_global_shortcuts(ui: &AppWindow) {
+    let bound = ui.as_weak();
+    let activated = ui.as_weak();
+    shortcuts::spawn(
+        move |action, trigger| {
+            let _ = bound.upgrade_in_event_loop(move |ui| {
+                // Unbound in the KDE dialog: fall back to the in-window key.
+                let key = if trigger.is_empty() {
+                    match action {
+                        Action::ToggleRecording => "Ctrl+R".to_owned(),
+                        Action::SaveReplay => "Ctrl+S".to_owned(),
+                    }
+                } else {
+                    trigger
+                };
+                match action {
+                    Action::ToggleRecording => ui.set_record_shortcut(key.into()),
+                    Action::SaveReplay => ui.set_replay_shortcut(key.into()),
+                }
+            });
+        },
+        move |action| {
+            log!("global shortcut: {action:?}");
+            let _ = activated.upgrade_in_event_loop(move |ui| match action {
+                Action::ToggleRecording => ui.invoke_global_toggle_recording(),
+                Action::SaveReplay => ui.invoke_global_save_replay(),
+            });
+        },
+    );
 }
 
 /// Encoder settings from the UI.
