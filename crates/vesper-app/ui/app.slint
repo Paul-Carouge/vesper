@@ -238,6 +238,8 @@ export component AppWindow inherits Window {
     in-out property <bool> game-layer-installed;
     /// A layer built with this binary was found (it can be installed).
     in property <bool> game-layer-available;
+    /// The installed layer differs from the one built with this binary.
+    in property <bool> game-layer-outdated;
 
     // ---- Recording ----------------------------------------------------
     in property <RecState> rec-state: RecState.idle;
@@ -812,160 +814,180 @@ export component AppWindow inherits Window {
             // Swallow clicks so they do not reach the scrim.
             TouchArea { }
 
-            VerticalLayout {
-                padding: 20px;
-                padding-top: Theme.space-md;
-                spacing: 22px;
+            // Scrolls only when the window is shorter than the settings.
+            drawer-flick := Flickable {
+                content-width: self.width;
+                content-height: Math.max(self.height, drawer-body.min-height);
+                interactive: self.content-height > self.height;
+                drawer-body := VerticalLayout {
+                    width: drawer-flick.width;
+                    height: drawer-flick.content-height;
+                    padding: 20px;
+                    padding-top: Theme.space-md;
+                    spacing: 22px;
 
-                HorizontalLayout {
-                    Text {
-                        horizontal-stretch: 1;
-                        text: "Output";
-                        vertical-alignment: center;
-                        font-size: Theme.font-title;
-                        font-weight: 700;
-                        color: Theme.text;
-                    }
-                    close-button := IconButton {
-                        icon: Icons.close;
-                        label: "Close settings";
-                        clicked => {
-                            root.close-settings();
-                        }
-                    }
-                }
-
-                if root.active: Rectangle {
-                    border-radius: Theme.radius-md;
-                    background: Theme.rec-soft;
-                    height: 36px;
-                    Text {
-                        text: "Locked while recording";
-                        font-size: Theme.font-small;
-                        font-weight: 600;
-                        color: Theme.rec;
-                    }
-                }
-
-                SettingGroup {
-                    label: "CODEC";
-                    hint: root.codec == VideoCodec.av1
-                        ? "Smallest files at a given quality. Needs a recent player."
-                        : root.codec == VideoCodec.hevc ? "Efficient and widely supported by hardware." : "Plays everywhere, larger files.";
-                    codec-picker := Segmented {
-                        label: "Codec";
-                        enabled: !root.active;
-                        options: ["AV1", "HEVC", "H.264"];
-                        selected: root.codec == VideoCodec.av1 ? 0 : root.codec == VideoCodec.hevc ? 1 : 2;
-                        changed(i) => {
-                            root.codec = i == 0 ? VideoCodec.av1 : i == 1 ? VideoCodec.hevc : VideoCodec.h264;
-                            root.output-settings-changed();
-                        }
-                    }
-                }
-
-                SettingGroup {
-                    label: "QUALITY";
-                    Segmented {
-                        label: "Quality preset";
-                        enabled: !root.active;
-                        options: ["Performance", "Balanced", "Quality"];
-                        selected: root.quality == QualityPreset.performance ? 0 : root.quality == QualityPreset.balanced ? 1 : 2;
-                        changed(i) => {
-                            root.quality = i == 0 ? QualityPreset.performance : i == 1 ? QualityPreset.balanced : QualityPreset.quality;
-                            root.output-settings-changed();
-                        }
-                    }
-                }
-
-                SettingGroup {
-                    label: "FRAME RATE";
-                    Segmented {
-                        label: "Frame rate";
-                        enabled: !root.active;
-                        options: ["30", "60", "120", "144"];
-                        selected: root.fps >= 144 ? 3 : root.fps >= 120 ? 2 : root.fps >= 60 ? 1 : 0;
-                        changed(i) => {
-                            root.fps = root.fps-options[i];
-                            root.output-settings-changed();
-                        }
-                    }
-                }
-
-                SettingGroup {
-                    label: "GAME CAPTURE";
-                    hint: "Records Vulkan games (Proton included) at their own frame rate, without the screen picker. Installs a small layer that loads into your Vulkan apps and stays idle until Vesper captures a game you allowed. Some anti-cheats may reject it: launch those games with VESPER_CAPTURE_DISABLE=1.";
                     HorizontalLayout {
-                        spacing: Theme.space-md;
-                        Labeled {
+                        Text {
                             horizontal-stretch: 1;
-                            title: "Game capture (Vulkan layer)";
-                            subtitle: root.game-layer-installed ? "Installed for this user" : root.game-layer-available ? "Not installed" : "Layer not found next to Vesper";
+                            text: "Output";
+                            vertical-alignment: center;
+                            font-size: Theme.font-title;
+                            font-weight: 700;
+                            color: Theme.text;
                         }
-                        VerticalLayout {
-                            alignment: center;
-                            Switch {
-                                label: "Game capture (Vulkan layer)";
-                                enabled: root.game-layer-installed || root.game-layer-available;
-                                checked: root.game-layer-installed;
-                                toggled(on) => {
-                                    root.game-layer-changed(on);
-                                }
-                            }
-                        }
-                    }
-                }
-
-                SettingGroup {
-                    label: "OUTPUT FOLDER";
-                    HorizontalLayout {
-                        spacing: Theme.space-sm;
-                        Rectangle {
-                            horizontal-stretch: 1;
-                            height: Theme.control-height;
-                            border-radius: Theme.radius-md;
-                            background: Theme.surface-raised;
-                            HorizontalLayout {
-                                padding-left: Theme.space-md;
-                                padding-right: Theme.space-md;
-                                spacing: Theme.space-sm;
-                                Icon {
-                                    y: (parent.height - self.height) / 2;
-                                    width: 18px;
-                                    height: 18px;
-                                    data: Icons.folder;
-                                    tint: Theme.text-muted;
-                                }
-                                Text {
-                                    horizontal-stretch: 1;
-                                    text: root.output-folder;
-                                    vertical-alignment: center;
-                                    font-size: Theme.font-small;
-                                    color: Theme.text;
-                                    overflow: elide;
-                                }
-                            }
-                        }
-                        Button {
-                            text: "Browse";
-                            enabled: !root.active;
-                            accessible-label: "Choose output folder";
+                        close-button := IconButton {
+                            icon: Icons.close;
+                            label: "Close settings";
                             clicked => {
-                                root.pick-output-folder();
+                                root.close-settings();
                             }
                         }
                     }
-                }
 
-                Rectangle {
-                    vertical-stretch: 1;
-                }
+                    if root.active: Rectangle {
+                        border-radius: Theme.radius-md;
+                        background: Theme.rec-soft;
+                        height: 36px;
+                        Text {
+                            text: "Locked while recording";
+                            font-size: Theme.font-small;
+                            font-weight: 600;
+                            color: Theme.rec;
+                        }
+                    }
 
-                Text {
-                    text: "Saved as MKV, which stays readable even if the app crashes.";
-                    font-size: Theme.font-small;
-                    color: Theme.text-faint;
-                    wrap: word-wrap;
+                    SettingGroup {
+                        label: "CODEC";
+                        hint: root.codec == VideoCodec.av1
+                            ? "Smallest files at a given quality. Needs a recent player."
+                            : root.codec == VideoCodec.hevc ? "Efficient and widely supported by hardware." : "Plays everywhere, larger files.";
+                        codec-picker := Segmented {
+                            label: "Codec";
+                            enabled: !root.active;
+                            options: ["AV1", "HEVC", "H.264"];
+                            selected: root.codec == VideoCodec.av1 ? 0 : root.codec == VideoCodec.hevc ? 1 : 2;
+                            changed(i) => {
+                                root.codec = i == 0 ? VideoCodec.av1 : i == 1 ? VideoCodec.hevc : VideoCodec.h264;
+                                root.output-settings-changed();
+                            }
+                        }
+                    }
+
+                    SettingGroup {
+                        label: "QUALITY";
+                        Segmented {
+                            label: "Quality preset";
+                            enabled: !root.active;
+                            options: ["Performance", "Balanced", "Quality"];
+                            selected: root.quality == QualityPreset.performance ? 0 : root.quality == QualityPreset.balanced ? 1 : 2;
+                            changed(i) => {
+                                root.quality = i == 0 ? QualityPreset.performance : i == 1 ? QualityPreset.balanced : QualityPreset.quality;
+                                root.output-settings-changed();
+                            }
+                        }
+                    }
+
+                    SettingGroup {
+                        label: "FRAME RATE";
+                        Segmented {
+                            label: "Frame rate";
+                            enabled: !root.active;
+                            options: ["30", "60", "120", "144"];
+                            selected: root.fps >= 144 ? 3 : root.fps >= 120 ? 2 : root.fps >= 60 ? 1 : 0;
+                            changed(i) => {
+                                root.fps = root.fps-options[i];
+                                root.output-settings-changed();
+                            }
+                        }
+                    }
+
+                    SettingGroup {
+                        label: "GAME CAPTURE";
+                        hint: "Records Vulkan games (Proton included) at their own frame rate, without the screen picker. Installs a small layer that loads into your Vulkan apps and stays idle until Vesper captures a game you allowed. Some anti-cheats may reject it: launch those games with VESPER_CAPTURE_DISABLE=1.";
+                        HorizontalLayout {
+                            spacing: Theme.space-md;
+                            Labeled {
+                                horizontal-stretch: 1;
+                                title: "Game capture (Vulkan layer)";
+                                subtitle: root.game-layer-outdated
+                                    ? "Update available"
+                                    : root.game-layer-installed ? "Installed for this user" : root.game-layer-available ? "Not installed" : "Layer not found next to Vesper";
+                            }
+                            if root.game-layer-outdated: VerticalLayout {
+                                alignment: center;
+                                Button {
+                                    text: "Update";
+                                    accessible-label: "Update the game capture layer";
+                                    clicked => {
+                                        root.game-layer-changed(true);
+                                    }
+                                }
+                            }
+                            VerticalLayout {
+                                alignment: center;
+                                Switch {
+                                    label: "Game capture (Vulkan layer)";
+                                    enabled: root.game-layer-installed || root.game-layer-available;
+                                    checked: root.game-layer-installed;
+                                    toggled(on) => {
+                                        root.game-layer-changed(on);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    SettingGroup {
+                        label: "OUTPUT FOLDER";
+                        HorizontalLayout {
+                            spacing: Theme.space-sm;
+                            Rectangle {
+                                horizontal-stretch: 1;
+                                height: Theme.control-height;
+                                border-radius: Theme.radius-md;
+                                background: Theme.surface-raised;
+                                HorizontalLayout {
+                                    padding-left: Theme.space-md;
+                                    padding-right: Theme.space-md;
+                                    spacing: Theme.space-sm;
+                                    Icon {
+                                        y: (parent.height - self.height) / 2;
+                                        width: 18px;
+                                        height: 18px;
+                                        data: Icons.folder;
+                                        tint: Theme.text-muted;
+                                    }
+                                    Text {
+                                        horizontal-stretch: 1;
+                                        text: root.output-folder;
+                                        vertical-alignment: center;
+                                        font-size: Theme.font-small;
+                                        color: Theme.text;
+                                        overflow: elide;
+                                    }
+                                }
+                            }
+                            Button {
+                                text: "Browse";
+                                enabled: !root.active;
+                                accessible-label: "Choose output folder";
+                                clicked => {
+                                    root.pick-output-folder();
+                                }
+                            }
+                        }
+                    }
+
+                    Rectangle {
+                        vertical-stretch: 1;
+                    }
+
+                    Text {
+                        text: "Saved as MKV, which stays readable even if the app crashes.";
+                        font-size: Theme.font-small;
+                        color: Theme.text-faint;
+                        wrap: word-wrap;
+                    }
                 }
             }
         }

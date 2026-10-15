@@ -142,4 +142,97 @@ fn scales_frames_of_other_sizes_to_the_encoder_size() {
     packets.extend(enc.flush().unwrap());
     let got: Vec<Duration> = packets.iter().map(|p| p.pts).collect();
     assert_eq!(got, (0..t).map(ms).collect::<Vec<_>>());
+
+    // Aspect kept with black bars (luma 16): 400x300 fits as 480x360 with
+    // 80 px bars left and right, 1920x800 as 640x266 with 47 px bars.
+    let frames = unsafe { decode_luma(enc.extradata(), &packets) };
+    assert_eq!(frames.len(), 20);
+    let col =
+        |f: &Luma, x: usize| (0..f.h).map(|y| f.y[y * f.w + x] as f64).sum::<f64>() / f.h as f64;
+    let row = |f: &Luma, y: usize| {
+        f.y[y * f.w..(y + 1) * f.w]
+            .iter()
+            .map(|&v| v as f64)
+            .sum::<f64>()
+            / f.w as f64
+    };
+    for f in &frames {
+        assert_eq!((f.w, f.h), (640, 360));
+    }
+    let small = &frames[8];
+    assert!(col(small, 20) < 20.0 && col(small, 620) < 20.0, "side bars");
+    assert!(col(small, 320) > 40.0, "picture");
+    // Black, not green: neutral chroma in the bars.
+    assert!(
+        small.corner_u.abs_diff(128) < 8,
+        "bar chroma {}",
+        small.corner_u
+    );
+    let wide = &frames[12];
+    assert!(
+        row(wide, 15) < 20.0 && row(wide, 345) < 20.0,
+        "top and bottom bars"
+    );
+    assert!(row(wide, 180) > 40.0, "picture");
+    let native = &frames[16];
+    assert!(
+        row(native, 2) > 20.0 || col(native, 2) > 20.0,
+        "no bars at native size"
+    );
+}
+
+struct Luma {
+    w: usize,
+    h: usize,
+    y: Vec<u8>,
+    /// U (Cb) sample at the top-left corner: 128 when the corner is gray.
+    corner_u: u8,
+}
+
+/// Decodes HEVC packets in software and returns each frame's luma plane.
+unsafe fn decode_luma(extradata: &[u8], packets: &[vesper_core::EncodedPacket]) -> Vec<Luma> {
+    use ffmpeg_next::ffi as ff;
+    unsafe {
+        let codec = ff::avcodec_find_decoder(ff::AVCodecID::AV_CODEC_ID_HEVC);
+        let mut ctx = ff::avcodec_alloc_context3(codec);
+        let pad = ff::AV_INPUT_BUFFER_PADDING_SIZE as usize;
+        let extra = ff::av_mallocz(extradata.len() + pad) as *mut u8;
+        std::ptr::copy_nonoverlapping(extradata.as_ptr(), extra, extradata.len());
+        (*ctx).extradata = extra;
+        (*ctx).extradata_size = extradata.len() as i32;
+        common::ok(
+            ff::avcodec_open2(ctx, codec, std::ptr::null_mut()),
+            "open decoder",
+        );
+        let mut pkt = ff::av_packet_alloc();
+        let mut frame = ff::av_frame_alloc();
+        let mut out = Vec::new();
+        let receive = |out: &mut Vec<Luma>| {
+            while ff::avcodec_receive_frame(ctx, frame) >= 0 {
+                let f = &*frame;
+                let (w, h) = (f.width as usize, f.height as usize);
+                let mut y = Vec::with_capacity(w * h);
+                for r in 0..h {
+                    let line = f.data[0].add(r * f.linesize[0] as usize);
+                    y.extend_from_slice(std::slice::from_raw_parts(line, w));
+                }
+                let corner_u = *f.data[1];
+                out.push(Luma { w, h, y, corner_u });
+                ff::av_frame_unref(frame);
+            }
+        };
+        for p in packets {
+            common::ok(ff::av_new_packet(pkt, p.data.len() as i32), "packet");
+            std::ptr::copy_nonoverlapping(p.data.as_ptr(), (*pkt).data, p.data.len());
+            common::ok(ff::avcodec_send_packet(ctx, pkt), "decode");
+            ff::av_packet_unref(pkt);
+            receive(&mut out);
+        }
+        ff::avcodec_send_packet(ctx, std::ptr::null());
+        receive(&mut out);
+        ff::av_frame_free(&mut frame);
+        ff::av_packet_free(&mut pkt);
+        ff::avcodec_free_context(&mut ctx);
+        out
+    }
 }

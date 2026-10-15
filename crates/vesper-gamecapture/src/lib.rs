@@ -83,6 +83,8 @@ struct Shared {
     games: Mutex<Vec<Game>>,
     select: Mutex<Option<u32>>,
     allowed: Mutex<Vec<String>>,
+    /// Whether frames are wanted ([`GameCapture::set_active`]).
+    active: AtomicBool,
     stop: AtomicBool,
 }
 
@@ -120,6 +122,7 @@ impl GameCapture {
             games: Mutex::new(Vec::new()),
             select: Mutex::new(None),
             allowed: Mutex::new(Vec::new()),
+            active: AtomicBool::new(true),
             stop: AtomicBool::new(false),
         });
         let s = shared.clone();
@@ -170,6 +173,14 @@ impl GameCapture {
             allowed.push(exe.to_owned());
         }
         drop(allowed);
+        self.wake();
+    }
+
+    /// Whether the selected game should copy frames (default true). While
+    /// inactive no game is started: games stay a pass-through and
+    /// [`Game::captured`] is false, but games and consent are still listed.
+    pub fn set_active(&self, active: bool) {
+        self.shared.active.store(active, Ordering::SeqCst);
         self.wake();
     }
 
@@ -704,7 +715,11 @@ impl Server {
                     && (c.last_frame.elapsed() > STALE_AFTER || !alive(c.pid)),
             })
             .collect();
-        let want = choose(&candidates, select, current);
+        let want = if self.shared.active.load(Ordering::SeqCst) {
+            choose(&candidates, select, current)
+        } else {
+            None
+        };
         if want == current {
             return;
         }
@@ -870,6 +885,7 @@ mod tests {
             games: Mutex::new(Vec::new()),
             select: Mutex::new(None),
             allowed: Mutex::new(Vec::new()),
+            active: AtomicBool::new(true),
             stop: AtomicBool::new(false),
         });
         let (tx, rx) = mpsc::channel();
@@ -966,6 +982,25 @@ mod tests {
         let (_, steam) = connect(&mut s, "game.exe", true);
         s.reselect();
         assert_eq!(next(&steam), None);
+    }
+
+    #[test]
+    fn inactive_starts_no_game() {
+        let (mut s, _rx) = server();
+        s.shared.active.store(false, Ordering::SeqCst);
+        let (_, layer) = connect(&mut s, "game.exe", true);
+        s.reselect();
+        assert!(s.started.is_none());
+        assert_eq!(next(&layer), None);
+
+        s.shared.active.store(true, Ordering::SeqCst);
+        s.reselect();
+        assert!(matches!(next(&layer), Some(Msg::Start { .. })));
+
+        s.shared.active.store(false, Ordering::SeqCst);
+        s.reselect();
+        assert!(s.started.is_none());
+        assert_eq!(next(&layer), Some(Msg::Stop));
     }
 
     #[test]

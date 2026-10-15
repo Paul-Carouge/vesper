@@ -176,7 +176,7 @@ fn quality(value: &str) -> Option<QualityPreset> {
 
 /// A process name as the kernel reports it: 1 to 15 bytes, one line.
 pub fn valid_game(name: &str) -> bool {
-    (1..=15).contains(&name.len()) && !name.chars().any(char::is_control)
+    (1..=15).contains(&name.len()) && name == name.trim() && !name.chars().any(char::is_control)
 }
 
 fn choice(value: &str, options: &[i32]) -> Option<i32> {
@@ -287,7 +287,7 @@ mod tests {
 
     #[test]
     fn bad_allowed_games_are_ignored() {
-        let text = "allow_game=\nallow_game=a_very_long_name.exe\nallow_game=ok\nallow_game=ok\n";
+        let text = "allow_game=\nallow_game=a_very_long_name.exe\nallow_game= ok\nallow_game=ok\nallow_game=ok\n";
         assert_eq!(defaults().parse(text).allowed_games, ["ok"]);
         let prefs = Prefs {
             allowed_games: vec!["x\ny".into(), "ok".into()],

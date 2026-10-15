@@ -4,10 +4,13 @@
 //! Consent: Steam games are allowed by the server itself; any other game
 //! waits until the user clicks Allow, which persists its process name in the
 //! settings. Nothing else is ever allowed automatically.
+//!
+//! The server only asks a game for frames while a pipeline consumes them
+//! (`GameFrames` attached); otherwise games stay a pass-through.
 
 use std::rc::Rc;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use slint::{ModelRc, VecModel};
 use vesper_gamecapture::{Consent, Game, GameCapture};
@@ -16,15 +19,17 @@ use crate::prefs::{ALLOWED_GAMES, valid_game};
 use crate::recorder::GameFrames;
 use crate::{AppWindow, GameEntry};
 
+/// Games the user ignored this session: not asked again until Vesper
+/// restarts, even if game capture restarts.
+static IGNORED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
 pub struct GameSource {
-    capture: GameCapture,
+    capture: Arc<GameCapture>,
     pub frames: GameFrames,
     /// Set when the server thread fails.
     failed: Arc<AtomicBool>,
     /// Pid picked in the UI, until that game goes away.
     selected: Option<u32>,
-    /// Games the user ignored this session: not asked again until restart.
-    ignored: Vec<String>,
     /// Last list shown, so the UI model is only replaced on change.
     shown: Vec<(String, u32)>,
 }
@@ -42,6 +47,8 @@ impl GameSource {
             f.push(event.map_err(|e| format!("Game capture failed: {e}")));
         })
         .map_err(|e| format!("Could not start game capture: {e}"))?;
+        let capture = Arc::new(capture);
+        frames.bind(&capture);
         for exe in ALLOWED_GAMES.lock().unwrap().iter() {
             capture.allow(exe);
         }
@@ -50,14 +57,30 @@ impl GameSource {
             frames,
             failed,
             selected: None,
-            ignored: Vec::new(),
             shown: Vec::new(),
         })
     }
 
-    /// Whether a game is being captured.
-    pub fn capturing(&self) -> bool {
-        self.capture.captured().is_some()
+    /// The game a recording would capture: the captured one, else the
+    /// picked one, else the newest allowed game with a swapchain.
+    fn candidate(&self, games: &[Game]) -> Option<Game> {
+        let ready = |g: &&Game| g.consent == Consent::Allowed && g.width > 0;
+        games
+            .iter()
+            .find(|g| g.captured)
+            .or_else(|| {
+                games
+                    .iter()
+                    .filter(ready)
+                    .find(|g| Some(g.pid) == self.selected)
+            })
+            .or_else(|| games.iter().rfind(|g| ready(g)))
+            .cloned()
+    }
+
+    /// Whether there is a game to record.
+    pub fn has_game(&self) -> bool {
+        self.candidate(&self.capture.games()).is_some()
     }
 
     /// Allows `exe` now and in later sessions. False if the name is not a
@@ -75,8 +98,8 @@ impl GameSource {
         true
     }
 
-    pub fn ignore(&mut self, exe: &str) {
-        self.ignored.push(exe.to_owned());
+    pub fn ignore(exe: &str) {
+        IGNORED.lock().unwrap().push(exe.to_owned());
     }
 
     pub fn select(&mut self, pid: u32) {
@@ -84,7 +107,7 @@ impl GameSource {
         self.capture.select(self.selected);
     }
 
-    /// Shows the captured game, the other allowed ones and the first game
+    /// Shows the game to record, the other allowed ones and the first game
     /// waiting for consent. False once the server failed: restart it.
     pub fn refresh(&mut self, ui: &AppWindow) -> bool {
         let games = self.capture.games();
@@ -97,18 +120,20 @@ impl GameSource {
             self.selected = None;
             self.capture.select(None);
         }
-        let captured = games.iter().find(|g| g.captured);
-        ui.set_source_name(captured.map_or("", |g| g.exe.as_str()).into());
-        let detail = captured
+        let shown_game = self.candidate(&games);
+        ui.set_source_name(shown_game.as_ref().map_or("", |g| g.exe.as_str()).into());
+        let detail = shown_game
+            .as_ref()
             .filter(|g| g.width > 0)
             .map_or(String::new(), |g| format!("{} × {}", g.width, g.height));
         ui.set_source_detail(detail.into());
 
         // Only games with a swapchain: Vulkan tools without a window never
         // show up or ask for consent.
+        let shown_pid = shown_game.map(|g| g.pid);
         let others: Vec<(String, u32)> = games
             .iter()
-            .filter(|g| g.consent == Consent::Allowed && !g.captured && g.width > 0)
+            .filter(|g| g.consent == Consent::Allowed && g.width > 0 && Some(g.pid) != shown_pid)
             .map(|g| (g.exe.clone(), g.pid))
             .collect();
         if others != self.shown {
@@ -124,11 +149,15 @@ impl GameSource {
         }
         // The prompt shown stays while its game still asks, so Allow never
         // lands on a name that changed under the cursor.
-        let asking = |g: &&Game| {
-            g.consent == Consent::Pending && g.width > 0 && !self.ignored.contains(&g.exe)
-        };
-        let shown = ui.get_pending_game();
-        if !games.iter().filter(asking).any(|g| g.exe == shown.as_str()) {
+        let ignored = IGNORED.lock().unwrap();
+        let asking =
+            |g: &&Game| g.consent == Consent::Pending && g.width > 0 && !ignored.contains(&g.exe);
+        let prompt = ui.get_pending_game();
+        if !games
+            .iter()
+            .filter(asking)
+            .any(|g| g.exe == prompt.as_str())
+        {
             let pending = games.iter().find(asking);
             ui.set_pending_game(pending.map_or("", |g| g.exe.as_str()).into());
         }

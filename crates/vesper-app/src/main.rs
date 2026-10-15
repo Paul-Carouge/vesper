@@ -22,7 +22,7 @@ use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use slint::ComponentHandle;
 use vesper_audio::Source;
@@ -108,19 +108,63 @@ fn main() -> Result<(), slint::PlatformError> {
         flash_notice(&ui, &e);
     }
 
+    // Refreshes game mode, and restarts a game capture server that failed
+    // or could not start, backing off 1, 2, 4... up to 30 s.
     let games_tick = slint::Timer::default();
     let weak = ui.as_weak();
-    let g = games.clone();
+    let (g, rec) = (games.clone(), recording.clone());
+    let (mut failures, mut retry_at) = (0u32, Instant::now());
     games_tick.start(slint::TimerMode::Repeated, GAMES_TICK, move || {
         let Some(ui) = weak.upgrade() else { return };
-        let alive = g
-            .borrow_mut()
-            .as_mut()
-            .is_none_or(|games| games.refresh(&ui));
-        if !alive {
+        if ui.get_source_kind() != SourceKind::Game {
+            failures = 0;
+            return;
+        }
+        let alive = g.borrow_mut().as_mut().map(|games| games.refresh(&ui));
+        let now = Instant::now();
+        let backoff = |n: u32| Duration::from_secs((1u64 << n.min(5)).min(30));
+        match alive {
+            Some(true) => {
+                if now > retry_at + Duration::from_secs(60) {
+                    failures = 0;
+                }
+                return;
+            }
             // A pipeline using the dead server reports its own error.
-            log!("game capture stopped: restarting it");
-            set_source_mode(&ui, &g, true);
+            Some(false) => {
+                log!("game capture stopped");
+                *g.borrow_mut() = None;
+                game::clear(&ui);
+                retry_at = now + backoff(failures);
+                failures += 1;
+            }
+            None if now < retry_at => return,
+            None => match GameSource::start() {
+                Ok(source) => {
+                    log!("game capture restarted");
+                    *g.borrow_mut() = Some(source);
+                    retry_at = now;
+                    let applied = rec
+                        .borrow()
+                        .as_ref()
+                        .is_some_and(|p| p.set_replay(replay_span(&ui)));
+                    if !applied
+                        && ui.get_replay_enabled()
+                        && let Err(e) = start_pipeline(&ui, &rec, &g, None)
+                    {
+                        flash_notice(&ui, &e);
+                    }
+                    return;
+                }
+                Err(e) => {
+                    log!("{e}");
+                    retry_at = now + backoff(failures);
+                    failures += 1;
+                }
+            },
+        }
+        if failures == 3 {
+            flash_notice(&ui, "Game capture stopped");
         }
     });
 
@@ -189,7 +233,7 @@ fn wire_callbacks(ui: &AppWindow, recording: &Shared, games: &Games) {
             return;
         }
         if ui.get_source_kind() == SourceKind::Game
-            && !g.borrow().as_ref().is_some_and(GameSource::capturing)
+            && !g.borrow().as_ref().is_some_and(GameSource::has_game)
         {
             flash_notice(&ui, "No game to record yet");
             return;
@@ -316,9 +360,13 @@ fn wire_callbacks(ui: &AppWindow, recording: &Shared, games: &Games) {
         }
         set_source_mode(&ui, &g, game);
         Prefs::from_ui(&ui).save();
-        if ui.get_replay_enabled()
-            && let Err(e) = start_pipeline(&ui, &rec, &g, None)
-        {
+        if !ui.get_replay_enabled() {
+            return;
+        }
+        // Without a saved source the portal picker would pop up right away.
+        if !game && recorder::load_restore_token().is_none() {
+            flash_notice(&ui, "Replay starts once a source is picked");
+        } else if let Err(e) = start_pipeline(&ui, &rec, &g, None) {
             flash_notice(&ui, &e);
         }
     });
@@ -341,12 +389,9 @@ fn wire_game_callbacks(ui: &AppWindow, games: &Games) {
     });
 
     let weak = ui.as_weak();
-    let g = games.clone();
     ui.on_ignore_game(move || {
         let Some(ui) = weak.upgrade() else { return };
-        if let Some(games) = g.borrow_mut().as_mut() {
-            games.ignore(&ui.get_pending_game());
-        }
+        GameSource::ignore(&ui.get_pending_game());
         ui.set_pending_game("".into());
     });
 
@@ -381,8 +426,8 @@ fn wire_game_callbacks(ui: &AppWindow, games: &Games) {
     });
 }
 
-/// Shows whether the layer is installed. An installed layer older than the
-/// one built with this binary is updated (the user opted in already).
+/// Shows whether the layer is installed, and whether the one built with this
+/// binary differs (the toggle's Update button installs it).
 fn show_layer_state(ui: &AppWindow) {
     let lib = layer::shipped();
     ui.set_game_layer_available(lib.is_some());
@@ -391,36 +436,31 @@ fn show_layer_state(ui: &AppWindow) {
         return;
     };
     let installed = layer::installed(&data);
-    if installed
-        && let Some(lib) = lib
-        && layer::outdated(&data, &lib)
-    {
-        log!("updating the game capture layer from {}", lib.display());
-        if let Err(e) = layer::install(&data, &lib) {
-            log!("could not update the game capture layer: {e}");
-        }
-    }
+    // Offered, never done silently. Debug builds change the layer on every
+    // build: no offer there.
+    let outdated =
+        !cfg!(debug_assertions) && installed && lib.is_some_and(|lib| layer::outdated(&data, &lib));
     ui.set_game_layer_installed(installed);
+    ui.set_game_layer_outdated(outdated);
 }
 
 /// Switches between the portal source and game capture. The game capture
-/// server only runs in game mode.
+/// server only runs in game mode; if it cannot start, game mode stays with
+/// the error shown, and the games tick retries.
 fn set_source_mode(ui: &AppWindow, games: &Games, game: bool) {
     game::clear(ui);
+    *games.borrow_mut() = None;
     if game {
+        ui.set_source_kind(SourceKind::Game);
         match GameSource::start() {
-            Ok(source) => {
-                *games.borrow_mut() = Some(source);
-                ui.set_source_kind(SourceKind::Game);
-                return;
-            }
+            Ok(source) => *games.borrow_mut() = Some(source),
             Err(e) => {
                 log!("{e}");
                 flash_notice(ui, &e);
             }
         }
+        return;
     }
-    *games.borrow_mut() = None;
     if recorder::load_restore_token().is_some() {
         ui.set_source_kind(SourceKind::Screen);
         ui.set_source_name("Last picked source".into());
@@ -489,6 +529,9 @@ fn start_pipeline(
     games: &Games,
     record: Option<PathBuf>,
 ) -> Result<(), String> {
+    if ui.get_source_kind() == SourceKind::Game && games.borrow().is_none() {
+        return Err("Game capture is not running".into());
+    }
     let settings = settings(ui, games);
     log!("start-pipeline: {settings:?}");
     let weak = ui.as_weak();
