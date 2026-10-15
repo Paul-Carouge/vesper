@@ -49,15 +49,17 @@ export component Card inherits Rectangle {
 }
 
 // Text button. `kind`: "secondary" (default), "primary", "ghost".
+// `small`: 28px high, for inline actions in dense rows.
 export component Button inherits FocusScope {
     in property <string> text;
     in property <string> icon;
     in property <string> kind: "secondary";
+    in property <bool> small;
     in property <string> shortcut-hint;
     callback clicked;
 
     focus-on-click: false;
-    min-height: Theme.control-height;
+    min-height: root.small ? 28px : Theme.control-height;
     min-width: layout.min-width;
     horizontal-stretch: 0;
     accessible-role: button;
@@ -80,11 +82,11 @@ export component Button inherits FocusScope {
 
     FocusRing {
         visible-ring: root.has-focus;
-        radius: Theme.radius-md;
+        radius: root.small ? Theme.radius-sm : Theme.radius-md;
     }
 
     bg := Rectangle {
-        border-radius: Theme.radius-md;
+        border-radius: root.small ? Theme.radius-sm : Theme.radius-md;
         border-width: root.kind == "secondary" ? 1px : 0px;
         border-color: Theme.border-strong;
         background: root.kind == "primary"
@@ -97,8 +99,8 @@ export component Button inherits FocusScope {
     }
 
     layout := HorizontalLayout {
-        padding-left: root.icon != "" ? 12px : 16px;
-        padding-right: 16px;
+        padding-left: root.small ? 10px : root.icon != "" ? 12px : 16px;
+        padding-right: root.small ? 10px : 16px;
         spacing: 8px;
         alignment: center;
         if root.icon != "": Icon {
@@ -112,7 +114,7 @@ export component Button inherits FocusScope {
         Text {
             text: root.text;
             vertical-alignment: center;
-            font-size: Theme.font-body;
+            font-size: root.small ? Theme.font-small : Theme.font-body;
             font-weight: 600;
             color: root.kind == "primary" ? Theme.on-accent : Theme.text;
             opacity: root.enabled ? 1 : 0.4;

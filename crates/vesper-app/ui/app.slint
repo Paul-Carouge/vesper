@@ -267,6 +267,9 @@ export component AppWindow inherits Window {
     /// One of 30, 60, 120, 144.
     in-out property <int> fps: 60;
     in property <string> output-folder;
+    /// `output-folder` as shown: its name ("Vesper") and where it is ("~/Videos").
+    in property <string> output-folder-name;
+    in property <string> output-folder-parent;
 
     // ---- Status line --------------------------------------------------
     in property <string> encoder: "VAAPI";
@@ -275,6 +278,8 @@ export component AppWindow inherits Window {
     in property <int> dropped-frames;
     /// Transient confirmation, e.g. "Replay saved". Empty hides it.
     in property <string> notice;
+    /// The notice is about a saved file: it offers Open and Play.
+    in property <bool> notice-has-file;
 
     in-out property <bool> settings-open;
     // Keys shown in hints: the global shortcuts once bound, else the in-window ones.
@@ -291,6 +296,8 @@ export component AppWindow inherits Window {
     callback mic-mute-changed(bool);
     callback output-settings-changed();
     callback pick-output-folder();
+    callback open-notice-file();
+    callback play-notice-file();
     callback source-mode-changed(bool);
     callback select-game(int);
     callback allow-game();
@@ -306,10 +313,13 @@ export component AppWindow inherits Window {
     // Anything but idle locks the source and output settings.
     property <bool> active: root.rec-state != RecState.idle;
     property <bool> game: root.source-kind == SourceKind.game;
+    // Open and Play only while idle: during a recording the stats keep the row.
+    property <bool> notice-actions: root.notice-has-file && root.notice != "" && !root.active;
+    property <string> fps-text: (root.recording ? "\{Math.round(root.measured-fps * 10) / 10}" : "\{root.fps}") + " fps";
 
     title: "Vesper";
     preferred-width: 440px;
-    preferred-height: 740px;
+    preferred-height: 780px;
     min-width: 360px;
     min-height: 520px;
     background: Theme.window-bg;
@@ -396,7 +406,8 @@ export component AppWindow inherits Window {
                 height: flick.content-height;
                 padding: 20px;
                 padding-top: Theme.space-md;
-                padding-bottom: Theme.space-lg;
+                // The status line's 28px row centers its text: 6px more below.
+                padding-bottom: Theme.space-sm;
                 spacing: Theme.space-lg;
 
                 // ---- Header ------------------------------------------------
@@ -517,7 +528,7 @@ export component AppWindow inherits Window {
                                     ? (root.source-name != "" ? "Game: " + root.source-name : "Waiting for a game")
                                     : root.source-kind == SourceKind.none
                                         ? "No source selected"
-                                        : (root.source-kind == SourceKind.screen ? "Screen: " : "Window: ") + root.source-name;
+                                        : "Source: " + self.title + ", " + self.subtitle;
                             }
                             if !root.game: VerticalLayout {
                                 alignment: center;
@@ -665,7 +676,7 @@ export component AppWindow inherits Window {
                                 title: "Replay buffer";
                                 subtitle: root.replay-enabled
                                     ? "Last \{root.replay-seconds < 60 ? root.replay-seconds + " s" : root.replay-seconds / 60 + " min"}, \{root.replay-memory}"
-                                    : "Off. Turn on to save moments after they happen";
+                                    : "Off. Turn on to save past moments";
                             }
                             VerticalLayout {
                                 alignment: center;
@@ -748,29 +759,92 @@ export component AppWindow inherits Window {
                 }
 
                 // ---- Status line -------------------------------------------
+                // Fixed height, so a notice with buttons moves nothing. While
+                // recording the stats stay: a notice is text only, between them.
                 HorizontalLayout {
+                    height: 28px;
                     spacing: Theme.space-sm;
                     padding-left: Theme.space-xs;
-                    padding-right: Theme.space-xs;
-                    Text {
+                    padding-right: root.notice-actions ? 0px : Theme.space-xs;
+                    if !root.notice-actions: Text {
                         horizontal-stretch: 1;
-                        text: root.encoder + " " + root.codec-name + (root.resolution != "" ? "   ·   " + root.resolution : "") + "   ·   " + (root.recording ? "\{Math.round(root.measured-fps * 10) / 10}" : "\{root.fps}") + " fps";
+                        // With a notice beside it, the fps goes first so elision spares it.
+                        text: root.active && root.notice != ""
+                            ? root.fps-text
+                            : root.encoder + " " + root.codec-name + (root.resolution != "" ? "   ·   " + root.resolution : "") + "   ·   " + root.fps-text;
+                        vertical-alignment: center;
                         font-size: Theme.font-small;
                         color: Theme.text-faint;
                         overflow: elide;
                         accessible-role: text;
                     }
-                    if root.notice != "": Text {
-                        text: root.notice;
-                        font-size: Theme.font-small;
-                        font-weight: 600;
-                        color: Theme.accent;
+                    if root.notice != "" && !root.notice-actions: HorizontalLayout {
+                        spacing: 6px;
+                        if root.notice-has-file: Icon {
+                            y: (parent.height - self.height) / 2;
+                            width: 14px;
+                            height: 14px;
+                            data: Icons.check;
+                            stroke: 2.25px;
+                            tint: Theme.accent;
+                        }
+                        Text {
+                            text: root.notice;
+                            vertical-alignment: center;
+                            font-size: Theme.font-small;
+                            font-weight: 600;
+                            color: Theme.accent;
+                            overflow: elide;
+                        }
                     }
-                    if root.notice == "": Text {
+                    if (root.notice == "" || root.active) && !root.notice-actions: Text {
                         text: root.dropped-frames == 1 ? "1 dropped" : "\{root.dropped-frames} dropped";
+                        vertical-alignment: center;
                         font-size: Theme.font-small;
                         font-weight: root.dropped-frames > 0 ? 600 : 400;
                         color: root.dropped-frames > 0 ? Theme.warn : Theme.text-faint;
+                    }
+                    // A saved file while idle: what happened, and what to do with it.
+                    if root.notice-actions: HorizontalLayout {
+                        horizontal-stretch: 1;
+                        spacing: 6px;
+                        accessible-role: text;
+                        accessible-label: root.notice;
+                        Icon {
+                            y: (parent.height - self.height) / 2;
+                            width: 16px;
+                            height: 16px;
+                            data: Icons.check;
+                            stroke: 2.25px;
+                            tint: Theme.accent;
+                        }
+                        Text {
+                            horizontal-stretch: 1;
+                            text: root.notice;
+                            vertical-alignment: center;
+                            font-size: Theme.font-small;
+                            font-weight: 600;
+                            color: Theme.accent;
+                            overflow: elide;
+                        }
+                    }
+                    if root.notice-actions: Button {
+                        text: "Open";
+                        kind: "ghost";
+                        small: true;
+                        accessible-label: "Show the file in its folder";
+                        clicked => {
+                            root.open-notice-file();
+                        }
+                    }
+                    if root.notice-actions: Button {
+                        text: "Play";
+                        kind: "ghost";
+                        small: true;
+                        accessible-label: "Play the file";
+                        clicked => {
+                            root.play-notice-file();
+                        }
                     }
                 }
             }
@@ -850,6 +924,8 @@ export component AppWindow inherits Window {
                         height: 36px;
                         Text {
                             text: "Locked while recording";
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
                             font-size: Theme.font-small;
                             font-weight: 600;
                             color: Theme.rec;
@@ -957,18 +1033,31 @@ export component AppWindow inherits Window {
                                         data: Icons.folder;
                                         tint: Theme.text-muted;
                                     }
-                                    Text {
+                                    // The name stays whole; a long path elides.
+                                    VerticalLayout {
                                         horizontal-stretch: 1;
-                                        text: root.output-folder;
-                                        vertical-alignment: center;
-                                        font-size: Theme.font-small;
-                                        color: Theme.text;
-                                        overflow: elide;
+                                        alignment: center;
+                                        accessible-role: text;
+                                        accessible-label: "Output folder: " + (root.output-folder != "" ? root.output-folder : "none");
+                                        Text {
+                                            text: root.output-folder != "" ? root.output-folder-name : "No folder chosen";
+                                            font-size: Theme.font-small;
+                                            font-weight: root.output-folder != "" ? 600 : 400;
+                                            color: root.output-folder != "" ? Theme.text : Theme.text-muted;
+                                            overflow: elide;
+                                        }
+                                        if root.output-folder-parent != "": Text {
+                                            text: root.output-folder-parent;
+                                            font-size: Theme.font-caption;
+                                            color: Theme.text-muted;
+                                            overflow: elide;
+                                        }
                                     }
                                 }
                             }
                             Button {
-                                text: "Browse";
+                                text: root.output-folder != "" ? "Change" : "Choose";
+                                kind: root.output-folder != "" ? "secondary" : "primary";
                                 enabled: !root.active;
                                 accessible-label: "Choose output folder";
                                 clicked => {

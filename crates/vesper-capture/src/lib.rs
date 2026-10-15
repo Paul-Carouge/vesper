@@ -10,7 +10,8 @@ mod pw;
 use std::os::fd::OwnedFd;
 use std::thread::JoinHandle;
 
-use ashpd::desktop::screencast::{CursorMode, Screencast, SelectSourcesOptions, SourceType};
+pub use ashpd::desktop::screencast::SourceType;
+use ashpd::desktop::screencast::{CursorMode, Screencast, SelectSourcesOptions};
 use ashpd::desktop::{PersistMode, Session};
 use futures_lite::future::block_on;
 use tracing::warn;
@@ -19,9 +20,22 @@ use vesper_core::VideoFrame;
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// What the user picked, as the portal describes its stream.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SourceInfo {
+    /// Monitor, window, or virtual (e.g. KDE's full workspace or a region);
+    /// `None` when the portal does not say.
+    pub source_type: Option<SourceType>,
+    /// Top-left corner in the compositor's logical space, if given.
+    pub position: Option<(i32, i32)>,
+    /// Logical size, if given.
+    pub size: Option<(i32, i32)>,
+}
+
 /// A running screen capture. Dropping it stops the capture.
 pub struct Capture {
     restore_token: Option<String>,
+    source: SourceInfo,
     session: Session<Screencast>,
     control: ::pipewire::channel::Sender<pw::Msg>,
     thread: Option<JoinHandle<()>>,
@@ -39,7 +53,7 @@ impl Capture {
         restore_token: Option<&str>,
         on_frame: impl FnMut(Result<VideoFrame>) + Send + 'static,
     ) -> Result<Self> {
-        let (session, node_id, fd, restore_token) = block_on(open_portal(restore_token))?;
+        let (session, node_id, fd, restore_token, source) = block_on(open_portal(restore_token))?;
         let (control, rx) = ::pipewire::channel::channel();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let tx = control.clone();
@@ -48,6 +62,7 @@ impl Capture {
             .spawn(move || pw::run(fd, node_id, on_frame, tx, rx, ready_tx))?;
         let capture = Self {
             restore_token,
+            source,
             session,
             control,
             thread: Some(thread),
@@ -60,6 +75,11 @@ impl Capture {
     /// Token that skips the picker next time (persist mode: until revoked).
     pub fn restore_token(&self) -> Option<&str> {
         self.restore_token.as_deref()
+    }
+
+    /// The picked monitor or window.
+    pub fn source(&self) -> &SourceInfo {
+        &self.source
     }
 
     /// Stops the capture. Same as dropping it.
@@ -83,9 +103,15 @@ impl Drop for Capture {
     }
 }
 
-async fn open_portal(
-    restore_token: Option<&str>,
-) -> Result<(Session<Screencast>, u32, OwnedFd, Option<String>)> {
+type Opened = (
+    Session<Screencast>,
+    u32,
+    OwnedFd,
+    Option<String>,
+    SourceInfo,
+);
+
+async fn open_portal(restore_token: Option<&str>) -> Result<Opened> {
     let proxy = Screencast::new().await?;
     let cursor = if proxy
         .available_cursor_modes()
@@ -115,19 +141,25 @@ async fn open_portal(
             .start(&session, None, Default::default())
             .await?
             .response()?;
-        let node_id = streams
+        let stream = streams
             .streams()
             .first()
-            .ok_or("portal returned no stream")?
-            .pipe_wire_node_id();
+            .ok_or("portal returned no stream")?;
+        let source = SourceInfo {
+            source_type: stream.source_type(),
+            position: stream.position(),
+            size: stream.size(),
+        };
+        let node_id = stream.pipe_wire_node_id();
         let fd = proxy
             .open_pipe_wire_remote(&session, Default::default())
             .await?;
-        Ok::<_, Error>((node_id, fd, streams.restore_token().map(str::to_owned)))
+        let token = streams.restore_token().map(str::to_owned);
+        Ok::<_, Error>((node_id, fd, token, source))
     }
     .await;
     match result {
-        Ok((node_id, fd, token)) => Ok((session, node_id, fd, token)),
+        Ok((node_id, fd, token, source)) => Ok((session, node_id, fd, token, source)),
         Err(e) => {
             let _ = session.close().await;
             Err(e)
