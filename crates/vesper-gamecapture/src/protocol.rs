@@ -265,18 +265,25 @@ pub fn tick_at(ns: u64, fps: u32) -> u64 {
     (((u128::from(ns) + 1) * fps - 1) / 1_000_000_000) as u64
 }
 
-/// Decides which presents the layer copies when recording at `fps`: about
-/// one per recording tick, the newest that still reaches the recorder before
-/// its tick. A game too close to the recording rate for that to be safe has
-/// every frame copied, as without pacing.
+/// Decides which presents the layer copies when recording at `fps`. Only a
+/// game at 4× the recording rate or more (e.g. uncapped) is paced, to about
+/// one copy per recording tick: the newest that still reaches the recorder
+/// before its tick. Any slower game, or one too irregular for a safe window,
+/// has every frame copied as without pacing: the recording must never get a
+/// repeat that copying everything would not have.
 #[derive(Debug, Clone)]
 pub struct Pacer {
     fps: u32,
     /// Next tick to serve.
     next: u64,
     last_present: u64,
-    /// Longest recent time between presents (rises at once, decays
-    /// slowly): irregular frame times must not fall through the window.
+    /// Smoothed time between presents.
+    interval: u64,
+    /// Pacing is on: at 4× the recording rate, off again below 3×.
+    paced: bool,
+    /// Longest recent time between presents (rises at once, decays over
+    /// about a second): irregular frame times must not fall through the
+    /// window.
     gap: u64,
     /// Time from a present to its copy being done on the GPU (rises at once,
     /// decays slowly).
@@ -290,6 +297,8 @@ impl Pacer {
             fps,
             next: 0,
             last_present: 0,
+            interval: 0,
+            paced: false,
             gap: 0,
             latency: 0,
         }
@@ -302,10 +311,26 @@ impl Pacer {
         let dt = now_ns.saturating_sub(self.last_present);
         // A pause (alt-tab, loading) says nothing about the frame pacing.
         if self.last_present != 0 && dt <= 4 * period {
-            self.gap = dt.max((self.gap * 15 + dt) / 16);
+            // Decays by time, not frames: a hitch every second keeps it up
+            // however fast the game runs in between.
+            self.gap = dt.max(self.gap.saturating_sub(self.gap * dt / 1_000_000_000));
+            self.interval = if self.interval == 0 {
+                dt
+            } else {
+                (self.interval * 7 + dt) / 8
+            };
         }
         self.last_present = now_ns;
-        if self.fps == 0 {
+        if self.fps == 0 || self.interval == 0 {
+            return true;
+        }
+        // Hysteresis, so a game near the threshold does not flap.
+        if self.interval * 4 <= period {
+            self.paced = true;
+        } else if self.interval * 3 > period {
+            self.paced = false;
+        }
+        if !self.paced {
             return true;
         }
         // Copy the first present in a window ending `lead` before the next
@@ -833,6 +858,13 @@ mod tests {
             (vec![1.0, 1.0, 1.0, 20.0], 0.2, 60),
             (vec![2.0, 4.0], 0.2, 60),
             (vec![0.5, 0.5, 0.5, 5.0], 0.1, 144),
+            // 144 fps with stutter: a 20 ms hitch every 20 frames, uneven
+            // pairs.
+            ([vec![6.94; 20], vec![20.0]].concat(), 0.3, 60),
+            (vec![6.0, 8.0], 0.3, 60),
+            // Uncapped with hitches.
+            ([vec![0.6; 100], vec![15.0]].concat(), 0.1, 60),
+            ([vec![0.6; 50], vec![4.0]].concat(), 0.1, 60),
         ];
         for (frames, jitter, fps) in cases {
             let jitter = (jitter * 1e6) as u64;
@@ -853,17 +885,19 @@ mod tests {
                             repeats <= all_repeats,
                             "{case}: {repeats} > {all_repeats} repeats"
                         );
-                        if game <= f64::from(fps) {
-                            // At or below the recording rate every frame is copied.
+                        if game < f64::from(fps) * 3.0 {
+                            // Below 3× the recording rate (e.g. 144 → 60, even
+                            // stuttering) every frame is copied.
                             assert_eq!(copies, all, "{case}");
+                            assert_eq!(repeats, all_repeats, "{case}");
                         } else if frames.len() == 1
                             && jitter < 500_000
-                            && game > f64::from(fps) * 2.3
+                            && game > f64::from(fps) * 4.2
                             && lat < tick_ns(1, fps) / 4
                         {
-                            // Regular, well above it, with a short copy (also
-                            // soon after a pause): about one copy per tick.
-                            // Closer, irregular, or a slow copy, copies more.
+                            // Regular, 4× above it or more, with a short copy
+                            // (also soon after a pause): about one copy per
+                            // tick. Irregular, or a slow copy, copies more.
                             assert!(
                                 copies <= ticks + ticks / 50,
                                 "{case}: {copies} copies, {ticks} ticks"
