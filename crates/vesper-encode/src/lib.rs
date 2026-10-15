@@ -329,7 +329,9 @@ impl Encoder {
                 ));
             }
         }
-        let size = borrow_file(fd0).seek(SeekFrom::End(0)).unwrap_or(0) as usize;
+        let size = borrow_file(fd0)
+            .seek(SeekFrom::End(0))
+            .map_err(|e| Error(format!("seek dmabuf: {e}")))? as usize;
 
         unsafe {
             let src = Frame::new()?;
@@ -363,8 +365,9 @@ impl Encoder {
                 ff::av_hwframe_map(dst.0, src.0, ff::AV_HWFRAME_MAP_READ as c_int),
                 "import DMA-BUF into VA surface",
             )?;
-            // The VA surface now holds its own reference to the BO; the fd in
-            // `desc` is not used again.
+            // The VA surface now holds its own reference to the BO. The mapping
+            // keeps `src` alive, so clear the fd: the frame owning it is released.
+            desc.objects[0].fd = -1;
             Ok(dst)
         }
     }
@@ -402,18 +405,23 @@ impl Encoder {
                 ),
                 "feed VPP",
             )?;
-            check(
-                ff::av_buffersink_get_frame(self.sink, self.filtered.0),
-                "run VPP",
-            )?;
+            // On error, wait for any VPP job still reading the producer's
+            // buffer before `frame` drops and releases it.
+            let sync_input = || vaSyncSurface(self.display, (*surface).data[3] as usize as u32);
+            let ret = ff::av_buffersink_get_frame(self.sink, self.filtered.0);
+            if ret < 0 {
+                sync_input();
+                check(ret, "run VPP")?;
+            }
             // Wait for VPP so the producer's buffer is no longer read, then release it.
             let nv12 = (*self.filtered.0).data[3] as usize as u32;
             let status = vaSyncSurface(self.display, nv12);
-            drop(frame);
             if status != 0 {
+                sync_input();
                 ff::av_frame_unref(self.filtered.0);
                 return Err(Error(format!("vaSyncSurface failed: VA status {status}")));
             }
+            drop(frame);
             let ret = ff::avcodec_send_frame(self.enc, self.filtered.0);
             ff::av_frame_unref(self.filtered.0);
             check(ret, "send frame to encoder")?;
@@ -445,6 +453,7 @@ impl Encoder {
             check(ret, "receive packet")?;
             unsafe {
                 let p = &*self.packet;
+                debug_assert!(p.pts >= 0, "negative packet pts {}", p.pts);
                 let data = if p.data.is_null() {
                     &[][..]
                 } else {
