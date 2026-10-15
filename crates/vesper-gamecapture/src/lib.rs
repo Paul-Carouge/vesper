@@ -269,6 +269,8 @@ struct Server {
     /// (no GPU to make them).
     is_sync_file: fn(BorrowedFd) -> bool,
     is_dmabuf: fn(BorrowedFd) -> bool,
+    /// `alive`; replaced in tests, whose clients have made-up pids.
+    alive: fn(u32) -> bool,
 }
 
 /// What selection needs to know about a client.
@@ -368,6 +370,7 @@ impl Server {
             pool_generation: 0,
             is_sync_file: protocol::is_sync_file,
             is_dmabuf: protocol::is_dmabuf,
+            alive,
         }
     }
 
@@ -716,7 +719,7 @@ impl Server {
                 ready: c.hello && c.width > 0 && c.height > 0,
                 seq: c.announced,
                 stale: Some(i) == current
-                    && (c.last_frame.elapsed() > STALE_AFTER || !alive(c.pid)),
+                    && (c.last_frame.elapsed() > STALE_AFTER || !(self.alive)(c.pid)),
             })
             .collect();
         let want = if self.shared.active.load(Ordering::SeqCst) {
@@ -901,6 +904,7 @@ mod tests {
             Box::new(move |f| drop(tx.send(f.unwrap()))),
         );
         s.is_dmabuf = |_| true;
+        s.alive = |_| true;
         (s, rx)
     }
 
