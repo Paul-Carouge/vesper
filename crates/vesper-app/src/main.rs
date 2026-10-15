@@ -9,16 +9,19 @@ macro_rules! log {
     ($($arg:tt)*) => { eprintln!("[vesper] {}", format_args!($($arg)*)) };
 }
 
+mod autostart;
 mod desktop;
 #[cfg(debug_assertions)]
 mod dev;
 mod game;
+mod instance;
 mod layer;
 mod meter;
 mod outputs;
 mod prefs;
 mod recorder;
 mod shortcuts;
+mod tray;
 
 use std::cell::RefCell;
 use std::path::PathBuf;
@@ -37,6 +40,7 @@ use outputs::SourceLabel;
 use prefs::Prefs;
 use recorder::{Event, Pipeline, Settings};
 use shortcuts::Action;
+use tray::Tray;
 
 /// The last started pipeline; it may have ended since.
 type Shared = Rc<RefCell<Option<Pipeline>>>;
@@ -70,6 +74,10 @@ const GAMES_TICK: Duration = Duration::from_millis(500);
 slint::include_modules!();
 
 fn main() -> Result<(), slint::PlatformError> {
+    // First, before any thread starts, so they all inherit the blocked mask.
+    handle_quit_signals();
+    // Started with the session: stay in the tray (when there is one).
+    let background = std::env::args().skip(1).any(|a| a == "--background");
     if let Err(e) = futures_lite::future::block_on(shortcuts::register_app_id()) {
         log!(
             "could not register the app id with the portal (is {}.desktop installed? see README): {e}",
@@ -93,6 +101,20 @@ fn main() -> Result<(), slint::PlatformError> {
     }
 
     let ui = AppWindow::new()?;
+    // Before anything starts: a second launch only shows the first window.
+    let weak = ui.as_weak();
+    let instance = match instance::claim(!background, move || {
+        let _ = weak.upgrade_in_event_loop(|ui| {
+            let _ = ui.show();
+            ui.invoke_tray_state_changed();
+        });
+    }) {
+        instance::Claim::First(conn) => conn,
+        instance::Claim::Running => {
+            log!("Vesper is already running");
+            return Ok(());
+        }
+    };
 
     // `VESPER_THEME=light|dark` overrides the system color scheme.
     match std::env::var("VESPER_THEME").as_deref() {
@@ -110,6 +132,8 @@ fn main() -> Result<(), slint::PlatformError> {
     }
     ui.set_replay_enabled(true);
     Prefs::load(Prefs::from_ui(&ui)).apply(&ui);
+    // The entry may have been removed elsewhere (e.g. System Settings).
+    ui.set_autostart(autostart::enabled());
     show_output_folder(&ui);
     update_replay_memory(&ui);
     show_layer_state(&ui);
@@ -120,6 +144,8 @@ fn main() -> Result<(), slint::PlatformError> {
     wire_callbacks(&ui, &recording, &games);
     wire_game_callbacks(&ui, &games);
     wire_global_shortcuts(&ui);
+    let tray = spawn_tray(&ui);
+    wire_background(&ui, tray.as_ref());
     // The replay buffer runs from launch (may open the picker once).
     // In game mode without a server, the games tick starts it once it runs.
     let game_down = ui.get_source_kind() == SourceKind::Game && games.borrow().is_none();
@@ -216,7 +242,20 @@ fn main() -> Result<(), slint::PlatformError> {
     #[cfg(debug_assertions)]
     dev::apply(&ui);
 
-    let result = ui.run();
+    if !(background && tray.is_some()) {
+        ui.show()?;
+        ui.invoke_tray_state_changed();
+    }
+    // Hiding the window does not end the loop: only Quit, Ctrl+Q, or closing
+    // the window without a tray does.
+    let result = slint::run_event_loop_until_quit();
+    if let Some(conn) = instance {
+        instance::release(conn);
+    }
+    let _ = ui.hide();
+    if let Some(tray) = tray {
+        tray.shutdown();
+    }
     // Closing the window mid-recording still finalizes the file. Before the
     // capture started, the thread may wait on the portal picker: exit without it.
     // Replays being saved are finished too.
@@ -438,6 +477,141 @@ fn wire_callbacks(ui: &AppWindow, recording: &Shared, games: &Games) {
             // buffer once game capture runs.
         } else if let Err(e) = start_pipeline(&ui, &rec, &g, None) {
             flash_notice(&ui, &e);
+        }
+    });
+}
+
+/// SIGTERM (the session ends) and SIGINT take the Quit path, so a recording
+/// is finalized and replays being saved finish. A second one exits at once.
+/// The signals are blocked in every thread and taken by a `sigwait` thread.
+fn handle_quit_signals() {
+    // SAFETY: plain libc calls on a local, initialized signal set.
+    let set = unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGTERM);
+        libc::sigaddset(&mut set, libc::SIGINT);
+        libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+        set
+    };
+    let spawned = std::thread::Builder::new()
+        .name("vesper-signals".into())
+        .spawn(move || {
+            let mut quitting = false;
+            loop {
+                let mut signal = 0;
+                // SAFETY: `set` is initialized; `signal` outlives the call.
+                if unsafe { libc::sigwait(&set, &mut signal) } != 0 {
+                    continue;
+                }
+                log!("signal {signal}: quitting");
+                let queued = !quitting
+                    && slint::invoke_from_event_loop(|| {
+                        let _ = slint::quit_event_loop();
+                    })
+                    .is_ok();
+                if !queued {
+                    std::process::exit(128 + signal);
+                }
+                quitting = true;
+            }
+        });
+    if let Err(e) = spawned {
+        log!("could not start the signal thread: {e}");
+    }
+}
+
+/// Registers the tray icon; `None` when the session has no tray. Its clicks
+/// take the same paths as the window's buttons, on the UI thread.
+fn spawn_tray(ui: &AppWindow) -> Option<Tray> {
+    let weak = ui.as_weak();
+    let spawned = Tray::spawn(tray_state(ui), move |command| {
+        log!("tray: {command:?}");
+        let _ = weak.upgrade_in_event_loop(move |ui| match command {
+            tray::Command::ToggleWindow => {
+                let _ = if ui.window().is_visible() {
+                    ui.hide()
+                } else {
+                    ui.show()
+                };
+                ui.invoke_tray_state_changed();
+            }
+            tray::Command::ToggleRecording => ui.invoke_global_toggle_recording(),
+            tray::Command::SaveReplay => ui.invoke_global_save_replay(),
+            tray::Command::ToggleReplay => ui.invoke_toggle_replay(),
+            tray::Command::Quit => ui.invoke_quit(),
+        });
+    });
+    match spawned {
+        Ok(tray) => Some(tray),
+        Err(e) => {
+            log!("no tray icon ({e}): closing the window quits");
+            None
+        }
+    }
+}
+
+fn tray_state(ui: &AppWindow) -> tray::State {
+    let rec = ui.get_rec_state();
+    tray::State {
+        window_visible: ui.window().is_visible(),
+        recording: matches!(rec, RecState::Recording | RecState::Stopping),
+        busy: matches!(rec, RecState::Starting | RecState::Stopping),
+        replay: ui.get_replay_enabled(),
+    }
+}
+
+/// Close-to-tray, quit, the tray's view of the state, and autostart.
+fn wire_background(ui: &AppWindow, tray: Option<&Tray>) {
+    ui.set_tray_available(tray.is_some());
+    ui.on_quit(|| {
+        log!("quit");
+        let _ = slint::quit_event_loop();
+    });
+
+    let weak = ui.as_weak();
+    let t = tray.cloned();
+    ui.on_tray_state_changed(move || {
+        if let (Some(ui), Some(tray)) = (weak.upgrade(), &t) {
+            tray.set(tray_state(&ui));
+        }
+    });
+
+    let weak = ui.as_weak();
+    let t = tray.cloned();
+    ui.window().on_close_requested(move || {
+        let (Some(ui), Some(tray)) = (weak.upgrade(), &t) else {
+            let _ = slint::quit_event_loop();
+            return slint::CloseRequestResponse::HideWindow;
+        };
+        if !prefs::TRAY_NOTICE_SHOWN.swap(true, Ordering::Relaxed) {
+            desktop::notify(
+                "Vesper is still running".into(),
+                "It stays in the tray, with the replay buffer and global shortcuts. \
+                 Quit from the tray icon's menu."
+                    .into(),
+                None,
+            );
+            Prefs::from_ui(&ui).save();
+        }
+        // The window hides once this returns.
+        tray.set(tray::State {
+            window_visible: false,
+            ..tray_state(&ui)
+        });
+        slint::CloseRequestResponse::HideWindow
+    });
+
+    let weak = ui.as_weak();
+    ui.on_autostart_changed(move |on| {
+        let Some(ui) = weak.upgrade() else { return };
+        log!("autostart-changed: {on}");
+        match autostart::set(on) {
+            Ok(()) => ui.set_autostart(on),
+            Err(e) => {
+                log!("autostart entry: {e}");
+                flash_notice(&ui, &format!("Could not change autostart: {e}"));
+            }
         }
     });
 }
@@ -789,8 +963,12 @@ impl From<VideoCodec> for vesper_core::Codec {
     }
 }
 
-/// Shows a short confirmation in the status line.
+/// Shows a short confirmation in the status line, and as a notification
+/// while the window is hidden in the tray.
 fn flash_notice(ui: &AppWindow, text: &str) {
+    if !ui.window().is_visible() {
+        desktop::notify("Vesper".into(), text.into(), None);
+    }
     show_notice(ui, text, None);
 }
 
@@ -850,7 +1028,8 @@ fn announce_failure(ui: &AppWindow, title: &str, error: &str) {
     if !window_focused(ui) {
         desktop::notify(title.to_owned(), error.to_owned(), None);
     }
-    flash_notice(ui, error);
+    // Not `flash_notice`: it would send a second, untitled notification.
+    show_notice(ui, error, None);
 }
 
 /// Shows the output folder's name, and its parent with the home folder as `~`.

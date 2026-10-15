@@ -67,6 +67,14 @@ Vesper looks for the layer next to its binary, then in `../lib/vesper/`; the set
 
 Settings are kept in `~/.config/vesper/settings`.
 
+## Background and tray
+
+Vesper shows an icon in the system tray (StatusNotifierItem, as on KDE Plasma). A left click shows or hides the window; its menu starts or stops a recording, saves the replay (while the replay buffer runs), turns the replay buffer on or off, and quits. A red dot marks a recording in progress.
+
+With a tray, closing the window keeps Vesper running in the background, with the replay buffer and global shortcuts; the first time, a notification says so. Quit from the tray menu or with Ctrl+Q in the window (logging out, SIGTERM or SIGINT quit the same way): a recording in progress and replays being saved are finished first. Without a tray (no StatusNotifierWatcher on the session bus), closing the window quits, as before. Only one Vesper runs per session: launching it again shows the running one's window (it owns the D-Bus name `io.github.PaulCarouge.Vesper`). While the window is hidden, messages such as *No game to record yet* come as notifications.
+
+*Start with the session* in the settings (off by default) writes `~/.config/autostart/io.github.PaulCarouge.Vesper.desktop` (under `$XDG_CONFIG_HOME` if set), which runs `vesper --background`; turning it off removes the file. `--background` starts with the window hidden in the tray (shown anyway when there is no tray), and the replay buffer starts if it is on in the settings.
+
 ## Out of scope
 
 Scenes, source compositing, filters, browser sources, streaming, plugins.

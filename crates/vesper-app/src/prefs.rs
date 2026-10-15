@@ -5,6 +5,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::outputs::{Kind, SourceLabel};
 use crate::{AppWindow, QualityPreset, SourceKind, VideoCodec};
@@ -12,6 +13,9 @@ use crate::{AppWindow, QualityPreset, SourceKind, VideoCodec};
 /// Process names (`/proc/<pid>/comm`) the user allowed game capture for. Not
 /// UI state, so kept here for `Prefs::from_ui`.
 pub static ALLOWED_GAMES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// The one-time "still running in the tray" notice was shown.
+pub static TRAY_NOTICE_SHOWN: AtomicBool = AtomicBool::new(false);
 
 /// Choices offered by the UI; anything else in the file is ignored.
 const FPS: [i32; 4] = [30, 60, 120, 144];
@@ -30,6 +34,7 @@ pub struct Prefs {
     /// Record a game (Vulkan layer) instead of a portal source.
     pub game_source: bool,
     pub allowed_games: Vec<String>,
+    pub tray_notice_shown: bool,
 }
 
 impl Prefs {
@@ -45,6 +50,7 @@ impl Prefs {
             output_folder: ui.get_output_folder().into(),
             game_source: ui.get_source_kind() == SourceKind::Game,
             allowed_games: ALLOWED_GAMES.lock().unwrap().clone(),
+            tray_notice_shown: TRAY_NOTICE_SHOWN.load(Ordering::Relaxed),
         }
     }
 
@@ -64,6 +70,7 @@ impl Prefs {
             .lock()
             .unwrap()
             .clone_from(&self.allowed_games);
+        TRAY_NOTICE_SHOWN.store(self.tray_notice_shown, Ordering::Relaxed);
     }
 
     /// `self` with the valid settings of `text` applied.
@@ -90,6 +97,7 @@ impl Prefs {
                 {
                     self.allowed_games.push(value.to_owned());
                 }
+                "tray_notice_shown" => set(&mut self.tray_notice_shown, flag(value)),
                 _ => {}
             }
         }
@@ -119,7 +127,10 @@ impl Prefs {
         if self.output_folder != default_folder && !self.output_folder.contains(['\n', '\r']) {
             text += &format!("output_folder={}\n", self.output_folder);
         }
-        text += &format!("game_source={}\n", self.game_source);
+        text += &format!(
+            "game_source={}\ntray_notice_shown={}\n",
+            self.game_source, self.tray_notice_shown
+        );
         for game in self.allowed_games.iter().filter(|g| valid_game(g)) {
             text += &format!("allow_game={game}\n");
         }
@@ -256,7 +267,7 @@ pub fn clear_source() {
 /// Writes a temporary file next to `path`, then renames it over `path`: a
 /// process crash leaves either the old or the new file, never half of one.
 /// No fsync: it would block the UI thread, and settings are cheap to lose.
-fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let dir = path.parent().ok_or(std::io::ErrorKind::NotFound)?;
     std::fs::create_dir_all(dir)?;
     let tmp = path.with_extension("tmp");
@@ -283,6 +294,7 @@ mod tests {
             output_folder: DEFAULT.into(),
             game_source: false,
             allowed_games: Vec::new(),
+            tray_notice_shown: false,
         }
     }
 
@@ -298,6 +310,7 @@ mod tests {
             output_folder: "/mnt/clips/my folder = 2".into(),
             game_source: true,
             allowed_games: vec!["Game.exe".into(), "a=b c".into()],
+            tray_notice_shown: true,
         }
     }
 

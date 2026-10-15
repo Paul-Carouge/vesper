@@ -4976,6 +4976,7 @@ dependencies = [
  "ashpd",
  "dirs",
  "futures-lite",
+ "ksni",
  "libc",
  "slint",
  "slint-build",
