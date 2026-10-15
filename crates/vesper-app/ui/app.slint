@@ -313,6 +313,9 @@ export component AppWindow inherits Window {
     // Anything but idle locks the source and output settings.
     property <bool> active: root.rec-state != RecState.idle;
     property <bool> game: root.source-kind == SourceKind.game;
+    // Open and Play only while idle: during a recording the stats keep the row.
+    property <bool> notice-actions: root.notice-has-file && root.notice != "" && !root.active;
+    property <string> fps-text: (root.recording ? "\{Math.round(root.measured-fps * 10) / 10}" : "\{root.fps}") + " fps";
 
     title: "Vesper";
     preferred-width: 440px;
@@ -756,37 +759,53 @@ export component AppWindow inherits Window {
                 }
 
                 // ---- Status line -------------------------------------------
-                // Fixed height, so a notice with buttons moves nothing.
+                // Fixed height, so a notice with buttons moves nothing. While
+                // recording the stats stay: a notice is text only, between them.
                 HorizontalLayout {
                     height: 28px;
                     spacing: Theme.space-sm;
                     padding-left: Theme.space-xs;
-                    padding-right: root.notice-has-file ? 0px : Theme.space-xs;
-                    if !root.notice-has-file: Text {
+                    padding-right: root.notice-actions ? 0px : Theme.space-xs;
+                    if !root.notice-actions: Text {
                         horizontal-stretch: 1;
-                        text: root.encoder + " " + root.codec-name + (root.resolution != "" ? "   ·   " + root.resolution : "") + "   ·   " + (root.recording ? "\{Math.round(root.measured-fps * 10) / 10}" : "\{root.fps}") + " fps";
+                        // With a notice beside it, the fps goes first so elision spares it.
+                        text: root.active && root.notice != ""
+                            ? root.fps-text
+                            : root.encoder + " " + root.codec-name + (root.resolution != "" ? "   ·   " + root.resolution : "") + "   ·   " + root.fps-text;
                         vertical-alignment: center;
                         font-size: Theme.font-small;
                         color: Theme.text-faint;
                         overflow: elide;
                         accessible-role: text;
                     }
-                    if root.notice != "" && !root.notice-has-file: Text {
-                        text: root.notice;
-                        vertical-alignment: center;
-                        font-size: Theme.font-small;
-                        font-weight: 600;
-                        color: Theme.accent;
+                    if root.notice != "" && !root.notice-actions: HorizontalLayout {
+                        spacing: 6px;
+                        if root.notice-has-file: Icon {
+                            y: (parent.height - self.height) / 2;
+                            width: 14px;
+                            height: 14px;
+                            data: Icons.check;
+                            stroke: 2.25px;
+                            tint: Theme.accent;
+                        }
+                        Text {
+                            text: root.notice;
+                            vertical-alignment: center;
+                            font-size: Theme.font-small;
+                            font-weight: 600;
+                            color: Theme.accent;
+                            overflow: elide;
+                        }
                     }
-                    if root.notice == "" && !root.notice-has-file: Text {
+                    if (root.notice == "" || root.active) && !root.notice-actions: Text {
                         text: root.dropped-frames == 1 ? "1 dropped" : "\{root.dropped-frames} dropped";
                         vertical-alignment: center;
                         font-size: Theme.font-small;
                         font-weight: root.dropped-frames > 0 ? 600 : 400;
                         color: root.dropped-frames > 0 ? Theme.warn : Theme.text-faint;
                     }
-                    // A saved file: what happened, and what to do with it.
-                    if root.notice-has-file: HorizontalLayout {
+                    // A saved file while idle: what happened, and what to do with it.
+                    if root.notice-actions: HorizontalLayout {
                         horizontal-stretch: 1;
                         spacing: 6px;
                         accessible-role: text;
@@ -809,7 +828,7 @@ export component AppWindow inherits Window {
                             overflow: elide;
                         }
                     }
-                    if root.notice-has-file: Button {
+                    if root.notice-actions: Button {
                         text: "Open";
                         kind: "ghost";
                         small: true;
@@ -818,7 +837,7 @@ export component AppWindow inherits Window {
                             root.open-notice-file();
                         }
                     }
-                    if root.notice-has-file: Button {
+                    if root.notice-actions: Button {
                         text: "Play";
                         kind: "ghost";
                         small: true;

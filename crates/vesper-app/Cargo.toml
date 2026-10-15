@@ -8,7 +8,8 @@ name = "vesper"
 path = "src/main.rs"
 
 [dependencies]
-slint = { version = "1.18", features = ["unstable-winit-030"] }
+# `~`: `unstable-winit-030` (window focus) may change in any minor release.
+slint = { version = "~1.18", features = ["unstable-winit-030"] }
 dirs = "7"
 libc = "0.2"
 ashpd = { version = "0.13", default-features = false, features = ["async-io", "global_shortcuts", "file_chooser", "notification"] }
@@ -22,4 +23,4 @@ vesper-audio.workspace = true
 vesper-gamecapture.workspace = true
 
 [build-dependencies]
-slint-build = "1.18"
+slint-build = "~1.18"

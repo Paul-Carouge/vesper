@@ -549,7 +549,7 @@ fn set_source_mode(ui: &AppWindow, games: &Games, game: bool) {
 /// Shows the picked portal source in the source card.
 fn show_source(ui: &AppWindow, label: &SourceLabel) {
     let (name, detail) = label.lines();
-    ui.set_source_kind(if label.window {
+    ui.set_source_kind(if label.kind == outputs::Kind::Window {
         SourceKind::Window
     } else {
         SourceKind::Screen

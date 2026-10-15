@@ -6,7 +6,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use crate::outputs::SourceLabel;
+use crate::outputs::{Kind, SourceLabel};
 use crate::{AppWindow, QualityPreset, SourceKind, VideoCodec};
 
 /// Process names (`/proc/<pid>/comm`) the user allowed game capture for. Not
@@ -204,7 +204,7 @@ fn parse_source(text: &str) -> SourceLabel {
     let (mut w, mut h) = (None, None);
     for (key, value) in text.lines().filter_map(|l| l.split_once('=')) {
         match key {
-            "window" => set(&mut label.window, flag(value)),
+            "kind" => set(&mut label.kind, Kind::from_id(value)),
             "name" if !value.is_empty() => label.name = Some(value.to_owned()),
             "width" => w = value.parse().ok(),
             "height" => h = value.parse().ok(),
@@ -212,11 +212,15 @@ fn parse_source(text: &str) -> SourceLabel {
         }
     }
     label.size = w.zip(h);
+    // Only a monitor has a name.
+    if label.kind != Kind::Monitor {
+        label.name = None;
+    }
     label
 }
 
 fn serialize_source(label: &SourceLabel) -> String {
-    let mut text = format!("window={}\n", label.window);
+    let mut text = format!("kind={}\n", label.kind.id());
     if let Some(name) = label.name.as_ref().filter(|n| !n.contains(['\n', '\r'])) {
         text += &format!("name={name}\n");
     }
@@ -381,20 +385,25 @@ mod tests {
         for label in [
             SourceLabel::default(),
             SourceLabel {
-                window: false,
+                kind: Kind::Monitor,
                 name: Some("DP-1".into()),
                 size: Some((3840, 2160)),
             },
             SourceLabel {
-                window: true,
+                kind: Kind::Window,
                 name: None,
                 size: Some((1280, 720)),
+            },
+            SourceLabel {
+                kind: Kind::Region,
+                name: None,
+                size: Some((1920, 1080)),
             },
         ] {
             assert_eq!(parse_source(&serialize_source(&label)), label);
         }
         let broken = SourceLabel {
-            name: Some("a\nwindow=true".into()),
+            name: Some("a\nkind=window".into()),
             ..SourceLabel::default()
         };
         assert_eq!(
@@ -402,6 +411,8 @@ mod tests {
             SourceLabel::default()
         );
         assert_eq!(parse_source("width=1\ngarbage"), SourceLabel::default());
+        // Only a monitor is named.
+        assert_eq!(parse_source("kind=region\nname=DP-1\n").name, None);
     }
 
     #[test]

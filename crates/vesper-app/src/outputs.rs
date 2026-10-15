@@ -1,17 +1,45 @@
 //! Names the picked portal source. The ScreenCast portal gives a monitor's
 //! position and logical size but not its name: the Wayland outputs give it
 //! (`wl_output` v4 `name`, e.g. "DP-1"), matched on that position. Window
-//! titles are not exposed at all.
+//! titles are not exposed at all, nor names for virtual sources.
 
-use vesper_capture::SourceInfo;
+use vesper_capture::{SourceInfo, SourceType};
 use wayland_client::protocol::{wl_output, wl_registry};
 use wayland_client::{Connection, Dispatch, QueueHandle, WEnum};
+
+/// What kind of source was picked.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Kind {
+    #[default]
+    Monitor,
+    Window,
+    /// A virtual source (e.g. KDE's full workspace or a region), or one the
+    /// portal did not describe: never named after a monitor.
+    Region,
+}
+
+impl Kind {
+    /// As saved in the settings.
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Monitor => "monitor",
+            Self::Window => "window",
+            Self::Region => "region",
+        }
+    }
+
+    pub fn from_id(id: &str) -> Option<Self> {
+        [Self::Monitor, Self::Window, Self::Region]
+            .into_iter()
+            .find(|k| k.id() == id)
+    }
+}
 
 /// The picked source, as the UI shows it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SourceLabel {
-    pub window: bool,
-    /// Output name, e.g. "DP-1"; `None` when unknown (always for windows).
+    pub kind: Kind,
+    /// Output name, e.g. "DP-1"; only ever set for a monitor.
     pub name: Option<String>,
     /// Size in pixels: the output's mode for a named monitor, else the
     /// portal's logical size.
@@ -20,8 +48,12 @@ pub struct SourceLabel {
 
 impl SourceLabel {
     /// Kind of source, as a word.
-    pub fn kind(&self) -> &'static str {
-        if self.window { "Window" } else { "Screen" }
+    pub fn kind_word(&self) -> &'static str {
+        match self.kind {
+            Kind::Monitor => "Screen",
+            Kind::Window => "Window",
+            Kind::Region => "Screen region",
+        }
     }
 
     /// Title and secondary line: "DP-1" / "Screen · 3840 × 2160", or
@@ -29,9 +61,9 @@ impl SourceLabel {
     pub fn lines(&self) -> (String, String) {
         let size = self.size.map(|(w, h)| format!("{w} × {h}"));
         match (&self.name, size) {
-            (Some(name), Some(size)) => (name.clone(), format!("{} · {size}", self.kind())),
-            (Some(name), None) => (name.clone(), self.kind().to_owned()),
-            (None, size) => (self.kind().to_owned(), size.unwrap_or_default()),
+            (Some(name), Some(size)) => (name.clone(), format!("{} · {size}", self.kind_word())),
+            (Some(name), None) => (name.clone(), self.kind_word().to_owned()),
+            (None, size) => (self.kind_word().to_owned(), size.unwrap_or_default()),
         }
     }
 }
@@ -50,14 +82,19 @@ struct Output {
 /// Names `source`. Blocks for two Wayland roundtrips: call it off the UI thread.
 pub fn describe(source: &SourceInfo) -> SourceLabel {
     log!("portal stream: {source:?}");
+    let kind = match source.source_type {
+        Some(SourceType::Monitor) => Kind::Monitor,
+        Some(SourceType::Window) => Kind::Window,
+        _ => Kind::Region,
+    };
     let unnamed = SourceLabel {
-        window: source.window,
+        kind,
         name: None,
         size: source
             .size
             .and_then(|(w, h)| Some((u32::try_from(w).ok()?, u32::try_from(h).ok()?))),
     };
-    if source.window {
+    if kind != Kind::Monitor {
         return unnamed;
     }
     let outputs = match outputs() {
@@ -69,7 +106,7 @@ pub fn describe(source: &SourceInfo) -> SourceLabel {
     };
     match pick(&outputs, source.position) {
         Some(output) => SourceLabel {
-            window: false,
+            kind,
             name: output.name.clone(),
             size: output.size.or(unnamed.size),
         },
@@ -216,7 +253,7 @@ mod tests {
     #[ignore = "needs a Wayland session"]
     fn names_a_real_monitor() {
         let label = describe(&SourceInfo {
-            window: false,
+            source_type: Some(SourceType::Monitor),
             position: Some((0, 0)),
             size: None,
         });
@@ -227,7 +264,7 @@ mod tests {
     #[test]
     fn labels() {
         let named = SourceLabel {
-            window: false,
+            kind: Kind::Monitor,
             name: Some("DP-1".into()),
             size: Some((3840, 2160)),
         };
@@ -236,11 +273,20 @@ mod tests {
             ("DP-1".into(), "Screen · 3840 × 2160".into())
         );
         let window = SourceLabel {
-            window: true,
+            kind: Kind::Window,
             name: None,
             size: Some((1280, 720)),
         };
         assert_eq!(window.lines(), ("Window".into(), "1280 × 720".into()));
+        let region = SourceLabel {
+            kind: Kind::Region,
+            name: None,
+            size: Some((1920, 1080)),
+        };
+        assert_eq!(
+            region.lines(),
+            ("Screen region".into(), "1920 × 1080".into())
+        );
         assert_eq!(
             SourceLabel::default().lines(),
             ("Screen".into(), String::new())

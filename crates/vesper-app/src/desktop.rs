@@ -74,7 +74,6 @@ async fn choose_folder(current: &Path) -> ashpd::Result<Option<PathBuf>> {
         .title("Choose the output folder")
         .accept_label("Choose")
         .directory(true)
-        .modal(true)
         .multiple(false);
     if current.is_dir() {
         request = request.current_folder(current)?;

@@ -1,9 +1,10 @@
 //! Developer knobs for layout checks and screenshots (debug builds only):
 //! - `VESPER_WINDOW_SIZE=360x700` sets the initial logical window size.
-//! - `VESPER_DEMO=source,game,allow,ignore,recording,settings,muted,browse,saved,notify,tab,esc,ctrl+<key>`
+//! - `VESPER_DEMO=source,game,allow,ignore,recording,recording-look,settings,muted,browse,saved,notify,tab,esc,ctrl+<key>`
 //!   replays UI intents and key presses once the window is up (`ctrl+comma`
-//!   for `,`). `saved` shows the saved-file notice and `notify` sends the
-//!   desktop notification, both for `VESPER_DEMO_FILE`.
+//!   for `,`). `recording-look` fakes the recording state (no capture).
+//!   `saved` shows the saved-file notice and `notify` sends the desktop
+//!   notification, both for `VESPER_DEMO_FILE`.
 //! - `VESPER_DEMO_DELAY=<ms>` runs `VESPER_DEMO` that long after launch
 //!   (default 300), e.g. once a game asks for consent (`allow`, `ignore`).
 //! - `vesper --record <seconds>` records without the UI, from the saved
@@ -140,6 +141,13 @@ pub fn apply(ui: &AppWindow) {
                 "allow" => ui.invoke_allow_game(),
                 "ignore" => ui.invoke_ignore_game(),
                 "browse" => ui.invoke_pick_output_folder(),
+                // The recording look without a capture, for screenshots.
+                "recording-look" => {
+                    ui.set_rec_state(crate::RecState::Recording);
+                    ui.set_elapsed_seconds(83);
+                    ui.set_measured_fps(59.9);
+                    ui.set_resolution("3840×2160".into());
+                }
                 "saved" => crate::show_notice(&ui, "Replay saved", Some(demo_file())),
                 "notify" => crate::desktop::notify(
                     "Replay saved".into(),

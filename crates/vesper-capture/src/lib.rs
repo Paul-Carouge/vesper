@@ -10,7 +10,8 @@ mod pw;
 use std::os::fd::OwnedFd;
 use std::thread::JoinHandle;
 
-use ashpd::desktop::screencast::{CursorMode, Screencast, SelectSourcesOptions, SourceType};
+pub use ashpd::desktop::screencast::SourceType;
+use ashpd::desktop::screencast::{CursorMode, Screencast, SelectSourcesOptions};
 use ashpd::desktop::{PersistMode, Session};
 use futures_lite::future::block_on;
 use tracing::warn;
@@ -22,8 +23,9 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// What the user picked, as the portal describes its stream.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SourceInfo {
-    /// A window rather than a monitor (unknown counts as a monitor).
-    pub window: bool,
+    /// Monitor, window, or virtual (e.g. KDE's full workspace or a region);
+    /// `None` when the portal does not say.
+    pub source_type: Option<SourceType>,
     /// Top-left corner in the compositor's logical space, if given.
     pub position: Option<(i32, i32)>,
     /// Logical size, if given.
@@ -144,7 +146,7 @@ async fn open_portal(restore_token: Option<&str>) -> Result<Opened> {
             .first()
             .ok_or("portal returned no stream")?;
         let source = SourceInfo {
-            window: stream.source_type() == Some(SourceType::Window),
+            source_type: stream.source_type(),
             position: stream.position(),
             size: stream.size(),
         };
