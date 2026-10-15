@@ -9,6 +9,9 @@ export { Theme }
 export enum SourceKind { none, screen, window }
 export enum VideoCodec { av1, hevc, h264 }
 export enum QualityPreset { performance, balanced, quality }
+/// Recording lifecycle, owned by the backend. `starting` covers the portal
+/// picker and encoder setup, `stopping` the encoder flush and muxer close.
+export enum RecState { idle, starting, recording, stopping }
 
 // Elapsed time with fixed-width digit cells, so the clock does not jitter.
 component Clock inherits HorizontalLayout {
@@ -29,6 +32,9 @@ component Clock inherits HorizontalLayout {
     ];
 
     alignment: center;
+    accessible-role: text;
+    accessible-label: "Elapsed time";
+    accessible-value: "\{h}:\{m < 10 ? "0" : ""}\{m}:\{s < 10 ? "0" : ""}\{s}";
     for d in root.digits: Text {
         width: d < 0 ? Theme.font-display * 0.32 : Theme.font-display * 0.6;
         text: d < 0 ? ":" : "\{d}";
@@ -41,21 +47,30 @@ component Clock inherits HorizontalLayout {
 
 component RecordButton inherits FocusScope {
     in property <bool> recording;
+    /// Starting or stopping: the button shows the pending state and ignores input.
+    in property <bool> busy;
     callback toggle;
 
     width: 88px;
     height: 88px;
     focus-on-click: false;
     accessible-role: button;
-    accessible-label: root.recording ? "Stop recording" : "Start recording";
+    accessible-label: root.busy
+        ? (root.recording ? "Stopping recording" : "Starting recording")
+        : root.recording ? "Stop recording" : "Start recording";
     accessible-description: "Ctrl+R";
+    accessible-enabled: root.enabled && !root.busy;
     accessible-action-default => {
-        root.toggle();
+        if (root.enabled && !root.busy) {
+            root.toggle();
+        }
     }
 
     key-pressed(event) => {
         if (event.text == Key.Space || event.text == Key.Return) {
-            root.toggle();
+            if (!root.busy) {
+                root.toggle();
+            }
             return accept;
         }
         reject
@@ -100,11 +115,13 @@ component RecordButton inherits FocusScope {
         y: (parent.height - self.height) / 2;
         border-radius: root.recording ? 9px : self.size / 2;
         background: touch.has-hover ? Theme.rec.brighter(0.08) : Theme.rec;
-        animate width, height, border-radius { duration: Theme.medium; easing: ease-out-quart; }
+        opacity: root.busy ? 0.5 : 1;
+        animate width, height, border-radius, opacity { duration: Theme.medium; easing: ease-out-quart; }
     }
 
     touch := TouchArea {
-        mouse-cursor: pointer;
+        enabled: root.enabled && !root.busy;
+        mouse-cursor: self.enabled ? pointer : default;
         clicked => {
             root.toggle();
         }
@@ -212,7 +229,7 @@ export component AppWindow inherits Window {
     in property <string> source-detail;
 
     // ---- Recording ----------------------------------------------------
-    in property <bool> recording;
+    in property <RecState> rec-state: RecState.idle;
     in property <int> elapsed-seconds;
 
     // ---- Replay buffer ------------------------------------------------
@@ -260,6 +277,11 @@ export component AppWindow inherits Window {
     property <string> codec-name: root.codec == VideoCodec.av1 ? "AV1" : root.codec == VideoCodec.hevc ? "HEVC" : "H.264";
     property <[int]> replay-options: [30, 60, 120];
     property <[int]> fps-options: [30, 60, 120, 144];
+    // Showing the recording look (REC, stop square), including while stopping.
+    property <bool> recording: root.rec-state == RecState.recording || root.rec-state == RecState.stopping;
+    property <bool> busy: root.rec-state == RecState.starting || root.rec-state == RecState.stopping;
+    // Anything but idle locks the source and output settings.
+    property <bool> active: root.rec-state != RecState.idle;
 
     title: "Vesper";
     preferred-width: 440px;
@@ -270,7 +292,11 @@ export component AppWindow inherits Window {
     default-font-size: Theme.font-body;
     forward-focus: keys;
 
+    // Same guards as the record button, so shortcuts cannot bypass them.
     function toggle-recording() {
+        if (root.busy || root.settings-open) {
+            return;
+        }
         if (root.recording) {
             root.stop-recording();
         } else {
@@ -280,7 +306,11 @@ export component AppWindow inherits Window {
 
     function open-settings() {
         root.settings-open = true;
-        codec-picker.focus();
+        if (root.active) {
+            close-button.focus();
+        } else {
+            codec-picker.focus();
+        }
     }
 
     function close-settings() {
@@ -289,7 +319,7 @@ export component AppWindow inherits Window {
     }
 
     function request-save-replay() {
-        if (root.replay-enabled) {
+        if (root.replay-enabled && !root.settings-open) {
             root.save-replay();
         }
     }
@@ -400,7 +430,7 @@ export component AppWindow inherits Window {
                             Button {
                                 text: root.source-kind == SourceKind.none ? "Choose" : "Change";
                                 kind: root.source-kind == SourceKind.none ? "primary" : "secondary";
-                                enabled: !root.recording && !root.settings-open;
+                                enabled: !root.active && !root.settings-open;
                                 accessible-label: "Choose source";
                                 clicked => {
                                     root.pick-source();
@@ -442,7 +472,7 @@ export component AppWindow inherits Window {
                                     }
                                 }
                                 Text {
-                                    text: root.recording ? "REC" : root.source-kind == SourceKind.none ? "No source" : "Ready";
+                                    text: root.rec-state == RecState.starting ? "Starting" : root.rec-state == RecState.stopping ? "Saving" : root.recording ? "REC" : root.source-kind == SourceKind.none ? "No source" : "Ready";
                                     vertical-alignment: center;
                                     font-size: Theme.font-caption;
                                     font-weight: 700;
@@ -467,6 +497,7 @@ export component AppWindow inherits Window {
                         RecordButton {
                             enabled: !root.settings-open;
                             recording: root.recording;
+                            busy: root.busy;
                             toggle => {
                                 root.toggle-recording();
                             }
@@ -474,7 +505,7 @@ export component AppWindow inherits Window {
                     }
 
                     Text {
-                        text: root.recording ? "Ctrl+R to stop" : "Ctrl+R to start recording";
+                        text: root.rec-state == RecState.starting ? "Starting…" : root.rec-state == RecState.stopping ? "Finishing the file…" : root.recording ? "Ctrl+R to stop" : "Ctrl+R to start recording";
                         horizontal-alignment: center;
                         font-size: Theme.font-small;
                         color: Theme.text-faint;
@@ -656,7 +687,7 @@ export component AppWindow inherits Window {
                         font-weight: 700;
                         color: Theme.text;
                     }
-                    IconButton {
+                    close-button := IconButton {
                         icon: Icons.close;
                         label: "Close settings";
                         clicked => {
@@ -665,7 +696,7 @@ export component AppWindow inherits Window {
                     }
                 }
 
-                if root.recording: Rectangle {
+                if root.active: Rectangle {
                     border-radius: Theme.radius-md;
                     background: Theme.rec-soft;
                     height: 36px;
@@ -684,7 +715,7 @@ export component AppWindow inherits Window {
                         : root.codec == VideoCodec.hevc ? "Efficient and widely supported by hardware." : "Plays everywhere, larger files.";
                     codec-picker := Segmented {
                         label: "Codec";
-                        enabled: !root.recording;
+                        enabled: !root.active;
                         options: ["AV1", "HEVC", "H.264"];
                         selected: root.codec == VideoCodec.av1 ? 0 : root.codec == VideoCodec.hevc ? 1 : 2;
                         changed(i) => {
@@ -698,7 +729,7 @@ export component AppWindow inherits Window {
                     label: "QUALITY";
                     Segmented {
                         label: "Quality preset";
-                        enabled: !root.recording;
+                        enabled: !root.active;
                         options: ["Performance", "Balanced", "Quality"];
                         selected: root.quality == QualityPreset.performance ? 0 : root.quality == QualityPreset.balanced ? 1 : 2;
                         changed(i) => {
@@ -712,7 +743,7 @@ export component AppWindow inherits Window {
                     label: "FRAME RATE";
                     Segmented {
                         label: "Frame rate";
-                        enabled: !root.recording;
+                        enabled: !root.active;
                         options: ["30", "60", "120", "144"];
                         selected: root.fps >= 144 ? 3 : root.fps >= 120 ? 2 : root.fps >= 60 ? 1 : 0;
                         changed(i) => {
@@ -754,7 +785,7 @@ export component AppWindow inherits Window {
                         }
                         Button {
                             text: "Browse";
-                            enabled: !root.recording;
+                            enabled: !root.active;
                             accessible-label: "Choose output folder";
                             clicked => {
                                 root.pick-output-folder();

@@ -1,6 +1,6 @@
 //! Fake backend state used until capture, encode and audio are wired in.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Level meter ballistics: instant attack, smooth release, peak hold.
 #[derive(Debug, Default, Clone, Copy, PartialEq)]
@@ -55,6 +55,8 @@ pub struct Sim {
     desktop: MeterState,
     mic: MeterState,
     recording: Option<RecordingStats>,
+    started: Option<Instant>,
+    last_tick: Option<Instant>,
     target_fps: f32,
     t: f32,
     rng: u32,
@@ -68,6 +70,8 @@ impl Default for Sim {
             desktop: MeterState::default(),
             mic: MeterState::default(),
             recording: None,
+            started: None,
+            last_tick: None,
             target_fps: 60.0,
             t: 0.0,
             rng: 0x9E37_79B9,
@@ -76,8 +80,9 @@ impl Default for Sim {
 }
 
 impl Sim {
-    pub fn start_recording(&mut self, fps: f32) {
+    pub fn start_recording(&mut self, fps: f32, now: Instant) {
         self.target_fps = fps;
+        self.started = Some(now);
         self.recording = Some(RecordingStats {
             elapsed: Duration::ZERO,
             fps,
@@ -87,10 +92,25 @@ impl Sim {
 
     pub fn stop_recording(&mut self) {
         self.recording = None;
+        self.started = None;
     }
 
-    /// Advances the simulation by `dt` and returns the state to display.
-    pub fn step(&mut self, dt: Duration) -> Snapshot {
+    /// Advances to `now` (wall clock) and returns the state to display.
+    pub fn tick(&mut self, now: Instant) -> Snapshot {
+        let dt = self
+            .last_tick
+            .map_or(Duration::ZERO, |last| now.saturating_duration_since(last));
+        self.last_tick = Some(now);
+        let mut snap = self.step(dt);
+        if let (Some(started), Some(rec)) = (self.started, self.recording.as_mut()) {
+            rec.elapsed = now.saturating_duration_since(started);
+            snap.recording = Some(*rec);
+        }
+        snap
+    }
+
+    /// Advances the simulation by `dt`.
+    fn step(&mut self, dt: Duration) -> Snapshot {
         self.t += dt.as_secs_f32();
         let t = self.t;
 
@@ -113,7 +133,6 @@ impl Sim {
         let target = self.target_fps;
         let drop_roll = self.noise();
         if let Some(rec) = self.recording.as_mut() {
-            rec.elapsed += dt;
             rec.fps = target - 0.2 * jitter.abs();
             // A rare dropped frame keeps the counter honest-looking.
             if drop_roll > 0.9993 {
@@ -185,18 +204,18 @@ mod tests {
     }
 
     #[test]
-    fn recording_tracks_elapsed_time() {
+    fn recording_tracks_wall_clock_time() {
+        let t0 = Instant::now();
         let mut sim = Sim::default();
-        assert!(sim.step(TICK).recording.is_none());
-        sim.start_recording(60.0);
-        let mut snap = sim.step(TICK);
-        for _ in 0..29 {
-            snap = sim.step(TICK);
-        }
+        assert!(sim.tick(t0).recording.is_none());
+        sim.start_recording(60.0, t0);
+        // Irregular ticks: elapsed follows the clock, not the tick count.
+        sim.tick(t0 + Duration::from_millis(10));
+        let snap = sim.tick(t0 + Duration::from_millis(1500));
         let rec = snap.recording.expect("recording");
-        assert_eq!(rec.elapsed, TICK * 30);
+        assert_eq!(rec.elapsed, Duration::from_millis(1500));
         assert!(rec.fps > 59.0 && rec.fps <= 60.0);
         sim.stop_recording();
-        assert!(sim.step(TICK).recording.is_none());
+        assert!(sim.tick(t0 + Duration::from_secs(2)).recording.is_none());
     }
 }

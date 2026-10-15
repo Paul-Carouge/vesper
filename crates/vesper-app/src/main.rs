@@ -4,11 +4,19 @@
 //! and simulate the state a real backend would publish (elapsed time, audio
 //! levels, encoder stats), so the UI can be exercised end to end.
 
+/// Minimal stderr logger, enough until a real backend brings `tracing`.
+macro_rules! log {
+    ($($arg:tt)*) => { eprintln!("[vesper] {}", format_args!($($arg)*)) };
+}
+
+#[cfg(debug_assertions)]
+mod dev;
 mod sim;
 
 use std::cell::RefCell;
+use std::path::PathBuf;
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use slint::ComponentHandle;
 
@@ -16,10 +24,11 @@ use sim::Sim;
 
 slint::include_modules!();
 
-/// Minimal stderr logger, enough until a real backend brings `tracing`.
-macro_rules! log {
-    ($($arg:tt)*) => { eprintln!("[vesper] {}", format_args!($($arg)*)) };
-}
+/// Simulated latency of the portal picker / encoder start and of the final
+/// flush, so the transient `starting` / `stopping` states are visible.
+const FAKE_START_DELAY: Duration = Duration::from_millis(350);
+const FAKE_PICKER_DELAY: Duration = Duration::from_millis(600);
+const FAKE_STOP_DELAY: Duration = Duration::from_millis(450);
 
 fn main() -> Result<(), slint::PlatformError> {
     let ui = AppWindow::new()?;
@@ -35,14 +44,15 @@ fn main() -> Result<(), slint::PlatformError> {
         _ => {}
     }
 
-    ui.set_output_folder(default_output_folder().into());
+    if let Some(folder) = default_output_folder() {
+        ui.set_output_folder(folder.to_string_lossy().as_ref().into());
+    }
     ui.set_replay_enabled(true);
 
     let sim = Rc::new(RefCell::new(Sim::default()));
     wire_callbacks(&ui, &sim);
 
-    // ~30 Hz is enough for meters and the clock; nothing redraws when idle
-    // except the meters themselves.
+    // ~30 Hz is enough for meters and the clock.
     let tick = slint::Timer::default();
     let weak = ui.as_weak();
     let sim_tick = sim.clone();
@@ -51,8 +61,7 @@ fn main() -> Result<(), slint::PlatformError> {
         Duration::from_millis(33),
         move || {
             let Some(ui) = weak.upgrade() else { return };
-            let mut sim = sim_tick.borrow_mut();
-            let s = sim.step(Duration::from_millis(33));
+            let s = sim_tick.borrow_mut().tick(Instant::now());
             ui.set_desktop_level(s.desktop.level);
             ui.set_desktop_peak(s.desktop.peak);
             ui.set_mic_level(s.mic.level);
@@ -65,88 +74,34 @@ fn main() -> Result<(), slint::PlatformError> {
         },
     );
 
-    apply_dev_overrides(&ui);
+    #[cfg(debug_assertions)]
+    dev::apply(&ui);
+
     ui.run()
 }
 
-/// Developer knobs for layout checks and screenshots:
-/// - `VESPER_WINDOW_SIZE=360x700` sets the initial logical window size.
-/// - `VESPER_DEMO=source,recording,settings,muted,tab,esc,ctrl+<key>`
-///   replays UI intents and key presses once the window is up.
-fn apply_dev_overrides(ui: &AppWindow) {
-    if let Ok(size) = std::env::var("VESPER_WINDOW_SIZE")
-        && let Some((w, h)) = size.split_once('x')
-        && let (Ok(w), Ok(h)) = (w.parse::<f32>(), h.parse::<f32>())
-    {
-        ui.window().set_size(slint::LogicalSize::new(w, h));
-    }
-    let Ok(demo) = std::env::var("VESPER_DEMO") else {
-        return;
-    };
-    let weak = ui.as_weak();
-    slint::Timer::single_shot(Duration::from_millis(300), move || {
-        let Some(ui) = weak.upgrade() else { return };
-        for step in demo.split(',') {
-            match step.trim() {
-                "source" => ui.invoke_pick_source(),
-                "recording" => ui.invoke_start_recording(),
-                "settings" => ui.set_settings_open(true),
-                "muted" => {
-                    ui.set_mic_muted(true);
-                    ui.invoke_mic_mute_changed(true);
-                }
-                "tab" => press_key(&ui, slint::platform::Key::Tab.into(), false),
-                "esc" => press_key(&ui, slint::platform::Key::Escape.into(), false),
-                other => match other.strip_prefix("ctrl+") {
-                    Some("comma") => press_key(&ui, ",".into(), true),
-                    Some(key) if !key.is_empty() => press_key(&ui, key.into(), true),
-                    _ => log!("VESPER_DEMO: unknown step {other:?}"),
-                },
-            }
-        }
-    });
-}
-
-fn press_key(ui: &AppWindow, text: slint::SharedString, control: bool) {
-    use slint::platform::{Key, WindowEvent};
-    let window = ui.window();
-    let ctrl: slint::SharedString = Key::Control.into();
-    if control {
-        window.dispatch_event(WindowEvent::KeyPressed { text: ctrl.clone() });
-    }
-    window.dispatch_event(WindowEvent::KeyPressed { text: text.clone() });
-    window.dispatch_event(WindowEvent::KeyReleased { text });
-    if control {
-        window.dispatch_event(WindowEvent::KeyReleased { text: ctrl });
-    }
-}
-
+/// Stub handlers.
+///
+/// Contract for the real backend: callbacks run on the UI thread and must
+/// return immediately. Do the work elsewhere and push every state change back
+/// with `weak.upgrade_in_event_loop(..)` or `slint::invoke_from_event_loop(..)`;
+/// never block inside a callback. `rec-state` goes
+/// `idle -> starting -> recording -> stopping -> idle`; the UI ignores record
+/// intents while it is `starting` or `stopping`.
 fn wire_callbacks(ui: &AppWindow, sim: &Rc<RefCell<Sim>>) {
     let weak = ui.as_weak();
     ui.on_pick_source(move || {
         log!("pick-source: would open the xdg-desktop-portal picker");
         let Some(ui) = weak.upgrade() else { return };
-        // Alternate between a screen and a window so both looks can be seen.
-        if ui.get_source_kind() == SourceKind::Screen {
-            ui.set_source_kind(SourceKind::Window);
-            ui.set_source_name("Firefox  —  Vesper on GitHub".into());
-            ui.set_source_detail("Window  ·  1920 × 1080".into());
-            ui.set_resolution("1920×1080".into());
-        } else {
-            ui.set_source_kind(SourceKind::Screen);
-            ui.set_source_name("Dell U2724D".into());
-            ui.set_source_detail("DP-1  ·  2560 × 1440".into());
-            ui.set_resolution("2560×1440".into());
-        }
+        cycle_fake_source(&ui);
     });
 
     let weak = ui.as_weak();
     let s = sim.clone();
     ui.on_start_recording(move || {
         let Some(ui) = weak.upgrade() else { return };
-        if ui.get_source_kind() == SourceKind::None {
-            log!("start-recording: no source yet, opening the picker first");
-            ui.invoke_pick_source();
+        if ui.get_rec_state() != RecState::Idle {
+            return;
         }
         log!(
             "start-recording: codec={:?} quality={:?} fps={}",
@@ -154,22 +109,49 @@ fn wire_callbacks(ui: &AppWindow, sim: &Rc<RefCell<Sim>>) {
             ui.get_quality(),
             ui.get_fps()
         );
-        s.borrow_mut().start_recording(ui.get_fps() as f32);
-        ui.set_elapsed_seconds(0);
-        ui.set_dropped_frames(0);
-        ui.set_measured_fps(ui.get_fps() as f32);
-        ui.set_recording(true);
+        ui.set_rec_state(RecState::Starting);
+        // Without a source, the portal picker opens first (async).
+        let needs_source = ui.get_source_kind() == SourceKind::None;
+        let delay = if needs_source {
+            FAKE_PICKER_DELAY
+        } else {
+            FAKE_START_DELAY
+        };
+        let weak = ui.as_weak();
+        let s = s.clone();
+        slint::Timer::single_shot(delay, move || {
+            let Some(ui) = weak.upgrade() else { return };
+            if needs_source {
+                cycle_fake_source(&ui);
+            }
+            s.borrow_mut()
+                .start_recording(ui.get_fps() as f32, Instant::now());
+            ui.set_elapsed_seconds(0);
+            ui.set_dropped_frames(0);
+            ui.set_measured_fps(ui.get_fps() as f32);
+            ui.set_rec_state(RecState::Recording);
+        });
     });
 
     let weak = ui.as_weak();
     let s = sim.clone();
     ui.on_stop_recording(move || {
         let Some(ui) = weak.upgrade() else { return };
+        if ui.get_rec_state() != RecState::Recording {
+            return;
+        }
         log!("stop-recording");
-        s.borrow_mut().stop_recording();
-        ui.set_recording(false);
-        ui.set_elapsed_seconds(0);
-        flash_notice(&ui, "Recording saved");
+        ui.set_rec_state(RecState::Stopping);
+        let weak = ui.as_weak();
+        let s = s.clone();
+        // Encoder flush + muxer finalization.
+        slint::Timer::single_shot(FAKE_STOP_DELAY, move || {
+            let Some(ui) = weak.upgrade() else { return };
+            s.borrow_mut().stop_recording();
+            ui.set_rec_state(RecState::Idle);
+            ui.set_elapsed_seconds(0);
+            flash_notice(&ui, "Recording saved");
+        });
     });
 
     let weak = ui.as_weak();
@@ -200,7 +182,7 @@ fn wire_callbacks(ui: &AppWindow, sim: &Rc<RefCell<Sim>>) {
         let Some(ui) = weak.upgrade() else { return };
         log!(
             "output-settings-changed: codec={:?} quality={:?} fps={}",
-            ui.get_codec(),
+            vesper_core::Codec::from(ui.get_codec()),
             ui.get_quality(),
             ui.get_fps()
         );
@@ -209,6 +191,21 @@ fn wire_callbacks(ui: &AppWindow, sim: &Rc<RefCell<Sim>>) {
     ui.on_pick_output_folder(|| {
         log!("pick-output-folder: would open the FileChooser portal");
     });
+}
+
+/// Alternates between a screen and a window so both looks can be seen.
+fn cycle_fake_source(ui: &AppWindow) {
+    if ui.get_source_kind() == SourceKind::Screen {
+        ui.set_source_kind(SourceKind::Window);
+        ui.set_source_name("Firefox  —  Vesper on GitHub".into());
+        ui.set_source_detail("Window  ·  1920 × 1080".into());
+        ui.set_resolution("1920×1080".into());
+    } else {
+        ui.set_source_kind(SourceKind::Screen);
+        ui.set_source_name("Dell U2724D".into());
+        ui.set_source_detail("DP-1  ·  2560 × 1440".into());
+        ui.set_resolution("2560×1440".into());
+    }
 }
 
 impl From<VideoCodec> for vesper_core::Codec {
@@ -235,10 +232,11 @@ fn flash_notice(ui: &AppWindow, text: &str) {
     });
 }
 
-fn default_output_folder() -> String {
-    std::env::var("HOME")
-        .map(|home| format!("{home}/Videos/Vesper"))
-        .unwrap_or_else(|_| "~/Videos/Vesper".to_owned())
+/// `$XDG_VIDEOS_DIR/Vesper`, falling back to `$HOME/Videos/Vesper`.
+fn default_output_folder() -> Option<PathBuf> {
+    dirs::video_dir()
+        .or_else(|| dirs::home_dir().map(|home| home.join("Videos")))
+        .map(|videos| videos.join("Vesper"))
 }
 
 #[cfg(test)]
@@ -259,5 +257,13 @@ mod tests {
             vesper_core::Codec::from(VideoCodec::H264),
             vesper_core::Codec::H264
         );
+    }
+
+    #[test]
+    fn output_folder_is_absolute() {
+        if let Some(folder) = default_output_folder() {
+            assert!(folder.is_absolute(), "{folder:?}");
+            assert!(folder.ends_with("Vesper"));
+        }
     }
 }

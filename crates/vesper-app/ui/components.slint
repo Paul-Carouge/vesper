@@ -65,7 +65,9 @@ export component Button inherits FocusScope {
     accessible-description: root.shortcut-hint;
     accessible-enabled: root.enabled;
     accessible-action-default => {
-        root.clicked();
+        if (root.enabled) {
+            root.clicked();
+        }
     }
 
     key-pressed(event) => {
@@ -141,7 +143,9 @@ export component IconButton inherits FocusScope {
     accessible-role: button;
     accessible-label: root.label;
     accessible-action-default => {
-        root.clicked();
+        if (root.enabled) {
+            root.clicked();
+        }
     }
 
     key-pressed(event) => {
@@ -169,7 +173,8 @@ export component IconButton inherits FocusScope {
     }
 
     touch := TouchArea {
-        mouse-cursor: pointer;
+        enabled: root.enabled;
+        mouse-cursor: root.enabled ? pointer : default;
         clicked => {
             root.clicked();
         }
@@ -178,7 +183,8 @@ export component IconButton inherits FocusScope {
 
 // On/off switch.
 export component Switch inherits FocusScope {
-    in-out property <bool> checked;
+    // Stateless: the parent owns `checked` and updates it from `toggled`.
+    in property <bool> checked;
     in property <string> label;
     callback toggled(bool);
 
@@ -194,8 +200,9 @@ export component Switch inherits FocusScope {
     }
 
     function toggle() {
-        root.checked = !root.checked;
-        root.toggled(root.checked);
+        if (root.enabled) {
+            root.toggled(!root.checked);
+        }
     }
 
     key-pressed(event) => {
@@ -231,7 +238,8 @@ export component Switch inherits FocusScope {
     }
 
     TouchArea {
-        mouse-cursor: pointer;
+        enabled: root.enabled;
+        mouse-cursor: root.enabled ? pointer : default;
         clicked => {
             root.toggle();
         }
@@ -242,7 +250,8 @@ export component Switch inherits FocusScope {
 export component Segmented inherits FocusScope {
     in property <[string]> options;
     in property <string> label;
-    in-out property <int> selected;
+    // Stateless: the parent owns `selected` and updates it from `changed`.
+    in property <int> selected;
     callback changed(int);
 
     focus-on-click: false;
@@ -252,8 +261,7 @@ export component Segmented inherits FocusScope {
     accessible-value: root.options[root.selected];
 
     function select(i: int) {
-        if (i >= 0 && i < root.options.length && i != root.selected) {
-            root.selected = i;
+        if (root.enabled && i >= 0 && i < root.options.length && i != root.selected) {
             root.changed(i);
         }
     }
@@ -337,10 +345,9 @@ export component Meter inherits Rectangle {
     border-radius: self.height / 2;
     background: Theme.meter-track;
     clip: true;
-    accessible-role: progress-indicator;
-    accessible-value-minimum: 0;
-    accessible-value-maximum: 100;
-    accessible-value: root.muted ? "muted" : "\{round(root.level * 100)}%";
+    // Purely visual: a 30 Hz value would flood screen readers. The mute
+    // button next to it carries the accessible state.
+    accessible-role: none;
 
     fill := Rectangle {
         x: 0;
