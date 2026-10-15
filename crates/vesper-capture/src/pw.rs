@@ -3,6 +3,7 @@
 use std::cell::{Cell, RefCell};
 use std::os::fd::{BorrowedFd, OwnedFd};
 use std::rc::Rc;
+use std::time::Duration;
 
 use pipewire as pw;
 use pw::spa::param::ParamType;
@@ -44,6 +45,30 @@ pub fn handle_msg(
     }
 }
 
+/// How long one setup roundtrip may take before `Capture::start` gives up.
+const ROUNDTRIP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Runs `mainloop` until `finished` holds, which callbacks signal by quitting
+/// the loop. Returns false if `timeout` passes first.
+fn run_until(mainloop: &MainLoopRc, finished: impl Fn() -> bool, timeout: Duration) -> bool {
+    let timed_out = Rc::new(Cell::new(false));
+    let timer = mainloop.loop_().add_timer({
+        let (timed_out, mainloop) = (timed_out.clone(), mainloop.clone());
+        move |_| {
+            timed_out.set(true);
+            mainloop.quit();
+        }
+    });
+    if let Err(e) = timer.update_timer(Some(timeout), None).into_result() {
+        error!("arming the roundtrip timer failed: {e}");
+        return false;
+    }
+    while !finished() && !timed_out.get() {
+        mainloop.run();
+    }
+    finished()
+}
+
 /// Runs a full roundtrip with the server.
 fn roundtrip(mainloop: &MainLoopRc, core: &CoreRc) -> Result<(), Error> {
     let pending = core.sync(0)?.seq();
@@ -69,8 +94,8 @@ fn roundtrip(mainloop: &MainLoopRc, core: &CoreRc) -> Result<(), Error> {
             }
         })
         .register();
-    while !done.get() && !failed.get() {
-        mainloop.run();
+    if !run_until(mainloop, || done.get() || failed.get(), ROUNDTRIP_TIMEOUT) {
+        return Err("pipewire server did not answer in time".into());
     }
     if failed.get() {
         return Err("pipewire connection failed".into());
@@ -415,9 +440,34 @@ pub fn run<F>(
             pw::stream::StreamFlags::AUTOCONNECT,
             &mut pods,
         )?;
-        Ok((context, core, stream, listener, generation))
+        // An AUTOCONNECT stream only pauses when its source node goes away
+        // (sharing stopped, window closed): watch the node itself. Disconnecting
+        // moves the stream to Unconnected, which ends the capture.
+        let registry = core.get_registry_rc()?;
+        let node_listener = registry
+            .add_listener_local()
+            .global_remove({
+                let stream = stream.clone();
+                move |id| {
+                    if id == node_id
+                        && let Err(e) = stream.disconnect()
+                    {
+                        error!("pw_stream_disconnect failed: {e}");
+                    }
+                }
+            })
+            .register();
+        Ok((
+            context,
+            core,
+            stream,
+            listener,
+            generation,
+            registry,
+            node_listener,
+        ))
     })();
-    let (_context, _core, stream, listener, generation) = match setup {
+    let (_context, _core, stream, listener, generation, _registry, node_listener) = match setup {
         Ok(s) => s,
         Err(e) => return drop(ready.send(Err(e))),
     };
@@ -436,6 +486,7 @@ pub fn run<F>(
     let _ = ready.send(Ok(()));
     mainloop.run();
     // A normal stop is not an end of capture to report.
+    drop(node_listener);
     drop(listener);
     if let Err(e) = stream.disconnect() {
         warn!("pw_stream_disconnect failed: {e}");
@@ -479,5 +530,15 @@ mod tests {
         .unwrap();
         mainloop.run();
         assert_eq!(*queued.borrow(), vec![0x20]);
+    }
+
+    #[test]
+    fn run_until_gives_up_after_timeout() {
+        pw::init();
+        let mainloop = MainLoopRc::new(None).unwrap();
+        let start = std::time::Instant::now();
+        assert!(!run_until(&mainloop, || false, Duration::from_millis(50)));
+        assert!(start.elapsed() >= Duration::from_millis(50));
+        assert!(run_until(&mainloop, || true, Duration::from_secs(60)));
     }
 }

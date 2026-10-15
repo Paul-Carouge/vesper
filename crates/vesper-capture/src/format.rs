@@ -26,10 +26,7 @@ pub fn spa_to_drm(format: VideoFormat) -> Option<u32> {
         VideoFormat::ARGB => fourcc(b"BA24"),
         VideoFormat::xBGR => fourcc(b"RX24"),
         VideoFormat::ABGR => fourcc(b"RA24"),
-        VideoFormat::xRGB_210LE => fourcc(b"XR30"),
-        VideoFormat::ARGB_210LE => fourcc(b"AR30"),
-        VideoFormat::xBGR_210LE => fourcc(b"XB30"),
-        VideoFormat::ABGR_210LE => fourcc(b"AB30"),
+        // No 10-bit 2:10:10:10 yet: the encoder's VPP path only takes 8-bit RGB.
         _ => return None,
     })
 }
@@ -260,12 +257,12 @@ mod tests {
 
     #[test]
     fn maps_common_formats_to_drm() {
-        // DRM_FORMAT_XRGB8888 = 0x34325258, ABGR2101010 = 0x30334241.
+        // DRM_FORMAT_XRGB8888 = 0x34325258.
         assert_eq!(spa_to_drm(VideoFormat::BGRx), Some(0x3432_5258));
         assert_eq!(spa_to_drm(VideoFormat::BGRA), Some(fourcc(b"AR24")));
         assert_eq!(spa_to_drm(VideoFormat::RGBx), Some(fourcc(b"XB24")));
         assert_eq!(spa_to_drm(VideoFormat::RGBA), Some(fourcc(b"AB24")));
-        assert_eq!(spa_to_drm(VideoFormat::ABGR_210LE), Some(0x3033_4241));
+        assert_eq!(spa_to_drm(VideoFormat::ABGR_210LE), None);
         assert_eq!(spa_to_drm(VideoFormat::NV12), None);
         assert_eq!(spa_to_drm(VideoFormat::RGB), None);
     }
