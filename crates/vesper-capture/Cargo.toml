@@ -4,4 +4,12 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+ashpd = { version = "0.13", default-features = false, features = ["async-io", "screencast"] }
+futures-lite = "2"
+libc = "0.2"
+pipewire = { version = "0.10", features = ["v0_3_33"] }
+tracing = "0.1"
 vesper-core.workspace = true
+
+[dev-dependencies]
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
