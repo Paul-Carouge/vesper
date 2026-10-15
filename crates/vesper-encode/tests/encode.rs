@@ -114,3 +114,32 @@ fn force_keyframe_makes_only_the_next_picture_a_keyframe() {
     let keys: Vec<usize> = (0..20).filter(|&i| packets[i].keyframe).collect();
     assert_eq!(keys, [0, 10, 15]);
 }
+
+#[test]
+fn scales_frames_of_other_sizes_to_the_encoder_size() {
+    if !Path::new("/dev/dri/renderD128").exists() {
+        eprintln!("no GPU, skipping");
+        return;
+    }
+    let (w, h) = (640, 360);
+    let mut enc = Encoder::new(Codec::Hevc, w, h, 30, RateControl::ConstantQp(30)).unwrap();
+    let ms = |t: u64| Duration::from_millis(1_000 + t * 33);
+    let mut packets = Vec::new();
+    let mut t = 0;
+    // Native, larger, smaller, another aspect, then native again. Each size
+    // is a new producer pool and generation, as after a game resize.
+    let sizes = [(640, 360), (1280, 720), (400, 300), (1920, 800), (640, 360)];
+    for (generation, (pw, ph)) in sizes.into_iter().enumerate() {
+        let producer = unsafe { Producer::new(pw, ph) };
+        for id in 0..3 {
+            let frame = unsafe { producer.frame(id, t as u32, generation as u32, ms(t)) };
+            packets.extend(enc.encode(frame).unwrap());
+            t += 1;
+        }
+        packets.extend(enc.repeat(ms(t)).unwrap());
+        t += 1;
+    }
+    packets.extend(enc.flush().unwrap());
+    let got: Vec<Duration> = packets.iter().map(|p| p.pts).collect();
+    assert_eq!(got, (0..t).map(ms).collect::<Vec<_>>());
+}

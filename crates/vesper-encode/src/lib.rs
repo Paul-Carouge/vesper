@@ -94,7 +94,9 @@ fn borrow_file(fd: RawFd) -> ManuallyDrop<File> {
 
 /// Hardware encoder for DMA-BUF frames.
 ///
-/// Uses the GPU at [`RENDER_NODE`]. Frames must have the encoder's size.
+/// Uses the GPU at [`RENDER_NODE`]. Frames of another size than the encoder's
+/// (a resized window or game) are scaled to it on the GPU, without keeping
+/// their aspect ratio.
 pub struct Encoder {
     width: u32,
     height: u32,
@@ -172,20 +174,43 @@ impl Encoder {
             let dev = (*e.device).data as *mut ff::AVHWDeviceContext;
             e.display = (*((*dev).hwctx as *mut ff::AVVAAPIDeviceContext)).display;
 
-            e.import_frames = not_null(ff::av_hwframe_ctx_alloc(e.device), "av_hwframe_ctx_alloc")?;
-            let fc = (*e.import_frames).data as *mut ff::AVHWFramesContext;
+            e.set_import_size(width, height)?;
+            e.build_graph()?;
+            e.open_encoder(codec, fps, rate)?;
+        }
+        Ok(e)
+    }
+
+    /// Makes `import_frames` describe `width`x`height` frames: DMA-BUFs are
+    /// imported at their own size. Surfaces already imported (and the filter
+    /// graph) keep a reference to the previous context.
+    unsafe fn set_import_size(&mut self, width: u32, height: u32) -> Result<(), Error> {
+        unsafe {
+            if !self.import_frames.is_null() {
+                let fc = &*((*self.import_frames).data as *const ff::AVHWFramesContext);
+                if (fc.width, fc.height) == (width as c_int, height as c_int) {
+                    return Ok(());
+                }
+            }
+            let mut frames = not_null(
+                ff::av_hwframe_ctx_alloc(self.device),
+                "av_hwframe_ctx_alloc",
+            )?;
+            let fc = (*frames).data as *mut ff::AVHWFramesContext;
             (*fc).format = ff::AVPixelFormat::AV_PIX_FMT_VAAPI;
             // Only describes the frames for VPP; imports take their real
             // format (XRGB/ARGB/...) from the DRM fourcc.
             (*fc).sw_format = ff::AVPixelFormat::AV_PIX_FMT_BGR0;
             (*fc).width = width as c_int;
             (*fc).height = height as c_int;
-            check(ff::av_hwframe_ctx_init(e.import_frames), "init VA frames")?;
-
-            e.build_graph()?;
-            e.open_encoder(codec, fps, rate)?;
+            if let Err(e) = check(ff::av_hwframe_ctx_init(frames), "init VA frames") {
+                ff::av_buffer_unref(&mut frames);
+                return Err(e);
+            }
+            ff::av_buffer_unref(&mut self.import_frames);
+            self.import_frames = frames;
         }
-        Ok(e)
+        Ok(())
     }
 
     unsafe fn build_graph(&mut self) -> Result<(), Error> {
@@ -334,7 +359,7 @@ impl Encoder {
     }
 
     /// Imports `frame`'s DMA-BUF as a VA surface (no copy).
-    unsafe fn import(&self, frame: &VideoFrame) -> Result<Frame, Error> {
+    unsafe fn import(&mut self, frame: &VideoFrame) -> Result<Frame, Error> {
         let n = frame.planes.len();
         if n == 0 || n > 4 {
             return Err(Error(format!("unsupported plane count {n}")));
@@ -356,6 +381,7 @@ impl Encoder {
             .map_err(|e| Error(format!("seek dmabuf: {e}")))? as usize;
 
         unsafe {
+            self.set_import_size(frame.width, frame.height)?;
             let src = Frame::new()?;
             let desc_buf = not_null(
                 ff::av_buffer_allocz(size_of::<ff::AVDRMFrameDescriptor>()),
@@ -397,13 +423,6 @@ impl Encoder {
     /// Encodes one frame. The RGB->NV12 GPU copy is complete when this
     /// returns, and `frame` is dropped (released to the producer) right after it.
     pub fn encode(&mut self, frame: VideoFrame) -> Result<Vec<EncodedPacket>, Error> {
-        if frame.width != self.width || frame.height != self.height {
-            // shortcut: no scaling of mismatched sizes; rebuild the encoder or add scale_vaapi w/h if capture resizes.
-            return Err(Error(format!(
-                "frame is {}x{}, encoder is {}x{}",
-                frame.width, frame.height, self.width, self.height
-            )));
-        }
         if self.generation != Some(frame.pool_generation) {
             self.imports.clear();
             self.generation = Some(frame.pool_generation);
@@ -423,7 +442,10 @@ impl Encoder {
                 ff::av_buffersrc_add_frame_flags(
                     self.src,
                     surface,
-                    ff::AV_BUFFERSRC_FLAG_KEEP_REF as c_int,
+                    // A frame of another size is scaled by VPP to the
+                    // encoder's size; skip buffersrc's per-frame warning.
+                    ff::AV_BUFFERSRC_FLAG_KEEP_REF as c_int
+                        | ff::AV_BUFFERSRC_FLAG_NO_CHECK_FORMAT as c_int,
                 ),
                 "feed VPP",
             )?;
@@ -560,7 +582,7 @@ mod tests {
     use vesper_core::{DmaBufPlane, ReleaseGuard};
 
     #[test]
-    fn rejects_frame_of_wrong_size_and_releases_it() {
+    fn rejects_a_bad_dmabuf_and_releases_it() {
         if !Path::new("/dev/dri/renderD128").exists() {
             eprintln!("no GPU, skipping");
             return;

@@ -4,14 +4,19 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
-use crate::{AppWindow, QualityPreset, VideoCodec};
+use crate::{AppWindow, QualityPreset, SourceKind, VideoCodec};
+
+/// Process names (`/proc/<pid>/comm`) the user allowed game capture for. Not
+/// UI state, so kept here for `Prefs::from_ui`.
+pub static ALLOWED_GAMES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 /// Choices offered by the UI; anything else in the file is ignored.
 const FPS: [i32; 4] = [30, 60, 120, 144];
 const REPLAY_SECONDS: [i32; 3] = [30, 60, 120];
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Prefs {
     pub codec: VideoCodec,
     pub quality: QualityPreset,
@@ -21,6 +26,9 @@ pub struct Prefs {
     pub desktop_muted: bool,
     pub mic_muted: bool,
     pub output_folder: String,
+    /// Record a game (Vulkan layer) instead of a portal source.
+    pub game_source: bool,
+    pub allowed_games: Vec<String>,
 }
 
 impl Prefs {
@@ -34,6 +42,8 @@ impl Prefs {
             desktop_muted: ui.get_desktop_muted(),
             mic_muted: ui.get_mic_muted(),
             output_folder: ui.get_output_folder().into(),
+            game_source: ui.get_source_kind() == SourceKind::Game,
+            allowed_games: ALLOWED_GAMES.lock().unwrap().clone(),
         }
     }
 
@@ -46,6 +56,13 @@ impl Prefs {
         ui.set_desktop_muted(self.desktop_muted);
         ui.set_mic_muted(self.mic_muted);
         ui.set_output_folder(self.output_folder.as_str().into());
+        if self.game_source {
+            ui.set_source_kind(SourceKind::Game);
+        }
+        ALLOWED_GAMES
+            .lock()
+            .unwrap()
+            .clone_from(&self.allowed_games);
     }
 
     /// `self` with the valid settings of `text` applied.
@@ -65,6 +82,12 @@ impl Prefs {
                 "mic_muted" => set(&mut self.mic_muted, flag(value)),
                 "output_folder" if Path::new(value).is_absolute() => {
                     self.output_folder = value.to_owned();
+                }
+                "game_source" => set(&mut self.game_source, flag(value)),
+                "allow_game"
+                    if valid_game(value) && !self.allowed_games.iter().any(|g| g == value) =>
+                {
+                    self.allowed_games.push(value.to_owned());
                 }
                 _ => {}
             }
@@ -94,6 +117,10 @@ impl Prefs {
         // A line break would split the line: keep the default folder instead.
         if self.output_folder != default_folder && !self.output_folder.contains(['\n', '\r']) {
             text += &format!("output_folder={}\n", self.output_folder);
+        }
+        text += &format!("game_source={}\n", self.game_source);
+        for game in self.allowed_games.iter().filter(|g| valid_game(g)) {
+            text += &format!("allow_game={game}\n");
         }
         text
     }
@@ -147,6 +174,11 @@ fn quality(value: &str) -> Option<QualityPreset> {
     }
 }
 
+/// A process name as the kernel reports it: 1 to 15 bytes, one line.
+pub fn valid_game(name: &str) -> bool {
+    (1..=15).contains(&name.len()) && !name.chars().any(char::is_control)
+}
+
 fn choice(value: &str, options: &[i32]) -> Option<i32> {
     value.trim().parse().ok().filter(|v| options.contains(v))
 }
@@ -188,6 +220,8 @@ mod tests {
             desktop_muted: false,
             mic_muted: false,
             output_folder: DEFAULT.into(),
+            game_source: false,
+            allowed_games: Vec::new(),
         }
     }
 
@@ -201,6 +235,8 @@ mod tests {
             desktop_muted: true,
             mic_muted: true,
             output_folder: "/mnt/clips/my folder = 2".into(),
+            game_source: true,
+            allowed_games: vec!["Game.exe".into(), "a=b c".into()],
         }
     }
 
@@ -214,6 +250,8 @@ mod tests {
             back,
             Prefs {
                 output_folder: changed().output_folder,
+                // Saved entries add to the list.
+                allowed_games: changed().allowed_games,
                 ..defaults()
             }
         );
@@ -245,6 +283,20 @@ mod tests {
                     desktop_muted=1\noutput_folder=relative/path\nnew_key=42\n\
                     garbage line\n=\n\u{0}\u{fffd}=x\n";
         assert_eq!(defaults().parse(text), defaults());
+    }
+
+    #[test]
+    fn bad_allowed_games_are_ignored() {
+        let text = "allow_game=\nallow_game=a_very_long_name.exe\nallow_game=ok\nallow_game=ok\n";
+        assert_eq!(defaults().parse(text).allowed_games, ["ok"]);
+        let prefs = Prefs {
+            allowed_games: vec!["x\ny".into(), "ok".into()],
+            ..defaults()
+        };
+        assert_eq!(
+            defaults().parse(&prefs.serialize(DEFAULT)).allowed_games,
+            ["ok"]
+        );
     }
 
     #[test]

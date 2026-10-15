@@ -6,7 +6,9 @@ import { Icon, Card, Button, IconButton, Switch, Segmented, Meter, SectionLabel,
 
 export { Theme }
 
-export enum SourceKind { none, screen, window }
+export enum SourceKind { none, screen, window, game }
+/// A game connected through the Vulkan layer that may be captured.
+export struct GameEntry { name: string, pid: int }
 export enum VideoCodec { av1, hevc, h264 }
 export enum QualityPreset { performance, balanced, quality }
 /// Recording lifecycle, owned by the backend. `starting` covers the portal
@@ -228,6 +230,14 @@ export component AppWindow inherits Window {
     in property <string> source-name;
     /// Extra detail shown under the source name, e.g. "2560 × 1440".
     in property <string> source-detail;
+    /// Game mode: other allowed games, to capture instead of the current one.
+    in property <[GameEntry]> other-games;
+    /// Process name of a game asking for consent; empty hides the prompt.
+    in property <string> pending-game;
+    /// The Vulkan layer is installed for this user.
+    in-out property <bool> game-layer-installed;
+    /// A layer built with this binary was found (it can be installed).
+    in property <bool> game-layer-available;
 
     // ---- Recording ----------------------------------------------------
     in property <RecState> rec-state: RecState.idle;
@@ -279,6 +289,11 @@ export component AppWindow inherits Window {
     callback mic-mute-changed(bool);
     callback output-settings-changed();
     callback pick-output-folder();
+    callback source-mode-changed(bool);
+    callback select-game(int);
+    callback allow-game();
+    callback ignore-game();
+    callback game-layer-changed(bool);
 
     property <string> codec-name: root.codec == VideoCodec.av1 ? "AV1" : root.codec == VideoCodec.hevc ? "HEVC" : "H.264";
     property <[int]> replay-options: [30, 60, 120];
@@ -288,6 +303,7 @@ export component AppWindow inherits Window {
     property <bool> busy: root.rec-state == RecState.starting || root.rec-state == RecState.stopping;
     // Anything but idle locks the source and output settings.
     property <bool> active: root.rec-state != RecState.idle;
+    property <bool> game: root.source-kind == SourceKind.game;
 
     title: "Vesper";
     preferred-width: 440px;
@@ -418,42 +434,144 @@ export component AppWindow inherits Window {
                     }
                 }
 
-                // ---- Source ------------------------------------------------
-                Card {
-                    HorizontalLayout {
+                // ---- Game consent ------------------------------------------
+                if root.pending-game != "": Card {
+                    border-color: Theme.accent;
+                    accessible-role: groupbox;
+                    accessible-label: "Allow Vesper to capture \{root.pending-game}?";
+                    VerticalLayout {
                         padding: Theme.space-md;
-                        padding-left: Theme.space-md;
-                        spacing: Theme.space-md;
-                        Rectangle {
-                            width: 40px;
-                            height: 40px;
-                            border-radius: Theme.radius-md;
-                            background: root.source-kind == SourceKind.none ? Theme.surface-raised : Theme.accent-soft;
-                            Icon {
-                                data: root.source-kind == SourceKind.window ? Icons.window : Icons.monitor;
-                                tint: root.source-kind == SourceKind.none ? Theme.text-muted : Theme.accent;
+                        spacing: Theme.space-sm;
+                        Text {
+                            text: "Allow Vesper to capture \{root.pending-game}?";
+                            font-size: Theme.font-body;
+                            font-weight: 600;
+                            color: Theme.text;
+                            wrap: word-wrap;
+                        }
+                        Text {
+                            text: "A Vulkan app asks to be recorded. Allow only games you recognize.";
+                            font-size: Theme.font-small;
+                            color: Theme.text-muted;
+                            wrap: word-wrap;
+                        }
+                        HorizontalLayout {
+                            alignment: end;
+                            spacing: Theme.space-sm;
+                            Button {
+                                text: "Ignore";
+                                kind: "ghost";
+                                accessible-label: "Ignore \{root.pending-game}";
+                                clicked => {
+                                    root.ignore-game();
+                                }
+                            }
+                            Button {
+                                text: "Allow";
+                                kind: "primary";
+                                accessible-label: "Allow capturing \{root.pending-game}";
+                                clicked => {
+                                    root.allow-game();
+                                }
                             }
                         }
-                        Labeled {
-                            horizontal-stretch: 1;
-                            title: root.source-kind == SourceKind.none ? "No source selected" : root.source-name;
-                            subtitle: root.source-kind == SourceKind.none
-                                ? "Pick a screen or a window to record"
-                                : root.source-detail != "" ? root.source-detail : root.source-kind == SourceKind.screen ? "Screen" : "Window";
-                            accessible-role: text;
-                            accessible-label: root.source-kind == SourceKind.none
-                                ? "No source selected"
-                                : (root.source-kind == SourceKind.screen ? "Screen: " : "Window: ") + root.source-name;
+                    }
+                }
+
+                // ---- Source ------------------------------------------------
+                Card {
+                    VerticalLayout {
+                        padding-bottom: Theme.space-md;
+                        spacing: Theme.space-sm;
+                        HorizontalLayout {
+                            padding: Theme.space-md;
+                            padding-bottom: 0px;
+                            padding-left: Theme.space-md;
+                            spacing: Theme.space-md;
+                            Rectangle {
+                                width: 40px;
+                                height: 40px;
+                                border-radius: Theme.radius-md;
+                                background: root.source-kind == SourceKind.none ? Theme.surface-raised : Theme.accent-soft;
+                                Icon {
+                                    data: root.game ? Icons.gamepad : root.source-kind == SourceKind.window ? Icons.window : Icons.monitor;
+                                    tint: root.source-kind == SourceKind.none ? Theme.text-muted : Theme.accent;
+                                }
+                            }
+                            Labeled {
+                                horizontal-stretch: 1;
+                                title: root.game
+                                    ? (root.source-name != "" ? root.source-name : "Waiting for a game…")
+                                    : root.source-kind == SourceKind.none ? "No source selected" : root.source-name;
+                                subtitle: root.game
+                                    ? (root.source-name != ""
+                                        ? "Game" + (root.source-detail != "" ? " · " + root.source-detail : "")
+                                        : root.game-layer-installed || root.pending-game != "" ? "Start a Vulkan game" : "Turn on game capture in settings")
+                                    : root.source-kind == SourceKind.none
+                                        ? "Pick a screen or a window to record"
+                                        : root.source-detail != "" ? root.source-detail : root.source-kind == SourceKind.screen ? "Screen" : "Window";
+                                accessible-role: text;
+                                accessible-label: root.game
+                                    ? (root.source-name != "" ? "Game: " + root.source-name : "Waiting for a game")
+                                    : root.source-kind == SourceKind.none
+                                        ? "No source selected"
+                                        : (root.source-kind == SourceKind.screen ? "Screen: " : "Window: ") + root.source-name;
+                            }
+                            if !root.game: VerticalLayout {
+                                alignment: center;
+                                Button {
+                                    text: root.source-kind == SourceKind.none ? "Choose" : "Change";
+                                    kind: root.source-kind == SourceKind.none ? "primary" : "secondary";
+                                    enabled: !root.active && !root.settings-open;
+                                    accessible-label: "Choose source";
+                                    clicked => {
+                                        root.pick-source();
+                                    }
+                                }
+                            }
                         }
-                        VerticalLayout {
-                            alignment: center;
-                            Button {
-                                text: root.source-kind == SourceKind.none ? "Choose" : "Change";
-                                kind: root.source-kind == SourceKind.none ? "primary" : "secondary";
+                        HorizontalLayout {
+                            padding-left: Theme.space-md;
+                            padding-right: Theme.space-md;
+                            Segmented {
+                                horizontal-stretch: 1;
+                                label: "Source type";
                                 enabled: !root.active && !root.settings-open;
-                                accessible-label: "Choose source";
-                                clicked => {
-                                    root.pick-source();
+                                options: ["Screen or window", "Game"];
+                                selected: root.game ? 1 : 0;
+                                changed(i) => {
+                                    root.source-mode-changed(i == 1);
+                                }
+                            }
+                        }
+                        if root.game && root.other-games.length > 0: VerticalLayout {
+                            padding-left: Theme.space-md;
+                            padding-right: Theme.space-md;
+                            spacing: Theme.space-xs;
+                            Text {
+                                text: "Also running";
+                                font-size: Theme.font-caption;
+                                font-weight: 600;
+                                color: Theme.text-muted;
+                            }
+                            for g in root.other-games: HorizontalLayout {
+                                spacing: Theme.space-sm;
+                                Text {
+                                    horizontal-stretch: 1;
+                                    text: g.name;
+                                    vertical-alignment: center;
+                                    font-size: Theme.font-small;
+                                    color: Theme.text;
+                                    overflow: elide;
+                                }
+                                Button {
+                                    text: "Capture";
+                                    kind: "ghost";
+                                    enabled: !root.settings-open;
+                                    accessible-label: "Capture \{g.name}";
+                                    clicked => {
+                                        root.select-game(g.pid);
+                                    }
                                 }
                             }
                         }
@@ -492,7 +610,7 @@ export component AppWindow inherits Window {
                                     }
                                 }
                                 Text {
-                                    text: root.rec-state == RecState.starting ? "Starting" : root.rec-state == RecState.stopping ? "Saving" : root.recording ? "REC" : root.source-kind == SourceKind.none ? "No source" : "Ready";
+                                    text: root.rec-state == RecState.starting ? "Starting" : root.rec-state == RecState.stopping ? "Saving" : root.recording ? "REC" : root.source-kind == SourceKind.none || (root.game && root.source-name == "") ? "No source" : "Ready";
                                     vertical-alignment: center;
                                     font-size: Theme.font-caption;
                                     font-weight: 700;
@@ -770,6 +888,30 @@ export component AppWindow inherits Window {
                         changed(i) => {
                             root.fps = root.fps-options[i];
                             root.output-settings-changed();
+                        }
+                    }
+                }
+
+                SettingGroup {
+                    label: "GAME CAPTURE";
+                    hint: "Records Vulkan games (Proton included) at their own frame rate, without the screen picker. Installs a small layer that loads into your Vulkan apps and stays idle until Vesper captures a game you allowed. Some anti-cheats may reject it: launch those games with VESPER_CAPTURE_DISABLE=1.";
+                    HorizontalLayout {
+                        spacing: Theme.space-md;
+                        Labeled {
+                            horizontal-stretch: 1;
+                            title: "Game capture (Vulkan layer)";
+                            subtitle: root.game-layer-installed ? "Installed for this user" : root.game-layer-available ? "Not installed" : "Layer not found next to Vesper";
+                        }
+                        VerticalLayout {
+                            alignment: center;
+                            Switch {
+                                label: "Game capture (Vulkan layer)";
+                                enabled: root.game-layer-installed || root.game-layer-available;
+                                checked: root.game-layer-installed;
+                                toggled(on) => {
+                                    root.game-layer-changed(on);
+                                }
+                            }
                         }
                     }
                 }

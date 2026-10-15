@@ -11,6 +11,8 @@ macro_rules! log {
 
 #[cfg(debug_assertions)]
 mod dev;
+mod game;
+mod layer;
 mod meter;
 mod prefs;
 mod recorder;
@@ -25,6 +27,7 @@ use std::time::Duration;
 use slint::ComponentHandle;
 use vesper_audio::Source;
 
+use game::GameSource;
 use meter::MeterState;
 use prefs::Prefs;
 use recorder::{Event, Pipeline, Settings};
@@ -33,12 +36,18 @@ use shortcuts::Action;
 /// The last started pipeline; it may have ended since.
 type Shared = Rc<RefCell<Option<Pipeline>>>;
 
+/// The game capture server, while the Game source is selected.
+type Games = Rc<RefCell<Option<GameSource>>>;
+
 /// Generation of the last started pipeline: a late `Stopped` from an older
 /// one must not reset the UI of the current one.
 static GENERATION: AtomicU64 = AtomicU64::new(0);
 
 /// Meter refresh period: ~30 Hz.
 const METER_TICK: Duration = Duration::from_millis(33);
+
+/// How often the game list and consent prompt are refreshed.
+const GAMES_TICK: Duration = Duration::from_millis(500);
 
 slint::include_modules!();
 
@@ -52,6 +61,11 @@ fn main() -> Result<(), slint::PlatformError> {
     #[cfg(debug_assertions)]
     if let Some(seconds) = dev::record_seconds() {
         dev::record(seconds, default_settings());
+        return Ok(());
+    }
+    #[cfg(debug_assertions)]
+    if let Some(seconds) = dev::record_game_seconds() {
+        dev::record_game(seconds, default_settings());
         return Ok(());
     }
     #[cfg(debug_assertions)]
@@ -79,20 +93,36 @@ fn main() -> Result<(), slint::PlatformError> {
     ui.set_replay_enabled(true);
     Prefs::load(Prefs::from_ui(&ui)).apply(&ui);
     update_replay_memory(&ui);
-    if recorder::load_restore_token().is_some() {
-        ui.set_source_kind(SourceKind::Screen);
-        ui.set_source_name("Last picked source".into());
-    }
+    show_layer_state(&ui);
 
     let recording = Shared::default();
-    wire_callbacks(&ui, &recording);
+    let games = Games::default();
+    set_source_mode(&ui, &games, ui.get_source_kind() == SourceKind::Game);
+    wire_callbacks(&ui, &recording, &games);
+    wire_game_callbacks(&ui, &games);
     wire_global_shortcuts(&ui);
     // The replay buffer runs from launch (may open the picker once).
     if ui.get_replay_enabled()
-        && let Err(e) = start_pipeline(&ui, &recording, None)
+        && let Err(e) = start_pipeline(&ui, &recording, &games, None)
     {
         flash_notice(&ui, &e);
     }
+
+    let games_tick = slint::Timer::default();
+    let weak = ui.as_weak();
+    let g = games.clone();
+    games_tick.start(slint::TimerMode::Repeated, GAMES_TICK, move || {
+        let Some(ui) = weak.upgrade() else { return };
+        let alive = g
+            .borrow_mut()
+            .as_mut()
+            .is_none_or(|games| games.refresh(&ui));
+        if !alive {
+            // A pipeline using the dead server reports its own error.
+            log!("game capture stopped: restarting it");
+            set_source_mode(&ui, &g, true);
+        }
+    });
 
     let tick = slint::Timer::default();
     let weak = ui.as_weak();
@@ -133,7 +163,7 @@ fn main() -> Result<(), slint::PlatformError> {
 /// `idle -> starting -> recording -> stopping -> idle`, or `starting -> idle`
 /// when the picker is cancelled or the pipeline fails to start; the UI ignores
 /// record intents while it is `starting` or `stopping`.
-fn wire_callbacks(ui: &AppWindow, recording: &Shared) {
+fn wire_callbacks(ui: &AppWindow, recording: &Shared, games: &Games) {
     let weak = ui.as_weak();
     ui.on_pick_source(move || {
         let Some(ui) = weak.upgrade() else { return };
@@ -148,6 +178,7 @@ fn wire_callbacks(ui: &AppWindow, recording: &Shared) {
 
     let weak = ui.as_weak();
     let rec = recording.clone();
+    let g = games.clone();
     ui.on_start_recording(move || {
         let Some(ui) = weak.upgrade() else { return };
         if ui.get_rec_state() != RecState::Idle {
@@ -155,6 +186,12 @@ fn wire_callbacks(ui: &AppWindow, recording: &Shared) {
         }
         if ui.get_output_folder().is_empty() {
             flash_notice(&ui, "Choose an output folder first");
+            return;
+        }
+        if ui.get_source_kind() == SourceKind::Game
+            && !g.borrow().as_ref().is_some_and(GameSource::capturing)
+        {
+            flash_notice(&ui, "No game to record yet");
             return;
         }
         let folder = PathBuf::from(ui.get_output_folder().as_str());
@@ -165,7 +202,7 @@ fn wire_callbacks(ui: &AppWindow, recording: &Shared) {
             .borrow()
             .as_ref()
             .is_some_and(|p| p.record(folder.clone()));
-        if !joined && let Err(e) = start_pipeline(&ui, &rec, Some(folder)) {
+        if !joined && let Err(e) = start_pipeline(&ui, &rec, &g, Some(folder)) {
             ui.set_rec_state(RecState::Idle);
             flash_notice(&ui, &e);
         }
@@ -204,6 +241,7 @@ fn wire_callbacks(ui: &AppWindow, recording: &Shared) {
 
     let weak = ui.as_weak();
     let rec = recording.clone();
+    let g = games.clone();
     ui.on_replay_changed(move |enabled, seconds| {
         let Some(ui) = weak.upgrade() else { return };
         log!("replay-changed: enabled={enabled} seconds={seconds}");
@@ -215,7 +253,7 @@ fn wire_callbacks(ui: &AppWindow, recording: &Shared) {
             .is_some_and(|p| p.set_replay(replay_span(&ui)));
         if !applied
             && enabled
-            && let Err(e) = start_pipeline(&ui, &rec, None)
+            && let Err(e) = start_pipeline(&ui, &rec, &g, None)
         {
             ui.set_replay_enabled(false);
             flash_notice(&ui, &e);
@@ -261,6 +299,134 @@ fn wire_callbacks(ui: &AppWindow, recording: &Shared) {
     ui.on_pick_output_folder(|| {
         log!("pick-output-folder: would open the FileChooser portal");
     });
+
+    // Another source type needs another pipeline: end the replay buffer's,
+    // and start one on the new source.
+    let weak = ui.as_weak();
+    let rec = recording.clone();
+    let g = games.clone();
+    ui.on_source_mode_changed(move |game| {
+        let Some(ui) = weak.upgrade() else { return };
+        if ui.get_rec_state() != RecState::Idle {
+            return;
+        }
+        log!("source-mode-changed: game={game}");
+        if let Some(p) = rec.borrow_mut().take() {
+            p.set_replay(None);
+        }
+        set_source_mode(&ui, &g, game);
+        Prefs::from_ui(&ui).save();
+        if ui.get_replay_enabled()
+            && let Err(e) = start_pipeline(&ui, &rec, &g, None)
+        {
+            flash_notice(&ui, &e);
+        }
+    });
+}
+
+/// Consent prompt, game picker and the layer toggle.
+fn wire_game_callbacks(ui: &AppWindow, games: &Games) {
+    let weak = ui.as_weak();
+    let g = games.clone();
+    ui.on_allow_game(move || {
+        let Some(ui) = weak.upgrade() else { return };
+        let exe = ui.get_pending_game();
+        log!("allow-game: {exe}");
+        if let Some(games) = g.borrow().as_ref()
+            && games.allow(&exe)
+        {
+            Prefs::from_ui(&ui).save();
+        }
+        ui.set_pending_game("".into());
+    });
+
+    let weak = ui.as_weak();
+    let g = games.clone();
+    ui.on_ignore_game(move || {
+        let Some(ui) = weak.upgrade() else { return };
+        if let Some(games) = g.borrow_mut().as_mut() {
+            games.ignore(&ui.get_pending_game());
+        }
+        ui.set_pending_game("".into());
+    });
+
+    let g = games.clone();
+    ui.on_select_game(move |pid| {
+        if let (Some(games), Ok(pid)) = (g.borrow_mut().as_mut(), u32::try_from(pid)) {
+            games.select(pid);
+        }
+    });
+
+    let weak = ui.as_weak();
+    ui.on_game_layer_changed(move |on| {
+        let Some(ui) = weak.upgrade() else { return };
+        log!("game-layer-changed: {on}");
+        let result = match (layer::data_home(), on) {
+            (None, _) => Err("No data folder (HOME is not set)".to_owned()),
+            (Some(data), true) => match layer::shipped() {
+                Some(lib) => layer::install(&data, &lib).map_err(|e| e.to_string()),
+                None => Err("The layer was not built with Vesper".to_owned()),
+            },
+            (Some(data), false) => layer::uninstall(&data).map_err(|e| e.to_string()),
+        };
+        match result {
+            Ok(()) if on => flash_notice(&ui, "Game capture installed"),
+            Ok(()) => flash_notice(&ui, "Game capture removed"),
+            Err(e) => {
+                log!("game capture layer: {e}");
+                flash_notice(&ui, &format!("Could not change game capture: {e}"));
+            }
+        }
+        show_layer_state(&ui);
+    });
+}
+
+/// Shows whether the layer is installed. An installed layer older than the
+/// one built with this binary is updated (the user opted in already).
+fn show_layer_state(ui: &AppWindow) {
+    let lib = layer::shipped();
+    ui.set_game_layer_available(lib.is_some());
+    let Some(data) = layer::data_home() else {
+        ui.set_game_layer_installed(false);
+        return;
+    };
+    let installed = layer::installed(&data);
+    if installed
+        && let Some(lib) = lib
+        && layer::outdated(&data, &lib)
+    {
+        log!("updating the game capture layer from {}", lib.display());
+        if let Err(e) = layer::install(&data, &lib) {
+            log!("could not update the game capture layer: {e}");
+        }
+    }
+    ui.set_game_layer_installed(installed);
+}
+
+/// Switches between the portal source and game capture. The game capture
+/// server only runs in game mode.
+fn set_source_mode(ui: &AppWindow, games: &Games, game: bool) {
+    game::clear(ui);
+    if game {
+        match GameSource::start() {
+            Ok(source) => {
+                *games.borrow_mut() = Some(source);
+                ui.set_source_kind(SourceKind::Game);
+                return;
+            }
+            Err(e) => {
+                log!("{e}");
+                flash_notice(ui, &e);
+            }
+        }
+    }
+    *games.borrow_mut() = None;
+    if recorder::load_restore_token().is_some() {
+        ui.set_source_kind(SourceKind::Screen);
+        ui.set_source_name("Last picked source".into());
+    } else {
+        ui.set_source_kind(SourceKind::None);
+    }
 }
 
 /// Global shortcuts take the same path as the in-window ones, minus the
@@ -297,8 +463,9 @@ fn wire_global_shortcuts(ui: &AppWindow) {
 }
 
 /// Encoder settings from the UI.
-fn settings(ui: &AppWindow) -> Settings {
+fn settings(ui: &AppWindow, games: &Games) -> Settings {
     Settings {
+        game: games.borrow().as_ref().map(|g| g.frames.clone()),
         codec: ui.get_codec().into(),
         fps: ui.get_fps().max(1) as u32,
         bits_per_pixel: bits_per_pixel(ui.get_codec(), ui.get_quality()),
@@ -316,8 +483,13 @@ fn replay_span(ui: &AppWindow) -> Option<Duration> {
 /// Starts a pipeline with the UI's settings and replay buffer, recording into
 /// `record` if set. It replaces the previous, ended one: that thread ends on
 /// its own.
-fn start_pipeline(ui: &AppWindow, shared: &Shared, record: Option<PathBuf>) -> Result<(), String> {
-    let settings = settings(ui);
+fn start_pipeline(
+    ui: &AppWindow,
+    shared: &Shared,
+    games: &Games,
+    record: Option<PathBuf>,
+) -> Result<(), String> {
+    let settings = settings(ui, games);
     log!("start-pipeline: {settings:?}");
     let weak = ui.as_weak();
     let generation = GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
@@ -356,7 +528,10 @@ fn on_recorder_event(ui: &AppWindow, generation: u64, event: Event) {
             ui.set_measured_fps(fps);
             ui.set_dropped_frames(dropped.min(i32::MAX as u64) as i32);
             ui.set_resolution(format!("{width}×{height}").into());
-            ui.set_source_detail(format!("{width} × {height}").into());
+            // Game mode shows the game's own size (the file keeps its first one).
+            if ui.get_source_kind() != SourceKind::Game {
+                ui.set_source_detail(format!("{width} × {height}").into());
+            }
         }
         Event::Finished(result) => {
             ui.set_rec_state(RecState::Idle);
@@ -439,6 +614,7 @@ fn default_settings() -> Settings {
         bits_per_pixel: bits_per_pixel(VideoCodec::Hevc, QualityPreset::Balanced),
         desktop_muted: false,
         mic_muted: false,
+        game: None,
     }
 }
 
