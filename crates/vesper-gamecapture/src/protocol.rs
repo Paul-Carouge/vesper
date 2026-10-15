@@ -9,7 +9,8 @@
 //! Flow: the layer connects and sends `Hello`, then `Swapchain` whenever its
 //! capturable swapchain changes (0x0 when it has none). The server answers
 //! `Start` to the game it wants; that layer then sends `Buffer` for each
-//! image of its export ring and a `Frame` per present. The server sends
+//! image of its export ring and a `Frame` per copied present (paced to the
+//! `Start`'s recording rate, see [`Pacer`]). The server sends
 //! `Release` when it is done with a buffer, and `Stop` to make the layer
 //! dormant again.
 
@@ -21,7 +22,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 /// Bumped on any incompatible change. Peers with another version are ignored.
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 
 /// Largest encoded message. Every message is far smaller.
 pub const MAX_MSG: usize = 1024;
@@ -50,8 +51,10 @@ pub enum Msg {
     /// Layer to server: size of the swapchain it would capture, 0x0 if none.
     Swapchain { width: u32, height: u32 },
     /// Server to layer: start capturing. `modifiers` lists the DRM modifiers
-    /// the server can import, in preference order; empty means any.
-    Start { modifiers: Vec<u64> },
+    /// the server can import, in preference order; empty means any. `fps` is
+    /// the recording rate the layer paces its copies to; 0 copies every
+    /// present.
+    Start { modifiers: Vec<u64>, fps: u32 },
     /// Server to layer: stop capturing and free the export ring.
     Stop,
     /// Layer to server, with the image's dma-buf fd: one image of the ring.
@@ -132,9 +135,10 @@ impl Msg {
                 u32(&mut b, *width);
                 u32(&mut b, *height);
             }
-            Msg::Start { modifiers } => {
+            Msg::Start { modifiers, fps } => {
                 let modifiers = &modifiers[..modifiers.len().min(MAX_MODIFIERS)];
                 u32(&mut b, START);
+                u32(&mut b, *fps);
                 u32(&mut b, modifiers.len() as u32);
                 for m in modifiers {
                     b.extend_from_slice(&m.to_le_bytes());
@@ -197,9 +201,10 @@ impl Msg {
                 height: r.u32()?,
             },
             START => {
+                let fps = r.u32()?;
                 let n = r.len(MAX_MODIFIERS)?;
                 let modifiers = (0..n).map(|_| r.u64()).collect::<io::Result<_>>()?;
-                Msg::Start { modifiers }
+                Msg::Start { modifiers, fps }
             }
             STOP => Msg::Stop,
             BUFFER => {
@@ -243,6 +248,92 @@ impl Msg {
             return Err(invalid("trailing bytes"));
         }
         Ok(msg)
+    }
+}
+
+/// Recording tick `n` at `fps`: `n / fps` s of `CLOCK_MONOTONIC`, in ns. The
+/// recorder ticks on this grid and the layer paces its copies to it, so both
+/// agree on which frame serves which tick.
+pub fn tick_ns(n: u64, fps: u32) -> u64 {
+    (u128::from(n) * 1_000_000_000 / u128::from(fps.max(1))) as u64
+}
+
+/// Index of the last tick at or before `ns`.
+pub fn tick_at(ns: u64, fps: u32) -> u64 {
+    // Largest n with n * 1e9 < (ns + 1) * fps: undoes `tick_ns`'s rounding.
+    let fps = u128::from(fps.max(1));
+    (((u128::from(ns) + 1) * fps - 1) / 1_000_000_000) as u64
+}
+
+/// Decides which presents the layer copies when recording at `fps`: about
+/// one per recording tick, the newest that still reaches the recorder before
+/// its tick. A game too close to the recording rate for that to be safe has
+/// every frame copied, as without pacing.
+#[derive(Debug, Clone)]
+pub struct Pacer {
+    fps: u32,
+    /// Next tick to serve.
+    next: u64,
+    last_present: u64,
+    /// Smoothed time between presents.
+    interval: u64,
+    /// Time from a present to its copy being done on the GPU (rises at once,
+    /// decays slowly).
+    latency: u64,
+}
+
+impl Pacer {
+    /// `fps` 0 copies every present.
+    pub fn new(fps: u32) -> Self {
+        Self {
+            fps,
+            next: 0,
+            last_present: 0,
+            interval: 0,
+            latency: 0,
+        }
+    }
+
+    /// Whether to copy the frame presented at `now_ns` (`CLOCK_MONOTONIC`).
+    /// Call once per present; call [`Pacer::copied`] once it was sent.
+    pub fn due(&mut self, now_ns: u64) -> bool {
+        if self.last_present != 0 {
+            let dt = now_ns.saturating_sub(self.last_present);
+            self.interval = if self.interval == 0 {
+                dt
+            } else {
+                (self.interval * 7 + dt) / 8
+            };
+        }
+        self.last_present = now_ns;
+        if self.fps == 0 {
+            return true;
+        }
+        let period = tick_ns(1, self.fps);
+        // Copy the first present in a window ending `lead` before the next
+        // tick (time for the copy and its delivery: `latency` is seen at the
+        // next present, so it overestimates) and wide enough to hold a
+        // present despite jitter. It must not reach back to the previous
+        // tick, or the copy would serve that one: a game too slow for such a
+        // window gets every frame copied.
+        let lead = self.latency.max(period / 4);
+        let window = (self.interval + self.interval / 8).max(period / 8);
+        if lead + window > period {
+            return true;
+        }
+        now_ns + lead + window >= tick_ns(self.next, self.fps)
+    }
+
+    /// The frame presented at `now_ns` was copied and sent.
+    pub fn copied(&mut self, now_ns: u64) {
+        // It serves the first tick after `now_ns` (the copy is done by then,
+        // see `due`), so the next copy serves the one after.
+        self.next = tick_at(now_ns, self.fps) + 2;
+    }
+
+    /// A copy was seen done `ns` after its present.
+    pub fn latency(&mut self, ns: u64) {
+        self.latency = ns.max((self.latency * 15 + ns) / 16);
     }
 }
 
@@ -377,8 +468,9 @@ pub fn recv(sock: BorrowedFd, nonblock: bool) -> io::Result<Option<(Msg, Option<
     if n < 0 {
         return Err(io::Error::last_os_error());
     }
-    // Take ownership of every received fd first so none leaks on error.
-    let mut fds = Vec::new();
+    // Take ownership of every received fd first so none leaks on error;
+    // extra ones close right away.
+    let mut first = None;
     unsafe {
         let mut c = libc::CMSG_FIRSTHDR(&hdr);
         while !c.is_null() {
@@ -387,7 +479,8 @@ pub fn recv(sock: BorrowedFd, nonblock: bool) -> io::Result<Option<(Msg, Option<
                 let count =
                     ((*c).cmsg_len as usize - libc::CMSG_LEN(0) as usize) / size_of::<RawFd>();
                 for i in 0..count {
-                    fds.push(OwnedFd::from_raw_fd(data.add(i).read_unaligned()));
+                    let fd = OwnedFd::from_raw_fd(data.add(i).read_unaligned());
+                    first.get_or_insert(fd);
                 }
             }
             c = libc::CMSG_NXTHDR(&hdr, c);
@@ -400,7 +493,7 @@ pub fn recv(sock: BorrowedFd, nonblock: bool) -> io::Result<Option<(Msg, Option<
         return Err(invalid("message too long"));
     }
     let msg = Msg::decode(&buf[..n as usize])?;
-    Ok(Some((msg, fds.into_iter().next())))
+    Ok(Some((msg, first)))
 }
 
 /// Credentials of the peer of a connected Unix socket.
@@ -462,10 +555,26 @@ pub fn is_dmabuf(fd: BorrowedFd) -> bool {
     }
 }
 
-/// Whether `fd` is a sync_file (an anonymous inode named `sync_file`).
+/// Whether `fd` is a sync_file: only those answer `SYNC_IOC_FILE_INFO`.
+/// One ioctl, where reading its `/proc/self/fd` link costs a path walk and
+/// allocations on every frame.
 pub fn is_sync_file(fd: BorrowedFd) -> bool {
-    std::fs::read_link(format!("/proc/self/fd/{}", fd.as_raw_fd()))
-        .is_ok_and(|p| p.as_os_str().as_bytes() == b"anon_inode:sync_file")
+    /// `struct sync_file_info` from `linux/sync_file.h`.
+    #[repr(C)]
+    struct SyncFileInfo {
+        name: [u8; 32],
+        status: i32,
+        flags: u32,
+        num_fences: u32,
+        pad: u32,
+        sync_fence_info: u64,
+    }
+    /// `_IOWR('>', 4, struct sync_file_info)`.
+    const SYNC_IOC_FILE_INFO: libc::c_ulong =
+        (3 << 30) | ((size_of::<SyncFileInfo>() as libc::c_ulong) << 16) | (0x3e << 8) | 4;
+    // num_fences 0: the kernel fills in the name and status only.
+    let mut info: SyncFileInfo = unsafe { zeroed() };
+    unsafe { libc::ioctl(fd.as_raw_fd(), SYNC_IOC_FILE_INFO as _, &raw mut info) == 0 }
 }
 
 /// Creates `dir` with mode 0700 if missing, then checks it is a real
@@ -517,6 +626,7 @@ mod tests {
             },
             Msg::Start {
                 modifiers: vec![0, 0x0200_0000_0000_1234],
+                fps: 60,
             },
             Msg::Stop,
             Msg::Buffer {
@@ -585,6 +695,7 @@ mod tests {
         }
         assert!(Msg::decode(&99u32.to_le_bytes()).is_err());
         let mut many = START.to_le_bytes().to_vec();
+        many.extend_from_slice(&60u32.to_le_bytes());
         many.extend_from_slice(&1000u32.to_le_bytes());
         assert!(Msg::decode(&many).is_err());
         let mut no_planes = Msg::Buffer {
@@ -603,6 +714,120 @@ mod tests {
         no_planes.truncate(no_planes.len() - 12);
         no_planes.extend_from_slice(&0u32.to_le_bytes());
         assert!(Msg::decode(&no_planes).is_err());
+    }
+
+    /// Presents at `game` fps (each up to `jitter` ns early or late) for 10 s,
+    /// paced to `pacer_fps`; each copy is done and reaches the recorder `lat`
+    /// ns later (seen done by the layer at the next present), and the
+    /// recorder ticks at `fps`. Returns (copies, ticks, ticks without a new
+    /// frame), after the first second.
+    fn pace(pacer_fps: u32, game: f64, jitter: u64, lat: u64, fps: u32, phase: u64) -> [u64; 3] {
+        let mut pacer = Pacer::new(pacer_fps);
+        let start = 1_000_000_000_000 + phase;
+        let end = start + 10_000_000_000;
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut arrivals = Vec::new();
+        let mut in_flight = None;
+        for j in 0.. {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let t =
+                start + (j as f64 * 1e9 / game) as u64 + (seed >> 33) % (2 * jitter + 1) - jitter;
+            if t > end {
+                break;
+            }
+            if let Some(copy) = in_flight
+                && t >= copy + lat
+            {
+                pacer.latency(t - copy);
+                in_flight = None;
+            }
+            if pacer.due(t) {
+                pacer.copied(t);
+                arrivals.push(t + lat);
+                in_flight.get_or_insert(t);
+            }
+        }
+        let (first, last) = (tick_at(start + 1_000_000_000, fps), tick_at(end, fps));
+        let (mut copies, mut repeats, mut a) = (0, 0, 0);
+        while arrivals[a] <= tick_ns(first, fps) {
+            a += 1;
+        }
+        for n in first + 1..=last {
+            let from = a;
+            while a < arrivals.len() && arrivals[a] <= tick_ns(n, fps) {
+                a += 1;
+            }
+            copies += (a - from) as u64;
+            repeats += u64::from(a == from);
+        }
+        [copies, last - first, repeats]
+    }
+
+    #[test]
+    fn tick_grid_round_trips() {
+        for fps in [30, 60, 144, 240] {
+            for n in [0, 1, 7, 1_000_003, 50_000_000_000] {
+                assert_eq!(tick_at(tick_ns(n, fps), fps), n, "{n} at {fps}");
+                assert_eq!(tick_at(tick_ns(n + 1, fps) - 1, fps), n);
+            }
+        }
+    }
+
+    #[test]
+    fn pacing_copies_one_frame_per_tick_without_repeats() {
+        // (game fps, jitter ms, recording fps)
+        let cases = [
+            (60.0, 0.5, 60),
+            (60.0, 2.0, 60),
+            (57.0, 0.5, 60),
+            (62.0, 0.5, 60),
+            (70.0, 0.5, 60),
+            (90.0, 0.5, 60),
+            (120.0, 0.5, 60),
+            (144.0, 0.0, 60),
+            (144.0, 1.0, 60),
+            (240.0, 0.3, 60),
+            (1685.0, 0.1, 60),
+            (60.0, 0.5, 30),
+            (144.0, 0.3, 144),
+            (140.0, 0.3, 144),
+            (200.0, 0.3, 144),
+            (240.0, 0.3, 144),
+            (500.0, 0.1, 144),
+        ];
+        for (game, jitter, fps) in cases {
+            let jitter = (jitter * 1e6) as u64;
+            for lat in [500_000, 1_000_000, 2_000_000, 5_000_000, 10_000_000] {
+                for phase in 0..16 {
+                    let phase = phase * 1_000_000_000 / 16 / u64::from(fps);
+                    let [all, ticks, all_repeats] = pace(0, game, jitter, lat, fps, phase);
+                    let [copies, _, repeats] = pace(fps, game, jitter, lat, fps, phase);
+                    let case =
+                        format!("game {game} jitter {jitter} lat {lat} rec {fps} phase {phase}");
+                    // Never more repeats than copying every present.
+                    assert!(
+                        repeats <= all_repeats,
+                        "{case}: {repeats} > {all_repeats} repeats"
+                    );
+                    if game <= f64::from(fps) {
+                        // At or below the recording rate every frame is copied.
+                        assert_eq!(copies, all, "{case}");
+                    } else if game > f64::from(fps) * 2.3 && lat < tick_ns(1, fps) / 4 {
+                        // Well above it, with a short copy: about one copy
+                        // per tick. Closer, or a slow copy, copies more.
+                        assert!(
+                            copies <= ticks + ticks / 50,
+                            "{case}: {copies} copies, {ticks} ticks"
+                        );
+                    }
+                }
+            }
+        }
+        // 0 fps: every present.
+        let mut p = Pacer::new(0);
+        assert!((0..100).all(|i| p.due(1_000 + i)));
     }
 
     #[test]

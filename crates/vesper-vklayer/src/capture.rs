@@ -5,6 +5,8 @@
 //! image into a free ring image, and signals two semaphores: one the present
 //! waits on instead of the app's, one exported as a sync_file for Vesper.
 //! No ring image free (Vesper is slow): the frame is skipped, never waited.
+//! Copies are paced to the recording rate (`protocol::Pacer`): a game faster
+//! than the recording only has about one frame per recorded frame copied.
 
 use std::ffi::{CStr, c_void};
 use std::os::fd::{AsFd, FromRawFd, OwnedFd};
@@ -111,6 +113,9 @@ struct Ring {
     pool: vk::CommandPool,
     blit: bool,
     slots: Vec<Slot>,
+    pacer: protocol::Pacer,
+    /// Oldest copy not yet seen done: (slot, present time), for the pacer.
+    timing: Option<(usize, u64)>,
 }
 
 struct Swapchain {
@@ -433,6 +438,16 @@ impl Device {
             }
         }
         let ring = sc.ring.as_mut().expect("created above");
+        let now = now_ns();
+        if let Some((i, at)) = ring.timing
+            && unsafe { self.fns.get_fence_status(ring.slots[i].fence) } == Ok(true)
+        {
+            ring.pacer.latency(now - at);
+            ring.timing = None;
+        }
+        if !ring.pacer.due(now) {
+            return None;
+        }
         for (g, i) in ipc::take_releases() {
             if g == ring.generation
                 && let Some(s) = ring.slots.get_mut(i as usize)
@@ -478,7 +493,11 @@ impl Device {
             Ok(ipc::send(&msg, fd.as_ref().map(|f| f.as_fd())))
         });
         match sent {
-            Ok(true) => s.free = false,
+            Ok(true) => {
+                s.free = false;
+                ring.pacer.copied(now);
+                ring.timing.get_or_insert((slot, now));
+            }
             Ok(false) => {}
             Err(e) => self.disable(sc, &e),
         }
@@ -796,6 +815,8 @@ impl Device {
             pool: check(pool, "create command pool")?,
             blit,
             slots: Vec::new(),
+            pacer: protocol::Pacer::new(ipc::fps()),
+            timing: None,
         };
         for index in 0..RING {
             let (fd, mut msg) = match self.create_slot(&mut ring, format, sc.extent, &modifiers) {

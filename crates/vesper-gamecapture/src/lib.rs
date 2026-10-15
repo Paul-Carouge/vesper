@@ -14,8 +14,8 @@
 //! Peers are identified by the kernel (`SO_PEERCRED`), never by what they
 //! claim: same user only, process name and environment read from `/proc`.
 //!
-//! The selected game copies each presented image into a small ring of
-//! exported DMA-BUFs. Frames arrive as [`VideoFrame`]s once their GPU copy
+//! The selected game copies presented images, paced to the recording rate
+//! ([`protocol::Pacer`]), into a small ring of exported DMA-BUFs. Frames arrive as [`VideoFrame`]s once their GPU copy
 //! is done; dropping a frame tells the game the buffer is free again. See
 //! [`protocol`] for the wire format.
 
@@ -27,7 +27,7 @@ use std::io::{self, Seek, SeekFrom};
 use std::mem::ManuallyDrop;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -52,6 +52,9 @@ const HELLO_TIMEOUT: Duration = Duration::from_secs(1);
 /// The captured game loses its priority after this long without a frame
 /// (frozen, stopped, or done presenting).
 const STALE_AFTER: Duration = Duration::from_secs(3);
+/// The captured game's process is checked for liveness only after this long
+/// without a frame (its socket may live on in a child).
+const LIVENESS_AFTER: Duration = Duration::from_millis(500);
 /// Messages read from one client per poll round, so none can starve others.
 const MAX_MESSAGES_PER_ROUND: usize = 64;
 
@@ -87,8 +90,9 @@ struct Shared {
     games: Mutex<Vec<Game>>,
     select: Mutex<Option<u32>>,
     allowed: Mutex<Vec<String>>,
-    /// Whether frames are wanted ([`GameCapture::set_active`]).
-    active: AtomicBool,
+    /// Recording rate frames are wanted at, 0 for none
+    /// ([`GameCapture::set_active`]).
+    fps: AtomicU32,
     stop: AtomicBool,
 }
 
@@ -135,7 +139,7 @@ impl GameCapture {
             games: Mutex::new(Vec::new()),
             select: Mutex::new(None),
             allowed: Mutex::new(Vec::new()),
-            active: AtomicBool::new(false),
+            fps: AtomicU32::new(0),
             stop: AtomicBool::new(false),
         });
         let s = shared.clone();
@@ -189,11 +193,13 @@ impl GameCapture {
         self.wake();
     }
 
-    /// Whether the selected game should copy frames (default false). While
-    /// inactive no game is started: games stay a pass-through and
-    /// [`Game::captured`] is false, but games and consent are still listed.
-    pub fn set_active(&self, active: bool) {
-        self.shared.active.store(active, Ordering::SeqCst);
+    /// `Some(fps)`: the selected game copies frames, paced to a recording
+    /// at `fps`. `None` (the default): no game is started, games stay a
+    /// pass-through and [`Game::captured`] is false, but games and consent
+    /// are still listed.
+    pub fn set_active(&self, fps: Option<u32>) {
+        let fps = fps.map_or(0, |f| f.max(1));
+        self.shared.fps.store(fps, Ordering::SeqCst);
         self.wake();
     }
 
@@ -270,8 +276,11 @@ struct Server {
     on_frame: OnFrame,
     clients: Vec<Client>,
     pending: Vec<Pending>,
-    /// Socket of the client told to `Start`.
+    /// Socket of the client told to `Start`, and the rate it was given.
     started: Option<Arc<OwnedFd>>,
+    started_fps: u32,
+    /// Reused every poll round.
+    candidates: Vec<Candidate>,
     announce_seq: u64,
     pool_generation: u32,
     /// `protocol::is_sync_file` / `protocol::is_dmabuf`; replaced in tests
@@ -282,6 +291,8 @@ struct Server {
     alive: fn(u32) -> bool,
     /// Uids already warned about.
     refused_uids: Vec<u32>,
+    /// Pids of games with another protocol version, already warned about.
+    refused_pids: Vec<u32>,
 }
 
 /// What selection needs to know about a client.
@@ -377,18 +388,23 @@ impl Server {
             clients: Vec::new(),
             pending: Vec::new(),
             started: None,
+            started_fps: 0,
+            candidates: Vec::new(),
             announce_seq: 0,
             pool_generation: 0,
             is_sync_file: protocol::is_sync_file,
             is_dmabuf: protocol::is_dmabuf,
             alive,
             refused_uids: Vec::new(),
+            refused_pids: Vec::new(),
         }
     }
 
     fn run(mut self) {
+        let mut fds = Vec::new();
         loop {
-            let mut fds = vec![pollfd(self.wake.as_fd()), pollfd(self.listener.as_fd())];
+            fds.clear();
+            fds.extend([pollfd(self.wake.as_fd()), pollfd(self.listener.as_fd())]);
             let nc = self.clients.len();
             fds.extend(self.clients.iter().map(|c| pollfd(c.sock.as_fd())));
             fds.extend(self.pending.iter().map(|p| pollfd(p.sync.as_fd())));
@@ -420,14 +436,15 @@ impl Server {
                 } > 0
                 {}
             }
-            // Pending frames first: their indices match `fds` until clients change.
-            let mut ready = fds[2 + nc..].iter().map(|f| f.revents != 0);
-            let (done, waiting) = std::mem::take(&mut self.pending)
-                .into_iter()
-                .partition(|_| ready.next().unwrap_or(false));
-            self.pending = waiting;
-            for p in done {
-                self.deliver(p.sock, p.generation, p.index, p.pts_ns);
+            // Pending frames first, oldest first: their indices match `fds`
+            // until clients change.
+            let mut removed = 0;
+            for (k, f) in fds[2 + nc..].iter().enumerate() {
+                if f.revents != 0 {
+                    let p = self.pending.remove(k - removed);
+                    removed += 1;
+                    self.deliver(p.sock, p.generation, p.index, p.pts_ns);
+                }
             }
             // Back to front so removals keep earlier indices valid.
             for i in (0..nc).rev() {
@@ -529,8 +546,26 @@ impl Server {
         match msg {
             // Identity comes from SO_PEERCRED, not from what the peer claims.
             Msg::Hello { version, .. } => {
-                if c.hello || version != protocol::VERSION {
-                    warn!("{} ({}): bad hello (protocol {version})", c.exe, c.pid);
+                if c.hello {
+                    warn!("{} ({}): second hello", c.exe, c.pid);
+                    return false;
+                }
+                if version != protocol::VERSION {
+                    // Once per process: an old layer reconnects every second.
+                    if !self.refused_pids.contains(&c.pid) {
+                        if self.refused_pids.len() >= MAX_CLIENTS {
+                            self.refused_pids.remove(0);
+                        }
+                        self.refused_pids.push(c.pid);
+                        warn!(
+                            "{} ({}): its Vesper Vulkan layer speaks protocol {version}, this Vesper \
+                             needs {}; not capturing it. Update the layer in Vesper's settings \
+                             and restart the game",
+                            c.exe,
+                            c.pid,
+                            protocol::VERSION
+                        );
+                    }
                     return false;
                 }
                 c.hello = true;
@@ -729,25 +764,29 @@ impl Server {
             .started
             .as_ref()
             .and_then(|s| self.clients.iter().position(|c| Arc::ptr_eq(&c.sock, s)));
-        let candidates: Vec<_> = self
-            .clients
-            .iter()
-            .enumerate()
-            .map(|(i, c)| Candidate {
+        let mut candidates = std::mem::take(&mut self.candidates);
+        candidates.clear();
+        candidates.extend(self.clients.iter().enumerate().map(|(i, c)| {
+            let silent = c.last_frame.elapsed();
+            Candidate {
                 pid: c.pid,
                 allowed: c.hello && self.allowed(c),
                 ready: c.hello && c.width > 0 && c.height > 0,
                 seq: c.announced,
+                // A game sending frames is alive: no syscall per frame.
                 stale: Some(i) == current
-                    && (c.last_frame.elapsed() > STALE_AFTER || !(self.alive)(c.pid)),
-            })
-            .collect();
-        let want = if self.shared.active.load(Ordering::SeqCst) {
+                    && (silent > STALE_AFTER || (silent > LIVENESS_AFTER && !(self.alive)(c.pid))),
+            }
+        }));
+        let fps = self.shared.fps.load(Ordering::SeqCst);
+        let want = if fps > 0 {
             choose(&candidates, select, current)
         } else {
             None
         };
-        if want == current {
+        self.candidates = candidates;
+        // Same game at another rate: start it again with the new one.
+        if want == current && (want.is_none() || fps == self.started_fps) {
             return;
         }
         if let Some(i) = current {
@@ -762,41 +801,59 @@ impl Server {
             let c = &mut self.clients[i];
             let start = Msg::Start {
                 modifiers: MODIFIERS.to_vec(),
+                fps,
             };
             match protocol::send(c.sock.as_fd(), &start, None, true) {
                 Ok(()) => {
                     c.ring = None;
                     c.last_frame = Instant::now();
                     self.started = Some(c.sock.clone());
+                    self.started_fps = fps;
                 }
                 Err(e) => warn!("starting game capture failed: {e}"),
             }
         }
     }
 
+    /// Updates the list for the app, only when it changed: this runs on
+    /// every wakeup, so for every game frame.
     fn publish_games(&self) {
-        let games = self
-            .clients
-            .iter()
-            .filter(|c| c.hello)
-            .map(|c| Game {
-                pid: c.pid,
-                exe: c.exe.clone(),
-                width: c.width,
-                height: c.height,
-                consent: if self.allowed(c) {
-                    Consent::Allowed
-                } else {
-                    Consent::Pending
-                },
-                captured: self
-                    .started
-                    .as_ref()
-                    .is_some_and(|s| Arc::ptr_eq(s, &c.sock)),
-                seq: c.announced,
+        let view = |c: &Client| {
+            let consent = if self.allowed(c) {
+                Consent::Allowed
+            } else {
+                Consent::Pending
+            };
+            let captured = self
+                .started
+                .as_ref()
+                .is_some_and(|s| Arc::ptr_eq(s, &c.sock));
+            (c.pid, c.width, c.height, consent, captured, c.announced)
+        };
+        let clients = self.clients.iter().filter(|c| c.hello);
+        let mut games = self.shared.games.lock().unwrap();
+        if games.len() == clients.clone().count()
+            && games.iter().zip(clients.clone()).all(|(g, c)| {
+                g.exe == c.exe
+                    && (g.pid, g.width, g.height, g.consent, g.captured, g.seq) == view(c)
+            })
+        {
+            return;
+        }
+        *games = clients
+            .map(|c| {
+                let (pid, width, height, consent, captured, seq) = view(c);
+                Game {
+                    pid,
+                    exe: c.exe.clone(),
+                    width,
+                    height,
+                    consent,
+                    captured,
+                    seq,
+                }
             })
             .collect();
-        *self.shared.games.lock().unwrap() = games;
     }
 }
 
@@ -949,7 +1006,7 @@ mod tests {
             games: Mutex::new(Vec::new()),
             select: Mutex::new(None),
             allowed: Mutex::new(Vec::new()),
-            active: AtomicBool::new(true),
+            fps: AtomicU32::new(60),
             stop: AtomicBool::new(false),
         });
         let (tx, rx) = mpsc::channel();
@@ -1052,20 +1109,70 @@ mod tests {
     #[test]
     fn inactive_starts_no_game() {
         let (mut s, _rx) = server();
-        s.shared.active.store(false, Ordering::SeqCst);
+        s.shared.fps.store(0, Ordering::SeqCst);
         let (_, layer) = connect(&mut s, "game.exe", true);
         s.reselect();
         assert!(s.started.is_none());
         assert_eq!(next(&layer), None);
 
-        s.shared.active.store(true, Ordering::SeqCst);
+        s.shared.fps.store(60, Ordering::SeqCst);
         s.reselect();
-        assert!(matches!(next(&layer), Some(Msg::Start { .. })));
+        assert!(matches!(next(&layer), Some(Msg::Start { fps: 60, .. })));
+        s.reselect();
+        assert_eq!(next(&layer), None);
 
-        s.shared.active.store(false, Ordering::SeqCst);
+        // Another recording rate: started again with it.
+        s.shared.fps.store(144, Ordering::SeqCst);
+        s.reselect();
+        assert_eq!(next(&layer), Some(Msg::Stop));
+        assert!(matches!(next(&layer), Some(Msg::Start { fps: 144, .. })));
+
+        s.shared.fps.store(0, Ordering::SeqCst);
         s.reselect();
         assert!(s.started.is_none());
         assert_eq!(next(&layer), Some(Msg::Stop));
+    }
+
+    #[test]
+    fn refuses_other_protocol_versions() {
+        let (mut s, _rx) = server();
+        for _ in 0..3 {
+            let (ours, _theirs) = pair();
+            s.add_client(ours, 7, "old".into(), true);
+            let hello = Msg::Hello {
+                version: protocol::VERSION - 1,
+                pid: 7,
+                exe: "old".into(),
+            };
+            let i = s.clients.len() - 1;
+            assert!(!s.handle(i, hello, None));
+            s.remove_client(i);
+        }
+        // Warned once for that process, however often it reconnects.
+        assert_eq!(s.refused_pids, [7]);
+        // A second hello is a protocol violation too.
+        let (i, _layer) = connect(&mut s, "game.exe", true);
+        let hello = Msg::Hello {
+            version: protocol::VERSION,
+            pid: 1,
+            exe: "x".into(),
+        };
+        assert!(!s.handle(i, hello, None));
+    }
+
+    #[test]
+    fn publishes_games_only_on_change() {
+        let (mut s, _rx) = server();
+        let (_, _layer) = connect(&mut s, "game.exe", true);
+        s.publish_games();
+        let before = s.shared.games.lock().unwrap().as_ptr();
+        s.publish_games();
+        assert_eq!(s.shared.games.lock().unwrap().as_ptr(), before);
+        s.reselect();
+        s.publish_games();
+        let games = s.shared.games.lock().unwrap().clone();
+        assert!(games[0].captured);
+        assert_eq!(games[0].exe, "game.exe");
     }
 
     #[test]
