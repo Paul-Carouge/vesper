@@ -1,6 +1,7 @@
 # T6: window snapshots of the live stream and scene UI with demo data (no
 # capture, no key, no webcam), in $L/shots as PNG. Env: SIZE (440x780
-# logical), SCALE (2), ONLY (a pattern: only the shots it matches).
+# logical), SCALE (2), ONLY (a pattern: only the shots it matches), SHOT_LANG
+# (en, fr: the UI language instead of the system's).
 . "${LABROOT:?not in the lab, use go or r2}/lib.sh" || exit 1
 mkdir -p $L/cfg/vesper $L/shots
 # The scenes' demo logo.
@@ -12,7 +13,7 @@ shot() {
   case $name in ${ONLY:-*}) ;; *) return ;; esac
   local size=${SIZE:-440x780} scale=${SCALE:-2}
   # Room for the whole window.
-  gamescope --backend headless -W $(( ${size%x*} * scale + 200 )) -H $(( ${size#*x} * scale + 200 )) -- env VESPER_THEME=$theme SLINT_SCALE_FACTOR=$scale \
+  gamescope --backend headless -W $(( ${size%x*} * scale + 200 )) -H $(( ${size#*x} * scale + 200 )) -- env ${SHOT_LANG:+LANGUAGE=$SHOT_LANG} VESPER_THEME=$theme SLINT_SCALE_FACTOR=$scale \
     VESPER_WINDOW_SIZE=$size VESPER_DEMO="$demo" VESPER_DEMO_DELAY=1500 \
     VESPER_DEMO_IMAGE=$L/logo.png VESPER_SNAPSHOT=$L/shots/$name.ppm $VESPER > $L/log/shot-$name.log 2>&1
   ffmpeg -y -loglevel error -i $L/shots/$name.ppm $L/shots/$name.png && rm $L/shots/$name.ppm && echo "$name: $(file -b $L/shots/$name.png | cut -d, -f2)"
@@ -49,3 +50,8 @@ SIZE=360x700 shot language-switch-light light screen-look,settings,scroll-end,cl
 shot meters-dark dark screen-look,replay-on,tracks-look,scroll-end
 shot meters-light light screen-look,replay-on,tracks-look,scroll-end
 SIZE=360x700 shot meters-narrow-dark dark screen-look,replay-on,tracks-look,scroll-end
+# Voice ducking and background music on an app track, English and French.
+SHOT_LANG=en shot ducking-en-dark dark screen-look,ducking-look,scroll-end
+SHOT_LANG=fr shot ducking-fr-light light screen-look,ducking-look,scroll-end
+SHOT_LANG=fr SIZE=360x700 shot ducking-fr-narrow-dark dark screen-look,ducking-look,scroll-end
+SHOT_LANG=en SIZE=360x700 shot ducking-en-narrow-light light screen-look,ducking-look,scroll-end

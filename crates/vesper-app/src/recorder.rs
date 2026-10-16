@@ -45,7 +45,8 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use vesper_audio::{
-    Aac, AudioCapture, CHANNELS, Mix, Options, Peaks, SAMPLE_RATE, Source, TrackState,
+    Aac, AudioCapture, CHANNELS, DuckSettings, Mix, Options, Peaks, SAMPLE_RATE, Source,
+    TrackState, VoiceKey,
 };
 use vesper_capture::Capture;
 use vesper_compose::{Compositor, Draw, Source as DrawSource};
@@ -321,6 +322,65 @@ pub struct Track {
     pub volume_db: f32,
     /// Processing, in order, before the volume.
     pub filters: Vec<TrackFilter>,
+    /// Voice ducking and background music (not for voice tracks).
+    pub ducking: Ducking,
+}
+
+/// How much, for [`Ducking`]: the duck's depth, the music's loudness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Level {
+    Low,
+    #[default]
+    Medium,
+    High,
+}
+
+impl Level {
+    pub const ALL: [Self; 3] = [Self::Low, Self::Medium, Self::High];
+}
+
+/// A track that is a voice, lowered while a voice speaks, or played as
+/// background music (see `vesper_dsp::Ducker`). A level is kept while its
+/// switch is off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Ducking {
+    /// A voice: the other tracks duck under it, and it does not duck.
+    /// By default only the Microphone track (see [`Ducking::for_source`]).
+    pub voice: bool,
+    /// Lowered while the voice speaks, by `duck_level`.
+    pub duck: bool,
+    pub duck_level: Level,
+    /// Background music at `music_level`: leveled under the voice, peaks
+    /// tamed, voice band dipped, ducked softly unless `duck` says more.
+    pub music: bool,
+    pub music_level: Level,
+}
+
+impl Ducking {
+    /// The default of a track on `source`: a voice for the Microphone.
+    pub fn for_source(source: &Source) -> Self {
+        Self {
+            voice: *source == Source::Microphone,
+            ..Self::default()
+        }
+    }
+
+    pub fn settings(&self) -> DuckSettings {
+        let duck_db = match self.duck_level {
+            Level::Low => 6.0,
+            Level::Medium => 12.0,
+            Level::High => 20.0,
+        };
+        let lufs = match self.music_level {
+            Level::Low => -30.0,
+            Level::Medium => -26.0,
+            Level::High => -22.0,
+        };
+        DuckSettings {
+            duck_db: if self.duck { duck_db } else { 0.0 },
+            music_lufs: self.music.then_some(lufs),
+        }
+    }
 }
 
 /// One filter of a track.
@@ -344,11 +404,12 @@ impl Track {
     pub fn new(name: &str, source: Source) -> Self {
         Self {
             name: name.to_owned(),
-            source,
             enabled: true,
             muted: false,
             volume_db: 0.0,
             filters: Vec::new(),
+            ducking: Ducking::for_source(&source),
+            source,
         }
     }
 }
@@ -588,6 +649,29 @@ impl Pipeline {
         if let Some(c) = capture {
             c.set_volume_db(db);
         }
+    }
+
+    /// Sets the ducking of track `index`, live.
+    pub fn set_ducking(&self, index: usize, ducking: Ducking) {
+        let mut audio = lock(&self.audio);
+        let (track, capture) = audio.track(index);
+        if let Some(t) = track {
+            t.ducking = ducking;
+        }
+        if let Some(c) = capture {
+            c.set_ducking(ducking.settings());
+            c.set_speaks(ducking.voice);
+        }
+    }
+
+    /// How much the duck lowers track `index` now, dB; 0 when it does not run.
+    pub fn ducking_db(&self, index: usize) -> f32 {
+        let audio = lock(&self.audio);
+        audio
+            .running
+            .iter()
+            .find(|(i, _)| *i == index)
+            .map_or(0.0, |(_, capture)| capture.ducking_db())
     }
 
     /// Sets the filters of track `index`, live: parameters glide, a new
@@ -940,6 +1024,8 @@ fn start_audio(sources: &AudioSources, sinks: &SharedSinks, on_event: &OnEvent) 
     let first = Arc::new(AtomicUsize::new(usize::from(in_files)));
     let mut running = Vec::new();
     let mut controls = Vec::new();
+    // The microphones speak into it, the other tracks duck under it.
+    let voice = Arc::new(VoiceKey::default());
     let mut failed = Vec::new();
     for (input, &i) in inputs.iter_mut().zip(&enabled) {
         let track = &tracks[i];
@@ -964,6 +1050,9 @@ fn start_audio(sources: &AudioSources, sinks: &SharedSinks, on_event: &OnEvent) 
                 let on_event = on_event.clone();
                 move || on_event(Event::AudioSignal)
             })),
+            voice: Some(voice.clone()),
+            ducking: track.ducking.settings(),
+            speaks: track.ducking.voice,
         };
         match AudioCapture::start(track.source.clone(), options, move |packet| {
             write_audio(&sinks, index.get(), packet)
@@ -998,6 +1087,8 @@ fn start_audio(sources: &AudioSources, sinks: &SharedSinks, on_event: &OnEvent) 
         if let Some(t) = audio.tracks.get(*i) {
             capture.set_muted(t.muted);
             capture.set_volume_db(t.volume_db);
+            capture.set_ducking(t.ducking.settings());
+            capture.set_speaks(t.ducking.voice);
             control.set(&active_filters(&t.filters));
         }
     }
