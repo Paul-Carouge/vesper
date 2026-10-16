@@ -1627,7 +1627,7 @@ export component AppWindow inherits Window {
                                     ? (root.source-name != ""
                                         ? (root.game-source == "window" ? "Game window" : root.game-source != "" ? "Game (" + root.game-source + ")" : "Game")
                                             + (root.source-detail != "" ? " · " + root.source-detail : "")
-                                        : root.game-layer-installed || root.pending-game != "" ? "Start a game" : "Start a game: its window is captured")
+                                        : root.game-layer-installed || root.pending-game != "" ? "Start a game" : root.game-layer-available ? "Start a game: its window is captured" : "Game capture layer not built")
                                     : root.source-kind == SourceKind.none
                                         ? "Pick a screen or a window to record"
                                         : root.source-detail != "" ? root.source-detail : root.source-kind == SourceKind.screen ? "Screen" : "Window";

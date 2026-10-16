@@ -8,6 +8,9 @@ mod format;
 mod pw;
 
 use std::os::fd::OwnedFd;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::task::{Poll, Waker};
 use std::thread::JoinHandle;
 
 pub use ashpd::desktop::screencast::SourceType;
@@ -62,26 +65,36 @@ impl Capture {
         on_frame: impl FnMut(Result<VideoFrame>) + Send + 'static,
     ) -> Result<Self> {
         let sources = SourceType::Monitor | SourceType::Window;
-        Self::start_with(sources, restore_token, max_fps, on_frame)
+        Self::start_with(
+            sources,
+            restore_token,
+            &Cancel::default(),
+            max_fps,
+            on_frame,
+        )
     }
 
-    /// [`Capture::start`], offering windows only (a game's window).
+    /// [`Capture::start`], offering windows only (a game's window). `cancel`
+    /// ends the wait for the portal, closing its picker.
     pub fn start_window(
         restore_token: Option<&str>,
+        cancel: &Cancel,
         max_fps: u32,
         on_frame: impl FnMut(Result<VideoFrame>) + Send + 'static,
     ) -> Result<Self> {
-        Self::start_with(SourceType::Window.into(), restore_token, max_fps, on_frame)
+        let sources = SourceType::Window.into();
+        Self::start_with(sources, restore_token, cancel, max_fps, on_frame)
     }
 
     fn start_with(
         sources: BitFlags<SourceType>,
         restore_token: Option<&str>,
+        cancel: &Cancel,
         max_fps: u32,
         on_frame: impl FnMut(Result<VideoFrame>) + Send + 'static,
     ) -> Result<Self> {
         let (session, node_id, fd, restore_token, source) =
-            block_on(open_portal(sources, restore_token))?;
+            block_on(open_portal(sources, restore_token, cancel))?;
         let (control, rx) = ::pipewire::channel::channel();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let tx = control.clone();
@@ -163,7 +176,60 @@ pub fn is_cancelled(error: &Error) -> bool {
     )
 }
 
-async fn open_portal(sources: BitFlags<SourceType>, restore_token: Option<&str>) -> Result<Opened> {
+/// Whether the portal answered `error` to the request itself (a restore it
+/// could not do, a refusal), not the user cancelling nor D-Bus failing.
+pub fn is_refused(error: &Error) -> bool {
+    matches!(
+        error.downcast_ref::<ashpd::Error>(),
+        Some(ashpd::Error::Response(_))
+    ) && !is_cancelled(error)
+}
+
+const CANCELLED: &str = "the capture was cancelled";
+
+/// Ends a [`Capture::start_window`] still waiting on the portal.
+#[derive(Debug, Clone, Default)]
+pub struct Cancel(Arc<CancelState>);
+
+#[derive(Debug, Default)]
+struct CancelState {
+    done: AtomicBool,
+    waker: Mutex<Option<Waker>>,
+}
+
+impl Cancel {
+    pub fn cancel(&self) {
+        self.0.done.store(true, Ordering::SeqCst);
+        let waker = self
+            .0
+            .waker
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+
+    /// Ready once [`Cancel::cancel`] was called.
+    fn wait(&self) -> impl Future<Output = ()> + '_ {
+        std::future::poll_fn(move |cx| {
+            // The waker first: a cancel in between still wakes it.
+            *self.0.waker.lock().unwrap_or_else(|e| e.into_inner()) = Some(cx.waker().clone());
+            if self.0.done.load(Ordering::SeqCst) {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        })
+    }
+}
+
+async fn open_portal(
+    sources: BitFlags<SourceType>,
+    restore_token: Option<&str>,
+    cancel: &Cancel,
+) -> Result<Opened> {
     let proxy = Screencast::new().await?;
     let cursor = if proxy
         .available_cursor_modes()
@@ -208,13 +274,42 @@ async fn open_portal(sources: BitFlags<SourceType>, restore_token: Option<&str>)
             .await?;
         let token = streams.restore_token().map(str::to_owned);
         Ok::<_, Error>((node_id, fd, token, source))
-    }
-    .await;
-    match result {
+    };
+    let cancelled = async {
+        cancel.wait().await;
+        Err::<(u32, OwnedFd, Option<String>, SourceInfo), Error>(CANCELLED.into())
+    };
+    // Cancelled: closing the session below ends the picker too.
+    match futures_lite::future::or(result, cancelled).await {
         Ok((node_id, fd, token, source)) => Ok((session, node_id, fd, token, source)),
         Err(e) => {
             let _ = session.close().await;
             Err(e)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cancel_wakes_a_waiting_portal_request() {
+        let cancel = Cancel::default();
+        let c = cancel.clone();
+        let t = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            c.cancel();
+        });
+        // Stands for the portal: never answers.
+        let never = futures_lite::future::pending::<bool>();
+        let waited = futures_lite::future::or(never, async {
+            cancel.wait().await;
+            true
+        });
+        assert!(block_on(waited));
+        t.join().unwrap();
+        // Already cancelled: ready at once.
+        block_on(cancel.wait());
     }
 }

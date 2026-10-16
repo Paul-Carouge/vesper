@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use slint::{ModelRc, VecModel};
-use vesper_capture::Capture;
+use vesper_capture::{Cancel, Capture};
 use vesper_gamecapture::{Consent, Game, GameCapture};
 
 use crate::fallback::{self, Action, Demand, Switch};
@@ -47,7 +47,8 @@ pub struct GameSource {
     /// The captured game disconnected since the last `take_closed`.
     closed: bool,
     /// The captured game disconnected but its process still runs, and since
-    /// when: its window takes over after the grace, unless it exits.
+    /// when: its window takes over after the grace. Watched until its window
+    /// is captured: exiting before stops the recording, never asks.
     lost: Option<(u32, Instant)>,
     /// How the shown game is captured, by pid ("Vulkan", "OpenGL", "").
     api: Option<(u32, &'static str)>,
@@ -67,9 +68,11 @@ struct GameWindow {
 }
 
 enum WindowState {
-    /// The portal is asked; `discard`: not needed any more once it answers.
+    /// The portal is asked; `discard`: not needed any more (its request is
+    /// cancelled, a capture it still starts is stopped).
     Opening {
         answer: Receiver<Opened>,
+        cancel: Cancel,
         discard: bool,
     },
     Open {
@@ -87,8 +90,9 @@ type Opened = Result<(Capture, Arc<AtomicBool>, Arc<AtomicBool>), (bool, String)
 
 /// Asks the portal for `key`'s window on a thread of its own (the picker
 /// may stay open for long), restoring it silently when its token still
-/// works. An invalid token is forgotten and the picker asks again.
-fn open_window(key: String, frames: GameFrames, fps: u32) -> Receiver<Opened> {
+/// works. A token the portal refuses is replaced once the picker asks
+/// again; a D-Bus failure keeps it. `cancel` closes the portal request.
+fn open_window(key: String, frames: GameFrames, fps: u32, cancel: Cancel) -> Receiver<Opened> {
     let (tx, rx) = std::sync::mpsc::channel();
     let started = std::thread::Builder::new()
         .name("vesper-game-window".into())
@@ -111,11 +115,12 @@ fn open_window(key: String, frames: GameFrames, fps: u32) -> Receiver<Opened> {
             // Twice the recording rate, as for a portal source.
             let max_fps = fps.saturating_mul(2);
             let token = fallback::load_token(&key);
-            let result = match Capture::start_window(token.as_deref(), max_fps, on_frame()) {
-                Err(e) if token.is_some() && !vesper_capture::is_cancelled(&e) => {
+            let start =
+                |token: Option<&str>| Capture::start_window(token, &cancel, max_fps, on_frame());
+            let result = match start(token.as_deref()) {
+                Err(e) if token.is_some() && vesper_capture::is_refused(&e) => {
                     log!("could not restore the game window ({e}): asking again");
-                    fallback::store_token(&key, None);
-                    Capture::start_window(None, max_fps, on_frame())
+                    start(None)
                 }
                 result => result,
             };
@@ -146,6 +151,14 @@ fn stop_window(capture: Capture) {
     if let Err(e) = stopped {
         log!("could not stop the game window capture: {e}");
     }
+}
+
+/// Whether a layer game with a swapchain waits for the user's Allow (not
+/// ignored): its prompt shows, so the window picker does not.
+fn waits_for_consent(games: &[Game], ignored: &[String]) -> bool {
+    games
+        .iter()
+        .any(|g| g.consent == Consent::Pending && g.width > 0 && !ignored.contains(&g.exe))
 }
 
 /// How the game `pid` is captured, from the capture library it loaded:
@@ -242,29 +255,26 @@ impl GameSource {
         self.capture.select(self.selected);
     }
 
-    /// The key of the window to capture: the Steam game's, or the shared one.
-    fn window_key(&self) -> String {
-        match &self.steam {
-            Some((_, Some((key, _)))) => key.clone(),
-            _ => fallback::OTHER_GAME.to_owned(),
-        }
-    }
-
     /// Stops the window capture, if any.
     fn close_window(&mut self) {
-        // An opening one is stopped on its thread once the portal answers.
-        if let Some(WindowState::Open { capture, live, .. }) = self.window.take().map(|w| w.state) {
-            live.store(false, Ordering::Relaxed);
-            self.frames.set_window(false);
-            stop_window(capture);
+        match self.window.take().map(|w| w.state) {
+            Some(WindowState::Open { capture, live, .. }) => {
+                live.store(false, Ordering::Relaxed);
+                self.frames.set_window(false);
+                stop_window(capture);
+            }
+            // Its thread stops what the portal still answers.
+            Some(WindowState::Opening { cancel, .. }) => cancel.cancel(),
+            None => {}
         }
         self.frames.set_picking(false);
     }
 
     /// Runs the window fallback: takes the portal's answer, notices a closed
     /// window, and opens or closes the window as [`Switch`] decides. `layer`:
-    /// a layer game is captured (or was just lost and still runs).
-    fn drive_window(&mut self, ui: &AppWindow, layer: bool) {
+    /// a layer game is captured, waits for consent, or was just lost and
+    /// still runs; `quit`: the lost one exited before its window was taken.
+    fn drive_window(&mut self, ui: &AppWindow, layer: bool, quit: bool) {
         let now = Instant::now();
         let demand = match self.frames.fps() {
             None => Demand::None,
@@ -276,8 +286,9 @@ impl GameSource {
             }
             Some(_) => Demand::Background,
         };
-        if let Some(WindowState::Opening { answer, discard }) =
-            self.window.as_ref().map(|w| &w.state)
+        if let Some(WindowState::Opening {
+            answer, discard, ..
+        }) = self.window.as_ref().map(|w| &w.state)
         {
             let discard = *discard;
             match answer.try_recv() {
@@ -306,7 +317,11 @@ impl GameSource {
                     // Not asked again until another game or request.
                     self.switch.block(&key);
                 }
-                Err(TryRecvError::Disconnected) => self.window = None,
+                // Its thread could not start: not retried every tick.
+                Err(TryRecvError::Disconnected) => {
+                    let key = self.window.take().map(|w| w.key).unwrap_or_default();
+                    self.switch.block(&key);
+                }
             }
         }
         let ended = matches!(
@@ -338,6 +353,7 @@ impl GameSource {
         let input = fallback::Input {
             demand,
             layer,
+            quit,
             game: self
                 .steam
                 .as_ref()
@@ -351,7 +367,13 @@ impl GameSource {
         match self.switch.tick(now, &input) {
             Action::None => {}
             Action::Close => match self.window.as_mut().map(|w| &mut w.state) {
-                Some(WindowState::Opening { discard, .. }) => *discard = true,
+                Some(WindowState::Opening {
+                    cancel, discard, ..
+                }) => {
+                    log!("game window not needed any more: closing its request");
+                    cancel.cancel();
+                    *discard = true;
+                }
                 _ => {
                     log!("game window capture stopped");
                     self.close_window();
@@ -364,11 +386,14 @@ impl GameSource {
                 };
                 let fps = self.frames.fps().unwrap_or(60);
                 log!("no game captured by the layer: asking for the game window ({key})");
+                let cancel = Cancel::default();
+                let answer = open_window(key.clone(), self.frames.clone(), fps, cancel.clone());
                 self.window = Some(GameWindow {
-                    key: key.clone(),
+                    key,
                     name,
                     state: WindowState::Opening {
-                        answer: open_window(key, self.frames.clone(), fps),
+                        answer,
+                        cancel,
                         discard: false,
                     },
                 });
@@ -402,20 +427,29 @@ impl GameSource {
             self.lost = Some((pid, Instant::now()));
         }
         self.captured = games.iter().find(|g| g.captured).map(|g| g.pid);
-        if let Some((pid, since)) = self.lost {
-            if !fallback::alive(pid) {
-                self.lost = None;
-                self.closed = true;
-                // Its lingering processes (wineserver...) must not ask for
-                // its window.
-                self.steam = Some((Instant::now(), fallback::running_game()));
-                let key = self.window_key();
-                self.switch.block(&key);
-            } else if self.captured.is_some() || since.elapsed() >= fallback::GRACE {
-                self.lost = None;
-            }
+        let window_open = matches!(
+            self.window.as_ref().map(|w| &w.state),
+            Some(WindowState::Open { .. })
+        );
+        if self.captured.is_some() || window_open {
+            self.lost = None;
         }
-        self.drive_window(ui, self.captured.is_some() || self.lost.is_some());
+        let mut quit = false;
+        if let Some((pid, _)) = self.lost
+            && !fallback::alive(pid)
+        {
+            self.lost = None;
+            self.closed = true;
+            quit = true;
+            // Its lingering processes (wineserver...) name the game whose
+            // window is not asked for.
+            self.steam = Some((Instant::now(), fallback::running_game()));
+        }
+        let lost = self
+            .lost
+            .is_some_and(|(_, t)| t.elapsed() < fallback::GRACE);
+        let pending = waits_for_consent(&games, &IGNORED.lock().unwrap());
+        self.drive_window(ui, self.captured.is_some() || lost || pending, quit);
         let shown_game = candidate(&games, self.selected).cloned();
         let window = match &self.window {
             Some(GameWindow {
@@ -513,6 +547,23 @@ mod tests {
             captured,
             seq,
         }
+    }
+
+    #[test]
+    fn a_game_asking_for_consent_holds_the_window_picker_back() {
+        let pending = [game(1, Consent::Pending, 640, false, 1)];
+        assert!(waits_for_consent(&pending, &[]));
+        // Ignored, or no swapchain yet (no prompt shows): the window may go.
+        assert!(!waits_for_consent(&pending, &["g1".into()]));
+        assert!(!waits_for_consent(
+            &[game(2, Consent::Pending, 0, false, 1)],
+            &[]
+        ));
+        assert!(!waits_for_consent(
+            &[game(3, Consent::Allowed, 640, false, 1)],
+            &[]
+        ));
+        assert!(!waits_for_consent(&[], &[]));
     }
 
     #[test]

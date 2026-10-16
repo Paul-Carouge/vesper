@@ -58,8 +58,12 @@ pub enum Window {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Input {
     pub demand: Demand,
-    /// A layer or interposer game is captured (or just lost, still alive).
+    /// A layer or interposer game is captured, waits for consent, or was
+    /// just lost and still runs.
     pub layer: bool,
+    /// The layer game lost earlier exited (before its window was captured):
+    /// its window is not asked for, an opening one is dropped.
+    pub quit: bool,
     /// Key of the Steam game running, if any.
     pub game: Option<String>,
     pub window: Window,
@@ -100,7 +104,11 @@ impl Switch {
         if rising || self.blocked.as_deref().is_some_and(|b| b != want) {
             self.blocked = None;
         }
-        if input.layer || input.demand == Demand::None {
+        // The lost layer game exited after all: its window is gone too.
+        if input.quit {
+            self.blocked = Some(want.to_owned());
+        }
+        if input.layer || input.quit || input.demand == Demand::None {
             self.no_layer_since = None;
             return match input.window {
                 Window::Closed => Action::None,
@@ -197,10 +205,7 @@ pub fn running_game() -> Option<(String, String)> {
         if !mine {
             continue;
         }
-        let Some(id) = std::fs::read(dir.join("environ"))
-            .ok()
-            .and_then(|e| steam_id(&e))
-        else {
+        let Some(id) = read_bounded(&dir.join("environ")).and_then(|e| steam_id(&e)) else {
             continue;
         };
         let comm = std::fs::read_to_string(dir.join("comm")).unwrap_or_default();
@@ -221,6 +226,18 @@ pub fn running_game() -> Option<(String, String)> {
         }
     }
     best.map(|(_, key, name)| (key, name))
+}
+
+/// At most the first 256 KiB of `path`: a process's environment can be huge.
+fn read_bounded(path: &Path) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take(256 * 1024)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    Some(bytes)
 }
 
 /// Whether the process `pid` still runs: a zombie (exited, not reaped yet)
@@ -298,9 +315,37 @@ mod tests {
         Input {
             demand,
             layer,
+            quit: false,
             game: game.map(str::to_owned),
             window,
         }
+    }
+
+    #[test]
+    fn a_lost_layer_game_that_exits_late_drops_its_opening_window() {
+        let (mut sw, t) = (Switch::default(), Instant::now());
+        // The layer game disconnected; its process outlived the grace.
+        let lost = input(Demand::Explicit, false, Some("steam:1"), Window::Closed);
+        sw.tick(t, &lost);
+        assert_eq!(sw.tick(t + GRACE, &lost), Action::Open("steam:1".into()));
+        // It exits while the portal is asked: dropped, never asked again.
+        let quit = Input {
+            quit: true,
+            ..input(Demand::Explicit, false, Some("steam:1"), Window::Opening)
+        };
+        assert_eq!(sw.tick(t + 3 * S, &quit), Action::Close);
+        assert_eq!(sw.tick(t + 10 * S, &lost), Action::None);
+        let bg = input(Demand::Background, false, Some("steam:1"), Window::Closed);
+        assert_eq!(sw.tick(t + 60 * S, &bg), Action::None);
+        // Exiting before the window was asked: never asked.
+        let (mut sw, t) = (Switch::default(), Instant::now());
+        sw.tick(t, &lost);
+        let quit = Input {
+            quit: true,
+            ..lost.clone()
+        };
+        assert_eq!(sw.tick(t + S, &quit), Action::None);
+        assert_eq!(sw.tick(t + 10 * S, &lost), Action::None);
     }
 
     const S: Duration = Duration::from_secs(1);
