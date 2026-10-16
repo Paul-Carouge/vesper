@@ -43,6 +43,43 @@ impl Coefs {
     pub fn bandpass(freq: f32, q: f64) -> Self {
         Self::new(freq, q, |_, alpha| [alpha, 0.0, -alpha])
     }
+
+    /// Peaking EQ (bell) of `db` at `freq`.
+    pub fn peaking(freq: f32, q: f64, db: f32) -> Self {
+        let a = 10f64.powf(f64::from(db) / 40.0);
+        let w0 = std::f64::consts::TAU * f64::from(freq) / f64::from(FS);
+        let (sin, cos) = w0.sin_cos();
+        let alpha = sin / (2.0 * q);
+        let a0 = 1.0 + alpha / a;
+        Self {
+            b0: (1.0 + alpha * a) / a0,
+            b1: -2.0 * cos / a0,
+            b2: (1.0 - alpha * a) / a0,
+            a1: -2.0 * cos / a0,
+            a2: (1.0 - alpha / a) / a0,
+        }
+    }
+
+    /// The two stages of ITU-R BS.1770 K-weighting at 48 kHz (high shelf,
+    /// then high-pass), the coefficients of the standard.
+    pub fn k_weighting() -> [Self; 2] {
+        [
+            Self {
+                b0: 1.535_124_859_586_97,
+                b1: -2.691_696_189_406_38,
+                b2: 1.198_392_810_852_85,
+                a1: -1.690_659_293_182_41,
+                a2: 0.732_480_774_215_85,
+            },
+            Self {
+                b0: 1.0,
+                b1: -2.0,
+                b2: 1.0,
+                a1: -1.990_047_454_833_98,
+                a2: 0.990_072_250_366_21,
+            },
+        ]
+    }
 }
 
 /// Transposed direct form II state, in `f64` (low cutoffs need the precision).
@@ -59,6 +96,11 @@ impl State {
         self.z1 = c.b1 * x - c.a1 * y + self.z2;
         self.z2 = c.b2 * x - c.a2 * y;
         y
+    }
+
+    #[cfg(test)]
+    pub fn raw(&self) -> (f64, f64) {
+        (self.z1, self.z2)
     }
 
     /// Zeroes a decayed state before it turns denormal.

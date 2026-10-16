@@ -50,6 +50,8 @@ fn main() -> Result<(), Error> {
             process: voice_chain(&voice, &source),
             on_state: None,
             on_signal: None,
+            voice: None,
+            ducking: Default::default(),
         };
         let capture = AudioCapture::start(source.clone(), options, move |p| drop(tx.send(p)))?;
         tracks.push((source, capture, rx));

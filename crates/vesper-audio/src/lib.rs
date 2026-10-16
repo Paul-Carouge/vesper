@@ -17,6 +17,14 @@
 //! corrected by repeating or dropping single frames, at most one per buffer
 //! and per 480 frames (~2000 ppm ceiling up to 480-frame buffers, ~977 ppm at
 //! 1024, ~488 ppm at 2048).
+//!
+//! Voice ducking: tracks started with the same [`VoiceKey`] talk through it.
+//! A voice track (microphone or input device) tells it when it speaks, as
+//! heard (after its filters, volume and mute); every other track ducks under
+//! it as its [`DuckSettings`] say, before its volume, so the duck is in the
+//! track's own file and in the mix alike. They meet on the monotonic clock
+//! (the pts of their blocks), lock-free: a track running a few ms behind
+//! the voice only ducks that much late.
 
 mod aac;
 mod mix;
@@ -24,7 +32,7 @@ mod nodes;
 mod pw;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -35,10 +43,12 @@ use ffmpeg::{ChannelLayout, codec, encoder, frame};
 use ffmpeg_next as ffmpeg;
 use tracing::{error, warn};
 use vesper_core::EncodedPacket;
+use vesper_dsp::{Ducker, VOICE_HOLD_FRAMES, VoiceDetector};
 
 pub use aac::Aac;
 pub use mix::{Mix, MixInput};
 pub use nodes::{Node, NodeWatch};
+pub use vesper_dsp::DuckSettings;
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 pub type Result<T> = std::result::Result<T, Error>;
@@ -100,6 +110,33 @@ pub fn db_to_gain(db: f32) -> f32 {
     }
 }
 
+/// When the voice tracks speak, shared with the tracks that duck under them.
+#[derive(Debug, Default)]
+pub struct VoiceKey {
+    /// End of the latest speech plus its hold, ns on `CLOCK_MONOTONIC`.
+    until: AtomicU64,
+}
+
+impl VoiceKey {
+    /// A voice speaks until `t` at least (several voices: the latest wins).
+    fn speak_until(&self, t: Duration) {
+        self.until.fetch_max(t.as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    /// Whether a voice speaks at `t`.
+    fn speaking_at(&self, t: Duration) -> bool {
+        (t.as_nanos() as u64) < self.until.load(Ordering::Relaxed)
+    }
+}
+
+/// What a track does with a [`VoiceKey`].
+enum Voice {
+    /// It is a voice: it tells the key when it speaks.
+    Speaks(VoiceDetector),
+    /// It ducks under the voice, and may be background music.
+    Ducks(Box<Ducker>),
+}
+
 /// Which audio to record. Devices are named by their PipeWire `node.name`,
 /// which stays the same across reboots.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -143,6 +180,11 @@ pub struct Options {
     /// Called on the encode thread when a block is louder than the meter's
     /// floor after [`AudioCapture::wake_on_signal`]; once per call of it.
     pub on_signal: Option<OnSignal>,
+    /// Voice ducking (see the crate docs): a microphone or input track
+    /// speaks into it, any other track ducks under it.
+    pub voice: Option<Arc<VoiceKey>>,
+    /// Ducking and background music of a track that is not a voice.
+    pub ducking: DuckSettings,
 }
 
 /// See [`Options::on_signal`].
@@ -205,6 +247,31 @@ struct Shared {
     fresh: AtomicBool,
     /// The next block above [`SIGNAL_PEAK`] calls `on_signal`.
     wake: AtomicBool,
+    /// `f32` bits of [`DuckSettings::duck_db`].
+    duck_db: AtomicU32,
+    /// `f32` bits of [`DuckSettings::music_lufs`], 0 for `None`.
+    music_lufs: AtomicU32,
+    /// `f32` bits of the duck's current reduction, dB.
+    ducking: AtomicU32,
+}
+
+impl Shared {
+    fn set_ducking(&self, settings: DuckSettings) {
+        let (duck, music) = (
+            settings.duck_db.max(0.0),
+            settings.music_lufs.unwrap_or(0.0),
+        );
+        self.duck_db.store(duck.to_bits(), Ordering::Relaxed);
+        self.music_lufs.store(music.to_bits(), Ordering::Relaxed);
+    }
+
+    fn ducking(&self) -> DuckSettings {
+        let music = f32::from_bits(self.music_lufs.load(Ordering::Relaxed));
+        DuckSettings {
+            duck_db: f32::from_bits(self.duck_db.load(Ordering::Relaxed)),
+            music_lufs: (music < 0.0).then_some(music),
+        }
+    }
 }
 
 impl Default for Shared {
@@ -218,6 +285,9 @@ impl Default for Shared {
             stereo: AtomicBool::new(false),
             fresh: AtomicBool::new(false),
             wake: AtomicBool::new(false),
+            duck_db: AtomicU32::new(0),
+            music_lufs: AtomicU32::new(0),
+            ducking: AtomicU32::new(0),
         }
     }
 }
@@ -270,12 +340,22 @@ impl AudioCapture {
         shared
             .gain
             .store(db_to_gain(options.volume_db).to_bits(), Ordering::Relaxed);
+        shared.set_ducking(options.ducking);
         // ~1 s of buffers at the default quantum.
         let (chunk_tx, chunk_rx) = mpsc::sync_channel(50);
         let mut enc = Encoder::new(encoder, options.anchor, shared.clone(), on_packet);
         enc.process = options.process;
         enc.mix = options.mix;
         enc.on_signal = options.on_signal;
+        enc.voice = options.voice.map(|key| {
+            let ch = usize::from(CHANNELS);
+            let role = if source.is_input() {
+                Voice::Speaks(VoiceDetector::new(ch))
+            } else {
+                Voice::Ducks(Box::new(Ducker::new(ch)))
+            };
+            (key, role)
+        });
         let encode_thread = std::thread::Builder::new()
             .name("vesper-audio-enc".into())
             .spawn(move || encode_loop(enc, chunk_rx))?;
@@ -321,6 +401,16 @@ impl AudioCapture {
     /// peaks were last taken: the meter must not rest.
     pub fn wake_on_signal(&self) -> bool {
         self.shared.wake_on_signal()
+    }
+
+    /// Ducking and background music, live (see [`Options::ducking`]).
+    pub fn set_ducking(&self, settings: DuckSettings) {
+        self.shared.set_ducking(settings);
+    }
+
+    /// How much the duck lowers the track now, dB (>= 0).
+    pub fn ducking_db(&self) -> f32 {
+        f32::from_bits(self.shared.ducking.load(Ordering::Relaxed))
     }
 
     /// `OpusHead` for the container's codec private data.
@@ -491,6 +581,8 @@ struct Encoder<F> {
     /// Gain reached at the end of the last block.
     gain: f32,
     process: Option<Process>,
+    /// Voice ducking, see [`Options::voice`].
+    voice: Option<(Arc<VoiceKey>, Voice)>,
     mix: Option<MixInput>,
     /// Gets each block as encoded, with its pts (a live stream's audio).
     tap: Option<Tap>,
@@ -519,6 +611,7 @@ impl<F: FnMut(EncodedPacket)> Encoder<F> {
             gain: f32::from_bits(shared.gain.load(Ordering::Relaxed)),
             shared,
             process: None,
+            voice: None,
             mix: None,
             tap: None,
             opus: true,
@@ -576,8 +669,15 @@ impl<F: FnMut(EncodedPacket)> Encoder<F> {
         self.delay = delay;
     }
 
-    /// Volume, mix, meter and encoder for the block in `self.block`.
+    /// Ducking, volume, voice, mix, meter and encoder for the block in
+    /// `self.block`.
     fn encode_block(&mut self) {
+        let at = self.anchor + frames_to_duration(self.sent as usize);
+        if let Some((key, Voice::Ducks(ducker))) = &mut self.voice {
+            ducker.process(&mut self.block, self.shared.ducking(), key.speaking_at(at));
+            let db = ducker.ducking_db();
+            self.shared.ducking.store(db.to_bits(), Ordering::Relaxed);
+        }
         let gain = if self.shared.muted.load(Ordering::Relaxed) {
             0.0
         } else {
@@ -586,14 +686,17 @@ impl<F: FnMut(EncodedPacket)> Encoder<F> {
         apply_gain(&mut self.block, self.gain, gain);
         self.gain = gain;
         self.meter();
+        // As heard: a muted microphone does not duck anything.
+        if let Some((key, Voice::Speaks(detector))) = &mut self.voice
+            && let Some(end) = detector.process(&self.block)
+        {
+            key.speak_until(at + frames_to_duration(end + VOICE_HOLD_FRAMES));
+        }
         if let Some(mix) = &self.mix {
             mix.push(&self.block, self.sent as u64);
         }
         if let Some(tap) = &mut self.tap {
-            tap(
-                self.anchor + frames_to_duration(self.sent as usize),
-                &self.block,
-            );
+            tap(at, &self.block);
         }
         if !self.opus {
             self.sent += FRAME as i64;
@@ -1133,5 +1236,87 @@ mod tests {
             "{}",
             peak(&shared)
         );
+    }
+
+    /// Amplitude of the `freq` sine in a 20 ms block (whole periods) of
+    /// interleaved stereo, channel 0.
+    fn tone(block: &[f32], freq: f32) -> f32 {
+        let (mut re, mut im) = (0.0, 0.0);
+        for (i, frame) in block.chunks(2).enumerate() {
+            let w = std::f32::consts::TAU * freq * i as f32 / SAMPLE_RATE as f32;
+            (re, im) = (re + frame[0] * w.cos(), im + frame[0] * w.sin());
+        }
+        2.0 * (re * re + im * im).sqrt() / (block.len() / 2) as f32
+    }
+
+    #[test]
+    fn music_ducks_under_the_microphone_in_the_mix() {
+        let anchor = Duration::from_secs(5);
+        let mix = Mix::start(anchor, |_| {}).unwrap();
+        mix.set_encoding(false);
+        let (tx, rx) = mpsc::channel();
+        mix.set_tap(Some(Box::new(move |pts, b: &[f32]| {
+            let _ = tx.send((pts, tone(b, 150.0)));
+        })));
+        let key = Arc::new(VoiceKey::default());
+        let track = |voice: Voice, ducking: DuckSettings| {
+            let shared = Arc::new(Shared::default());
+            shared.set_ducking(ducking);
+            let mut enc = Encoder::new(open_encoder().unwrap(), anchor, shared, |_| {});
+            (enc.voice, enc.mix) = (Some((key.clone(), voice)), Some(mix.input()));
+            enc
+        };
+        let mut mic = track(
+            Voice::Speaks(VoiceDetector::new(2)),
+            DuckSettings::default(),
+        );
+        let duck = DuckSettings {
+            duck_db: 12.0,
+            music_lufs: None,
+        };
+        let mut music = track(Voice::Ducks(Box::new(Ducker::new(2))), duck);
+        // The mic speaks (a 1 kHz tone) from 1 s to 2 s, over a 150 Hz song.
+        let sine = |freq: f32, amp: f32, k: usize| -> Vec<f32> {
+            (k * FRAME..(k + 1) * FRAME)
+                .flat_map(|i| {
+                    let t = i as f32 / SAMPLE_RATE as f32;
+                    [amp * (std::f32::consts::TAU * freq * t).sin(); 2]
+                })
+                .collect()
+        };
+        for k in 0..175 {
+            let amp = if (50..100).contains(&k) { 0.3 } else { 0.0 };
+            mic.push(&sine(1_000.0, amp, k));
+            music.push(&sine(150.0, 0.25, k));
+        }
+        let got: Vec<_> = rx.try_iter().collect();
+        // The limiter's lookahead holds the last one back.
+        assert!(got.len() >= 174, "{}", got.len());
+        assert_eq!(got[60].0, anchor + Duration::from_millis(1_200));
+        let db = |k: usize| 20.0 * (got[k].1 / 0.25).log10();
+        assert!(db(49).abs() < 0.1, "{}", db(49));
+        // Down by the depth within the 50 ms attack (from the 20 ms the
+        // detector needs), the whole word and its 300 ms hold.
+        for k in [54, 75, 99, 113] {
+            assert!((db(k) + 12.0).abs() < 0.3, "block {k}: {} dB", db(k));
+        }
+        // Back after the 600 ms release.
+        assert!(db(146).abs() < 0.1, "{}", db(146));
+        // The duck shows for a meter.
+        assert_eq!(music.shared.ducking.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn a_muted_microphone_ducks_nothing() {
+        let key = Arc::new(VoiceKey::default());
+        let shared = Arc::new(Shared::default());
+        shared.muted.store(true, Ordering::Relaxed);
+        let mut mic = test_encoder(&shared);
+        mic.voice = Some((key.clone(), Voice::Speaks(VoiceDetector::new(2))));
+        mic.push(&vec![0.3; FRAME * 2 * 20]);
+        assert!(!key.speaking_at(Duration::ZERO));
+        shared.muted.store(false, Ordering::Relaxed);
+        mic.push(&vec![0.3; FRAME * 2 * 20]);
+        assert!(key.speaking_at(Duration::from_millis(600)));
     }
 }
