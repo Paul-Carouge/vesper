@@ -1,0 +1,17 @@
+[package]
+name = "vesper-compose"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+vesper-core.workspace = true
+# `loaded`: libvulkan is opened at run time, so building (and CI) needs no Vulkan.
+ash = { version = "0.38", default-features = false, features = ["loaded", "std"] }
+# DMA_BUF_IOCTL_EXPORT_SYNC_FILE (implicit fence of the main frame).
+libc = "0.2"
+tracing = "0.1"
+
+[dev-dependencies]
+vesper-encode.workspace = true
+ffmpeg-next.workspace = true
+tracing-subscriber = "0.3"
