@@ -25,6 +25,9 @@ starts with an item as versions before per-service stream keys saved it
 (no `service` attribute), e.g. for `keyring_locked_keeps_the_old_key` with
 `DISMISS=1`. `HANG=1` never answers `OpenSession`, like a keyring that
 was started but hangs (for `a_hung_keyring_gives_up_quickly`).
+`NO_REPLACE=1` ignores `CreateItem`'s replace flag and adds an item each
+time, like keyrings that do not honour it (for
+`keyring_store_keeps_only_the_new_key`).
 """
 import os
 
@@ -95,7 +98,7 @@ class Collection(dbus.service.Object):
         if self.service.locked:
             raise dbus.exceptions.DBusException("locked", name="org.freedesktop.Secret.Error.IsLocked")
         attributes = dict(properties.get("org.freedesktop.Secret.Item.Attributes", {}))
-        if replace:
+        if replace and os.environ.get("NO_REPLACE") != "1":
             for path, item in list(self.service.items.items()):
                 if item.attributes == attributes:
                     item.Delete()

@@ -1280,6 +1280,11 @@ export component AppWindow inherits Window {
     // Go live or end the stream (button, Ctrl+L, tray, global shortcut).
     public function global-toggle-live() {
         if (root.live-state != LiveState.ending) {
+            // A key pasted without Enter: the buttons do not take the
+            // focus, so it would never be saved and the old key would go out.
+            if (root.live-state == LiveState.off) {
+                live-key-field.commit();
+            }
             root.toggle-live();
         }
     }
@@ -2567,7 +2572,7 @@ export component AppWindow inherits Window {
                                     }
                                 }
                             }
-                            TextField {
+                            live-key-field := TextField {
                                 label: "New stream key";
                                 password: true;
                                 placeholder: root.live-key-state != "" ? "Paste a new key to replace it" : "Paste the key, then press Enter";

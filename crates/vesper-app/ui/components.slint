@@ -567,6 +567,14 @@ export component TextField inherits Rectangle {
     callback accepted(string);
     callback edited(string);
 
+    // Accepts what was typed but not confirmed yet (no Enter, focus kept).
+    public function commit() {
+        if (input.text != root.text) {
+            root.accepted(input.text);
+            input.text = root.text;
+        }
+    }
+
     forward-focus: input;
     height: 32px;
     border-radius: Theme.radius-sm;

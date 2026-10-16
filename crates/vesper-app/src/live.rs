@@ -1,7 +1,7 @@
 //! The Live card and the stream settings: going live and ending, the
 //! stream's state and stats, and the stream key (see `secret`). The key is
-//! read and written on short-lived threads: D-Bus and an unlock prompt must
-//! never block the UI.
+//! read and written on a thread of its own, in the order asked: D-Bus and
+//! an unlock prompt must never block the UI.
 
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -84,21 +84,38 @@ fn store_key(ui: &AppWindow, key: StreamKey, done: &'static str) {
     );
 }
 
-/// Runs `work` on a new thread, then `done` with its result on the UI thread.
+/// Runs `work` on the keyring thread, then `done` with its result on the
+/// UI thread.
 fn off_ui<T: Send + 'static>(
     ui: &AppWindow,
     work: impl FnOnce() -> T + Send + 'static,
     done: impl FnOnce(&AppWindow, T) + Send + 'static,
 ) {
     let weak = ui.as_weak();
-    let spawned = std::thread::Builder::new()
-        .name("vesper-secret".into())
-        .spawn(move || {
-            let result = work();
-            let _ = weak.upgrade_in_event_loop(move |ui| done(&ui, result));
-        });
-    if let Err(e) = spawned {
-        log!("could not start a thread: {e}");
+    in_order(Box::new(move || {
+        let result = work();
+        let _ = weak.upgrade_in_event_loop(move |ui| done(&ui, result));
+    }));
+}
+
+type Job = Box<dyn FnOnce() + Send>;
+
+/// Runs `job` on one thread, after the jobs given before it: a key entered
+/// right before Go live is saved before it is read, never after.
+fn in_order(job: Job) {
+    static QUEUE: std::sync::OnceLock<Option<std::sync::mpsc::Sender<Job>>> =
+        std::sync::OnceLock::new();
+    let queue = QUEUE.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<Job>();
+        std::thread::Builder::new()
+            .name("vesper-secret".into())
+            .spawn(move || rx.into_iter().for_each(|job| job()))
+            .inspect_err(|e| log!("could not start a thread: {e}"))
+            .ok()
+            .map(|_| tx)
+    });
+    if let Some(queue) = queue {
+        let _ = queue.send(job);
     }
 }
 
@@ -119,6 +136,32 @@ fn old_key_service(saving_off: bool, legacy: Option<Prefs>) -> Option<String> {
     secret::key_id(&legacy?.live)
 }
 
+/// What to say when `request` has no key and its service needs one; `other`
+/// is a service that has a key, never used for this one.
+fn no_key(request: &StreamRequest, other: Option<&str>) -> Option<String> {
+    let name = match request.settings.service {
+        _ if request.key.is_some() => return None,
+        Service::Twitch => "Twitch",
+        Service::YouTube => "YouTube",
+        Service::Custom => return None,
+    };
+    let other = other.map_or(String::new(), |o| format!(" (one is saved for {o})"));
+    Some(format!(
+        "No {name} stream key saved{other}: paste {name}'s key in the settings"
+    ))
+}
+
+/// Says where the key of an older version went: it was saved for the
+/// service selected back then, which may not be the one it belongs to.
+fn say_moved(ui: &AppWindow, id: &str) {
+    flash_notice(
+        ui,
+        &format!(
+            "Your previous stream key is now saved for {id}: paste it again if it is another service's"
+        ),
+    );
+}
+
 pub fn wire(ui: &AppWindow, recording: &Shared, games: &Games) {
     CONTEXT.with(|c| *c.borrow_mut() = Some((recording.clone(), games.clone())));
     // An older version's single key goes to the service it was saved for,
@@ -127,8 +170,13 @@ pub fn wire(ui: &AppWindow, recording: &Shared, games: &Games) {
     match old_key_service(saving_off, crate::prefs::legacy_settings()) {
         Some(id) => off_ui(
             ui,
-            move || secret::migrate(&id),
-            |ui, ()| show_key_state(ui),
+            move || secret::migrate(&id).then_some(id),
+            |ui, moved| {
+                if let Some(id) = moved {
+                    say_moved(ui, &id);
+                }
+                show_key_state(ui);
+            },
         ),
         None => show_key_state(ui),
     }
@@ -162,8 +210,21 @@ pub fn wire(ui: &AppWindow, recording: &Shared, games: &Games) {
         ui.set_live_detail("".into());
         // Only the key saved for this service (or server): never another's.
         let id = secret::key_id(&settings);
-        let load = move || id.and_then(|id| secret::load(&id));
-        off_ui(&ui, load, move |ui, key| {
+        let load = move || {
+            let key = id.as_deref().and_then(secret::load);
+            // None: which other service has one, to say so (never used).
+            let other = key
+                .is_none()
+                .then(|| {
+                    ["twitch", "youtube"]
+                        .into_iter()
+                        .filter(|o| id.as_deref() != Some(o))
+                        .find(|o| secret::saved(o).is_some())
+                })
+                .flatten();
+            (key, other)
+        };
+        off_ui(&ui, load, move |ui, (key, other)| {
             // Ended meanwhile (e.g. the pipeline stopped).
             let Some((rec, g)) = CONTEXT.with(|c| c.borrow().clone()) else {
                 return;
@@ -180,6 +241,7 @@ pub fn wire(ui: &AppWindow, recording: &Shared, games: &Games) {
             let request = StreamRequest { settings, key };
             if let Err(e) = request.url() {
                 ui.set_live_state(LiveState::Off);
+                let e = no_key(&request, other).unwrap_or(e);
                 flash_notice(ui, &e);
                 return;
             }
@@ -350,6 +412,50 @@ pub fn reset(ui: &AppWindow) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn going_live_without_a_key_says_which_service_lacks_one() {
+        let request = |service, key: Option<&str>| StreamRequest {
+            settings: StreamSettings {
+                service,
+                custom_url: "rtmp://h.example/app".into(),
+                ..StreamSettings::default()
+            },
+            key: key.and_then(StreamKey::new),
+        };
+        assert_eq!(
+            no_key(&request(Service::YouTube, None), Some("twitch")).as_deref(),
+            Some(
+                "No YouTube stream key saved (one is saved for twitch): paste YouTube's key in the settings"
+            )
+        );
+        assert_eq!(
+            no_key(&request(Service::Twitch, None), None).as_deref(),
+            Some("No Twitch stream key saved: paste Twitch's key in the settings")
+        );
+        assert_eq!(no_key(&request(Service::YouTube, Some("k")), None), None);
+        // A custom server may take no key.
+        assert_eq!(no_key(&request(Service::Custom, None), None), None);
+    }
+
+    /// A slow save given before a read finishes first: the read gets the
+    /// key just entered, not the one before it.
+    #[test]
+    fn keyring_work_runs_in_the_order_it_was_given() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let saved = std::sync::Arc::new(std::sync::Mutex::new("old"));
+        let (s, t) = (saved.clone(), tx.clone());
+        in_order(Box::new(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            *s.lock().unwrap() = "new";
+            t.send("saved").unwrap();
+        }));
+        in_order(Box::new(move || {
+            tx.send(*saved.lock().unwrap()).unwrap();
+        }));
+        let got: Vec<_> = rx.iter().take(2).collect();
+        assert_eq!(got, ["saved", "new"]);
+    }
 
     #[test]
     fn the_old_key_goes_only_to_the_service_it_was_saved_for() {

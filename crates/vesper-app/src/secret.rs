@@ -271,7 +271,7 @@ async fn keyring_store(id: &str, key: &StreamKey) -> Result<()> {
         ),
     ]);
     let secret: Secret = (
-        session,
+        session.clone(),
         Vec::new(),
         key.expose().as_bytes().to_vec(),
         "text/plain".into(),
@@ -283,7 +283,37 @@ async fn keyring_store(id: &str, key: &StreamKey) -> Result<()> {
     if !prompt(&conn, &p).await? {
         return Err("the keyring refused the key".into());
     }
-    Ok(())
+    keep_only(&conn, &service, &session, id, key).await
+}
+
+/// The error of a keyring that answered a save but does not hold the key.
+const NOT_KEPT: &str = "the keyring did not keep the key";
+
+/// Deletes `id`'s items that do not hold `key`, now saved: a keyring that
+/// adds an item instead of replacing would otherwise keep serving the older
+/// key ([`first_secret`] reads the first). [`NOT_KEPT`] when none holds it.
+async fn keep_only(
+    conn: &zbus::Connection,
+    service: &zbus::Proxy<'_>,
+    session: &OwnedObjectPath,
+    id: &str,
+    key: &StreamKey,
+) -> Result<()> {
+    let (unlocked, _) = items(service, attributes(id)).await?;
+    let secrets: HashMap<OwnedObjectPath, Secret> = service
+        .call("GetSecrets", &(&unlocked, session))
+        .await
+        .map_err(call_error)?;
+    let holds = |item: &OwnedObjectPath| {
+        secrets.get(item).is_some_and(|(_, _, value, _)| {
+            StreamKey::new(&String::from_utf8_lossy(value)).as_ref() == Some(key)
+        })
+    };
+    if !unlocked.iter().any(holds) {
+        return Err(NOT_KEPT.into());
+    }
+    let stale: Vec<_> = unlocked.iter().filter(|i| !holds(i)).cloned().collect();
+    delete_items(conn, &stale).await
 }
 
 async fn delete_items(conn: &zbus::Connection, paths: &[OwnedObjectPath]) -> Result<()> {
@@ -532,36 +562,41 @@ fn file_migrate(legacy: &Path, id: &str, target: Target) -> Result<Migrated> {
 /// Gives the one key of an older version (keyring item or file) to `id`,
 /// the service it was saved for (the caller reads it from the settings of
 /// that version). Never to another one: a key is only read for the service
-/// it is saved for, and a newer key of `id` is never overwritten.
-pub fn migrate(id: &str) {
+/// it is saved for, and a newer key of `id` is never overwritten. True
+/// when a key was moved.
+pub fn migrate(id: &str) -> bool {
     let _writing = writing();
-    let keyring = match block_on(keyring_migrate(id)) {
+    let (keyring, mut moved) = match block_on(keyring_migrate(id)) {
         Ok(done) => {
             if done != Migrated::Nothing {
                 log!("old stream key for {id}: {done:?}");
             }
-            true
+            (true, done == Migrated::Moved)
         }
-        Err(e) if e == ABSENT => false,
+        Err(e) if e == ABSENT => (false, false),
         Err(e) => {
             log!("secret service: {e}; the old stream key is kept");
-            return;
+            return false;
         }
     };
     let Some(legacy) = legacy_file_path() else {
-        return;
+        return moved;
     };
     let path = file_path();
     let target = match (keyring, &path) {
         (true, _) => Target::Keyring,
         (false, Some(path)) => Target::File(path),
-        (false, None) => return,
+        (false, None) => return moved,
     };
     match file_migrate(&legacy, id, target) {
         Ok(Migrated::Nothing) => {}
-        Ok(done) => log!("old stream key file for {id}: {done:?}"),
+        Ok(done) => {
+            log!("old stream key file for {id}: {done:?}");
+            moved |= done == Migrated::Moved;
+        }
         Err(e) => log!("{e}; {} is kept", legacy.display()),
     }
+    moved
 }
 
 /// `id`'s key: from the keyring (may ask to unlock it), else the file.
@@ -594,6 +629,10 @@ pub fn store(id: &str, key: &StreamKey) -> std::result::Result<Store, String> {
         Err(e) if e == NO_ANSWER => {
             log!("secret service: {e}");
             Err("The keyring did not answer: key not saved".into())
+        }
+        Err(e) if e == NOT_KEPT => {
+            log!("secret service: {e}");
+            Err("The keyring did not keep the key: not saved".into())
         }
         // There is a keyring, which refused (locked, prompt dismissed): no
         // copy in clear.
@@ -779,6 +818,23 @@ mod tests {
         assert_eq!(block_on(keyring_load(a)).unwrap(), None);
         assert_eq!(block_on(keyring_load(b)).unwrap(), Some(k));
         block_on(keyring_clear(b)).unwrap();
+    }
+
+    /// With the fake started as `NO_REPLACE=1` (it adds an item on every
+    /// `CreateItem`): a new key replaces the old one all the same, so a
+    /// load never serves the older key.
+    #[test]
+    #[ignore = "needs the fake Secret Service with NO_REPLACE=1"]
+    fn keyring_store_keeps_only_the_new_key() {
+        let id = "test-no-replace";
+        assert_eq!(store(id, &key("first_key")), Ok(Store::Keyring));
+        assert_eq!(store(id, &key("second_key")), Ok(Store::Keyring));
+        assert_eq!(block_on(keyring_load(id)).unwrap(), Some(key("second_key")));
+        let (conn, _) = block_on(open()).unwrap();
+        let service = block_on(proxy(&conn, SERVICE, "org.freedesktop.Secret.Service")).unwrap();
+        let (unlocked, locked) = block_on(items(&service, attributes(id))).unwrap();
+        assert_eq!(unlocked.len() + locked.len(), 1);
+        clear(id);
     }
 
     /// Adds an item as versions before per-service keys saved it.
