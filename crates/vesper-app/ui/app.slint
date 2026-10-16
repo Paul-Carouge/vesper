@@ -2204,7 +2204,7 @@ export component AppWindow inherits Window {
                                     }
                                     if !track.voice: DuckOption {
                                         title: @tr("Lower when I speak");
-                                        hint: @tr("Turned down while your microphone hears you, back up after.");
+                                        hint: @tr("Turned down while a voice is heard, back up after.");
                                         label: @tr("Lower {} when I speak", track.name);
                                         checked: track.duck;
                                         levels: [@tr("Light"), @tr("Medium"), @tr("Strong")];

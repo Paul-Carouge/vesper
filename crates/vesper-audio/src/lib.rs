@@ -138,6 +138,8 @@ struct Voice {
     key: Arc<VoiceKey>,
     detector: VoiceDetector,
     ducker: Box<Ducker>,
+    /// Was a voice at the last block.
+    speaks: bool,
 }
 
 impl Voice {
@@ -147,6 +149,7 @@ impl Voice {
             key,
             detector: VoiceDetector::new(ch),
             ducker: Box::new(Ducker::new(ch)),
+            speaks: false,
         }
     }
 }
@@ -601,7 +604,9 @@ struct Encoder<F> {
     process: Option<Process>,
     /// Voice ducking, see [`Options::voice`].
     voice: Option<Voice>,
-    /// Now, for the voice ducking: `monotonic_now` but in tests.
+    /// Now, for the voice ducking: `monotonic_now` but in tests. A ducking
+    /// track whose thread stalls then catches up ducks its older audio by
+    /// what the voice does now: the duck shifts by the stall.
     clock: fn() -> Duration,
     mix: Option<MixInput>,
     /// Gets each block as encoded, with its pts (a live stream's audio).
@@ -696,14 +701,20 @@ impl<F: FnMut(EncodedPacket)> Encoder<F> {
         let at = self.anchor + frames_to_duration(self.sent as usize);
         let speaks = self.shared.speaks.load(Ordering::Relaxed);
         if let Some(v) = &mut self.voice {
-            let db = if speaks {
-                0.0
+            if speaks && !v.speaks {
+                // A voice from now: it starts listening afresh.
+                v.detector = VoiceDetector::new(usize::from(CHANNELS));
+            }
+            v.speaks = speaks;
+            // A voice lets a duck it was in come back up smoothly (a no-op
+            // once idle): a jump would click.
+            let (settings, speaking) = if speaks {
+                (DuckSettings::default(), false)
             } else {
-                let speaking = v.key.speaking_at((self.clock)());
-                v.ducker
-                    .process(&mut self.block, self.shared.ducking(), speaking);
-                v.ducker.ducking_db()
+                (self.shared.ducking(), v.key.speaking_at((self.clock)()))
             };
+            v.ducker.process(&mut self.block, settings, speaking);
+            let db = v.ducker.ducking_db();
             self.shared.ducking.store(db.to_bits(), Ordering::Relaxed);
         }
         let gain = if self.shared.muted.load(Ordering::Relaxed) {
@@ -1399,6 +1410,31 @@ mod tests {
         }));
         run_voice(&mut mic, &mut music, |_, _| {});
         check_duck(&levels.lock().unwrap());
+    }
+
+    #[test]
+    fn becoming_a_voice_mid_duck_comes_back_up_smoothly() {
+        let key = Arc::new(VoiceKey::default());
+        let mut track = voice_track(&key, Duration::ZERO, false, DUCK_12);
+        let out = Arc::new(std::sync::Mutex::new(Vec::<f32>::new()));
+        let o = out.clone();
+        track.tap = Some(Box::new(move |_, b: &[f32]| {
+            o.lock().unwrap().extend(b.iter().step_by(2));
+        }));
+        set_now(Duration::from_secs(1));
+        key.speak_until(Duration::from_secs(10));
+        track.push(&vec![0.25; FRAME * 2 * 10]);
+        track.shared.speaks.store(true, Ordering::Relaxed);
+        track.push(&vec![0.25; FRAME * 2 * 80]);
+        let out = out.lock().unwrap();
+        let step = out
+            .windows(2)
+            .map(|w| (w[1] - w[0]).abs())
+            .fold(0.0, f32::max);
+        assert!(step < 1e-3, "{step}");
+        assert!((out[FRAME * 9] - 0.25 * db_to_gain(-12.0)).abs() < 1e-3);
+        assert_eq!(*out.last().unwrap(), 0.25);
+        assert_eq!(track.shared.ducking.load(Ordering::Relaxed), 0);
     }
 
     #[test]

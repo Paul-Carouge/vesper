@@ -1254,8 +1254,8 @@ msgstr "Piste"
 msgid "Track name"
 msgstr "Nom de la piste"
 
-msgid "Turned down while your microphone hears you, back up after."
-msgstr "Baissée tant que votre micro vous entend, remontée ensuite."
+msgid "Turned down while a voice is heard, back up after."
+msgstr "Baissée tant qu’on entend une voix, remontée ensuite."
 
 msgid "Type a name"
 msgstr "Saisissez un nom"
