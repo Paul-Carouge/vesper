@@ -683,7 +683,12 @@ impl Encoder {
                 self.blit(black, dst, ptr::null())?;
                 self.cleared.push(dst);
             }
-            self.blit((*picture).data[3] as usize as u32, dst, &fit)?;
+            if let Err(e) = self.blit((*picture).data[3] as usize as u32, dst, &fit) {
+                // The job may be running: wait for it before the producer's
+                // buffer is released (radeonsi fences the target, not the source).
+                vaSyncSurface(self.display, dst);
+                return Err(e);
+            }
             Ok(canvas)
         }
     }
