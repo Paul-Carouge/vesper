@@ -1,0 +1,64 @@
+// Copies a camera picture into the compositor's own RGBA image, so the
+// camera's buffer goes back at once and later compositions redraw from the
+// copy. Regenerate camera.spv with scripts/shaders.sh after editing.
+//
+// MODE_RGB: a 1:1 fetch of the imported RGB DMA-BUF (alpha dropped).
+// MODE_NV12 / MODE_YUY2: YUV bytes, tightly packed in a buffer, converted
+// with the camera's matrix and range. Colours stay in their (sRGB-like)
+// transfer encoding: Y'CbCr -> R'G'B', as the camera meant them.
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set = 0, binding = 0, std140) uniform Params {
+    uvec4 head;  // x: MODE_*, z: chroma offset (NV12, bytes), w: chroma row stride (NV12) or row stride (YUY2)
+    vec4 range;  // x: luma offset, y: luma scale, w: chroma scale (around 128)
+    vec4 coef;   // R from Cr, G from Cb, G from Cr, B from Cb
+};
+layout(set = 0, binding = 1, std430) readonly buffer Yuv {
+    uint data[];
+};
+layout(set = 0, binding = 2) uniform sampler2D rgb;
+layout(set = 0, binding = 3, rgba8) uniform writeonly image2D out_image;
+
+const uint MODE_RGB = 0u;
+const uint MODE_NV12 = 1u;
+const uint MODE_YUY2 = 2u;
+
+float byte_at(uint i) {
+    return float((data[i >> 2] >> ((i & 3u) * 8u)) & 0xffu);
+}
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(out_image);
+    if (any(greaterThanEqual(p, size))) {
+        return;
+    }
+    vec3 c;
+    if (head.x == MODE_RGB) {
+        c = texelFetch(rgb, p, 0).rgb;
+    } else {
+        uint x = uint(p.x);
+        uint y = uint(p.y);
+        float l;
+        float u;
+        float v;
+        if (head.x == MODE_NV12) {
+            l = byte_at(y * uint(size.x) + x);
+            uint i = head.z + (y / 2u) * head.w + (x / 2u) * 2u;
+            u = byte_at(i);
+            v = byte_at(i + 1u);
+        } else {
+            uint i = y * head.w + (x / 2u) * 4u;
+            l = byte_at(i + (x & 1u) * 2u);
+            u = byte_at(i + 1u);
+            v = byte_at(i + 3u);
+        }
+        float yy = (l - range.x) * range.y;
+        float cb = (u - 128.0) * range.w;
+        float cr = (v - 128.0) * range.w;
+        c = clamp(vec3(yy + coef.x * cr, yy - coef.y * cb - coef.z * cr, yy + coef.w * cb), 0.0, 1.0);
+    }
+    imageStore(out_image, p, vec4(c, 1.0));
+}

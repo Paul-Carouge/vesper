@@ -10,7 +10,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use common::Producer;
-use vesper_compose::{Compositor, Draw, Fit, OUTPUT_FOURCC, PREVIEW_HEIGHT, PREVIEW_WIDTH, Source};
+use vesper_compose::{
+    Compositor, Draw, Fit, OUTPUT_FOURCC, PREVIEW_HEIGHT, PREVIEW_WIDTH, Source, YuvLayout,
+    YuvMatrix, YuvPicture,
+};
 use vesper_core::{Codec, ReleaseGuard, VideoFrame};
 use vesper_encode::{Encoder, RateControl};
 
@@ -565,4 +568,223 @@ fn textures_removed_while_their_copy_runs_are_freed_after_it() {
     }
     let (_, px) = compose_read(&mut c, None, &draws);
     assert_eq!(px[..4], [0, 0, 255, 255]);
+}
+
+/// Y'CbCr bytes to R'G'B' bytes, in f64: the reference for the shader.
+fn yuv_to_rgb(yuv: [u8; 3], matrix: YuvMatrix, full_range: bool) -> [f64; 3] {
+    let (kr, kb) = match matrix {
+        YuvMatrix::Bt601 => (0.299, 0.114),
+        YuvMatrix::Bt709 => (0.2126, 0.0722),
+        YuvMatrix::Bt2020 => (0.2627, 0.0593),
+    };
+    let kg = 1.0 - kr - kb;
+    let [y, u, v] = yuv.map(f64::from);
+    let (y, cb, cr) = if full_range {
+        (y / 255.0, (u - 128.0) / 255.0, (v - 128.0) / 255.0)
+    } else {
+        ((y - 16.0) / 219.0, (u - 128.0) / 224.0, (v - 128.0) / 224.0)
+    };
+    let r = y + 2.0 * (1.0 - kr) * cr;
+    let b = y + 2.0 * (1.0 - kb) * cb;
+    let g = (y - kr * r - kb * b) / kg;
+    [r, g, b].map(|c| (c.clamp(0.0, 1.0) * 255.0).round())
+}
+
+/// A `w` x `h` picture coloured by `colour(x, y)` (constant over 2 x 2
+/// blocks), with odd plane offsets and padded rows: (planes, data).
+fn yuv_picture(
+    layout: YuvLayout,
+    w: usize,
+    h: usize,
+    colour: impl Fn(usize, usize) -> [u8; 3],
+) -> (Vec<(usize, usize)>, Vec<u8>) {
+    let pad = 16;
+    match layout {
+        YuvLayout::Nv12 => {
+            let (ys, cs) = (w + pad, w + pad);
+            let uv_at = 7 + ys * h + 5;
+            let mut data = vec![0xaa; uv_at + cs * h / 2 + 3];
+            for y in 0..h {
+                for x in 0..w {
+                    let [l, u, v] = colour(x, y);
+                    data[7 + y * ys + x] = l;
+                    let c = uv_at + (y / 2) * cs + (x / 2) * 2;
+                    (data[c], data[c + 1]) = (u, v);
+                }
+            }
+            (vec![(7, ys), (uv_at, cs)], data)
+        }
+        YuvLayout::Yuy2 => {
+            let s = w * 2 + pad;
+            let mut data = vec![0xaa; 3 + s * h];
+            for y in 0..h {
+                for x in 0..w {
+                    let [l, u, v] = colour(x, y);
+                    let i = 3 + y * s + (x / 2) * 4;
+                    data[i + (x & 1) * 2] = l;
+                    (data[i + 1], data[i + 3]) = (u, v);
+                }
+            }
+            (vec![(3, s)], data)
+        }
+    }
+}
+
+/// NV12 and YUY2 pictures in BT.601 full and limited and BT.709 limited
+/// come out as the reference conversion (±2), pure red as published.
+#[test]
+fn yuv_camera_pictures_convert_like_the_reference() {
+    if !gpu() {
+        return;
+    }
+    let (w, h) = (PREVIEW_WIDTH, PREVIEW_HEIGHT);
+    let mut c = Compositor::new(w, h).unwrap();
+    let (cw, ch) = (128usize, 32usize);
+    // Pure red in each matrix and range.
+    let anchors = [
+        (YuvMatrix::Bt601, false, [81, 90, 240]),
+        (YuvMatrix::Bt709, false, [63, 102, 240]),
+        (YuvMatrix::Bt601, true, [76, 85, 255]),
+    ];
+    let mut seed = 0x1234_5678u32;
+    let mut next = move || {
+        seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        (seed >> 24) as u8
+    };
+    let mut colours = vec![
+        [0, 128, 128],
+        [255, 128, 128],
+        [16, 16, 16],
+        [235, 240, 240],
+    ];
+    colours.extend((0..60).map(|_| [next(), next(), next()]));
+    let blocks = cw / 8;
+    for layout in [YuvLayout::Nv12, YuvLayout::Yuy2] {
+        for (matrix, full_range, red) in anchors {
+            let colour = |x: usize, y: usize| {
+                let b = (y / 8) * blocks + x / 8;
+                if b == 0 {
+                    red
+                } else {
+                    colours[b % colours.len()]
+                }
+            };
+            let (planes, data) = yuv_picture(layout, cw, ch, colour);
+            let staged = c
+                .uploader()
+                .prepare_yuv(&YuvPicture {
+                    width: cw as u32,
+                    height: ch as u32,
+                    layout,
+                    planes: &planes,
+                    data: &data,
+                    matrix,
+                    full_range,
+                })
+                .unwrap();
+            c.set_camera_yuv(3, staged).unwrap();
+            let at_native = Draw {
+                rect: [0.0, 0.0, cw as f32 / w as f32, ch as f32 / h as f32],
+                ..full(Source::Camera(3), Fit::Stretch, 1.0)
+            };
+            let (_, px) = compose_read(&mut c, None, &[at_native]);
+            let what = format!("{layout:?} {matrix:?} full {full_range}");
+            let i = ((4 * w + 4) * 4) as usize;
+            for (k, want) in [255, 0, 0].into_iter().enumerate() {
+                let got = i32::from(px[i + k]);
+                assert!(
+                    (got - want).abs() <= 2,
+                    "{what}: red is {:?}",
+                    &px[i..i + 3]
+                );
+            }
+            for by in 0..ch / 8 {
+                for bx in 0..blocks {
+                    let (x, y) = (bx * 8 + 3, by * 8 + 5);
+                    let want = yuv_to_rgb(colour(x, y), matrix, full_range);
+                    let i = (y * w as usize + x) * 4;
+                    for k in 0..3 {
+                        assert!(
+                            (f64::from(px[i + k]) - want[k]).abs() <= 2.0,
+                            "{what}: block ({bx}, {by}) yuv {:?} is {:?}, want {want:?}",
+                            colour(x, y),
+                            &px[i..i + 3]
+                        );
+                    }
+                }
+            }
+            assert_eq!(
+                px[(cw * 4) + 4 * 4 * w as usize..][..4],
+                [0, 0, 0, 255],
+                "outside"
+            );
+        }
+    }
+}
+
+/// A camera's DMA-BUF is copied 1:1, released by the composition that
+/// copied it, and redrawn from the copy; one the GPU cannot import hides
+/// the camera without failing the composition.
+#[test]
+fn camera_frames_are_copied_then_released_and_bad_ones_hide_the_camera() {
+    if !gpu() {
+        return;
+    }
+    let (w, h) = (PREVIEW_WIDTH, PREVIEW_HEIGHT);
+    let producer = unsafe { Producer::new(w, h) };
+    let mut c = Compositor::new(w, h).unwrap();
+    let released = Arc::new(AtomicUsize::new(0));
+    let frame = |t: u32| {
+        let mut f = unsafe { producer.frame(t as usize % common::POOL, t, 7, Duration::ZERO) };
+        let r = released.clone();
+        f.release = ReleaseGuard::new(move || {
+            r.fetch_add(1, Ordering::SeqCst);
+        });
+        f
+    };
+    let draws = [full(Source::Camera(1), Fit::Stretch, 1.0)];
+    let check = |px: &[u8], t: u32| {
+        for (x, y) in [(0, 0), (17, 200), (300, 40), (w - 1, h - 1)] {
+            let i = ((y * w + x) * 4) as usize;
+            let [b, g, r] = pattern(w, h, t, x, y);
+            assert_eq!(px[i..i + 4], [r, g, b, 255], "picture {t} at ({x}, {y})");
+        }
+    };
+    // Latest wins: the first picture goes back unused.
+    c.set_camera_frame(1, frame(1)).unwrap();
+    c.set_camera_frame(1, frame(2)).unwrap();
+    assert_eq!(released.load(Ordering::SeqCst), 1);
+    let (_, px) = compose_read(&mut c, None, &draws);
+    assert_eq!(released.load(Ordering::SeqCst), 2, "copied, then released");
+    check(&px, 2);
+    // Redrawn from the copy: nothing held.
+    let (_, px) = compose_read(&mut c, None, &draws);
+    check(&px, 2);
+    c.set_camera_frame(1, frame(3)).unwrap();
+    let (_, px) = compose_read(&mut c, None, &draws);
+    check(&px, 3);
+    assert_eq!(released.load(Ordering::SeqCst), 3);
+
+    // A picture the GPU cannot take: the camera is hidden, the rest drawn.
+    c.set_texture(9, 4, 4, &solid(4, 4, [0, 0, 255, 255]))
+        .unwrap();
+    let mut bad = frame(4);
+    bad.fourcc = u32::from_le_bytes(*b"NV12");
+    c.set_camera_frame(1, bad).unwrap();
+    let both = [full(Source::Texture(9), Fit::Stretch, 1.0), draws[0]];
+    let (_, px) = compose_read(&mut c, None, &both);
+    assert_eq!(released.load(Ordering::SeqCst), 4);
+    assert_eq!(px[..4], [0, 0, 255, 255], "camera hidden, texture drawn");
+    let failures = c.take_camera_failures();
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    assert_eq!(failures[0].0, 1);
+    // Back with its next good picture.
+    c.set_camera_frame(1, frame(5)).unwrap();
+    let (_, px) = compose_read(&mut c, None, &both);
+    check(&px, 5);
+    assert!(c.take_camera_failures().is_empty());
+    c.remove_camera(1);
+    let (_, px) = compose_read(&mut c, None, &both);
+    assert_eq!(px[..4], [0, 0, 255, 255], "removed");
+    assert_eq!(released.load(Ordering::SeqCst), 5);
 }
