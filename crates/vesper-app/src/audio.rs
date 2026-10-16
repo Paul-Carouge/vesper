@@ -213,7 +213,7 @@ pub fn show_tracks(ui: &AppWindow, tracks: &[Track]) {
 }
 
 /// A name the settings can keep: one line, at most 64 characters.
-fn clean_name(name: &str) -> Option<String> {
+pub fn clean_name(name: &str) -> Option<String> {
     let name: String = name
         .trim()
         .chars()
@@ -390,7 +390,7 @@ fn show_sources(ui: &AppWindow, nodes: &[Node]) {
 
 /// Shows the latest device list again (after a track or device change), or
 /// just the tracks before any list came.
-fn show_known_sources(ui: &AppWindow) {
+pub fn show_known_sources(ui: &AppWindow) {
     match SOURCES.with(|s| s.borrow().nodes.clone()) {
         Some(nodes) => show_sources(ui, &nodes),
         None => refresh_rows(ui),
@@ -448,7 +448,7 @@ fn watch_sources(ui: &AppWindow, on: bool) {
 
 /// Hands a new track list to the running pipeline, if any. It restarts its
 /// audio once nothing records; a new pipeline reads the UI anyway.
-fn apply_tracks(ui: &AppWindow, rec: &Shared) {
+pub fn apply_tracks(ui: &AppWindow, rec: &Shared) {
     if let Some(p) = rec.borrow().as_ref() {
         p.set_tracks(recorded_tracks(ui), ui.get_audio_mix());
     }

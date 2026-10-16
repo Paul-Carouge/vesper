@@ -84,7 +84,7 @@ export component Card inherits Rectangle {
     border-color: Theme.border;
 }
 
-// Text button. `kind`: "secondary" (default), "primary", "ghost".
+// Text button. `kind`: "secondary" (default), "primary", "ghost", "danger" (destructive).
 // `small`: 28px high, for inline actions in dense rows.
 export component Button inherits FocusScope {
     in property <string> text;
@@ -127,6 +127,8 @@ export component Button inherits FocusScope {
         border-color: Theme.border-strong;
         background: root.kind == "primary"
             ? (touch.pressed ? Theme.accent.darker(0.15) : touch.has-hover ? Theme.accent-hover : Theme.accent)
+            : root.kind == "danger"
+            ? (touch.pressed ? Theme.rec.darker(0.2) : touch.has-hover ? Theme.rec.darker(0.1) : Theme.rec)
             : root.kind == "ghost"
                 ? (touch.pressed ? Theme.surface-pressed : touch.has-hover ? Theme.surface-hover : transparent)
                 : (touch.pressed ? Theme.surface-pressed : touch.has-hover ? Theme.surface-hover : Theme.surface-raised);
@@ -144,7 +146,7 @@ export component Button inherits FocusScope {
             width: 18px;
             height: 18px;
             data: root.icon;
-            tint: root.kind == "primary" ? Theme.on-accent : Theme.text;
+            tint: root.kind == "primary" || root.kind == "danger" ? Theme.on-accent : Theme.text;
             opacity: root.enabled ? 1 : 0.4;
         }
         Text {
@@ -152,7 +154,7 @@ export component Button inherits FocusScope {
             vertical-alignment: center;
             font-size: root.small ? Theme.font-small : Theme.font-body;
             font-weight: 600;
-            color: root.kind == "primary" ? Theme.on-accent : Theme.text;
+            color: root.kind == "primary" || root.kind == "danger" ? Theme.on-accent : Theme.text;
             opacity: root.enabled ? 1 : 0.4;
         }
     }
@@ -565,6 +567,7 @@ export component TextField inherits Rectangle {
     callback accepted(string);
     callback edited(string);
 
+    forward-focus: input;
     height: 32px;
     border-radius: Theme.radius-sm;
     background: Theme.surface-raised;

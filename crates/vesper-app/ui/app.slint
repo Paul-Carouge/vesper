@@ -30,6 +30,8 @@ export struct DeviceChoice { name: string, label: string, connected: bool }
 export enum SourceKind { none, screen, window, game }
 /// A game connected through the Vulkan layer that may be captured.
 export struct GameEntry { name: string, pid: int }
+// A saved profile: its file name and its name.
+export struct ProfileEntry { slug: string, name: string }
 export enum VideoCodec { av1, hevc, h264 }
 export enum QualityPreset { performance, balanced, quality }
 /// Recording lifecycle, owned by the backend. `starting` covers the portal
@@ -759,6 +761,84 @@ component MenuRow inherits FocusScope {
     }
 }
 
+// A profile in the profile menu; the current one is checked.
+component ProfileRow inherits FocusScope {
+    in property <string> name;
+    in property <bool> selected;
+    // Focused once shown (the menu opened from the keyboard).
+    in property <bool> take-focus;
+    callback clicked;
+
+    init => {
+        if (self.take-focus) {
+            self.focus();
+        }
+    }
+
+    focus-on-click: false;
+    height: 36px;
+    accessible-role: list-item;
+    accessible-label: root.name;
+    accessible-item-selectable: true;
+    accessible-item-selected: root.selected;
+    accessible-enabled: root.enabled;
+    accessible-action-default => {
+        if (root.enabled) {
+            root.clicked();
+        }
+    }
+
+    key-pressed(event) => {
+        if (event.text == Key.Space || event.text == Key.Return) {
+            if (root.enabled) { root.clicked(); }
+            return accept;
+        }
+        reject
+    }
+
+    FocusRing {
+        visible-ring: root.has-focus;
+        radius: Theme.radius-sm;
+    }
+
+    Rectangle {
+        border-radius: Theme.radius-sm;
+        background: touch.pressed ? Theme.surface-pressed : touch.has-hover ? Theme.surface-hover : transparent;
+        animate background { duration: Theme.fast; }
+    }
+
+    HorizontalLayout {
+        padding-left: Theme.space-sm;
+        padding-right: Theme.space-sm;
+        spacing: Theme.space-sm;
+        opacity: root.enabled || root.selected ? 1 : 0.45;
+        Text {
+            horizontal-stretch: 1;
+            text: root.name;
+            vertical-alignment: center;
+            font-size: Theme.font-body;
+            font-weight: root.selected ? 600 : 400;
+            color: Theme.text;
+            overflow: elide;
+        }
+        if root.selected: Icon {
+            y: (parent.height - self.height) / 2;
+            width: 18px;
+            height: 18px;
+            data: Icons.check;
+            tint: Theme.accent;
+        }
+    }
+
+    touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: self.enabled ? pointer : default;
+        clicked => {
+            root.clicked();
+        }
+    }
+}
+
 // A titled control inside a setting group.
 component Field inherits VerticalLayout {
     in property <string> title;
@@ -934,6 +1014,21 @@ export component AppWindow inherits Window {
 
     // Background: "Start with the session" (autostart entry), and whether a
     // tray icon keeps Vesper running once the window is closed.
+    // Profiles: the saved ones, the current one, and why a name was refused.
+    in property <[ProfileEntry]> profiles;
+    in property <string> profile-slug;
+    in property <string> profile-name;
+    in-out property <string> profile-error;
+    callback profile-menu-opened();
+    callback profile-switch(string);
+    // A new profile with the default settings, a copy of the current one,
+    // the current one renamed: true once done, else `profile-error` says why.
+    callback profile-create(string) -> bool;
+    callback profile-duplicate(string) -> bool;
+    callback profile-rename(string) -> bool;
+    // Deletes the current profile (never the last one).
+    callback profile-delete();
+
     in-out property <bool> autostart;
     in property <bool> tray-available;
     callback autostart-changed(bool);
@@ -987,6 +1082,50 @@ export component AppWindow inherits Window {
     property <bool> choosing-source;
     // The settings' device list shown: 1 Desktop audio, 2 Microphone, 0 none.
     property <int> device-list;
+    // The profile menu is shown, and what it shows: 0 the profiles, 1 a new
+    // profile's name, 2 the copy's name, 3 the new name, 4 the delete
+    // confirmation.
+    property <bool> profile-menu;
+    property <int> profile-mode;
+    property <string> profile-draft;
+    // Switching waits for the recording and the stream to end.
+    property <bool> profiles-locked: root.active || !root.live-off;
+
+    public function open-profile-menu(mode: int) {
+        root.profile-menu = true;
+        root.set-profile-mode(mode);
+        root.profile-menu-opened();
+    }
+
+    function set-profile-mode(mode: int) {
+        root.profile-mode = mode;
+        root.profile-error = "";
+        root.profile-draft = mode == 3 ? root.profile-name : mode == 2 ? root.profile-name + " copy" : "";
+    }
+
+    function close-profile-menu() {
+        root.profile-menu = false;
+        root.profile-mode = 0;
+        profile-field.focus();
+    }
+
+    function submit-profile-name() {
+        // New and Duplicate switch profiles: not while recording or streaming.
+        if (root.profile-mode != 3 && root.profiles-locked) {
+            return;
+        }
+        if (root.profile-mode == 1 ? root.profile-create(root.profile-draft) : root.profile-mode == 2 ? root.profile-duplicate(root.profile-draft) : root.profile-rename(root.profile-draft)) {
+            root.close-profile-menu();
+        }
+    }
+
+    // The tracks are shown anew: their settings close first.
+    function switch-profile(slug: string) {
+        root.close-track();
+        root.picking = false;
+        root.profile-switch(slug);
+        root.close-profile-menu();
+    }
     // A list of sources or devices is shown: the backend keeps them current.
     out property <bool> watching-sources: root.picking || root.choosing-source || root.settings-open;
     changed watching-sources => {
@@ -1086,6 +1225,7 @@ export component AppWindow inherits Window {
 
     function open-settings() {
         root.settings-open = true;
+        root.profile-menu = false;
         if (root.active) {
             close-button.focus();
         } else {
@@ -1190,6 +1330,23 @@ export component AppWindow inherits Window {
                         color: Theme.text;
                         horizontal-stretch: 1;
                     }
+                    profile-field := SelectField {
+                        min-width: 96px;
+                        max-width: 200px;
+                        horizontal-stretch: 0;
+                        label: "Profile";
+                        text: root.profile-name;
+                        expanded: root.profile-menu;
+                        enabled: !root.settings-open;
+                        description: root.profiles-locked ? "Switching is locked while recording or streaming" : "";
+                        clicked => {
+                            if (root.profile-menu) {
+                                root.close-profile-menu();
+                            } else {
+                                root.open-profile-menu(0);
+                            }
+                        }
+                    }
                     settings-button := IconButton {
                         enabled: !root.settings-open;
                         icon: Icons.sliders;
@@ -1197,6 +1354,202 @@ export component AppWindow inherits Window {
                         active: root.settings-open;
                         clicked => {
                             root.open-settings();
+                        }
+                    }
+                }
+
+                // ---- Profile menu ------------------------------------------
+                if root.profile-menu: FocusScope {
+                    focus-on-tab-navigation: false;
+                    focus-on-click: false;
+                    // Escape: back to the profiles, else the menu closes.
+                    key-pressed(event) => {
+                        if (event.text == Key.Escape) {
+                            if (root.profile-mode != 0) {
+                                root.set-profile-mode(0);
+                            } else {
+                                root.close-profile-menu();
+                            }
+                            return accept;
+                        }
+                        reject
+                    }
+                    Card {
+                        VerticalLayout {
+                            padding: Theme.space-sm;
+                            spacing: Theme.space-xs;
+                            VerticalLayout {
+                                spacing: 2px;
+                                accessible-role: list;
+                                accessible-label: "Profiles";
+                                for p in root.profiles: ProfileRow {
+                                    name: p.name;
+                                    selected: p.slug == root.profile-slug;
+                                    enabled: !root.profiles-locked;
+                                    take-focus: profile-field.keyboard && self.selected && root.profile-mode == 0;
+                                    clicked => {
+                                        if (p.slug == root.profile-slug) {
+                                            root.close-profile-menu();
+                                        } else {
+                                            root.switch-profile(p.slug);
+                                        }
+                                    }
+                                }
+                            }
+                            if root.profiles-locked: HorizontalLayout {
+                                padding-left: Theme.space-sm;
+                                padding-right: Theme.space-sm;
+                                Text {
+                                    text: "Switching is locked while recording or streaming.";
+                                    font-size: Theme.font-small;
+                                    color: Theme.text-muted;
+                                    wrap: word-wrap;
+                                }
+                            }
+                            Rectangle {
+                                height: 1px;
+                                background: Theme.border;
+                            }
+                            if root.profile-mode == 0: HorizontalLayout {
+                                spacing: Theme.space-xs;
+                                alignment: start;
+                                Button {
+                                    text: "New";
+                                    small: true;
+                                    kind: "ghost";
+                                    enabled: !root.profiles-locked;
+                                    accessible-label: "New profile";
+                                    clicked => {
+                                        root.set-profile-mode(1);
+                                    }
+                                }
+                                Button {
+                                    text: "Duplicate";
+                                    small: true;
+                                    kind: "ghost";
+                                    enabled: !root.profiles-locked;
+                                    accessible-label: "Duplicate \{root.profile-name}";
+                                    clicked => {
+                                        root.set-profile-mode(2);
+                                    }
+                                }
+                                Button {
+                                    text: "Rename";
+                                    small: true;
+                                    kind: "ghost";
+                                    accessible-label: "Rename \{root.profile-name}";
+                                    clicked => {
+                                        root.set-profile-mode(3);
+                                    }
+                                }
+                                Button {
+                                    text: "Delete";
+                                    small: true;
+                                    kind: "ghost";
+                                    // Never the last one.
+                                    enabled: !root.profiles-locked && root.profiles.length > 1;
+                                    accessible-label: "Delete \{root.profile-name}";
+                                    accessible-description: root.profiles.length > 1 ? "" : "The last profile cannot be deleted";
+                                    clicked => {
+                                        root.set-profile-mode(4);
+                                    }
+                                }
+                            }
+                            if root.profile-mode >= 1 && root.profile-mode <= 3: VerticalLayout {
+                                padding: Theme.space-sm;
+                                spacing: Theme.space-sm;
+                                Text {
+                                    text: root.profile-mode == 1 ? "New profile, with the default settings" : root.profile-mode == 2 ? "Copy of “\{root.profile-name}”" : "Rename “\{root.profile-name}”";
+                                    font-size: Theme.font-small;
+                                    font-weight: 600;
+                                    color: Theme.text;
+                                    overflow: elide;
+                                }
+                                TextField {
+                                    text: root.profile-draft;
+                                    label: "Profile name";
+                                    placeholder: "Profile name";
+                                    enabled: root.profile-mode == 3 || !root.profiles-locked;
+                                    init => {
+                                        self.focus();
+                                    }
+                                    edited(text) => {
+                                        root.profile-draft = text;
+                                    }
+                                    accepted(text) => {
+                                        root.profile-draft = text;
+                                        root.submit-profile-name();
+                                    }
+                                }
+                                // Always there, so a new error is announced.
+                                Text {
+                                    max-height: root.profile-error == "" ? 0px : 1000px;
+                                    text: root.profile-error;
+                                    font-size: Theme.font-small;
+                                    color: Theme.warn;
+                                    wrap: word-wrap;
+                                    accessible-role: text;
+                                    accessible-live-region: AccessibleLiveness.assertive;
+                                }
+                                HorizontalLayout {
+                                    alignment: end;
+                                    spacing: Theme.space-sm;
+                                    Button {
+                                        text: "Cancel";
+                                        small: true;
+                                        kind: "ghost";
+                                        clicked => {
+                                            root.set-profile-mode(0);
+                                        }
+                                    }
+                                    Button {
+                                        text: root.profile-mode == 1 ? "Create" : root.profile-mode == 2 ? "Duplicate" : "Rename";
+                                        small: true;
+                                        kind: "primary";
+                                        // A recording or stream that started meanwhile.
+                                        enabled: root.profile-mode == 3 || !root.profiles-locked;
+                                        clicked => {
+                                            root.submit-profile-name();
+                                        }
+                                    }
+                                }
+                            }
+                            if root.profile-mode == 4: VerticalLayout {
+                                padding: Theme.space-sm;
+                                spacing: Theme.space-sm;
+                                Text {
+                                    text: "Delete “\{root.profile-name}”? Its settings and plugin states are deleted.";
+                                    font-size: Theme.font-small;
+                                    color: Theme.text;
+                                    wrap: word-wrap;
+                                }
+                                HorizontalLayout {
+                                    alignment: end;
+                                    spacing: Theme.space-sm;
+                                    Button {
+                                        text: "Cancel";
+                                        small: true;
+                                        kind: "ghost";
+                                        init => {
+                                            self.focus();
+                                        }
+                                        clicked => {
+                                            root.set-profile-mode(0);
+                                        }
+                                    }
+                                    Button {
+                                        text: "Delete";
+                                        small: true;
+                                        kind: "danger";
+                                        enabled: !root.profiles-locked;
+                                        accessible-label: "Delete \{root.profile-name}";
+                                        clicked => {
+                                            root.profile-delete();
+                                            root.close-profile-menu();
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }

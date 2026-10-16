@@ -1,11 +1,20 @@
 """A throwaway, in-memory org.freedesktop.secrets for testing the stream key
 storage on a private bus, never the user's keyring:
 
-    dbus-run-session -- bash -c 'python3 -I scripts/fake_secret_service.py & sleep 1;
-        cargo test -p vesper-app keyring -- --ignored'
+    dbus-run-session -- bash -c 'python3 -I scripts/fake_secret_service.py &
+        until dbus-send --session --print-reply --dest=org.freedesktop.DBus /org/freedesktop/DBus \
+            org.freedesktop.DBus.NameHasOwner string:org.freedesktop.secrets | grep -q true;
+        do sleep 0.1; done
+        cargo test -p vesper-app secret::tests::keyring_ -- --ignored'
+
+Wait for the name as above, not a fixed sleep: a call made before the fake
+owns it would make the bus start the real keyring daemon.
 
 The default collection starts locked: `Unlock` goes through a prompt that
-completes at once (`DISMISS=1` dismisses it instead).
+completes at once (`DISMISS=1` dismisses it instead). `SEED_OLD=<key>`
+starts with an item as versions before per-service stream keys saved it
+(no `service` attribute), e.g. for `keyring_locked_keeps_the_old_key` with
+`DISMISS=1`.
 """
 import os
 
@@ -47,6 +56,18 @@ class Item(dbus.service.Object):
         self.attributes = attributes
         self.secret = secret
 
+    @dbus.service.method(dbus.PROPERTIES_IFACE, in_signature="ss", out_signature="v")
+    def Get(self, interface, name):
+        if interface == ITEM and name == "Attributes":
+            return dbus.Dictionary(self.attributes, signature="ss")
+        raise dbus.exceptions.DBusException(name, name="org.freedesktop.DBus.Error.UnknownProperty")
+
+    @dbus.service.method(dbus.PROPERTIES_IFACE, in_signature="s", out_signature="a{sv}")
+    def GetAll(self, interface):
+        if interface != ITEM:
+            return dbus.Dictionary({}, signature="sv")
+        return dbus.Dictionary({"Attributes": dbus.Dictionary(self.attributes, signature="ss")}, signature="sv")
+
     @dbus.service.method(ITEM, out_signature="o")
     def Delete(self):
         del self.service.items[self.path]
@@ -83,6 +104,12 @@ class Service(dbus.service.Object):
         self.prompts = 0
         self.locked = True
         self.collection = Collection(self, DEFAULT)
+        seed = os.environ.get("SEED_OLD")
+        if seed:
+            self.count += 1
+            path = f"{DEFAULT}/{self.count}"
+            attributes = {"application": "io.github.PaulCarouge.Vesper", "type": "stream-key"}
+            self.items[path] = Item(self, path, attributes, seed.encode())
 
     @dbus.service.method(SERVICE, in_signature="sv", out_signature="vo")
     def OpenSession(self, algorithm, value):

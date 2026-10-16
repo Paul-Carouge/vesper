@@ -1,5 +1,7 @@
-//! User settings kept across launches in `$XDG_CONFIG_HOME/vesper/settings`,
-//! as `key=value` lines. Unknown keys, missing keys and bad values are
+//! User settings kept across launches, as `key=value` lines: the app's own
+//! in `$XDG_CONFIG_HOME/vesper/settings` (with the current profile), the
+//! recording settings in the current profile's file (see `profiles`). Both
+//! go through [`Prefs::parse`]. Unknown keys, missing keys and bad values are
 //! ignored: those settings keep their defaults. Written atomically.
 
 use std::collections::HashSet;
@@ -52,6 +54,10 @@ pub struct Prefs {
     pub tray_notice_shown: bool,
     /// Live stream settings; the key is never here (see `secret`).
     pub live: StreamSettings,
+    /// The current profile's file name (see `profiles`); in `settings`.
+    pub profile: String,
+    /// The current profile's name; in its file.
+    pub profile_name: String,
 }
 
 impl Prefs {
@@ -71,6 +77,8 @@ impl Prefs {
             allowed_games: ALLOWED_GAMES.lock().unwrap().clone(),
             tray_notice_shown: TRAY_NOTICE_SHOWN.load(Ordering::Relaxed),
             live: crate::live::settings(ui),
+            profile: ui.get_profile_slug().into(),
+            profile_name: ui.get_profile_name().into(),
         }
     }
 
@@ -110,6 +118,17 @@ impl Prefs {
             vesper_core::Codec::Hevc => VideoCodec::Hevc,
             vesper_core::Codec::H264 => VideoCodec::H264,
         });
+        ui.set_profile_slug(self.profile.as_str().into());
+        ui.set_profile_name(self.profile_name.as_str().into());
+    }
+
+    /// `self` with the app's own settings of `app`: the ones no profile has.
+    pub fn with_app_settings(self, app: &Self) -> Self {
+        Self {
+            allowed_games: app.allowed_games.clone(),
+            tray_notice_shown: app.tray_notice_shown,
+            ..self
+        }
     }
 
     /// `self` with the valid settings of `text` applied.
@@ -191,6 +210,8 @@ impl Prefs {
                     }
                 }
                 "live_codec" => set(&mut self.live.codec, codec(value).map(Into::into)),
+                "profile" if crate::profiles::valid_slug(value) => self.profile = value.to_owned(),
+                "name" if valid_track_name(value) => self.profile_name = value.to_owned(),
                 _ => {}
             }
         }
@@ -209,9 +230,24 @@ impl Prefs {
         self
     }
 
+    /// The `settings` file: the app's own settings and the current profile.
+    pub fn serialize_settings(&self) -> String {
+        let mut text = "# Vesper settings, rewritten on every change.\n".to_owned();
+        if crate::profiles::valid_slug(&self.profile) {
+            text += &format!("profile={}\n", self.profile);
+        }
+        text += &format!("tray_notice_shown={}\n", self.tray_notice_shown);
+        for game in self.allowed_games.iter().filter(|g| valid_game(g)) {
+            text += &format!("allow_game={game}\n");
+        }
+        text
+    }
+
+    /// A profile's file: its name and the recording settings.
+    ///
     /// The folder is left out while it is `default_folder`, so a later
     /// default (e.g. a moved `XDG_VIDEOS_DIR`) still applies.
-    pub fn serialize(&self, default_folder: &str) -> String {
+    pub fn serialize_profile(&self, default_folder: &str) -> String {
         let codec = match self.codec {
             VideoCodec::Av1 => "av1",
             VideoCodec::Hevc => "hevc",
@@ -222,9 +258,12 @@ impl Prefs {
             QualityPreset::Balanced => "balanced",
             QualityPreset::Quality => "quality",
         };
-        let mut text = format!(
-            "# Vesper settings, rewritten on every change.\n\
-             codec={codec}\nquality={quality}\nfps={}\nreplay={}\nreplay_seconds={}\n",
+        let mut text = "# Vesper profile, rewritten on every change.\n".to_owned();
+        if valid_track_name(&self.profile_name) {
+            text += &format!("name={}\n", self.profile_name);
+        }
+        text += &format!(
+            "codec={codec}\nquality={quality}\nfps={}\nreplay={}\nreplay_seconds={}\n",
             self.fps, self.replay_enabled, self.replay_seconds
         );
         // Marks the list as saved, even empty.
@@ -248,13 +287,7 @@ impl Prefs {
         if self.output_folder != default_folder && !self.output_folder.contains(['\n', '\r']) {
             text += &format!("output_folder={}\n", self.output_folder);
         }
-        text += &format!(
-            "game_source={}\ntray_notice_shown={}\n",
-            self.game_source, self.tray_notice_shown
-        );
-        for game in self.allowed_games.iter().filter(|g| valid_game(g)) {
-            text += &format!("allow_game={game}\n");
-        }
+        text += &format!("game_source={}\n", self.game_source);
         let live = &self.live;
         let service = match live.service {
             Service::Twitch => "twitch",
@@ -280,30 +313,90 @@ impl Prefs {
         text
     }
 
-    /// `defaults` with the saved settings applied. A missing or unreadable
-    /// file keeps the defaults.
+    /// `defaults` with the saved settings applied: the app's own from
+    /// `settings`, the recording ones from the current profile (see
+    /// [`crate::profiles::open`]). Missing files keep the defaults. A file
+    /// that cannot be read keeps them too, and turns saving off (see
+    /// [`SAVING_OFF`]): the user's settings are never overwritten with them.
     pub fn load(defaults: Self) -> Self {
-        let Some(path) = path() else { return defaults };
-        match read_capped(&path) {
-            Ok(bytes) => defaults.parse(&String::from_utf8_lossy(&bytes)),
+        let (Some(path), Some(dir)) = (path(), crate::profiles::dir()) else {
+            return defaults;
+        };
+        match crate::profiles::open(&path, &dir, defaults.clone()) {
+            Ok(prefs) => prefs,
             Err(e) => {
-                if e.kind() != std::io::ErrorKind::NotFound {
-                    log!("could not read {}: {e}", path.display());
-                }
+                log!("{e}: settings are not saved until Vesper restarts");
+                SAVING_OFF.store(true, Ordering::Relaxed);
                 defaults
             }
         }
     }
 
-    pub fn save(&self) {
-        let Some(path) = path() else { return };
-        let default_folder = crate::default_output_folder().unwrap_or_default();
-        let text = self.serialize(&default_folder.to_string_lossy());
-        if let Err(e) = write_atomically(&path, text.as_bytes()) {
-            log!("could not save {}: {e}", path.display());
+    /// `self` with the settings of file `path` applied; unchanged when the
+    /// file does not exist. An error for a file that cannot be read.
+    pub fn try_read(self, path: &Path) -> std::io::Result<Self> {
+        match read_capped(path) {
+            Ok(bytes) => Ok(self.parse(&String::from_utf8_lossy(&bytes))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(self),
+            Err(e) => Err(std::io::Error::new(
+                e.kind(),
+                format!("could not read {}: {e}", path.display()),
+            )),
         }
     }
+
+    pub fn save(&self) {
+        if SAVING_OFF.load(Ordering::Relaxed) {
+            return;
+        }
+        let (Some(path), Some(dir)) = (path(), crate::profiles::dir()) else {
+            return;
+        };
+        let default_folder = crate::default_output_folder().unwrap_or_default();
+        if let Err(e) = self.save_to(&path, &dir, &default_folder.to_string_lossy(), false) {
+            log!("{e}");
+        }
+    }
+
+    /// Writes the current profile's file into `profiles`, then `settings`:
+    /// the settings never name a profile that was not written. `durable`:
+    /// each file and its folder reach the disk before the next is written.
+    pub fn save_to(
+        &self,
+        settings: &Path,
+        profiles: &Path,
+        default_folder: &str,
+        durable: bool,
+    ) -> std::io::Result<()> {
+        let mut files = Vec::with_capacity(2);
+        if crate::profiles::valid_slug(&self.profile) {
+            let file = crate::profiles::file(profiles, &self.profile);
+            files.push((file, self.serialize_profile(default_folder)));
+        }
+        files.push((settings.to_owned(), self.serialize_settings()));
+        for (path, text) in files {
+            write_file(&path, text.as_bytes(), durable).map_err(|e| {
+                std::io::Error::new(e.kind(), format!("could not save {}: {e}", path.display()))
+            })?;
+        }
+        Ok(())
+    }
 }
+
+/// The settings of the version before profiles, as they were (see
+/// `profiles::backup_path`); `None` without a readable copy.
+pub fn legacy_settings() -> Option<Prefs> {
+    let backup = crate::profiles::backup_path(&path()?);
+    backup.is_file().then_some(())?;
+    Prefs::default()
+        .try_read(&backup)
+        .inspect_err(|e| log!("{e}"))
+        .ok()
+}
+
+/// The settings could not be read at startup: nothing is saved, so the
+/// defaults shown never replace them.
+pub static SAVING_OFF: AtomicBool = AtomicBool::new(false);
 
 fn set<T>(field: &mut T, value: Option<T>) {
     if let Some(value) = value {
@@ -586,6 +679,12 @@ fn read_capped(path: &Path) -> std::io::Result<Vec<u8>> {
 /// process crash leaves either the old or the new file, never half of one.
 /// No fsync: it would block the UI thread, and settings are cheap to lose.
 pub fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    write_file(path, bytes, false)
+}
+
+/// [`write_atomically`]; `durable`: the file, then its folder (the rename),
+/// reach the disk before it returns. For one-time changes not to be lost.
+pub fn write_file(path: &Path, bytes: &[u8], durable: bool) -> std::io::Result<()> {
     static WRITES: AtomicU64 = AtomicU64::new(0);
     let dir = path.parent().ok_or(std::io::ErrorKind::NotFound)?;
     std::fs::create_dir_all(dir)?;
@@ -604,12 +703,27 @@ pub fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         .create_new(true)
         .mode(0o600)
         .open(&tmp)
-        .and_then(|mut file| file.write_all(bytes))
+        .and_then(|mut file| {
+            file.write_all(bytes)?;
+            if durable {
+                file.sync_all()?;
+            }
+            Ok(())
+        })
         .and_then(|()| std::fs::rename(&tmp, path));
     if written.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
-    written
+    written?;
+    if durable {
+        sync_dir(dir)?;
+    }
+    Ok(())
+}
+
+/// Makes the files created or renamed in `dir` durable.
+pub fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::File::open(dir)?.sync_all()
 }
 
 #[cfg(test)]
@@ -635,6 +749,8 @@ mod tests {
             allowed_games: Vec::new(),
             tray_notice_shown: false,
             live: StreamSettings::default(),
+            profile: String::new(),
+            profile_name: String::new(),
         }
     }
 
@@ -694,6 +810,15 @@ mod tests {
                 bitrate: 4_500_000,
                 codec: vesper_core::Codec::Av1,
             },
+            profile: "game-1440p".into(),
+            profile_name: "Game — 1440p / AV1".into(),
+        }
+    }
+
+    impl Prefs {
+        /// Both files in one.
+        fn serialize(&self, default_folder: &str) -> String {
+            self.serialize_settings() + &self.serialize_profile(default_folder)
         }
     }
 
@@ -709,7 +834,33 @@ mod tests {
                 output_folder: changed().output_folder,
                 // Saved entries add to the list.
                 allowed_games: changed().allowed_games,
+                // Unnamed: the current profile stays.
+                profile: changed().profile,
+                profile_name: changed().profile_name,
                 ..defaults()
+            }
+        );
+    }
+
+    #[test]
+    fn app_settings_and_profile_settings_go_to_their_file() {
+        let prefs = changed();
+        let settings = prefs.serialize_settings();
+        let profile = prefs.serialize_profile(DEFAULT);
+        assert!(settings.contains("profile=game-1440p\n") && settings.contains("allow_game="));
+        assert!(!settings.contains("codec=") && !settings.contains("track="));
+        assert!(profile.contains("name=Game — 1440p / AV1\n") && profile.contains("codec=h264"));
+        assert!(!profile.contains("allow_game") && !profile.contains("tray_notice"));
+        assert!(!profile.contains("profile="));
+        // A profile file holds no app setting, even a stale one.
+        let back = defaults().parse(&profile).with_app_settings(&defaults());
+        assert_eq!(
+            back,
+            Prefs {
+                allowed_games: Vec::new(),
+                tray_notice_shown: false,
+                profile: String::new(),
+                ..changed()
             }
         );
     }
