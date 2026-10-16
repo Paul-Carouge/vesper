@@ -5130,6 +5130,7 @@ name = "vesper-capture"
 version = "0.1.0"
 dependencies = [
  "ashpd",
+ "async-io",
  "futures-lite",
  "libc",
  "pipewire",

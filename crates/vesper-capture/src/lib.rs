@@ -25,7 +25,8 @@ use futures_lite::future::block_on;
 use tracing::warn;
 use vesper_core::VideoFrame;
 
-/// How long dropping a [`Capture`] waits for the portal to close its session.
+/// How long dropping a [`Capture`], or cancelling its picker, waits for the
+/// portal to close its session.
 const CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
@@ -308,23 +309,31 @@ async fn open_portal(
     match futures_lite::future::or(result, cancelled).await {
         Ok((node_id, fd, token, source)) => Ok((session, node_id, fd, token, source)),
         Err(e) => {
-            if cancel.0.done.load(Ordering::SeqCst) {
-                // Ends the picker of the request in flight (the session's
-                // close below should too); a finished request just errors.
-                for path in &requests {
-                    let _ = proxy
-                        .connection()
-                        .call_method(
-                            Some("org.freedesktop.portal.Desktop"),
-                            path.as_str(),
-                            Some("org.freedesktop.portal.Request"),
-                            "Close",
-                            &(),
-                        )
-                        .await;
+            let close = async {
+                if cancel.0.done.load(Ordering::SeqCst) {
+                    // Ends the picker of the request in flight (the session's
+                    // close below should too); a finished request just errors.
+                    for path in &requests {
+                        let _ = proxy
+                            .connection()
+                            .call_method(
+                                Some("org.freedesktop.portal.Desktop"),
+                                path.as_str(),
+                                Some("org.freedesktop.portal.Request"),
+                                "Close",
+                                &(),
+                            )
+                            .await;
+                    }
                 }
-            }
-            let _ = session.close().await;
+                let _ = session.close().await;
+            };
+            // A frozen portal must not hang the capture thread.
+            let gave_up = async {
+                async_io::Timer::after(CLOSE_TIMEOUT).await;
+                warn!("portal did not close the request in time");
+            };
+            futures_lite::future::or(close, gave_up).await;
             Err(e)
         }
     }
