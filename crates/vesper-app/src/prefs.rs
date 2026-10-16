@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use vesper_audio::{MAX_DB, MIN_DB, Source};
 
+use crate::i18n::Language;
 use crate::outputs::{Kind, SourceLabel};
 use crate::recorder::{MAX_FILTERS, MAX_TRACKS, Track, TrackFilter};
 use crate::scenes::{self, Scenes};
@@ -53,6 +54,8 @@ pub struct Prefs {
     pub game_source: bool,
     pub allowed_games: Vec<String>,
     pub tray_notice_shown: bool,
+    /// The UI language; in `settings`.
+    pub language: Language,
     /// Live stream settings; the key is never here (see `secret`).
     pub live: StreamSettings,
     /// The current profile's file name (see `profiles`); in `settings`.
@@ -79,6 +82,7 @@ impl Prefs {
             game_source: ui.get_source_kind() == SourceKind::Game,
             allowed_games: ALLOWED_GAMES.lock().unwrap().clone(),
             tray_notice_shown: TRAY_NOTICE_SHOWN.load(Ordering::Relaxed),
+            language: Language::from_index(ui.get_language()),
             live: crate::live::settings(ui),
             profile: ui.get_profile_slug().into(),
             profile_name: ui.get_profile_name().into(),
@@ -106,6 +110,7 @@ impl Prefs {
             .unwrap()
             .clone_from(&self.allowed_games);
         TRAY_NOTICE_SHOWN.store(self.tray_notice_shown, Ordering::Relaxed);
+        ui.set_language(self.language.index());
         let live = &self.live;
         ui.set_live_service(match live.service {
             Service::Twitch => LiveService::Twitch,
@@ -132,6 +137,7 @@ impl Prefs {
         Self {
             allowed_games: app.allowed_games.clone(),
             tray_notice_shown: app.tray_notice_shown,
+            language: app.language,
             ..self
         }
     }
@@ -199,6 +205,7 @@ impl Prefs {
                     self.allowed_games.push(value.to_owned());
                 }
                 "tray_notice_shown" => set(&mut self.tray_notice_shown, flag(value)),
+                "language" => set(&mut self.language, Language::from_id(value)),
                 "live_service" => set(&mut self.live.service, service(value)),
                 "live_url" if one_line(value) => self.live.custom_url = value.trim().to_owned(),
                 "live_height" => {
@@ -247,6 +254,7 @@ impl Prefs {
             text += &format!("profile={}\n", self.profile);
         }
         text += &format!("tray_notice_shown={}\n", self.tray_notice_shown);
+        text += &format!("language={}\n", self.language.id());
         for game in self.allowed_games.iter().filter(|g| valid_game(g)) {
             text += &format!("allow_game={game}\n");
         }
@@ -450,8 +458,8 @@ fn quality(value: &str) -> Option<QualityPreset> {
 /// The desktop and microphone tracks of a first launch.
 pub fn default_tracks() -> Vec<Track> {
     vec![
-        Track::new("Desktop", Source::Desktop),
-        Track::new("Microphone", Source::Microphone),
+        Track::new(tr!("Desktop"), Source::Desktop),
+        Track::new(tr!("Microphone"), Source::Microphone),
     ]
 }
 
@@ -602,6 +610,13 @@ fn flag(value: &str) -> Option<bool> {
 /// `$XDG_CONFIG_HOME/vesper/settings`.
 fn path() -> Option<PathBuf> {
     dirs::config_dir().map(|d| d.join("vesper").join("settings"))
+}
+
+/// The language saved in `settings`, read before the window shows anything.
+pub fn saved_language() -> Language {
+    path()
+        .and_then(|p| Prefs::default().try_read(&p).ok())
+        .map_or_else(Language::default, |p| p.language)
 }
 
 /// `$XDG_CONFIG_HOME/vesper/source`: how to show the source of the saved
@@ -759,6 +774,7 @@ mod tests {
             game_source: false,
             allowed_games: Vec::new(),
             tray_notice_shown: false,
+            language: Language::System,
             live: StreamSettings::default(),
             profile: String::new(),
             profile_name: String::new(),
@@ -814,6 +830,7 @@ mod tests {
             game_source: true,
             allowed_games: vec!["Game.exe".into(), "a=b c".into()],
             tray_notice_shown: true,
+            language: Language::French,
             live: StreamSettings {
                 service: Service::Custom,
                 custom_url: "srt://host:9000?latency=200000".into(),
@@ -893,6 +910,7 @@ mod tests {
             Prefs {
                 allowed_games: Vec::new(),
                 tray_notice_shown: false,
+                language: Language::System,
                 profile: String::new(),
                 ..changed()
             }

@@ -106,7 +106,7 @@ export global SceneStore {
     }
 
     public pure function kind-name(kind: LayerKind) -> string {
-        kind == LayerKind.main ? "Capture" : kind == LayerKind.camera ? "Camera" : kind == LayerKind.image ? "Image" : "Text"
+        kind == LayerKind.main ? @tr("Capture") : kind == LayerKind.camera ? @tr("Camera") : kind == LayerKind.image ? @tr("Image") : @tr("Text")
     }
 }
 
@@ -193,7 +193,7 @@ export component SceneBar inherits Card {
     property <length> cell: (root.inner - (root.columns - 1) * root.gap) / root.columns;
 
     accessible-role: groupbox;
-    accessible-label: "Scenes";
+    accessible-label: @tr("Scenes");
 
     VerticalLayout {
         padding: Theme.card-padding;
@@ -203,14 +203,14 @@ export component SceneBar inherits Card {
             spacing: Theme.space-sm;
             SectionLabel {
                 horizontal-stretch: 1;
-                text: "SCENE";
+                text: @tr("SCENE");
                 vertical-alignment: center;
             }
             if SceneStore.camera-on: HorizontalLayout {
                 horizontal-stretch: 0;
                 spacing: 6px;
                 accessible-role: text;
-                accessible-label: "Camera on";
+                accessible-label: @tr("Camera on");
                 VerticalLayout {
                     alignment: center;
                     Rectangle {
@@ -222,7 +222,7 @@ export component SceneBar inherits Card {
                 }
                 Text {
                     horizontal-stretch: 0;
-                    text: "Camera on";
+                    text: @tr("Camera on");
                     vertical-alignment: center;
                     font-size: Theme.font-caption;
                     font-weight: 600;
@@ -230,11 +230,11 @@ export component SceneBar inherits Card {
                 }
             }
             Button {
-                text: "Edit";
+                text: @tr("Edit");
                 icon: Icons.layers;
                 kind: "ghost";
                 small: true;
-                accessible-label: "Edit the scenes";
+                accessible-label: @tr("Edit the scenes");
                 clicked => {
                     root.edit();
                 }
@@ -419,7 +419,7 @@ component Swatches inherits HorizontalLayout {
         focus-on-click: false;
         enabled: root.enabled;
         accessible-role: radio-button;
-        accessible-label: "\{root.label} colour \{c == #FFFFFF ? "white" : c == #000000 ? "black" : c == #8A8D99 ? "grey" : c == #9A8CFF ? "violet" : c == #FF5C52 ? "red" : c == #F2B84B ? "amber" : c == #4CC38A ? "green" : "blue"}";
+        accessible-label: @tr("{} colour {}", root.label, c == #FFFFFF ? @tr("white") : c == #000000 ? @tr("black") : c == #8A8D99 ? @tr("grey") : c == #9A8CFF ? @tr("violet") : c == #FF5C52 ? @tr("red") : c == #F2B84B ? @tr("amber") : c == #4CC38A ? @tr("green") : @tr("blue"));
         accessible-checkable: true;
         accessible-checked: self.chosen;
         accessible-action-default => {
@@ -525,7 +525,7 @@ component SceneCanvas inherits Rectangle {
 
     height: (self.width - 2 * root.margin) / root.ratio + 2 * root.margin;
     accessible-role: image;
-    accessible-label: "Scene preview";
+    accessible-label: @tr("Scene preview");
 
     function begin(layer: int, handle: int, x: length, y: length) {
         root.press-x = x;
@@ -713,7 +713,7 @@ component LayerItem inherits FocusScope {
     focus-on-click: false;
     height: 40px;
     accessible-role: list-item;
-    accessible-label: root.layer.label + (root.layer.visible ? "" : " (hidden)");
+    accessible-label: root.layer.visible ? root.layer.label : @tr("{} (hidden)", root.layer.label);
     accessible-item-selectable: true;
     accessible-item-selected: root.selected;
     accessible-action-default => {
@@ -772,7 +772,7 @@ component LayerItem inherits FocusScope {
                 width: 32px;
                 height: 32px;
                 icon: root.layer.visible ? Icons.eye : Icons.eye-off;
-                label: (root.layer.visible ? "Hide " : "Show ") + root.layer.label;
+                label: root.layer.visible ? @tr("Hide {}", root.layer.label) : @tr("Show {}", root.layer.label);
                 clicked => {
                     root.toggle-visible();
                 }
@@ -782,7 +782,7 @@ component LayerItem inherits FocusScope {
                 width: 32px;
                 height: 32px;
                 icon: Icons.arrow-up;
-                label: "Move \{root.layer.label} up";
+                label: @tr("Move {} up", root.layer.label);
                 enabled: !root.top;
                 opacity: self.enabled ? 1 : 0.35;
                 clicked => {
@@ -794,7 +794,7 @@ component LayerItem inherits FocusScope {
                 width: 32px;
                 height: 32px;
                 icon: Icons.arrow-down;
-                label: "Move \{root.layer.label} down";
+                label: @tr("Move {} down", root.layer.label);
                 enabled: !root.bottom;
                 opacity: self.enabled ? 1 : 0.35;
                 clicked => {
@@ -806,7 +806,7 @@ component LayerItem inherits FocusScope {
                 width: 32px;
                 height: 32px;
                 icon: Icons.trash;
-                label: "Remove \{root.layer.label}";
+                label: @tr("Remove {}", root.layer.label);
                 clicked => {
                     root.remove();
                 }
@@ -920,7 +920,7 @@ component ScenesCard inherits Card {
     }
 
     accessible-role: groupbox;
-    accessible-label: "Scenes";
+    accessible-label: @tr("Scenes");
 
     VerticalLayout {
         padding: Theme.space-sm;
@@ -930,14 +930,14 @@ component ScenesCard inherits Card {
             padding-top: Theme.space-xs;
             padding-bottom: Theme.space-xs;
             SectionLabel {
-                text: "SCENES";
+                text: @tr("SCENES");
             }
         }
         if !root.any: VerticalLayout {
             padding: Theme.space-sm;
             spacing: Theme.space-md;
             Text {
-                text: "No scenes yet: the capture is recorded alone. A scene adds images, text or a webcam over it.";
+                text: @tr("No scenes yet: the capture is recorded alone. A scene adds images, text or a webcam over it.");
                 font-size: Theme.font-small;
                 color: Theme.text-muted;
                 wrap: word-wrap;
@@ -945,7 +945,7 @@ component ScenesCard inherits Card {
             HorizontalLayout {
                 alignment: start;
                 Button {
-                    text: "New scene";
+                    text: @tr("New scene");
                     icon: Icons.plus;
                     kind: "primary";
                     small: true;
@@ -958,11 +958,11 @@ component ScenesCard inherits Card {
         if root.any: VerticalLayout {
             spacing: 2px;
             accessible-role: list;
-            accessible-label: "Scenes";
+            accessible-label: @tr("Scenes");
             for scene[i] in SceneStore.scenes: ListRow {
                 text: scene.name;
                 selected: i == SceneStore.editing;
-                badge: i == SceneStore.active ? "Recorded" : "";
+                badge: i == SceneStore.active ? @tr("Recorded") : "";
                 clicked => {
                     root.edit(i);
                 }
@@ -973,30 +973,30 @@ component ScenesCard inherits Card {
             spacing: Theme.space-xs;
             alignment: start;
             Button {
-                text: "New";
+                text: @tr("scene" => "New");
                 small: true;
                 kind: "ghost";
                 enabled: SceneStore.scenes.length < 16;
-                accessible-label: "New scene";
+                accessible-label: @tr("New scene");
                 clicked => {
                     SceneStore.add-scene();
                 }
             }
             Button {
-                text: "Duplicate";
+                text: @tr("Duplicate");
                 small: true;
                 kind: "ghost";
                 enabled: SceneStore.scenes.length < 16;
-                accessible-label: "Duplicate \{root.name}";
+                accessible-label: @tr("Duplicate {}", root.name);
                 clicked => {
                     SceneStore.duplicate-scene(SceneStore.editing);
                 }
             }
             Button {
-                text: "Rename";
+                text: @tr("Rename");
                 small: true;
                 kind: "ghost";
-                accessible-label: "Rename \{root.name}";
+                accessible-label: @tr("Rename {}", root.name);
                 clicked => {
                     SceneStore.name-error = "";
                     root.draft = root.name;
@@ -1004,10 +1004,10 @@ component ScenesCard inherits Card {
                 }
             }
             Button {
-                text: "Delete";
+                text: @tr("Delete");
                 small: true;
                 kind: "ghost";
-                accessible-label: "Delete \{root.name}";
+                accessible-label: @tr("Delete {}", root.name);
                 clicked => {
                     root.mode = 2;
                 }
@@ -1018,8 +1018,8 @@ component ScenesCard inherits Card {
             spacing: Theme.space-sm;
             TextField {
                 text: root.draft;
-                label: "Scene name";
-                placeholder: "Scene name";
+                label: @tr("Scene name");
+                placeholder: @tr("Scene name");
                 init => {
                     self.focus();
                 }
@@ -1044,7 +1044,7 @@ component ScenesCard inherits Card {
                 alignment: end;
                 spacing: Theme.space-sm;
                 Button {
-                    text: "Cancel";
+                    text: @tr("Cancel");
                     small: true;
                     kind: "ghost";
                     clicked => {
@@ -1052,7 +1052,7 @@ component ScenesCard inherits Card {
                     }
                 }
                 Button {
-                    text: "Rename";
+                    text: @tr("Rename");
                     small: true;
                     kind: "primary";
                     clicked => {
@@ -1065,7 +1065,7 @@ component ScenesCard inherits Card {
             padding: Theme.space-sm;
             spacing: Theme.space-sm;
             Text {
-                text: SceneStore.scenes.length > 1 ? "Delete “\{root.name}”?" : "Delete “\{root.name}”? Without scenes, the capture is recorded alone.";
+                text: SceneStore.scenes.length > 1 ? @tr("Delete “{}”?", root.name) : @tr("Delete “{}”? Without scenes, the capture is recorded alone.", root.name);
                 font-size: Theme.font-small;
                 color: Theme.text;
                 wrap: word-wrap;
@@ -1074,7 +1074,7 @@ component ScenesCard inherits Card {
                 alignment: end;
                 spacing: Theme.space-sm;
                 Button {
-                    text: "Cancel";
+                    text: @tr("Cancel");
                     small: true;
                     kind: "ghost";
                     init => {
@@ -1085,10 +1085,10 @@ component ScenesCard inherits Card {
                     }
                 }
                 Button {
-                    text: "Delete";
+                    text: @tr("Delete");
                     small: true;
                     kind: "danger";
-                    accessible-label: "Delete \{root.name}";
+                    accessible-label: @tr("Delete {}", root.name);
                     clicked => {
                         root.mode = 0;
                         SceneStore.delete-scene(SceneStore.editing);
@@ -1103,7 +1103,7 @@ component ScenesCard inherits Card {
 component PreviewCard inherits Card {
     in property <bool> locked;
     property <bool> any: SceneStore.scenes.length > 0;
-    property <[LayerRow]> layers: root.any && SceneStore.editing < SceneStore.scenes.length ? SceneStore.scenes[SceneStore.editing].layers : [{ kind: LayerKind.main, label: "Capture", visible: true, opacity: 1, w: 1, h: 1 }];
+    property <[LayerRow]> layers: root.any && SceneStore.editing < SceneStore.scenes.length ? SceneStore.scenes[SceneStore.editing].layers : [{ kind: LayerKind.main, label: @tr("Capture"), visible: true, opacity: 1, w: 1, h: 1 }];
     property <int> preset: !SceneStore.canvas-fixed ? 0
         : SceneStore.canvas-width == 1920 && SceneStore.canvas-height == 1080 ? 1
         : SceneStore.canvas-width == 2560 && SceneStore.canvas-height == 1440 ? 2
@@ -1119,11 +1119,11 @@ component PreviewCard inherits Card {
             spacing: Theme.space-sm;
             SectionLabel {
                 horizontal-stretch: 1;
-                text: "PREVIEW";
+                text: @tr("PREVIEW");
                 vertical-alignment: center;
             }
             Text {
-                text: SceneStore.live ? "Live" : "Layout";
+                text: SceneStore.live ? @tr("Live") : @tr("Layout");
                 vertical-alignment: center;
                 font-size: Theme.font-caption;
                 font-weight: 600;
@@ -1147,14 +1147,14 @@ component PreviewCard inherits Card {
             spacing: Theme.space-md;
             Text {
                 horizontal-stretch: 1;
-                text: "Not recorded now.";
+                text: @tr("Not recorded now.");
                 vertical-alignment: center;
                 font-size: Theme.font-small;
                 color: Theme.text-muted;
                 overflow: elide;
             }
             Button {
-                text: "Record this scene";
+                text: @tr("Record this scene");
                 small: true;
                 clicked => {
                     SceneStore.switch(SceneStore.editing);
@@ -1163,11 +1163,11 @@ component PreviewCard inherits Card {
         }
         Divider { }
         PropField {
-            title: "Canvas";
+            title: @tr("Canvas");
             Segmented {
-                label: "Canvas size";
+                label: @tr("Canvas size");
                 enabled: !root.locked;
-                options: ["Auto", "1080p", "1440p", "2160p", "Custom"];
+                options: [@tr("Auto"), "1080p", "1440p", "2160p", @tr("Custom")];
                 selected: root.custom ? 4 : root.preset;
                 changed(i) => {
                     root.custom-open = i == 4;
@@ -1181,7 +1181,7 @@ component PreviewCard inherits Card {
                 TextField {
                     horizontal-stretch: 1;
                     enabled: !root.locked;
-                    label: "Canvas width";
+                    label: @tr("Canvas width");
                     text: SceneStore.canvas-width;
                     accepted(text) => {
                         SceneStore.canvas-changed(true, text.to-float(), SceneStore.canvas-height);
@@ -1195,7 +1195,7 @@ component PreviewCard inherits Card {
                 TextField {
                     horizontal-stretch: 1;
                     enabled: !root.locked;
-                    label: "Canvas height";
+                    label: @tr("Canvas height");
                     text: SceneStore.canvas-height;
                     accepted(text) => {
                         SceneStore.canvas-changed(true, SceneStore.canvas-width, text.to-float());
@@ -1203,7 +1203,7 @@ component PreviewCard inherits Card {
                 }
             }
             Text {
-                text: root.locked ? "Locked while recording or streaming." : root.preset == 0 ? "The size of the captured source." : "The capture is fitted into it.";
+                text: root.locked ? @tr("Locked while recording or streaming.") : root.preset == 0 ? @tr("The size of the captured source.") : @tr("The capture is fitted into it.");
                 font-size: Theme.font-small;
                 color: Theme.text-muted;
                 wrap: word-wrap;
@@ -1221,7 +1221,7 @@ component LayersCard inherits Card {
     property <LayerRow> draft;
 
     accessible-role: groupbox;
-    accessible-label: "Layers";
+    accessible-label: @tr("Layers");
 
     VerticalLayout {
         padding: Theme.space-sm;
@@ -1231,16 +1231,16 @@ component LayersCard inherits Card {
             spacing: Theme.space-sm;
             SectionLabel {
                 horizontal-stretch: 1;
-                text: "LAYERS";
+                text: @tr("LAYERS");
                 vertical-alignment: center;
             }
             Button {
-                text: root.menu == 0 ? "Add" : "Close";
+                text: root.menu == 0 ? @tr("Add") : @tr("Close");
                 icon: root.menu == 0 ? Icons.plus : "";
                 kind: "ghost";
                 small: true;
                 enabled: root.menu != 0 || root.n < 16;
-                accessible-label: root.menu == 0 ? "Add a layer" : "Close the menu";
+                accessible-label: root.menu == 0 ? @tr("Add a layer") : @tr("Close the menu");
                 clicked => {
                     root.menu = root.menu == 0 ? 1 : 0;
                 }
@@ -1249,25 +1249,25 @@ component LayersCard inherits Card {
         if root.menu == 1: VerticalLayout {
             spacing: 2px;
             MenuItem {
-                text: "Capture";
+                text: @tr("Capture");
                 icon: Icons.monitor;
-                detail: "Screen, window or game";
+                detail: @tr("Screen, window or game");
                 clicked => {
                     root.menu = 0;
                     SceneStore.add-layer(LayerKind.main, "");
                 }
             }
             MenuItem {
-                text: "Image…";
+                text: @tr("Image…");
                 icon: Icons.image;
-                detail: "PNG or JPEG";
+                detail: @tr("PNG or JPEG");
                 clicked => {
                     root.menu = 0;
                     SceneStore.pick-image(-1);
                 }
             }
             MenuItem {
-                text: "Text";
+                text: @tr("Text");
                 icon: Icons.text;
                 clicked => {
                     root.menu = 0;
@@ -1275,7 +1275,7 @@ component LayersCard inherits Card {
                 }
             }
             MenuItem {
-                text: "Camera";
+                text: @tr("Camera");
                 icon: Icons.camera;
                 clicked => {
                     root.menu = 2;
@@ -1289,7 +1289,7 @@ component LayersCard inherits Card {
             if SceneStore.cameras-state != 2 || SceneStore.cameras.length == 0: Text {
                 height: 36px;
                 x: Theme.space-sm;
-                text: SceneStore.cameras-state != 2 ? "Looking for cameras…" : "No camera found";
+                text: SceneStore.cameras-state != 2 ? @tr("Looking for cameras…") : @tr("No camera found");
                 vertical-alignment: center;
                 font-size: Theme.font-small;
                 color: Theme.text-muted;
@@ -1307,7 +1307,7 @@ component LayersCard inherits Card {
         if root.n == 0: Text {
             x: Theme.space-sm;
             height: 36px;
-            text: "Empty: the scene records black.";
+            text: @tr("Empty: the scene records black.");
             vertical-alignment: center;
             font-size: Theme.font-small;
             color: Theme.text-muted;
@@ -1315,7 +1315,7 @@ component LayersCard inherits Card {
         VerticalLayout {
             spacing: 2px;
             accessible-role: list;
-            accessible-label: "Layers, top first";
+            accessible-label: @tr("Layers, top first");
             for k in root.n: LayerItem {
                 property <int> i: root.n - 1 - k;
                 layer: root.layers[self.i];
@@ -1358,7 +1358,7 @@ component PropsCard inherits Card {
     }
 
     accessible-role: groupbox;
-    accessible-label: "\{root.layer.label} settings";
+    accessible-label: @tr("{} settings", root.layer.label);
 
     VerticalLayout {
         padding: Theme.card-padding;
@@ -1390,7 +1390,7 @@ component PropsCard inherits Card {
         }
 
         if root.layer.kind == LayerKind.image: PropField {
-            title: "File";
+            title: @tr("File");
             HorizontalLayout {
                 spacing: Theme.space-sm;
                 Text {
@@ -1402,9 +1402,9 @@ component PropsCard inherits Card {
                     overflow: elide;
                 }
                 Button {
-                    text: "Change";
+                    text: @tr("Change");
                     small: true;
-                    accessible-label: "Change the image";
+                    accessible-label: @tr("Change the image");
                     clicked => {
                         SceneStore.pick-image(root.index);
                     }
@@ -1413,10 +1413,10 @@ component PropsCard inherits Card {
         }
 
         if root.layer.kind == LayerKind.camera: PropField {
-            title: "Camera";
+            title: @tr("Camera");
             camera-field := SelectField {
                 property <bool> open;
-                label: "Camera";
+                label: @tr("Camera");
                 text: root.layer.label;
                 icon: Icons.camera;
                 expanded: self.open;
@@ -1432,7 +1432,7 @@ component PropsCard inherits Card {
                 if SceneStore.cameras-state != 2 || SceneStore.cameras.length == 0: Text {
                     height: 36px;
                     x: Theme.space-sm;
-                    text: SceneStore.cameras-state != 2 ? "Looking for cameras…" : "No camera found";
+                    text: SceneStore.cameras-state != 2 ? @tr("Looking for cameras…") : @tr("No camera found");
                     vertical-alignment: center;
                     font-size: Theme.font-small;
                     color: Theme.text-muted;
@@ -1453,10 +1453,10 @@ component PropsCard inherits Card {
         }
 
         if root.text: PropField {
-            title: "Text";
+            title: @tr("Text");
             TextBox {
                 text: root.layer.value;
-                label: "Text";
+                label: @tr("Text");
                 edited(t) => {
                     root.draft = root.layer;
                     root.draft.value = t;
@@ -1466,10 +1466,10 @@ component PropsCard inherits Card {
         }
 
         if root.text: PropField {
-            title: "Font";
+            title: @tr("Font");
             font-field := SelectField {
-                label: "Font";
-                text: root.layer.font == "" ? "Default (sans-serif)" : root.layer.font;
+                label: @tr("Font");
+                text: root.layer.font == "" ? @tr("Default (sans-serif)") : root.layer.font;
                 expanded: root.fonts-open;
                 clicked => {
                     root.fonts-open = !root.fonts-open;
@@ -1481,8 +1481,8 @@ component PropsCard inherits Card {
             if root.fonts-open: VerticalLayout {
                 spacing: Theme.space-xs;
                 TextField {
-                    label: "Search fonts";
-                    placeholder: "Search fonts";
+                    label: @tr("Search fonts");
+                    placeholder: @tr("Search fonts");
                     init => {
                         self.focus();
                     }
@@ -1497,7 +1497,7 @@ component PropsCard inherits Card {
                     border-color: Theme.border;
                     clip: true;
                     if SceneStore.fonts-loading: Text {
-                        text: "Loading the fonts…";
+                        text: @tr("Loading the fonts…");
                         font-size: Theme.font-small;
                         color: Theme.text-muted;
                     }
@@ -1507,7 +1507,7 @@ component PropsCard inherits Card {
                             padding: 4px;
                             spacing: 2px;
                             ListRow {
-                                text: "Default (sans-serif)";
+                                text: @tr("Default (sans-serif)");
                                 selected: root.layer.font == "";
                                 clicked => {
                                     root.fonts-open = false;
@@ -1533,7 +1533,7 @@ component PropsCard inherits Card {
         }
 
         if root.text: PropSlider {
-            label: "Size";
+            label: @tr("Size");
             value: root.layer.size;
             minimum: 8;
             maximum: 256;
@@ -1548,9 +1548,9 @@ component PropsCard inherits Card {
         }
 
         if root.text: PropField {
-            title: "Colour";
+            title: @tr("Colour");
             Swatches {
-                label: "Text";
+                label: @tr("Text");
                 current: root.layer.color;
                 picked(c) => {
                     root.draft = root.layer;
@@ -1565,14 +1565,14 @@ component PropsCard inherits Card {
             HorizontalLayout {
                 Text {
                     horizontal-stretch: 1;
-                    text: "Outline";
+                    text: @tr("Outline");
                     vertical-alignment: center;
                     font-size: Theme.font-small;
                     font-weight: 600;
                     color: Theme.text;
                 }
                 Switch {
-                    label: "Outline";
+                    label: @tr("Outline");
                     checked: root.layer.outline;
                     toggled(on) => {
                         root.draft = root.layer;
@@ -1582,7 +1582,7 @@ component PropsCard inherits Card {
                 }
             }
             if root.layer.outline: Swatches {
-                label: "Outline";
+                label: @tr("Outline");
                 current: root.layer.outline-color;
                 picked(c) => {
                     root.draft = root.layer;
@@ -1591,7 +1591,7 @@ component PropsCard inherits Card {
                 }
             }
             if root.layer.outline: PropSlider {
-                label: "Width";
+                label: @tr("Width");
                 value: root.layer.outline-width;
                 minimum: 0.5;
                 maximum: 16;
@@ -1611,14 +1611,14 @@ component PropsCard inherits Card {
             HorizontalLayout {
                 Text {
                     horizontal-stretch: 1;
-                    text: "Shadow";
+                    text: @tr("Shadow");
                     vertical-alignment: center;
                     font-size: Theme.font-small;
                     font-weight: 600;
                     color: Theme.text;
                 }
                 Switch {
-                    label: "Shadow";
+                    label: @tr("Shadow");
                     checked: root.layer.shadow;
                     toggled(on) => {
                         root.draft = root.layer;
@@ -1628,7 +1628,7 @@ component PropsCard inherits Card {
                 }
             }
             if root.layer.shadow: Swatches {
-                label: "Shadow";
+                label: @tr("Shadow");
                 current: root.layer.shadow-color;
                 picked(c) => {
                     root.draft = root.layer;
@@ -1639,10 +1639,10 @@ component PropsCard inherits Card {
         }
 
         if root.text: PropField {
-            title: "Alignment";
+            title: @tr("Alignment");
             Segmented {
-                label: "Alignment";
-                options: ["Left", "Center", "Right"];
+                label: @tr("Alignment");
+                options: [@tr("Left"), @tr("Center"), @tr("Right")];
                 selected: root.layer.align;
                 changed(i) => {
                     root.draft = root.layer;
@@ -1653,7 +1653,7 @@ component PropsCard inherits Card {
         }
 
         PropSlider {
-            label: "Opacity";
+            label: @tr("Opacity");
             value: root.layer.opacity;
             step: 0.05;
             default-value: 1;
@@ -1666,10 +1666,10 @@ component PropsCard inherits Card {
         }
 
         PropField {
-            title: "Fit";
+            title: @tr("Fit");
             Segmented {
-                label: "Fit";
-                options: ["Contain", "Cover", "Stretch"];
+                label: @tr("Fit");
+                options: [@tr("Contain"), @tr("Cover"), @tr("Stretch")];
                 selected: root.layer.fit;
                 changed(i) => {
                     root.draft = root.layer;
@@ -1680,8 +1680,8 @@ component PropsCard inherits Card {
         }
 
         PropField {
-            title: "Crop";
-            for side[s] in ["Left", "Top", "Right", "Bottom"]: PropSlider {
+            title: @tr("Crop");
+            for side[s] in [@tr("Left"), @tr("Top"), @tr("Right"), @tr("Bottom")]: PropSlider {
                 property <float> v: s == 0 ? root.layer.crop-left : s == 1 ? root.layer.crop-top : s == 2 ? root.layer.crop-right : root.layer.crop-bottom;
                 label: side;
                 value: self.v;
@@ -1720,7 +1720,7 @@ export component SceneEditor inherits Rectangle {
 
     background: Theme.window-bg;
     accessible-role: groupbox;
-    accessible-label: "Scene editor";
+    accessible-label: @tr("Scene editor");
 
     // Swallows clicks so they do not reach the window below.
     TouchArea { }
@@ -1741,7 +1741,7 @@ export component SceneEditor inherits Rectangle {
             }
             Text {
                 horizontal-stretch: 1;
-                text: "Scenes";
+                text: @tr("Scenes");
                 vertical-alignment: center;
                 font-size: Theme.font-title;
                 font-weight: 700;
@@ -1749,7 +1749,7 @@ export component SceneEditor inherits Rectangle {
             }
             close-button := IconButton {
                 icon: Icons.close;
-                label: "Close the scene editor";
+                label: @tr("Close the scene editor");
                 clicked => {
                     root.close();
                 }
@@ -1793,7 +1793,7 @@ export component SceneEditor inherits Rectangle {
                         VerticalLayout {
                             padding: Theme.card-padding;
                             Text {
-                                text: "Select a layer in the list or on the preview to change it.";
+                                text: @tr("Select a layer in the list or on the preview to change it.");
                                 font-size: Theme.font-small;
                                 color: Theme.text-muted;
                                 wrap: word-wrap;

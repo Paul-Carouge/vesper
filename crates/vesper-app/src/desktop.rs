@@ -71,8 +71,8 @@ pub fn pick_folder(
 
 async fn choose_folder(current: &Path) -> ashpd::Result<Option<PathBuf>> {
     let mut request = SelectedFiles::open_file()
-        .title("Choose the output folder")
-        .accept_label("Choose")
+        .title(tr!("Choose the output folder"))
+        .accept_label(tr!("Choose"))
         .directory(true)
         .multiple(false);
     if current.is_dir() {
@@ -97,12 +97,12 @@ pub fn pick_image(
 }
 
 async fn choose_image(current: Option<&Path>) -> ashpd::Result<Option<PathBuf>> {
-    let images = FileFilter::new("PNG or JPEG images")
+    let images = FileFilter::new(tr!("PNG or JPEG images"))
         .mimetype("image/png")
         .mimetype("image/jpeg");
     let mut request = SelectedFiles::open_file()
-        .title("Choose an image")
-        .accept_label("Choose")
+        .title(tr!("Choose an image"))
+        .accept_label(tr!("Choose"))
         .multiple(false)
         .filter(images.clone())
         .current_filter(images);
@@ -135,8 +135,8 @@ pub fn notify(title: String, body: String, file: Option<PathBuf>) {
         if actions {
             notification = notification
                 .default_action("open")
-                .button(Button::new("Open folder", "open"))
-                .button(Button::new("Play", "play"));
+                .button(Button::new(tr!("Open folder"), "open"))
+                .button(Button::new(tr!("Play"), "play"));
         }
         let sent = block_on(async {
             NotificationProxy::new()

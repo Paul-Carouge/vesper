@@ -9,6 +9,21 @@ macro_rules! log {
     ($($arg:tt)*) => { eprintln!("[vesper] {}", format_args!($($arg)*)) };
 }
 
+/// A string shown to the user, in the current language (see `i18n`):
+/// a `&'static str`, or with arguments for its `{}` a `String`. Only
+/// literals, so the catalogue test finds them.
+macro_rules! tr {
+    ($msgid:literal) => {
+        $crate::i18n::tr($msgid)
+    };
+    ($msgid:literal, $($arg:expr),+ $(,)?) => {
+        $crate::i18n::fill(
+            $crate::i18n::tr($msgid),
+            &[$(&$arg as &dyn ::std::fmt::Display),+],
+        )
+    };
+}
+
 mod audio;
 mod autostart;
 mod desktop;
@@ -17,12 +32,15 @@ mod dev;
 mod fallback;
 mod filters;
 mod game;
+mod i18n;
 mod instance;
 mod layer;
 mod live;
 mod meter;
 mod outputs;
 mod overlay;
+#[cfg(test)]
+mod po;
 mod prefs;
 mod profiles;
 mod recorder;
@@ -146,6 +164,8 @@ fn main() -> Result<(), slint::PlatformError> {
     }
 
     let ui = AppWindow::new()?;
+    // Before any string is made: the default tracks' names are translated.
+    i18n::apply(prefs::saved_language());
     ui.set_version(version().into());
     // Before anything starts: a second launch only shows the first window.
     let weak = ui.as_weak();
@@ -198,7 +218,10 @@ fn main() -> Result<(), slint::PlatformError> {
     scene_ui::wire(&ui, &recording, &games);
     profiles::wire(&ui, &recording, &games, defaults);
     if prefs::SAVING_OFF.load(Ordering::Relaxed) {
-        flash_notice(&ui, "Could not read the settings: changes are not saved");
+        flash_notice(
+            &ui,
+            tr!("Could not read the settings: changes are not saved"),
+        );
     }
     wire_global_shortcuts(&ui);
     let tray = spawn_tray(&ui);
@@ -286,7 +309,7 @@ fn main() -> Result<(), slint::PlatformError> {
             },
         }
         if failures == 3 {
-            flash_notice(&ui, "Game capture stopped");
+            flash_notice(&ui, tr!("Game capture stopped"));
         }
     });
 
@@ -358,7 +381,7 @@ fn wire_callbacks(ui: &AppWindow, recording: &Shared, games: &Games) {
         ui.set_source_kind(SourceKind::None);
         ui.set_source_name("".into());
         ui.set_source_detail("".into());
-        flash_notice(&ui, "The picker opens when you record");
+        flash_notice(&ui, tr!("The picker opens when you record"));
     });
 
     let weak = ui.as_weak();
@@ -370,7 +393,7 @@ fn wire_callbacks(ui: &AppWindow, recording: &Shared, games: &Games) {
             return;
         }
         if ui.get_output_folder().is_empty() {
-            flash_notice(&ui, "Choose an output folder first");
+            flash_notice(&ui, tr!("Choose an output folder first"));
             return;
         }
         // Game mode without a layer game records the game's window.
@@ -408,14 +431,14 @@ fn wire_callbacks(ui: &AppWindow, recording: &Shared, games: &Games) {
         let Some(ui) = weak.upgrade() else { return };
         log!("save-replay: last {} s", ui.get_replay_seconds());
         if ui.get_output_folder().is_empty() {
-            flash_notice(&ui, "Choose an output folder first");
+            flash_notice(&ui, tr!("Choose an output folder first"));
             return;
         }
         let folder = PathBuf::from(ui.get_output_folder().as_str());
         let saving =
             ui.get_replay_enabled() && rec.borrow().as_ref().is_some_and(|p| p.save_replay(folder));
         if !saving {
-            flash_notice(&ui, "The replay buffer is not running");
+            flash_notice(&ui, tr!("The replay buffer is not running"));
         }
     });
 
@@ -470,7 +493,7 @@ fn wire_callbacks(ui: &AppWindow, recording: &Shared, games: &Games) {
                 Ok(None) => {}
                 Err(e) => {
                     log!("folder picker: {e}");
-                    flash_notice(&ui, "Could not open the folder picker");
+                    flash_notice(&ui, tr!("Could not open the folder picker"));
                 }
             });
         });
@@ -499,7 +522,7 @@ fn wire_callbacks(ui: &AppWindow, recording: &Shared, games: &Games) {
         }
         // The stream runs in this pipeline: end it first.
         if ui.get_live_state() != LiveState::Off {
-            flash_notice(&ui, "End the stream to change the source");
+            flash_notice(&ui, tr!("End the stream to change the source"));
             return;
         }
         log!("source-mode-changed: game={game}");
@@ -537,7 +560,7 @@ fn start_replay(ui: &AppWindow, rec: &Shared, games: &Games) {
     let game = ui.get_source_kind() == SourceKind::Game;
     // Without a saved source the portal picker would pop up right away.
     if !game && recorder::load_restore_token().is_none() {
-        flash_notice(ui, "Replay starts once a source is picked");
+        flash_notice(ui, tr!("Replay starts once a source is picked"));
     } else if game && games.borrow().is_none() {
         // The start error is shown; the games tick starts the replay
         // buffer once game capture runs.
@@ -664,10 +687,12 @@ fn wire_background(ui: &AppWindow, tray: Option<&Tray>) {
         };
         if !prefs::TRAY_NOTICE_SHOWN.swap(true, Ordering::Relaxed) {
             desktop::notify(
-                "Vesper is still running".into(),
-                "It stays in the tray, with the replay buffer and global shortcuts. \
-                 Quit from the tray icon's menu."
-                    .into(),
+                tr!("Vesper is still running").into(),
+                tr!(
+                    "It stays in the tray, with the replay buffer and global shortcuts. \
+                     Quit from the tray icon's menu."
+                )
+                .into(),
                 None,
             );
             Prefs::from_ui(&ui).save();
@@ -688,9 +713,28 @@ fn wire_background(ui: &AppWindow, tray: Option<&Tray>) {
             Ok(()) => ui.set_autostart(on),
             Err(e) => {
                 log!("autostart entry: {e}");
-                flash_notice(&ui, &format!("Could not change autostart: {e}"));
+                flash_notice(&ui, &tr!("Could not change autostart: {}", e));
             }
         }
+    });
+
+    let weak = ui.as_weak();
+    ui.on_language_changed(move || {
+        let Some(ui) = weak.upgrade() else { return };
+        let language = i18n::Language::from_index(ui.get_language());
+        log!("language-changed: {language:?}");
+        i18n::apply(language);
+        Prefs::from_ui(&ui).save();
+        // The UI's own strings follow at once; shown ones made in Rust are
+        // made again (a notice or the source's details wait for the next).
+        audio::show_tracks(&ui, &audio::tracks_from_ui(&ui));
+        audio::show_known_sources(&ui);
+        filters::show_kinds(&ui);
+        scene_ui::show(&ui, &scene_ui::from_ui(&ui));
+        update_replay_memory(&ui);
+        ui.set_live_url_warning(stream::cleartext_warning(&ui.get_live_url()).into());
+        live::show_key_state(&ui);
+        ui.invoke_tray_state_changed();
     });
 }
 
@@ -729,19 +773,19 @@ fn wire_game_callbacks(ui: &AppWindow, games: &Games) {
         let Some(ui) = weak.upgrade() else { return };
         log!("game-layer-changed: {on}");
         let result = match (layer::data_home(), on) {
-            (None, _) => Err("No data folder (HOME is not set)".to_owned()),
+            (None, _) => Err(tr!("No data folder (HOME is not set)").to_owned()),
             (Some(data), true) => match layer::shipped() {
                 Some(lib) => layer::install(&data, &lib).map_err(|e| e.to_string()),
-                None => Err("The layer was not built with Vesper".to_owned()),
+                None => Err(tr!("The layer was not built with Vesper").to_owned()),
             },
             (Some(data), false) => layer::uninstall(&data).map_err(|e| e.to_string()),
         };
         match result {
-            Ok(()) if on => flash_notice(&ui, "Game capture installed"),
-            Ok(()) => flash_notice(&ui, "Game capture removed"),
+            Ok(()) if on => flash_notice(&ui, tr!("Game capture installed")),
+            Ok(()) => flash_notice(&ui, tr!("Game capture removed")),
             Err(e) => {
                 log!("game capture layer: {e}");
-                flash_notice(&ui, &format!("Could not change game capture: {e}"));
+                flash_notice(&ui, &tr!("Could not change game capture: {}", e));
             }
         }
         show_layer_state(&ui);
@@ -789,8 +833,8 @@ fn set_source_mode(ui: &AppWindow, games: &Games, game: bool) {
             // Saved by an older version: named once its capture starts.
             None => {
                 ui.set_source_kind(SourceKind::Screen);
-                ui.set_source_name("Saved source".into());
-                ui.set_source_detail("Screen or window".into());
+                ui.set_source_name(tr!("Saved source").into());
+                ui.set_source_detail(tr!("Screen or window").into());
             }
         }
     } else {
@@ -888,7 +932,7 @@ fn start_pipeline(
     stream: Option<stream::StreamRequest>,
 ) -> Result<(), String> {
     if ui.get_source_kind() == SourceKind::Game && games.borrow().is_none() {
-        return Err("Game capture is not running".into());
+        return Err(tr!("Game capture is not running").into());
     }
     let settings = settings(ui, games);
     log!("start-pipeline: {settings:?}");
@@ -897,7 +941,7 @@ fn start_pipeline(
     let pipeline = Pipeline::start(settings, replay_span(ui), record, stream, move |event| {
         let _ = weak.upgrade_in_event_loop(move |ui| on_recorder_event(&ui, generation, event));
     })
-    .map_err(|e| format!("Could not start: {e}"))?;
+    .map_err(|e| tr!("Could not start: {}", e))?;
     *shared.borrow_mut() = Some(pipeline);
     Ok(())
 }
@@ -947,9 +991,9 @@ fn on_recorder_event(ui: &AppWindow, generation: u64, event: Event) {
                     log!("saved {}", path.display());
                     let stream = GAME_CLOSED_STREAM.swap(false, Ordering::Relaxed);
                     let title = match (GAME_CLOSED.swap(false, Ordering::Relaxed), stream) {
-                        (true, true) => "Game closed: recording saved, stream ended",
-                        (true, false) => "Game closed, recording saved",
-                        (false, _) => "Recording saved",
+                        (true, true) => tr!("Game closed: recording saved, stream ended"),
+                        (true, false) => tr!("Game closed, recording saved"),
+                        (false, _) => tr!("Recording saved"),
                     };
                     announce_saved(ui, title, path);
                 }
@@ -957,23 +1001,23 @@ fn on_recorder_event(ui: &AppWindow, generation: u64, event: Event) {
                     GAME_CLOSED.store(false, Ordering::Relaxed);
                     GAME_CLOSED_STREAM.store(false, Ordering::Relaxed);
                     log!("recording failed: {e}");
-                    announce_failure(ui, "Recording failed", &e);
+                    announce_failure(ui, tr!("Recording failed"), &e);
                 }
             }
         }
         Event::ReplaySaved(result) => match result {
             Ok(path) => {
                 log!("saved replay {}", path.display());
-                announce_saved(ui, "Replay saved", path);
+                announce_saved(ui, tr!("Replay saved"), path);
             }
             Err(e) => {
                 log!("replay failed: {e}");
-                announce_failure(ui, "Replay not saved", &e);
+                announce_failure(ui, tr!("Replay not saved"), &e);
             }
         },
         Event::AudioTrack(name, TrackState::Reconnecting(reason)) => {
             log!("audio track {name:?}: {reason}");
-            flash_notice(ui, &format!("{name}: reconnecting…"));
+            flash_notice(ui, &tr!("{}: reconnecting…", name));
         }
         Event::AudioMissing(text) | Event::Notice(text) => flash_notice(ui, &text),
         Event::Camera(on) => {
@@ -981,7 +1025,7 @@ fn on_recorder_event(ui: &AppWindow, generation: u64, event: Event) {
             ui.global::<SceneStore>().set_camera_on(on);
         }
         Event::AudioTrack(name, TrackState::Running) => {
-            flash_notice(ui, &format!("{name}: audio is back"));
+            flash_notice(ui, &tr!("{}: audio is back", name));
         }
         // An older pipeline's stream ended with it: its late news must not
         // change the current one's.
@@ -1021,11 +1065,11 @@ fn update_replay_memory(ui: &AppWindow) {
         * max_bits_per_pixel(ui.get_codec(), ui.get_quality());
     let mb = bitrate / 8e6 * f64::from(ui.get_replay_seconds() + 2);
     let quality = match ui.get_quality() {
-        QualityPreset::Performance => "Performance",
-        QualityPreset::Balanced => "Balanced",
-        QualityPreset::Quality => "Quality",
+        QualityPreset::Performance => tr!("Performance"),
+        QualityPreset::Balanced => tr!("Balanced"),
+        QualityPreset::Quality => tr!("Quality"),
     };
-    ui.set_replay_memory(format!("≈ {} MB at 4K{} {quality}", mb.round(), ui.get_fps()).into());
+    ui.set_replay_memory(tr!("≈ {} MB at 4K{} {}", mb.round(), ui.get_fps(), quality).into());
 }
 
 /// Constant-quality target of each preset, on the encoder's QP scale (AV1:
@@ -1102,19 +1146,19 @@ impl From<VideoCodec> for vesper_core::Codec {
 fn friendly(error: &str) -> String {
     let has = |s: &str| error.contains(s);
     let text = if has("No space left on device") || has("File too large") {
-        "The disk is full"
+        tr!("The disk is full")
     } else if has("Read-only file system") {
-        "The output folder is read-only"
+        tr!("The output folder is read-only")
     } else if has("Could not create") && has("Permission denied") {
-        "Vesper cannot write to the output folder"
+        tr!("Vesper cannot write to the output folder")
     } else if has("Could not create") && (has("File exists") || has("Not a directory")) {
-        "The output folder is not a folder"
+        tr!("The output folder is not a folder")
     } else if has("Could not create") && has("No such file or directory") {
-        "The output folder is missing"
+        tr!("The output folder is missing")
     } else if has("Could not open the encoder") {
-        "The video encoder (VAAPI) is unavailable"
+        tr!("The video encoder (VAAPI) is unavailable")
     } else if has("Portal request was cancelled") {
-        "No source was picked"
+        tr!("No source was picked")
     } else {
         return error.to_owned();
     };
@@ -1124,7 +1168,7 @@ fn friendly(error: &str) -> String {
         .split_once("(saved up to there: ")
         .and_then(|(_, rest)| rest.strip_suffix(')'));
     match saved.and_then(|path| Path::new(path).file_name()) {
-        Some(name) => format!("{text}: {} saved up to there", name.to_string_lossy()),
+        Some(name) => tr!("{}: {} saved up to there", text, name.to_string_lossy()),
         None => text.to_owned(),
     }
 }

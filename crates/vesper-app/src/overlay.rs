@@ -481,8 +481,9 @@ fn feed(s: &CameraShared, on_event: &OnEvent) {
             log!("webcam {id}: {why}; retrying in {backoff:?}");
             if !told.contains(&id) {
                 told.push(id);
-                on_event(Event::Notice(format!(
-                    "Webcam hidden: {why}. Vesper keeps trying."
+                on_event(Event::Notice(tr!(
+                    "Webcam hidden: {}. Vesper keeps trying.",
+                    why
                 )));
             }
             s.publish(id, Feed::Gone);
@@ -540,7 +541,7 @@ fn feed(s: &CameraShared, on_event: &OnEvent) {
             if !o.cpu_told && o.cam.software_decode() {
                 o.cpu_told = true;
                 on_event(Event::Notice(
-                    "Webcam decoded on the CPU: the GPU could not decode it".into(),
+                    tr!("Webcam decoded on the CPU: the GPU could not decode it").into(),
                 ));
             }
             match frame {

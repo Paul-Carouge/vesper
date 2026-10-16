@@ -301,9 +301,6 @@ pub const MAX_TRACKS: usize = 8;
 /// Most filters a track has.
 pub const MAX_FILTERS: usize = 16;
 
-/// A recording whose file (or folder) was deleted: nothing was saved.
-const DELETED: &str = "The recording file was deleted while recording";
-
 /// Name of the mix in the files.
 const MIX_NAME: &str = "Mix";
 
@@ -487,7 +484,7 @@ impl Pipeline {
                 let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
                     run(&settings, &slot, &ctl, &started_flag, &sources, &on_event)
                 }))
-                .unwrap_or_else(|_| Err("Internal error: the recorder crashed".into()));
+                .unwrap_or_else(|_| Err(tr!("Internal error: the recorder crashed").into()));
                 lock(&ctl).ended = true;
                 // After a panic, the audio captures (mic included) must not keep running.
                 stop_audio(&sources);
@@ -739,10 +736,11 @@ impl Recording {
     fn finish(self, error: Option<String>) -> Result<PathBuf, String> {
         let finished = self.mux.finish();
         if finished.as_ref().is_err_and(vesper_mux::Error::is_deleted) {
-            return Err(DELETED.into());
+            return Err(tr!("The recording file was deleted while recording").into());
         }
         match error.or(finished.err().map(|e| e.to_string())) {
             None => Ok(self.path),
+            // Kept in English: matched by `friendly()`.
             Some(e) => Err(format!("{e} (saved up to there: {})", self.path.display())),
         }
     }
@@ -997,9 +995,9 @@ fn start_audio(sources: &AudioSources, sinks: &SharedSinks, on_event: &OnEvent) 
 fn missing_audio(failed: &[&str], no_mix: bool) -> Option<String> {
     match (failed, no_mix) {
         ([], false) => None,
-        ([], true) => Some("Recording without the mix track".to_owned()),
-        ([one], _) => Some(format!("Recording without the audio track {one}")),
-        (many, _) => Some(format!(
+        ([], true) => Some(tr!("Recording without the mix track").to_owned()),
+        ([one], _) => Some(tr!("Recording without the audio track {}", one)),
+        (many, _) => Some(tr!(
             "Recording without the audio tracks {}",
             many.join(", ")
         )),
@@ -1049,7 +1047,7 @@ fn run(
             let capture = Capture::start(load_restore_token().as_deref(), max_fps, move |event| {
                 s.park(event.map_err(|e| e.to_string()));
             })
-            .map_err(|e| format!("Could not start the capture: {e}"))?;
+            .map_err(|e| tr!("Could not start the capture: {}", e))?;
             if let Some(token) = capture.restore_token()
                 && let Err(e) = save_restore_token(token)
             {
@@ -1103,6 +1101,7 @@ impl Video {
                 max_bitrate: bitrate,
             },
         )
+        // Kept in English: matched by `friendly()`.
         .map_err(|e| format!("Could not open the encoder: {e}"))?;
         let track = VideoTrack {
             codec: settings.codec,
@@ -1188,7 +1187,7 @@ impl Streaming {
             let source = v
                 .enc
                 .scaled_source()
-                .map_err(|e| format!("Could not open the stream encoder: {e}"))?;
+                .map_err(|e| tr!("Could not open the stream encoder: {}", e))?;
             let (tx, rx) = std::sync::mpsc::channel();
             let rate = RateControl::ConstantBitrate(s.bitrate);
             std::thread::Builder::new()
@@ -1196,18 +1195,18 @@ impl Streaming {
                 .spawn(move || {
                     let opened = source
                         .open(codec, width, height, fps, rate)
-                        .map_err(|e| format!("Could not open the stream encoder: {e}"));
+                        .map_err(|e| tr!("Could not open the stream encoder: {}", e));
                     let _ = tx.send(opened);
                 })
-                .map_err(|e| format!("Could not open the stream encoder: {e}"))?;
+                .map_err(|e| tr!("Could not open the stream encoder: {}", e))?;
             StreamVideo::Opening(rx)
         };
         // The mix runs whenever a track does: without it, a silent stream.
         let aac = if lock(sources).mixer.is_some() {
-            Some(Aac::new().map_err(|e| format!("Could not open the AAC encoder: {e}"))?)
+            Some(Aac::new().map_err(|e| tr!("Could not open the AAC encoder: {}", e))?)
         } else {
             on_event(Event::AudioMissing(
-                "Streaming without sound: no audio track runs".into(),
+                tr!("Streaming without sound: no audio track runs").into(),
             ));
             None
         };
@@ -1250,7 +1249,7 @@ impl Streaming {
             audio,
             self.on_event.clone(),
         )
-        .map_err(|e| format!("Could not start the stream: {e}"))?;
+        .map_err(|e| tr!("Could not start the stream: {}", e))?;
         if let Some(aac) = self.aac.take() {
             lock(sources).set_stream_tap(Some(AudioTap::new(aac, sink.audio_in())));
         }
@@ -1279,7 +1278,7 @@ impl Streaming {
             let enc = match rx.try_recv() {
                 Ok(opened) => opened?,
                 Err(std::sync::mpsc::TryRecvError::Empty) => return Ok(()),
-                Err(_) => return Err("Could not open the stream encoder".into()),
+                Err(_) => return Err(tr!("Could not open the stream encoder").into()),
             };
             let track = VideoTrack {
                 codec: self.codec,
@@ -1338,7 +1337,7 @@ impl Streaming {
         } else {
             self.slow = 0;
         }
-        for p in out.map_err(|e| format!("Stream encoding failed: {e}"))? {
+        for p in out.map_err(|e| tr!("Stream encoding failed: {}", e))? {
             self.key_pending &= !p.keyframe;
             sink.push_video(p);
         }
@@ -1377,11 +1376,14 @@ fn create_file(
     audio: &[AudioTrack],
 ) -> Result<(Muxer, PathBuf), String> {
     std::fs::create_dir_all(folder)
+        // Kept in English: matched by `friendly()`.
         .map_err(|e| format!("Could not create {}: {e}", folder.display()))?;
     let path = reserve_path(folder, &format!("{stem} {}", local_timestamp()))
+        // Kept in English: matched by `friendly()`.
         .map_err(|e| format!("Could not create a file in {}: {e}", folder.display()))?;
     let mux = Muxer::create(&path, start, video.clone(), audio).map_err(|e| {
         let _ = std::fs::remove_file(&path);
+        // Kept in English: matched by `friendly()`.
         format!("Could not create {}: {e}", path.display())
     })?;
     Ok((mux, path))
@@ -1398,7 +1400,7 @@ fn write_replay(
     let start = packets
         .iter()
         .find(|(s, _)| *s == 0)
-        .ok_or("The replay buffer is empty")?
+        .ok_or(tr!("The replay buffer is empty"))?
         .1
         .pts;
     let (mut mux, path) = create_file(folder, "Vesper Replay", start, video, audio)?;
@@ -1410,7 +1412,7 @@ fn write_replay(
         Ok(()) => Ok(path),
         Err(e) => {
             let _ = std::fs::remove_file(&path);
-            Err(format!("Could not save the replay: {e}"))
+            Err(tr!("Could not save the replay: {}", e))
         }
     }
 }
@@ -1427,7 +1429,9 @@ fn save_replay(
     let audio = lock(sources).file_tracks();
     let snapshot = lock(sinks).ring.as_ref().map(Ring::snapshot);
     let (Some(video), Some(snapshot)) = (video, snapshot) else {
-        on_event(Event::ReplaySaved(Err("The replay buffer is empty".into())));
+        on_event(Event::ReplaySaved(Err(
+            tr!("The replay buffer is empty").into()
+        )));
         return;
     };
     let (track, event) = (video.track.clone(), on_event.clone());
@@ -1444,8 +1448,9 @@ fn save_replay(
             c.saves.retain(|s| !s.is_finished());
             c.saves.push(save);
         }
-        Err(e) => on_event(Event::ReplaySaved(Err(format!(
-            "Could not save the replay: {e}"
+        Err(e) => on_event(Event::ReplaySaved(Err(tr!(
+            "Could not save the replay: {}",
+            e
         )))),
     }
 }
@@ -1495,7 +1500,7 @@ fn pump(
         }
         let (frame, ended) = slot.take();
         if let Some(e) = ended {
-            error = Some(format!("Capture ended: {e}"));
+            error = Some(tr!("Capture ended: {}", e));
             break;
         }
         // The canvas: a fixed one, else the first frame's size. A fixed
@@ -1582,17 +1587,15 @@ fn pump(
             if waiting_since.is_some_and(|t| monotonic_now() - t >= FIRST_FRAME_TIMEOUT) {
                 waiting_since = None;
                 let what = if settings.game.is_some() {
-                    "the game"
+                    tr!("No frame from the game")
                 } else {
-                    "the source"
+                    tr!("No frame from the source")
                 };
                 if c.record.take().is_some() {
-                    on_event(Event::Finished(Err(format!("No frame from {what}"))));
+                    on_event(Event::Finished(Err(what.into())));
                 }
                 if c.stream.take().is_some() {
-                    on_event(Event::Stream(StreamState::Ended(Some(format!(
-                        "No frame from {what}"
-                    )))));
+                    on_event(Event::Stream(StreamState::Ended(Some(what.into()))));
                 }
                 // Without a replay buffer the pipeline ends: check again at
                 // once instead of waiting for a frame.
@@ -1721,7 +1724,7 @@ fn pump(
             let rec = lock(sinks).rec.take();
             if let Some(r) = rec {
                 on_event(Event::Finished(
-                    r.finish(Some("No picture was recorded".into())),
+                    r.finish(Some(tr!("No picture was recorded").into())),
                 ));
             }
         }
@@ -1768,7 +1771,7 @@ fn pump(
         let packets = match packets {
             Ok(p) => p,
             Err(e) => {
-                error = Some(format!("Encoding failed: {e}"));
+                error = Some(tr!("Encoding failed: {}", e));
                 break;
             }
         };
@@ -1853,7 +1856,7 @@ fn pump(
     match error {
         Some(e) => Err(e),
         None if video.is_none() && lock(control).record.is_some() => {
-            Err("No frame was captured".into())
+            Err(tr!("No frame was captured").into())
         }
         None => Ok(()),
     }
@@ -2197,7 +2200,7 @@ impl Stage {
                 Some(_) if !std::mem::replace(&mut self.stuck_told, true) => {
                     log!("scene compositor: a previous one is stuck freeing its device");
                     (self.on_event)(Event::Notice(
-                        "Scene overlays may be unavailable: the GPU is busy".into(),
+                        tr!("Scene overlays may be unavailable: the GPU is busy").into(),
                     ));
                 }
                 _ => {}
@@ -2222,7 +2225,7 @@ impl Stage {
         log!("scene compositor: {why}; retrying in {:?}", self.backoff);
         if !std::mem::replace(&mut self.told, true) {
             (self.on_event)(Event::Notice(
-                "Scene overlays are off for now: the GPU compositor failed".into(),
+                tr!("Scene overlays are off for now: the GPU compositor failed").into(),
             ));
         }
         if let Some(o) = &self.overlays {
@@ -2515,7 +2518,7 @@ impl Stage {
                 log!("webcam {id}: hidden: {why}");
                 if !std::mem::replace(&mut self.camera_told, true) {
                     (self.on_event)(Event::Notice(
-                        "A webcam is hidden: the GPU could not use its picture".into(),
+                        tr!("A webcam is hidden: the GPU could not use its picture").into(),
                     ));
                 }
             }

@@ -638,25 +638,28 @@ pub fn store(id: &str, key: &StreamKey) -> std::result::Result<Store, String> {
             log!("secret service: {e}; keeping the stream key in a private file");
             file_store(id, key)
                 .map(|()| Store::File)
-                .map_err(|e| format!("Could not save the stream key: {e}"))
+                .map_err(|e| tr!("Could not save the stream key: {}", e))
         }
         Err(e) if e == NO_ANSWER => {
             log!("secret service: {e}");
-            Err("The keyring did not answer: key not saved".into())
+            Err(tr!("The keyring did not answer: key not saved").into())
         }
         Err(e) if e == STALE_LEFT => {
             file_clear(id);
-            Err("Stream key saved, but an older key could not be removed from the keyring".into())
+            Err(
+                tr!("Stream key saved, but an older key could not be removed from the keyring")
+                    .into(),
+            )
         }
         Err(e) if e == NOT_KEPT => {
             log!("secret service: {e}");
-            Err("The keyring did not keep the key: not saved".into())
+            Err(tr!("The keyring did not keep the key: not saved").into())
         }
         // There is a keyring, which refused (locked, prompt dismissed): no
         // copy in clear.
         Err(e) => {
             log!("secret service: {e}");
-            Err("The keyring stayed locked: key not saved".into())
+            Err(tr!("The keyring stayed locked: key not saved").into())
         }
     }
 }
@@ -952,7 +955,7 @@ mod tests {
         assert_eq!(load("test-hung"), None);
         assert_eq!(
             store("test-hung", &key("live_test_key_123")),
-            Err("The keyring did not answer: key not saved".into())
+            Err(tr!("The keyring did not answer: key not saved").into())
         );
         assert_eq!(file_load("test-hung"), None);
         clear("test-hung");

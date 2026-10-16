@@ -201,9 +201,9 @@ impl GameSource {
             if event.is_err() {
                 fail.store(true, Ordering::Relaxed);
             }
-            f.push(event.map_err(|e| format!("Game capture failed: {e}")));
+            f.push(event.map_err(|e| tr!("Game capture failed: {}", e)));
         })
-        .map_err(|e| format!("Could not start game capture: {e}"))?;
+        .map_err(|e| tr!("Could not start game capture: {}", e))?;
         let capture = Arc::new(capture);
         frames.bind(&capture);
         for exe in ALLOWED_GAMES.lock().unwrap().iter() {

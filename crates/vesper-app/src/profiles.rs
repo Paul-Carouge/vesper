@@ -30,7 +30,6 @@ use crate::{AppWindow, Games, LiveState, ProfileEntry, RecState, Shared, flash_n
 
 /// The profile settings of a version without profiles become.
 const DEFAULT_SLUG: &str = "default";
-const DEFAULT_NAME: &str = "Default";
 
 /// Longest file name made from a profile name, before a `-2` suffix.
 const MAX_SLUG: usize = 40;
@@ -137,13 +136,13 @@ pub fn check_name(
     name: &str,
     except: Option<&str>,
 ) -> Result<String, &'static str> {
-    let name = crate::audio::clean_name(name).ok_or("Enter a name")?;
+    let name = crate::audio::clean_name(name).ok_or(tr!("Enter a name"))?;
     let lower = name.to_lowercase();
     let taken = list
         .iter()
         .any(|e| Some(e.slug.as_str()) != except && e.name.to_lowercase() == lower);
     if taken {
-        return Err("Another profile has this name");
+        return Err(tr!("Another profile has this name"));
     }
     Ok(name)
 }
@@ -185,17 +184,17 @@ pub fn open(settings: &Path, dir: &Path, defaults: Prefs) -> std::io::Result<Pre
     let legacy = app.profile.is_empty();
     let base = if legacy {
         backup(settings)?;
-        log!("settings moved into the {DEFAULT_NAME:?} profile");
+        log!("settings moved into the default profile");
         app
     } else {
         // Profiles were there and are gone: `settings` has no recording
         // settings left (and its backup is not replaced).
-        log!("no profile left: a new {DEFAULT_NAME:?} one");
+        log!("no profile left: a new default one");
         defaults.clone().with_app_settings(&app)
     };
     let prefs = Prefs {
         profile: DEFAULT_SLUG.into(),
-        profile_name: DEFAULT_NAME.into(),
+        profile_name: tr!("Default").into(),
         ..base
     };
     prefs.save_to(settings, dir, &defaults.output_folder, true)?;
@@ -298,12 +297,15 @@ fn plan(old: &Prefs, new: &Prefs) -> Plan {
 /// Nor while saving is off (the settings could not be read).
 fn locked(ui: &AppWindow) -> bool {
     if crate::prefs::SAVING_OFF.load(std::sync::atomic::Ordering::Relaxed) {
-        flash_notice(ui, "Settings could not be read: profiles are unavailable");
+        flash_notice(
+            ui,
+            tr!("Settings could not be read: profiles are unavailable"),
+        );
         return true;
     }
     let locked = ui.get_rec_state() != RecState::Idle || ui.get_live_state() != LiveState::Off;
     if locked {
-        flash_notice(ui, "Profiles are locked while recording or streaming");
+        flash_notice(ui, tr!("Profiles are locked while recording or streaming"));
     }
     locked
 }
@@ -394,7 +396,7 @@ pub fn wire(ui: &AppWindow, rec: &Shared, games: &Games, defaults: Prefs) {
                 Err(e) => refused(&ui, &e),
             },
             None => {
-                flash_notice(&ui, "That profile is gone");
+                flash_notice(&ui, tr!("That profile is gone"));
                 show_list(&ui, &d);
             }
         }
@@ -446,7 +448,10 @@ pub fn wire(ui: &AppWindow, rec: &Shared, games: &Games, defaults: Prefs) {
             return false;
         };
         if crate::prefs::SAVING_OFF.load(std::sync::atomic::Ordering::Relaxed) {
-            return report(&ui, Some("Settings could not be read: nothing is saved"));
+            return report(
+                &ui,
+                Some(tr!("Settings could not be read: nothing is saved")),
+            );
         }
         let slug = ui.get_profile_slug();
         match check_name(&list(&d), &name, Some(&slug)) {
@@ -470,7 +475,7 @@ pub fn wire(ui: &AppWindow, rec: &Shared, games: &Games, defaults: Prefs) {
         }
         let gone = Prefs::from_ui(&ui);
         let Some(next) = list(&d).into_iter().find(|e| e.slug != gone.profile) else {
-            flash_notice(&ui, "The last profile cannot be deleted");
+            flash_notice(&ui, tr!("The last profile cannot be deleted"));
             return;
         };
         let next = match load(&d, &next, &defaults) {
@@ -484,11 +489,11 @@ pub fn wire(ui: &AppWindow, rec: &Shared, games: &Games, defaults: Prefs) {
                 if let Some(registry) = vesper_vst::global() {
                     unused.into_iter().for_each(|id| registry.remove(id));
                 }
-                flash_notice(&ui, &format!("Deleted {}", gone.profile_name));
+                flash_notice(&ui, &tr!("Deleted {}", gone.profile_name));
             }
             Err(e) => {
                 log!("could not delete profile {}: {e}", gone.profile);
-                flash_notice(&ui, &format!("Could not delete {}", gone.profile_name));
+                flash_notice(&ui, &tr!("Could not delete {}", gone.profile_name));
             }
         }
         show_list(&ui, &d);
@@ -498,7 +503,7 @@ pub fn wire(ui: &AppWindow, rec: &Shared, games: &Games, defaults: Prefs) {
 /// A profile that cannot be read is not switched to.
 fn refused(ui: &AppWindow, e: &std::io::Error) {
     log!("{e}");
-    flash_notice(ui, "Could not read that profile");
+    flash_notice(ui, tr!("Could not read that profile"));
 }
 
 /// Deletes `gone`'s file from `dir`. Then its plugin instances whose

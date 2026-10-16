@@ -138,7 +138,7 @@ fn track_labels(
         if connected {
             label
         } else {
-            format!("{label} (disconnected)")
+            tr!("{} (disconnected)", label)
         }
     };
     let chosen = |choice: &DeviceChoice| {
@@ -149,8 +149,8 @@ fn track_labels(
         }
     };
     match source {
-        Source::Desktop => ("Desktop audio".into(), chosen(desktop)),
-        Source::Microphone => ("Microphone".into(), chosen(mic)),
+        Source::Desktop => (tr!("Desktop audio").into(), chosen(desktop)),
+        Source::Microphone => (tr!("Microphone").into(), chosen(mic)),
         Source::Output(name) | Source::Input(name) => {
             let (label, connected) = device_label(source, name, nodes);
             let label = unplugged(label, connected);
@@ -268,7 +268,7 @@ fn node(source: Source, label: &str) -> Node {
 
 /// "Default" for the system's default device.
 fn default_mark(node: &Node) -> String {
-    if node.default { "Default" } else { "" }.into()
+    if node.default { tr!("Default") } else { "" }.into()
 }
 
 /// The choices of "Add track" and of a track's Source: Desktop audio and
@@ -280,19 +280,19 @@ fn options(
     mic: &DeviceChoice,
 ) -> Vec<SourceOption> {
     let device = |choice: &DeviceChoice| match (choice.name.is_empty(), choice.connected) {
-        (true, _) => "System default".into(),
+        (true, _) => tr!("System default").into(),
         (false, true) => choice.label.to_string(),
-        (false, false) => format!("{} (disconnected)", choice.label),
+        (false, false) => tr!("{} (disconnected)", choice.label),
     };
     let defaults = [
-        (node(Source::Desktop, "Desktop audio"), device(desktop)),
-        (node(Source::Microphone, "Microphone"), device(mic)),
+        (node(Source::Desktop, tr!("Desktop audio")), device(desktop)),
+        (node(Source::Microphone, tr!("Microphone")), device(mic)),
     ];
     let heading = |source: &Source| match source {
-        Source::Output(_) => "OUTPUT DEVICES",
-        Source::Input(_) => "INPUT DEVICES",
-        Source::App(_) => "APPLICATIONS",
-        _ => "DESKTOP AND MICROPHONE",
+        Source::Output(_) => tr!("OUTPUT DEVICES"),
+        Source::Input(_) => tr!("INPUT DEVICES"),
+        Source::App(_) => tr!("APPLICATIONS"),
+        _ => tr!("DESKTOP AND MICROPHONE"),
     };
     let listed = nodes.iter().map(|n| (n, default_mark(n)));
     let (desktop, mic) = (chosen_source(desktop, false), chosen_source(mic, true));
@@ -313,9 +313,9 @@ fn device_options(
     taken: impl Fn(&Source) -> bool,
 ) -> Vec<SourceOption> {
     let (default, heading) = if mic {
-        (Source::Microphone, "INPUT DEVICES")
+        (Source::Microphone, tr!("INPUT DEVICES"))
     } else {
-        (Source::Desktop, "OUTPUT DEVICES")
+        (Source::Desktop, tr!("OUTPUT DEVICES"))
     };
     let chosen = chosen_source(choice, mic);
     let devices = nodes.iter().filter(|n| {
@@ -326,10 +326,10 @@ fn device_options(
     });
     let missing = (chosen != default && !nodes.iter().any(|n| n.source == chosen))
         .then(|| node(chosen.clone(), &choice.label));
-    let system = node(default, "System default");
+    let system = node(default, tr!("System default"));
     let list = std::iter::once((&system, String::new()))
         .chain(devices.map(|n| (n, default_mark(n))))
-        .chain(missing.iter().map(|n| (n, "Disconnected".into())));
+        .chain(missing.iter().map(|n| (n, tr!("Disconnected").into())));
     grouped(
         list,
         |source| {
@@ -554,7 +554,7 @@ pub fn wire(ui: &AppWindow, rec: &Shared) {
         if tracks.len() >= MAX_TRACKS || recorded(&tracks, &source, &desktop, &mic) {
             return;
         }
-        let name = clean_name(&option.label).unwrap_or_else(|| "Track".into());
+        let name = clean_name(&option.label).unwrap_or_else(|| tr!("Track").into());
         log!("track-added: {name} ({})", option.source);
         tracks.push(Track::new(&name, source));
         show_tracks(&ui, &tracks);
