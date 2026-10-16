@@ -321,6 +321,8 @@ fn show_list(ui: &AppWindow, dir: &Path) {
 
 /// Saves the current profile, then shows and applies `new` (saved too).
 fn activate(ui: &AppWindow, rec: &Shared, games: &Games, dir: &Path, new: Prefs) {
+    // For the service it was typed for, before the new profile's is shown.
+    ui.invoke_commit_live_key();
     let old = Prefs::from_ui(ui);
     old.save();
     if let Some(r) = vesper_vst::global() {
