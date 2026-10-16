@@ -62,8 +62,15 @@ pub const CHANNELS: u16 = 2;
 /// Opus frame: 20 ms.
 const FRAME: usize = 960;
 const BIT_RATE: usize = 160_000;
-/// Peak meter window: ~33 ms.
-const PEAK_WINDOW: usize = 1_600;
+/// Peak at or above which a block counts as clipped: full scale (an integer
+/// source's loudest sample is a hair under 1.0).
+const CLIP_PEAK: f32 = 0.999;
+/// Peak above which a block wakes a resting meter: -60 dBFS, the meter's
+/// floor.
+const SIGNAL_PEAK: f32 = 0.001;
+/// Left and right differing by more than this (-60 dBFS) is stereo content,
+/// not an upmixed mono source.
+const STEREO_DIFF: f32 = 0.001;
 /// Timeline error allowed before inserting silence or dropping input at once:
 /// above timestamp jitter (sub-ms graph clock), far above a slow drift step.
 pub const TOLERANCE: Duration = Duration::from_millis(5);
@@ -133,6 +140,42 @@ pub struct Options {
     /// Told when the source is lost and when it is back, on the capture's
     /// PipeWire thread.
     pub on_state: Option<OnState>,
+    /// Called on the encode thread when a block is louder than the meter's
+    /// floor after [`AudioCapture::wake_on_signal`]; once per call of it.
+    pub on_signal: Option<OnSignal>,
+}
+
+/// See [`Options::on_signal`].
+pub type OnSignal = Box<dyn Fn() + Send>;
+
+/// Peak levels of a track since they were last taken, after volume and mute,
+/// for a level meter. See [`AudioCapture::take_peaks`].
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub struct Peaks {
+    /// Linear sample peaks: 1.0 is full scale, more is over.
+    pub left: f32,
+    pub right: f32,
+    /// A block reached full scale.
+    pub clipped: bool,
+    /// Left and right have differed since the capture started: not a mono
+    /// source upmixed to both.
+    pub stereo: bool,
+    /// At least one block came since the last take. Blocks are 20 ms and
+    /// come in bursts: a meter polling at 30 Hz sometimes gets none, which
+    /// is not silence.
+    pub fresh: bool,
+}
+
+impl Peaks {
+    /// Silence, as a block would report it: what a track that does not run
+    /// shows (`Default` is "no block came", which keeps the last peaks).
+    pub const SILENT: Self = Self {
+        left: 0.0,
+        right: 0.0,
+        clipped: false,
+        stereo: false,
+        fresh: true,
+    };
 }
 
 /// Where a running track's source is at, for [`Options::on_state`].
@@ -153,8 +196,15 @@ struct Shared {
     muted: AtomicBool,
     /// `f32` bits of the linear gain.
     gain: AtomicU32,
-    /// `f32` bits of the last window's peak.
-    peak: AtomicU32,
+    /// `f32` bits of the peaks since they were last taken. Non-negative
+    /// floats order like their bits, so `fetch_max` keeps the loudest.
+    left: AtomicU32,
+    right: AtomicU32,
+    clipped: AtomicBool,
+    stereo: AtomicBool,
+    fresh: AtomicBool,
+    /// The next block above [`SIGNAL_PEAK`] calls `on_signal`.
+    wake: AtomicBool,
 }
 
 impl Default for Shared {
@@ -162,8 +212,37 @@ impl Default for Shared {
         Self {
             muted: AtomicBool::new(false),
             gain: AtomicU32::new(1f32.to_bits()),
-            peak: AtomicU32::new(0),
+            left: AtomicU32::new(0),
+            right: AtomicU32::new(0),
+            clipped: AtomicBool::new(false),
+            stereo: AtomicBool::new(false),
+            fresh: AtomicBool::new(false),
+            wake: AtomicBool::new(false),
         }
+    }
+}
+
+impl Shared {
+    fn take_peaks(&self) -> Peaks {
+        let take = |a: &AtomicU32| f32::from_bits(a.swap(0, Ordering::Relaxed));
+        Peaks {
+            left: take(&self.left),
+            right: take(&self.right),
+            clipped: self.clipped.swap(false, Ordering::Relaxed),
+            stereo: self.stereo.load(Ordering::Relaxed),
+            fresh: self.fresh.swap(false, Ordering::Relaxed),
+        }
+    }
+
+    /// See [`AudioCapture::wake_on_signal`].
+    fn wake_on_signal(&self) -> bool {
+        self.wake.store(true, Ordering::Relaxed);
+        // A block stored between the last take and the store above did not
+        // see the request: look at what it left.
+        let loud = |a: &AtomicU32| f32::from_bits(a.load(Ordering::Relaxed)) > SIGNAL_PEAK;
+        // Taking the request back: the encode thread may have just fired it,
+        // then the event wakes the meter anyway.
+        (loud(&self.left) || loud(&self.right)) && self.wake.swap(false, Ordering::Relaxed)
     }
 }
 
@@ -196,6 +275,7 @@ impl AudioCapture {
         let mut enc = Encoder::new(encoder, options.anchor, shared.clone(), on_packet);
         enc.process = options.process;
         enc.mix = options.mix;
+        enc.on_signal = options.on_signal;
         let encode_thread = std::thread::Builder::new()
             .name("vesper-audio-enc".into())
             .spawn(move || encode_loop(enc, chunk_rx))?;
@@ -229,9 +309,18 @@ impl AudioCapture {
             .store(db_to_gain(db).to_bits(), Ordering::Relaxed);
     }
 
-    /// Peak level of the last ~33 ms, linear 0..=1 (0 while muted).
-    pub fn peak(&self) -> f32 {
-        f32::from_bits(self.shared.peak.load(Ordering::Relaxed))
+    /// Peaks since the last call (0 while muted), and whether a block
+    /// clipped since then. Cheap: a few atomics.
+    pub fn take_peaks(&self) -> Peaks {
+        self.shared.take_peaks()
+    }
+
+    /// The next block louder than the meter's floor calls
+    /// [`Options::on_signal`]: a resting meter needs no polling. Returns
+    /// true, without arming, when such a block already came since the
+    /// peaks were last taken: the meter must not rest.
+    pub fn wake_on_signal(&self) -> bool {
+        self.shared.wake_on_signal()
     }
 
     /// `OpusHead` for the container's codec private data.
@@ -408,8 +497,7 @@ struct Encoder<F> {
     /// Off: blocks go to `tap` only, nothing is encoded (a mix kept for a
     /// stream while the files have none).
     opus: bool,
-    peak: f32,
-    peak_samples: usize,
+    on_signal: Option<OnSignal>,
     on_packet: F,
 }
 
@@ -434,8 +522,7 @@ impl<F: FnMut(EncodedPacket)> Encoder<F> {
             mix: None,
             tap: None,
             opus: true,
-            peak: 0.0,
-            peak_samples: 0,
+            on_signal: None,
             on_packet,
         }
     }
@@ -498,6 +585,7 @@ impl<F: FnMut(EncodedPacket)> Encoder<F> {
         };
         apply_gain(&mut self.block, self.gain, gain);
         self.gain = gain;
+        self.meter();
         if let Some(mix) = &self.mix {
             mix.push(&self.block, self.sent as u64);
         }
@@ -514,13 +602,6 @@ impl<F: FnMut(EncodedPacket)> Encoder<F> {
         let out = self.frame.data_mut(0);
         for (dst, &s) in out.as_chunks_mut::<4>().0.iter_mut().zip(&self.block) {
             dst.copy_from_slice(&s.to_le_bytes());
-            self.peak = self.peak.max(s.abs());
-            self.peak_samples += 1;
-            if self.peak_samples == PEAK_WINDOW * usize::from(CHANNELS) {
-                let peak = self.peak.min(1.0);
-                self.shared.peak.store(peak.to_bits(), Ordering::Relaxed);
-                (self.peak, self.peak_samples) = (0.0, 0);
-            }
         }
         self.frame.set_pts(Some(self.sent));
         self.sent += FRAME as i64;
@@ -528,6 +609,35 @@ impl<F: FnMut(EncodedPacket)> Encoder<F> {
             error!("opus encode failed: {e}");
         }
         self.drain();
+    }
+
+    /// Feeds the level meter from the block: per channel max-abs, a few
+    /// atomics per 20 ms, no allocation. `f32::max` drops NaN.
+    fn meter(&self) {
+        let (mut left, mut right, mut side) = (0f32, 0f32, 0f32);
+        for &[l, r] in self.block.as_chunks::<2>().0 {
+            left = left.max(l.abs());
+            right = right.max(r.abs());
+            side = side.max((l - r).abs());
+        }
+        let shared = &self.shared;
+        shared.left.fetch_max(left.to_bits(), Ordering::Relaxed);
+        shared.right.fetch_max(right.to_bits(), Ordering::Relaxed);
+        shared.fresh.store(true, Ordering::Relaxed);
+        let peak = left.max(right);
+        if peak >= CLIP_PEAK {
+            shared.clipped.store(true, Ordering::Relaxed);
+        }
+        if side > STEREO_DIFF && !shared.stereo.load(Ordering::Relaxed) {
+            shared.stereo.store(true, Ordering::Relaxed);
+        }
+        if peak > SIGNAL_PEAK
+            && shared.wake.load(Ordering::Relaxed)
+            && shared.wake.swap(false, Ordering::Relaxed)
+            && let Some(on_signal) = &self.on_signal
+        {
+            on_signal();
+        }
     }
 
     fn drain(&mut self) {
@@ -563,7 +673,7 @@ impl<F: FnMut(EncodedPacket)> Encoder<F> {
             }
             self.drain();
         }
-        self.shared.peak.store(0, Ordering::Relaxed);
+        self.shared.take_peaks();
     }
 }
 
@@ -902,19 +1012,83 @@ mod tests {
     }
 
     fn peak(shared: &Shared) -> f32 {
-        f32::from_bits(shared.peak.load(Ordering::Relaxed))
+        let peaks = shared.take_peaks();
+        peaks.left.max(peaks.right)
     }
 
     #[test]
     fn muted_track_reports_zero_peak() {
         let shared = Arc::new(Shared::default());
         let mut enc = test_encoder(&shared);
-        enc.push(&vec![0.75; PEAK_WINDOW * 2 * 2]);
+        enc.push(&vec![0.75; FRAME * 2 * 2]);
         assert_eq!(peak(&shared), 0.75);
         shared.muted.store(true, Ordering::Relaxed);
-        // The first muted block ramps down; the windows after it are silent.
-        enc.push(&vec![0.75; PEAK_WINDOW * 2 * 4]);
+        // The first muted block ramps down; the blocks after it are silent.
+        enc.push(&vec![0.75; FRAME * 2]);
+        peak(&shared);
+        enc.push(&vec![0.75; FRAME * 2 * 3]);
         assert_eq!(peak(&shared), 0.0);
+    }
+
+    #[test]
+    fn peaks_keep_the_loudest_per_channel_until_taken() {
+        let shared = Arc::new(Shared::default());
+        let mut enc = test_encoder(&shared);
+        let block = |l: f32, r: f32| [l, r].repeat(FRAME);
+        enc.push(&block(0.5, -0.25));
+        enc.push(&block(0.1, 0.1));
+        let peaks = shared.take_peaks();
+        assert_eq!((peaks.left, peaks.right), (0.5, 0.25));
+        assert!(peaks.stereo && !peaks.clipped && peaks.fresh);
+        let peaks = shared.take_peaks();
+        assert_eq!(peaks.left, 0.0, "taken");
+        assert!(!peaks.fresh, "no block since");
+        enc.push(&block(-1.0, 1.0));
+        assert!(shared.take_peaks().clipped);
+        assert!(!shared.take_peaks().clipped, "taken");
+    }
+
+    #[test]
+    fn a_signal_before_the_request_is_not_lost() {
+        let shared = Arc::new(Shared::default());
+        let mut enc = test_encoder(&shared);
+        enc.push(&vec![0.0; FRAME * 2]);
+        shared.take_peaks();
+        assert!(!shared.wake_on_signal(), "silent: armed");
+        assert!(shared.wake.load(Ordering::Relaxed));
+        shared.take_peaks();
+        shared.wake.store(false, Ordering::Relaxed);
+        // A block lands between the last take and the request.
+        enc.push(&vec![0.5; FRAME * 2]);
+        assert!(shared.wake_on_signal(), "the meter keeps ticking");
+        assert!(!shared.wake.load(Ordering::Relaxed), "not armed");
+    }
+
+    #[test]
+    fn upmixed_mono_is_not_stereo() {
+        let shared = Arc::new(Shared::default());
+        let mut enc = test_encoder(&shared);
+        enc.push(&vec![0.3; FRAME * 2 * 3]);
+        assert!(!shared.take_peaks().stereo);
+    }
+
+    #[test]
+    fn signal_wakes_once_per_request() {
+        use std::sync::atomic::AtomicUsize;
+        let shared = Arc::new(Shared::default());
+        let mut enc = test_encoder(&shared);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+        enc.on_signal = Some(Box::new(move || {
+            c.fetch_add(1, Ordering::Relaxed);
+        }));
+        enc.push(&vec![0.5; FRAME * 2]);
+        assert_eq!(calls.load(Ordering::Relaxed), 0, "not asked");
+        shared.wake.store(true, Ordering::Relaxed);
+        enc.push(&vec![0.0; FRAME * 2]);
+        assert_eq!(calls.load(Ordering::Relaxed), 0, "silence");
+        enc.push(&vec![0.5; FRAME * 2 * 3]);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -951,7 +1125,8 @@ mod tests {
             s.iter_mut().for_each(|x| *x *= 2.0);
             0
         }));
-        enc.push(&vec![0.5; PEAK_WINDOW * 2 * 2]);
+        peak(&shared);
+        enc.push(&vec![0.5; FRAME * 2 * 2]);
         // 0.5 doubled by the processor, then -6 dB.
         assert!(
             (peak(&shared) - db_to_gain(-6.0)).abs() < 1e-4,

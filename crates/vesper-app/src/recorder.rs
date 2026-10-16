@@ -44,7 +44,9 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use vesper_audio::{Aac, AudioCapture, CHANNELS, Mix, Options, SAMPLE_RATE, Source, TrackState};
+use vesper_audio::{
+    Aac, AudioCapture, CHANNELS, Mix, Options, Peaks, SAMPLE_RATE, Source, TrackState,
+};
 use vesper_capture::Capture;
 use vesper_compose::{Compositor, Draw, Source as DrawSource};
 use vesper_core::{Codec, EncodedPacket, VideoFrame};
@@ -247,6 +249,9 @@ pub enum Event {
     /// The audio tracks started (on the first frame) or restarted: their
     /// peaks move from now on.
     AudioStarted,
+    /// A track got louder than the meters' floor after they went to rest
+    /// (see [`Pipeline::wake_meters_on_signal`]).
+    AudioSignal,
     /// Sent while recording.
     Stats {
         width: u32,
@@ -627,13 +632,9 @@ impl Pipeline {
         (audio.tracks, audio.mix, audio.changed) = (tracks, mix, true);
     }
 
-    /// Whether audio tracks run, so their peaks may move.
-    pub fn audio_running(&self) -> bool {
-        !lock(&self.audio).running.is_empty()
-    }
-
-    /// Recent peak of track `index`, linear 0..=1; 0 when it does not run.
-    pub fn peak(&self, index: usize) -> f32 {
+    /// Peaks of track `index` since the last call; silence when it does not
+    /// run.
+    pub fn take_peaks(&self, index: usize) -> Peaks {
         let audio = lock(&self.audio);
         // Ticked by the meters: frees a replaced filter chain soon after the
         // audio thread hands it back, not at the next change.
@@ -644,7 +645,19 @@ impl Pipeline {
             .running
             .iter()
             .find(|(i, _)| *i == index)
-            .map_or(0.0, |(_, capture)| capture.peak())
+            .map_or(Peaks::SILENT, |(_, capture)| capture.take_peaks())
+    }
+
+    /// The meters rest: the next track louder than their floor sends
+    /// [`Event::AudioSignal`], once. Returns true when a track was already
+    /// louder since the last take: the meters must keep ticking.
+    pub fn wake_meters_on_signal(&self) -> bool {
+        let audio = lock(&self.audio);
+        // Every track is asked, even after a loud one.
+        audio
+            .running
+            .iter()
+            .fold(false, |loud, (_, capture)| capture.wake_on_signal() | loud)
     }
 
     /// Stops and waits for the recording, if any, to be finalized.
@@ -946,6 +959,10 @@ fn start_audio(sources: &AudioSources, sinks: &SharedSinks, on_event: &OnEvent) 
             on_state: Some(Box::new({
                 let (on_event, name) = (on_event.clone(), track.name.clone());
                 move |state| on_event(Event::AudioTrack(name.clone(), state))
+            })),
+            on_signal: Some(Box::new({
+                let on_event = on_event.clone();
+                move || on_event(Event::AudioSignal)
             })),
         };
         match AudioCapture::start(track.source.clone(), options, move |packet| {

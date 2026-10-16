@@ -424,10 +424,14 @@ fn look(ui: &AppWindow, step: &str) -> bool {
                 },
             ];
             crate::audio::show_tracks(ui, &tracks);
-            let levels = [0.62, 0.35, 0.48, 0.0];
-            let model = |v: &[f32]| std::rc::Rc::new(slint::VecModel::from(v.to_vec())).into();
-            ui.set_track_levels(model(&levels));
-            ui.set_track_peaks(model(&levels.map(|l: f32| (l + 0.12).min(1.0))));
+            // Stereo desktop in the yellow, a mono mic, a stereo app that
+            // clipped, a muted headset.
+            ui.set_track_meters(demo_meters(&[
+                ((-9.0, -11.5), (-5.0, -7.0), true, false),
+                ((-21.0, -21.0), (-14.0, -14.0), false, false),
+                ((-2.5, -4.0), (0.0, -1.0), true, true),
+                ((-60.0, -60.0), (-60.0, -60.0), true, false),
+            ]));
         }
         // The microphone's settings open, with the voice preset and some
         // gain reduction.
@@ -451,8 +455,10 @@ fn look(ui: &AppWindow, step: &str) -> bool {
             crate::audio::show_tracks(ui, &tracks);
             ui.invoke_open_track_settings(1);
             let model = |v: &[f32]| std::rc::Rc::new(slint::VecModel::from(v.to_vec())).into();
-            ui.set_track_levels(model(&[0.4, 0.55]));
-            ui.set_track_peaks(model(&[0.5, 0.66]));
+            ui.set_track_meters(demo_meters(&[
+                ((-24.0, -26.0), (-18.0, -19.0), true, false),
+                ((-16.0, -16.0), (-10.0, -10.0), false, false),
+            ]));
             ui.set_filter_reductions(model(&[0.0, 0.0, 0.0, 4.2, 1.5, 0.8]));
         }
         // On air for 12:34 on Twitch, as the stats show it.
@@ -479,6 +485,26 @@ fn look(ui: &AppWindow, step: &str) -> bool {
         _ => return false,
     }
     true
+}
+
+/// Meters at these levels and held peaks (dBFS, left and right), stereo,
+/// clipped.
+type DemoMeter = ((f32, f32), (f32, f32), bool, bool);
+
+fn demo_meters(meters: &[DemoMeter]) -> slint::ModelRc<crate::TrackMeter> {
+    use crate::meter::position;
+    let meters: Vec<_> = meters
+        .iter()
+        .map(|&((l, r), (hl, hr), stereo, clip)| crate::TrackMeter {
+            left: position(l),
+            right: position(r),
+            hold_left: position(hl),
+            hold_right: position(hr),
+            clip,
+            stereo,
+        })
+        .collect();
+    std::rc::Rc::new(slint::VecModel::from(meters)).into()
 }
 
 /// Gameplay (capture, logo, caption, webcam), Be right back, Starting soon.

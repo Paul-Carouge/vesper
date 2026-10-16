@@ -958,7 +958,7 @@ fn on_recorder_event(ui: &AppWindow, generation: u64, event: Event) {
             prefs::save_source(&label);
         }
         Event::Source(_) => {}
-        Event::AudioStarted => ui.invoke_meters_wake(),
+        Event::AudioStarted | Event::AudioSignal => ui.invoke_meters_wake(),
         Event::Started => {
             ui.set_rec_state(RecState::Recording);
             ui.set_elapsed_seconds(0);

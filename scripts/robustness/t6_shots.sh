@@ -45,3 +45,7 @@ SIZE=360x700 shot consent-narrow-light light game-look,consent-look
 SIZE=360x700 shot filters-narrow-dark dark screen-look,filters-look,scroll-end
 # Live language switch: picks English in the settings (at 360x700, after scroll-end).
 SIZE=360x700 shot language-switch-light light screen-look,settings,scroll-end,click:196:408
+# Audio level meters: stereo and mono bars, peak hold, a latched clip, a muted track.
+shot meters-dark dark screen-look,replay-on,tracks-look,scroll-end
+shot meters-light light screen-look,replay-on,tracks-look,scroll-end
+SIZE=360x700 shot meters-narrow-dark dark screen-look,replay-on,tracks-look,scroll-end

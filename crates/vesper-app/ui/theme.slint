@@ -36,6 +36,12 @@ export global Theme {
     // Meter
     out property <color> meter-track: dark ? #23242C : #E9E9EE;
     out property <color> meter-hot: dark ? #F2B84B : #D08A00;
+    // Level meter zones: below -12 dBFS, -12 to -3, above -3. Lit, each at
+    // least 3:1 on `meter-track` and `surface`; unlit, the same at `meter-unlit`.
+    out property <color> meter-low: dark ? #5BD08A : #188A4A;
+    out property <color> meter-mid: dark ? #F2B84B : #B07400;
+    out property <color> meter-high: dark ? #FF5C52 : #D23A30;
+    out property <float> meter-unlit: dark ? 0.2 : 0.22;
 
     // Metrics
     out property <length> radius-sm: 8px;

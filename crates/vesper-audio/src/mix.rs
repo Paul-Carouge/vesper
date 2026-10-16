@@ -332,10 +332,10 @@ mod tests {
             .collect();
         a.push(&sine, 0);
         b.push(&sine, 0);
-        // The peak of the last meter window, as sent to the encoder.
+        // The loudest block sent to the encoder.
         let state = lock(&mix.state);
         let shared = &state.enc.as_ref().unwrap().shared;
-        let peak = f32::from_bits(shared.peak.load(std::sync::atomic::Ordering::Relaxed));
+        let peak = shared.take_peaks().left;
         let ceiling = 10f32.powf(CEILING_DB / 20.0);
         assert!(peak <= ceiling + 1e-6, "{peak}");
         assert!(peak > ceiling * 0.95, "{peak}");

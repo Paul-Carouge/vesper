@@ -509,7 +509,7 @@ fn update_preview(ui: &AppWindow) {
 }
 
 /// The window is visible, not minimized, not hidden by the compositor.
-fn shown_on_screen(ui: &AppWindow) -> bool {
+pub fn shown_on_screen(ui: &AppWindow) -> bool {
     ui.window().is_visible() && !ui.window().is_minimized() && !OCCLUDED.get()
 }
 
@@ -634,6 +634,10 @@ pub fn wire(ui: &AppWindow, rec: &Shared, games: &Games) {
             _ => false,
         };
         if let Some(ui) = weak.upgrade() {
+            // The level meters stop while the window is away too.
+            if back {
+                ui.invoke_meters_wake();
+            }
             if back && ui.global::<SceneStore>().get_open() && !TICK.with(slint::Timer::running) {
                 shown(&ui);
             } else if !back && OCCLUDED.get() {
