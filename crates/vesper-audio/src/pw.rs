@@ -136,17 +136,40 @@ struct Reconnect {
     outage: bool,
 }
 
+/// What to do after losing a connection.
+#[derive(Debug, PartialEq)]
+struct Retry {
+    /// The wait before the next attempt.
+    wait: Duration,
+    /// A new outage begins (worth a warning).
+    new_outage: bool,
+    /// The source coming back may end the wait early. Not after a connection
+    /// shorter than the wait: a source flapping faster than the backoff
+    /// keeps the full waits, so it cannot reconnect faster than them.
+    on_return: bool,
+}
+
 impl Reconnect {
     /// After losing a connection that streamed for `up` (`None`: never
-    /// streamed): the wait before the next attempt, and whether a new outage
-    /// begins (worth a warning).
-    fn lost(&mut self, up: Option<Duration>) -> (Duration, bool) {
+    /// streamed, e.g. the device is missing).
+    fn lost(&mut self, up: Option<Duration>) -> Retry {
         if up.is_some_and(|up| up >= HEALTHY) {
             *self = Self::default();
         }
-        let new = !std::mem::replace(&mut self.outage, true);
-        (self.backoff.next(), new)
+        let new_outage = !std::mem::replace(&mut self.outage, true);
+        let wait = self.backoff.next();
+        Retry {
+            wait,
+            new_outage,
+            on_return: up.is_none_or(|up| up >= wait),
+        }
     }
+}
+
+/// The rest of a wait ended early `waited` after it began: the next attempt
+/// never starts sooner than `BACKOFF_FIRST` after a loss.
+fn rest_after_return(waited: Duration) -> Duration {
+    BACKOFF_FIRST.saturating_sub(waited)
 }
 
 /// How one connection to PipeWire is doing, seen from its callbacks.
@@ -237,7 +260,11 @@ pub fn run(
         }
         let reason = health.lost.take().unwrap_or_else(|| "stream ended".into());
         let up = health.streaming_since.get().map(|t| t.elapsed());
-        let (wait, new_outage) = reconnect.lost(up);
+        let Retry {
+            wait,
+            new_outage,
+            on_return,
+        } = reconnect.lost(up);
         // Warned once per outage: a removed device retries every 2 s, and a
         // flapping one keeps backing off within the same outage.
         if new_outage {
@@ -255,10 +282,84 @@ pub fn run(
             move |_| mainloop.quit()
         });
         let _ = timer.update_timer(Some(wait), None);
+        let waiting = Instant::now();
+        // A device is retried as soon as it is back, not up to 2 s later.
+        let back = match (&source, on_return) {
+            (Source::Input(node) | Source::Output(node), true) => Returns::watch(&mainloop, node)
+                .inspect_err(|e| debug!("{source:?}: cannot watch for its return: {e}"))
+                .ok(),
+            _ => None,
+        };
         mainloop.run();
+        // Once per wait: further returns do not shorten it again.
+        drop(back);
+        let rest = rest_after_return(waiting.elapsed());
+        if !stopped.get() && !rest.is_zero() {
+            let _ = timer.update_timer(Some(rest), None);
+            mainloop.run();
+        }
         if stopped.get() {
             return;
         }
+    }
+}
+
+/// Leaves the loop when a node targeted as `target` (its `node.name` or
+/// `object.serial`) is added to the graph after the watch began. Dropping
+/// it stops watching.
+///
+/// Fields drop in declaration order: listeners before their proxies.
+struct Returns {
+    _registry_listener: pw::registry::Listener,
+    _core_listener: pw::core::Listener,
+    _registry: pw::registry::RegistryRc,
+    _core: pw::core::CoreRc,
+    _context: pw::context::ContextRc,
+}
+
+impl Returns {
+    fn watch(mainloop: &pw::main_loop::MainLoopRc, target: &str) -> Result<Self, Error> {
+        let context = pw::context::ContextRc::new(mainloop, None)?;
+        let core = context.connect_rc(None)?;
+        let registry = core.get_registry_rc()?;
+        // The nodes already there come before the first sync: not a return.
+        // shortcut: a device back before this watch began counts as present
+        // and waits for the timer; only matters for a replug within ms.
+        let synced = Rc::new(Cell::new(false));
+        let registry_listener = registry
+            .add_listener_local()
+            .global({
+                let (synced, mainloop, target) =
+                    (synced.clone(), mainloop.clone(), target.to_owned());
+                move |global| {
+                    let Some(props) = global.props else { return };
+                    if synced.get()
+                        && global.type_ == ObjectType::Node
+                        && (props.get(*pw::keys::NODE_NAME) == Some(target.as_str())
+                            || props.get(*pw::keys::OBJECT_SERIAL) == Some(target.as_str()))
+                    {
+                        debug!("{target}: back in the graph");
+                        mainloop.quit();
+                    }
+                }
+            })
+            .register();
+        let pending = core.sync(0)?;
+        let core_listener = core
+            .add_listener_local()
+            .done(move |id, seq| {
+                if id == pw::core::PW_ID_CORE && seq == pending {
+                    synced.set(true);
+                }
+            })
+            .register();
+        Ok(Self {
+            _registry_listener: registry_listener,
+            _core_listener: core_listener,
+            _registry: registry,
+            _core: core,
+            _context: context,
+        })
     }
 }
 
@@ -923,25 +1024,50 @@ mod tests {
         // A device that streams for an instant, then drops, again and again.
         let flaps: Vec<_> = (0..7)
             .map(|_| r.lost(brief))
-            .map(|(wait, new)| (wait.as_millis(), new))
+            .map(|retry| (retry.wait.as_millis(), retry.new_outage, retry.on_return))
             .collect();
+        // Shorter than every wait: its returns never cut one.
         assert_eq!(
             flaps,
             [
-                (100, true),
-                (200, false),
-                (400, false),
-                (800, false),
-                (1_600, false),
-                (2_000, false),
-                (2_000, false)
+                (100, true, false),
+                (200, false, false),
+                (400, false, false),
+                (800, false, false),
+                (1_600, false, false),
+                (2_000, false, false),
+                (2_000, false, false)
             ]
         );
-        // Never streamed: same outage, still backing off.
-        assert_eq!(r.lost(None), (Duration::from_secs(2), false));
+        // Never streamed (device missing): same outage, still backing off,
+        // but its return ends the wait.
+        let retry = |wait, new_outage, on_return| Retry {
+            wait,
+            new_outage,
+            on_return,
+        };
+        let two = Duration::from_secs(2);
+        assert_eq!(r.lost(None), retry(two, false, true));
+        // Up for a whole wait: not a fast flap, its return counts.
+        assert_eq!(r.lost(Some(two)), retry(two, false, true));
+        assert_eq!(r.lost(Some(two / 2)), retry(two, false, false));
+        // Just short of healthy: still the same outage at full backoff.
+        let almost = Some(HEALTHY - Duration::from_millis(1));
+        assert_eq!(r.lost(almost), retry(two, false, true));
         // A healthy run ends it: a real unplug retries fast and warns again.
-        assert_eq!(r.lost(Some(HEALTHY)), (BACKOFF_FIRST, true));
-        assert_eq!(r.lost(None), (2 * BACKOFF_FIRST, false));
+        assert_eq!(r.lost(Some(HEALTHY)), retry(BACKOFF_FIRST, true, true));
+        assert_eq!(r.lost(None), retry(2 * BACKOFF_FIRST, false, true));
+    }
+
+    #[test]
+    fn a_return_never_retries_sooner_than_the_first_backoff() {
+        // Back at once: the attempt still waits out the first step.
+        assert_eq!(rest_after_return(Duration::ZERO), BACKOFF_FIRST);
+        let ms = Duration::from_millis;
+        assert_eq!(rest_after_return(ms(30)), ms(70));
+        // Later than that: right away.
+        assert_eq!(rest_after_return(BACKOFF_FIRST), Duration::ZERO);
+        assert_eq!(rest_after_return(ms(1_500)), Duration::ZERO);
     }
 
     #[test]
