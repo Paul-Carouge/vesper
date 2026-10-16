@@ -6,6 +6,7 @@ use super::producer::{POOL, Producer};
 use super::*;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::Instant;
+use vesper_core::ReleaseGuard;
 
 const W: u32 = 640;
 const H: u32 = 360;
@@ -31,6 +32,7 @@ fn feeder(
     live: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
     size: Arc<Mutex<(u32, u32)>>,
+    counts: Arc<(AtomicUsize, AtomicUsize)>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         // Producers are not Send: created here, one per size.
@@ -46,7 +48,14 @@ fn feeder(
                 producers.push((want, unsafe { Producer::new(want.0, want.1) }));
             }
             let producer = &producers.iter().find(|(s, _)| *s == want).unwrap().1;
-            let frame = unsafe { producer.frame(t as usize % POOL, t, 0, monotonic_now()) };
+            let mut frame = unsafe { producer.frame(t as usize % POOL, t, 0, monotonic_now()) };
+            let c = counts.clone();
+            c.0.fetch_add(1, Ordering::SeqCst);
+            let release = std::mem::replace(&mut frame.release, ReleaseGuard::new(|| {}));
+            frame.release = ReleaseGuard::new(move || {
+                drop(release);
+                c.1.fetch_add(1, Ordering::SeqCst);
+            });
             route.push(Ok(frame));
             t += 1;
         }
@@ -58,6 +67,8 @@ struct Rig {
     live: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
     size: Arc<Mutex<(u32, u32)>>,
+    /// Frames sent, frames released by the pipeline.
+    counts: Arc<(AtomicUsize, AtomicUsize)>,
     feeder: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -71,12 +82,20 @@ impl Rig {
         let live = Arc::new(AtomicBool::new(true));
         let paused = Arc::new(AtomicBool::new(false));
         let size = Arc::new(Mutex::new((W, H)));
-        let feeder = feeder(route.clone(), live.clone(), paused.clone(), size.clone());
+        let counts = Arc::new((AtomicUsize::new(0), AtomicUsize::new(0)));
+        let feeder = feeder(
+            route.clone(),
+            live.clone(),
+            paused.clone(),
+            size.clone(),
+            counts.clone(),
+        );
         Some(Self {
             route,
             live,
             paused,
             size,
+            counts,
             feeder: Some(feeder),
         })
     }
@@ -794,5 +813,86 @@ fn a_fixed_canvas_scene_without_the_capture_needs_no_frame() {
     assert_eq!(video_size(&path), (480, 270));
     let (n, key, _) = inspect(&path);
     assert!(key && n > 20, "{n} packets");
+    std::fs::remove_dir_all(out).unwrap();
+}
+
+/// With an overlay scene, every capture frame goes back to its producer
+/// within a tick or so: none is kept while the source sends nothing (the
+/// game's ring has 4 buffers, KWin's pool a few).
+#[test]
+fn composed_scenes_release_every_capture_frame_promptly() {
+    for damage_driven in [false, true] {
+        let Some(rig) = Rig::new() else { return };
+        rig.route
+            .0
+            .probe
+            .base
+            .store(damage_driven, Ordering::Relaxed);
+        let out = dir(&format!("release-{damage_driven}"));
+        let png = red_png(&out);
+        let settings = Settings {
+            scene: logo_scene(&png),
+            ..settings(&rig.route)
+        };
+        let Some((p, rx)) = record_with(settings, &out) else {
+            return;
+        };
+        let (sent, released) = (&rig.counts.0, &rig.counts.1);
+        // While frames flow: at most the parked one and the one being drawn.
+        for _ in 0..20 {
+            std::thread::sleep(Duration::from_millis(37));
+            let held = sent.load(Ordering::SeqCst) - released.load(Ordering::SeqCst);
+            assert!(held <= 2, "{held} frames held");
+        }
+        rig.paused.store(true, Ordering::Relaxed);
+        // Two ticks after the last frame, all are back.
+        std::thread::sleep(Duration::from_millis(33 + 2 * 34));
+        assert_eq!(
+            released.load(Ordering::SeqCst),
+            sent.load(Ordering::SeqCst),
+            "a frame is kept (damage-driven {damage_driven})"
+        );
+        // A scene switch without a new frame: drawn from the copy of a
+        // damage-driven source, else at the next frame.
+        assert!(p.set_scene(Scene::main()));
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(p.set_scene(logo_scene(&png)));
+        std::thread::sleep(Duration::from_millis(300));
+        let path = finish(&p, &rx);
+        p.join();
+        let frames = decode_all(&path);
+        let last = frames.last().unwrap();
+        if damage_driven {
+            assert_logo(last, "redrawn from the copy");
+        }
+        assert_eq!(released.load(Ordering::SeqCst), sent.load(Ordering::SeqCst));
+        drop(rig);
+        std::fs::remove_dir_all(out).unwrap();
+    }
+}
+
+/// Toggling between a composed scene and the capture alone keeps one warm
+/// compositor instead of making a device per switch.
+#[test]
+fn rapid_scene_toggles_reuse_one_compositor() {
+    let Some(rig) = Rig::new() else { return };
+    let out = dir("toggle");
+    let png = red_png(&out);
+    let Some((p, rx)) = record_with(settings(&rig.route), &out) else {
+        return;
+    };
+    for i in 0..12 {
+        let scene = if i % 2 == 0 {
+            logo_scene(&png)
+        } else {
+            Scene::main()
+        };
+        assert!(p.set_scene(scene));
+        std::thread::sleep(Duration::from_millis(120));
+    }
+    let path = finish(&p, &rx);
+    p.join();
+    assert_eq!(rig.route.0.probe.compositors.load(Ordering::Relaxed), 1);
+    assert!(inspect(&path).0 > 30);
     std::fs::remove_dir_all(out).unwrap();
 }

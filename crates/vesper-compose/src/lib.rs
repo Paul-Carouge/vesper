@@ -6,8 +6,12 @@
 //! (`/dev/dri/renderD128`, never the iGPU), at low global priority when the
 //! driver allows it so a game keeps the GPU first. One compute shader
 //! (`shaders/compose.comp`, SPIR-V committed) draws up to [`MAX_LAYERS`]
-//! layers per frame. `compose` waits its fence before returning: VA has no
-//! implicit sync with Vulkan on radeonsi.
+//! layers per frame. [`Compositor::submit`] queues a composition and
+//! [`Compositor::poll`] hands the frame over once its fence signalled (VA
+//! has no implicit sync with Vulkan on radeonsi): a caller on a frame clock
+//! never waits longer than it chooses for a GPU busy with a game.
+//! Textures are prepared (mips, staging copy) by an [`Uploader`] on any
+//! thread; [`Compositor::set_staged`] only queues the GPU copy.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -15,7 +19,7 @@ use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::os::unix::fs::MetadataExt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ash::vk;
 use vesper_core::{DmaBufPlane, ReleaseGuard, VideoFrame};
@@ -198,6 +202,213 @@ fn dev_numbers(rdev: u64) -> (i64, i64) {
     (major as i64, minor as i64)
 }
 
+/// The Vulkan instance and device, alive while the compositor or a staged
+/// texture needs them.
+struct Gpu {
+    _entry: ash::Entry,
+    instance: ash::Instance,
+    device: ash::Device,
+    memory: vk::PhysicalDeviceMemoryProperties,
+}
+
+impl Drop for Gpu {
+    fn drop(&mut self) {
+        unsafe {
+            self.device.destroy_device(None);
+            self.instance.destroy_instance(None);
+        }
+    }
+}
+
+impl Gpu {
+    /// A host-visible buffer, persistently mapped.
+    unsafe fn buffer(
+        &self,
+        size: u64,
+        usage: vk::BufferUsageFlags,
+        cached: bool,
+    ) -> Result<Buffer> {
+        let d = &self.device;
+        let mut b = Buffer::NULL;
+        let r = unsafe {
+            (|| {
+                b.buffer = d
+                    .create_buffer(
+                        &vk::BufferCreateInfo::default()
+                            .size(size)
+                            .usage(usage)
+                            .sharing_mode(vk::SharingMode::EXCLUSIVE),
+                        None,
+                    )
+                    .map_err(err("create buffer"))?;
+                let reqs = d.get_buffer_memory_requirements(b.buffer);
+                let host =
+                    vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+                let type_index = cached
+                    .then(|| {
+                        memory_type(
+                            &self.memory,
+                            reqs.memory_type_bits,
+                            host | vk::MemoryPropertyFlags::HOST_CACHED,
+                        )
+                    })
+                    .flatten()
+                    .or_else(|| memory_type(&self.memory, reqs.memory_type_bits, host))
+                    .ok_or_else(|| Error("no host-visible memory".into()))?;
+                b.memory = d
+                    .allocate_memory(
+                        &vk::MemoryAllocateInfo::default()
+                            .allocation_size(reqs.size)
+                            .memory_type_index(type_index),
+                        None,
+                    )
+                    .map_err(err("allocate buffer memory"))?;
+                d.bind_buffer_memory(b.buffer, b.memory, 0)
+                    .map_err(err("bind buffer memory"))?;
+                b.ptr = d
+                    .map_memory(b.memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
+                    .map_err(err("map buffer"))? as *mut u8;
+                Ok(())
+            })()
+        };
+        match r {
+            Ok(()) => Ok(b),
+            Err(e) => {
+                unsafe { b.destroy(d) };
+                Err(e)
+            }
+        }
+    }
+}
+
+fn memory_type(
+    memory: &vk::PhysicalDeviceMemoryProperties,
+    bits: u32,
+    flags: vk::MemoryPropertyFlags,
+) -> Option<u32> {
+    let types = &memory.memory_types[..memory.memory_type_count as usize];
+    (0..types.len() as u32)
+        .find(|&i| bits & (1 << i) != 0 && types[i as usize].property_flags.contains(flags))
+}
+
+/// Prepares textures for one compositor on any thread, without its lock:
+/// the CPU mip chain and the staging copy. Cheap to clone.
+#[derive(Clone)]
+pub struct Uploader {
+    gpu: Arc<Gpu>,
+    width: u32,
+    height: u32,
+}
+
+// The Vulkan calls it makes (create, allocate, map) are thread-safe.
+unsafe impl Send for Uploader {}
+unsafe impl Sync for Uploader {}
+
+/// A texture's pixels in a staging buffer, ready for
+/// [`Compositor::set_staged`].
+pub struct Staged {
+    gpu: Arc<Gpu>,
+    buffer: Buffer,
+    width: u32,
+    height: u32,
+    levels: u32,
+    regions: Vec<vk::BufferImageCopy>,
+}
+
+// The mapping is only written by `Uploader::prepare`.
+unsafe impl Send for Staged {}
+
+impl Drop for Staged {
+    fn drop(&mut self) {
+        unsafe { self.buffer.destroy(&self.gpu.device) };
+    }
+}
+
+impl Uploader {
+    /// Stages `width` x `height` premultiplied RGBA8 pixels with a full mip
+    /// chain for downscaled draws. Levels at least twice the canvas size
+    /// are dropped: they are never sampled. A few ms per megapixel.
+    pub fn prepare(&self, width: u32, height: u32, rgba: &[u8]) -> Result<Staged> {
+        if width == 0 || height == 0 || width > 16384 || height > 16384 {
+            return Err(Error(format!("bad texture size {width}x{height}")));
+        }
+        if rgba.len() != width as usize * height as usize * 4 {
+            return Err(Error(format!(
+                "texture {width}x{height} needs {} bytes, got {}",
+                width as usize * height as usize * 4,
+                rgba.len()
+            )));
+        }
+        // shortcut: a crop zooming into a huge image loses that detail; keep
+        // more levels if the editor ever allows such zooms.
+        let (mut w, mut h) = (width as usize, height as usize);
+        let mut px = std::borrow::Cow::Borrowed(rgba);
+        while w / 2 >= self.width as usize && h / 2 >= self.height as usize {
+            let (p, nw, nh) = half(&px, w, h);
+            (px, w, h) = (std::borrow::Cow::Owned(p), nw, nh);
+        }
+        let levels = usize::BITS - w.max(h).leading_zeros();
+        let mut chain = vec![(px.into_owned(), w, h)];
+        while chain.len() < levels as usize {
+            let (p, w, h) = chain.last().expect("level 0 is there");
+            chain.push(half(p, *w, *h));
+        }
+        let total: usize = chain.iter().map(|(p, _, _)| p.len()).sum();
+        let buffer = unsafe {
+            self.gpu
+                .buffer(total as u64, vk::BufferUsageFlags::TRANSFER_SRC, false)?
+        };
+        let mut regions = Vec::new();
+        let mut offset = 0;
+        for (level, (p, w, h)) in chain.iter().enumerate() {
+            unsafe { std::ptr::copy_nonoverlapping(p.as_ptr(), buffer.ptr.add(offset), p.len()) };
+            regions.push(
+                vk::BufferImageCopy::default()
+                    .buffer_offset(offset as u64)
+                    .image_subresource(
+                        vk::ImageSubresourceLayers::default()
+                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                            .mip_level(level as u32)
+                            .layer_count(1),
+                    )
+                    .image_extent(vk::Extent3D {
+                        width: *w as u32,
+                        height: *h as u32,
+                        depth: 1,
+                    }),
+            );
+            offset += p.len();
+        }
+        Ok(Staged {
+            gpu: self.gpu.clone(),
+            buffer,
+            width: w as u32,
+            height: h as u32,
+            levels,
+            regions,
+        })
+    }
+}
+
+/// A copy of the last main frame kept on request (see
+/// [`Compositor::submit`]), drawn in its place when a composition has none.
+struct Base {
+    image: Image,
+    width: u32,
+    height: u32,
+    /// A copy was queued into it.
+    valid: bool,
+}
+
+/// A queued composition.
+struct InFlight {
+    slot: usize,
+    /// Released when the GPU is done with it.
+    main: Option<VideoFrame>,
+    preview: bool,
+    since: Instant,
+}
+
 struct Image {
     image: vk::Image,
     memory: vk::DeviceMemory,
@@ -260,7 +471,6 @@ struct Preview {
 pub struct Compositor {
     width: u32,
     height: u32,
-    _entry: ash::Entry,
     instance: ash::Instance,
     device: ash::Device,
     memory_fd: ash::khr::external_memory_fd::Device,
@@ -277,6 +487,16 @@ pub struct Compositor {
     pool: vk::CommandPool,
     cmd: vk::CommandBuffer,
     fence: vk::Fence,
+    /// Texture copies: their own command buffer and fence, so they queue
+    /// while a composition is in flight.
+    upload_cmd: vk::CommandBuffer,
+    upload_fence: vk::Fence,
+    /// The staging buffer of the last queued copy, freed once it is done.
+    upload_pending: Option<Staged>,
+    /// Images freed once no queued work may read them.
+    graveyard: Vec<Image>,
+    base: Option<Base>,
+    in_flight: Option<InFlight>,
     queries: Option<(vk::QueryPool, f32)>,
     gpu_time: Option<Duration>,
     sampler: vk::Sampler,
@@ -284,9 +504,9 @@ pub struct Compositor {
     pipeline_layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
     descriptor_pool: vk::DescriptorPool,
-    /// Compose pass, preview pass.
-    sets: [vk::DescriptorSet; 2],
-    params: [Buffer; 2],
+    /// Compose pass, preview pass, base copy pass.
+    sets: [vk::DescriptorSet; 3],
+    params: [Buffer; 3],
     dummy: Texture,
     textures: HashMap<u32, Texture>,
     imports: Vec<Import>,
@@ -296,6 +516,8 @@ pub struct Compositor {
     preview: Option<Preview>,
     /// A fence wait timed out: the GPU state is unknown, refuse further work.
     lost: bool,
+    /// Last field: the device outlives every handle above.
+    gpu: Arc<Gpu>,
 }
 
 // Vulkan handles are externally synchronised; `&mut self` provides that.
@@ -327,7 +549,14 @@ impl Compositor {
                 return Err(e);
             }
         };
-        // From here `Drop` frees whatever exists, the device and instance included.
+        let memory = unsafe { instance.get_physical_device_memory_properties(physical) };
+        // From here `Gpu` frees the device and instance, `Drop` the rest.
+        let gpu = Arc::new(Gpu {
+            _entry: entry,
+            instance: instance.clone(),
+            device: device.clone(),
+            memory,
+        });
         let mut c = unsafe {
             Self {
                 width,
@@ -335,17 +564,22 @@ impl Compositor {
                 memory_fd: ash::khr::external_memory_fd::Device::new(&instance, &device),
                 semaphore_fd: ash::khr::external_semaphore_fd::Device::new(&instance, &device),
                 acquire: vk::Semaphore::null(),
-                memory: instance.get_physical_device_memory_properties(physical),
+                memory,
                 physical,
                 modifiers: HashMap::new(),
                 queue: device.get_device_queue(family, 0),
-                _entry: entry,
                 instance,
                 device,
                 family,
                 pool: vk::CommandPool::null(),
                 cmd: vk::CommandBuffer::null(),
                 fence: vk::Fence::null(),
+                upload_cmd: vk::CommandBuffer::null(),
+                upload_fence: vk::Fence::null(),
+                upload_pending: None,
+                graveyard: Vec::new(),
+                base: None,
+                in_flight: None,
                 queries: timestamps.map(|period| (vk::QueryPool::null(), period)),
                 gpu_time: None,
                 sampler: vk::Sampler::null(),
@@ -353,8 +587,8 @@ impl Compositor {
                 pipeline_layout: vk::PipelineLayout::null(),
                 pipeline: vk::Pipeline::null(),
                 descriptor_pool: vk::DescriptorPool::null(),
-                sets: [vk::DescriptorSet::null(); 2],
-                params: [Buffer::NULL, Buffer::NULL],
+                sets: [vk::DescriptorSet::null(); 3],
+                params: [Buffer::NULL, Buffer::NULL, Buffer::NULL],
                 dummy: Texture {
                     image: Image::NULL,
                     width: 1,
@@ -369,6 +603,7 @@ impl Compositor {
                 generation: vesper_core::next_pool_generation(),
                 preview: None,
                 lost: false,
+                gpu,
             }
         };
         unsafe { c.init()? };
@@ -385,18 +620,22 @@ impl Compositor {
                     None,
                 )
                 .map_err(err("create command pool"))?;
-            self.cmd = d
+            let cmds = d
                 .allocate_command_buffers(
                     &vk::CommandBufferAllocateInfo::default()
                         .command_pool(self.pool)
                         .level(vk::CommandBufferLevel::PRIMARY)
-                        .command_buffer_count(1),
+                        .command_buffer_count(2),
                 )
-                .map_err(err("allocate command buffer"))?[0];
+                .map_err(err("allocate command buffer"))?;
+            (self.cmd, self.upload_cmd) = (cmds[0], cmds[1]);
             self.acquire = d
                 .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
                 .map_err(err("create semaphore"))?;
             self.fence = d
+                .create_fence(&vk::FenceCreateInfo::default(), None)
+                .map_err(err("create fence"))?;
+            self.upload_fence = d
                 .create_fence(&vk::FenceCreateInfo::default(), None)
                 .map_err(err("create fence"))?;
             if let Some((pool, _)) = &mut self.queries {
@@ -472,21 +711,21 @@ impl Compositor {
             let sizes = [
                 vk::DescriptorPoolSize {
                     ty: vk::DescriptorType::UNIFORM_BUFFER,
-                    descriptor_count: 2,
+                    descriptor_count: 3,
                 },
                 vk::DescriptorPoolSize {
                     ty: vk::DescriptorType::STORAGE_IMAGE,
-                    descriptor_count: 2,
+                    descriptor_count: 3,
                 },
                 vk::DescriptorPoolSize {
                     ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-                    descriptor_count: 2 * MAX_LAYERS as u32,
+                    descriptor_count: 3 * MAX_LAYERS as u32,
                 },
             ];
             self.descriptor_pool = d
                 .create_descriptor_pool(
                     &vk::DescriptorPoolCreateInfo::default()
-                        .max_sets(2)
+                        .max_sets(3)
                         .pool_sizes(&sizes),
                     None,
                 )
@@ -495,11 +734,11 @@ impl Compositor {
                 .allocate_descriptor_sets(
                     &vk::DescriptorSetAllocateInfo::default()
                         .descriptor_pool(self.descriptor_pool)
-                        .set_layouts(&[self.set_layout; 2]),
+                        .set_layouts(&[self.set_layout; 3]),
                 )
                 .map_err(err("allocate descriptor sets"))?;
-            self.sets = [sets[0], sets[1]];
-            for i in 0..2 {
+            self.sets = [sets[0], sets[1], sets[2]];
+            for i in 0..3 {
                 self.params[i] = self.buffer(
                     size_of::<Params>() as u64,
                     vk::BufferUsageFlags::UNIFORM_BUFFER,
@@ -517,7 +756,9 @@ impl Compositor {
                     &[],
                 );
             }
-            self.dummy = self.upload(1, 1, &[0; 4])?;
+            let staged = self.uploader().prepare(1, 1, &[0; 4])?;
+            self.dummy = self.upload(staged)?;
+            self.wait_upload()?;
             for _ in 0..RING {
                 let slot = self.create_slot(self.width, self.height)?;
                 self.ring.push(slot);
@@ -540,46 +781,77 @@ impl Compositor {
         self.gpu_time
     }
 
+    /// Prepares textures for this compositor on other threads.
+    pub fn uploader(&self) -> Uploader {
+        Uploader {
+            gpu: self.gpu.clone(),
+            width: self.width,
+            height: self.height,
+        }
+    }
+
     /// Sets (or replaces) texture `id` from `width` x `height` premultiplied
-    /// RGBA8 pixels, with a full mip chain for downscaled draws. Blocks until
-    /// the upload is done and builds the mips on the calling thread (a few
-    /// ms per megapixel): call it when the content changes, not per frame,
-    /// and off the pipeline thread for large images. Levels at least twice
-    /// the canvas size are dropped.
+    /// RGBA8 pixels and waits for the copy: [`Uploader::prepare`] then
+    /// [`Compositor::set_staged`], on this thread.
     pub fn set_texture(&mut self, id: u32, width: u32, height: u32, rgba: &[u8]) -> Result<()> {
         self.check_alive()?;
-        if width == 0 || height == 0 || width > 16384 || height > 16384 {
-            return Err(Error(format!("bad texture size {width}x{height}")));
+        let staged = self.uploader().prepare(width, height, rgba)?;
+        self.set_staged(id, staged)?;
+        self.wait_upload()
+    }
+
+    /// Sets (or replaces) texture `id`: queues the GPU copy of `staged`
+    /// and returns. Compositions queued after it draw the new texture. Waits
+    /// only for the previous copy, if still running.
+    pub fn set_staged(&mut self, id: u32, staged: Staged) -> Result<()> {
+        self.check_alive()?;
+        if !Arc::ptr_eq(&staged.gpu, &self.gpu) {
+            return Err(Error("staged for another compositor".into()));
         }
-        if rgba.len() != width as usize * height as usize * 4 {
-            return Err(Error(format!(
-                "texture {width}x{height} needs {} bytes, got {}",
-                width as usize * height as usize * 4,
-                rgba.len()
-            )));
-        }
-        // Drawn at most canvas-sized: levels at least twice the canvas are
-        // never sampled, so they are not built or uploaded.
-        // shortcut: a crop zooming into a huge image loses that detail; keep
-        // more levels if the editor ever allows such zooms.
-        let (mut w, mut h) = (width as usize, height as usize);
-        let mut px = std::borrow::Cow::Borrowed(rgba);
-        while w / 2 >= self.width as usize && h / 2 >= self.height as usize {
-            let (p, nw, nh) = half(&px, w, h);
-            (px, w, h) = (std::borrow::Cow::Owned(p), nw, nh);
-        }
-        let texture = unsafe { self.upload(w as u32, h as u32, &px)? };
+        self.wait_upload()?;
+        let texture = unsafe { self.upload(staged)? };
         if let Some(old) = self.textures.insert(id, texture) {
-            // `upload` waited for the queue: nothing uses the old one.
-            unsafe { old.image.destroy(&self.device) };
+            self.graveyard.push(old.image);
         }
+        self.collect_garbage();
         Ok(())
     }
 
-    /// Frees texture `id`. Draws of it are skipped from then on.
+    /// Frees texture `id` (once no queued work reads it). Draws of it are
+    /// skipped from then on.
     pub fn remove_texture(&mut self, id: u32) {
         if let Some(old) = self.textures.remove(&id) {
-            unsafe { old.image.destroy(&self.device) };
+            self.graveyard.push(old.image);
+        }
+        self.collect_garbage();
+    }
+
+    /// Waits for the last texture copy (at most the GPU timeout) and frees
+    /// its staging buffer.
+    fn wait_upload(&mut self) -> Result<()> {
+        if self.upload_pending.is_none() {
+            return Ok(());
+        }
+        let d = &self.device;
+        let r = unsafe {
+            d.wait_for_fences(&[self.upload_fence], true, FENCE_TIMEOUT.as_nanos() as u64)
+        };
+        if let Err(e) = r {
+            self.lost = true;
+            return Err(Error(format!("wait for a texture copy: {e}")));
+        }
+        unsafe { d.reset_fences(&[self.upload_fence]) }.map_err(err("reset fence"))?;
+        self.upload_pending = None;
+        Ok(())
+    }
+
+    /// Frees replaced images once no composition is in flight (texture
+    /// copies never read them).
+    fn collect_garbage(&mut self) {
+        if self.in_flight.is_none() {
+            for i in self.graveyard.drain(..) {
+                unsafe { i.destroy(&self.device) };
+            }
         }
     }
 
@@ -608,20 +880,55 @@ impl Compositor {
         Some(unsafe { std::slice::from_raw_parts(p.buffers[i].ptr, len) })
     }
 
-    /// Composes `draws` over black into the next free ring image and returns
-    /// it, ready for the encoder (the GPU is done with it). `main` is released
-    /// as soon as the GPU has read it. Draws of a missing source are skipped.
-    /// The frame's pts is `main`'s, or zero without one: set it as needed.
-    /// `main` is sampled without mips: a large downscale of it may alias.
-    /// Without `main`, the previous producer's imports are freed.
+    /// Composes `draws` over black and waits for it: [`Compositor::submit`]
+    /// then [`Compositor::poll`] up to the GPU timeout. For tests and tools:
+    /// a frame clock should not wait.
     pub fn compose(&mut self, main: Option<VideoFrame>, draws: &[Draw]) -> Result<VideoFrame> {
+        self.submit(main, draws, false)?;
+        match self.poll(FENCE_TIMEOUT)? {
+            Some(f) => Ok(f),
+            None => {
+                self.lost = true;
+                Err(Error("the GPU stopped answering".into()))
+            }
+        }
+    }
+
+    /// Whether a composition is queued and not polled out yet.
+    pub fn in_flight(&self) -> bool {
+        self.in_flight.is_some()
+    }
+
+    /// Whether a copy of a main frame is kept (see `keep_base`).
+    pub fn has_base(&self) -> bool {
+        self.base.as_ref().is_some_and(|b| b.valid)
+    }
+
+    /// Queues the composition of `draws` over black into the next free ring
+    /// image; [`Compositor::poll`] returns it. `main` is released once the
+    /// GPU has read it. Draws of a missing source are skipped. Without
+    /// `main`, `Source::Main` draws the kept copy of an earlier one, if any
+    /// (else the previous producer's imports are freed). `keep_base`: also
+    /// copy `main` for that (one more pass over it). `main` is sampled
+    /// without mips: a large downscale of it may alias. Fails while another
+    /// composition is in flight.
+    pub fn submit(
+        &mut self,
+        main: Option<VideoFrame>,
+        draws: &[Draw],
+        keep_base: bool,
+    ) -> Result<()> {
         self.check_alive()?;
+        if self.in_flight.is_some() {
+            return Err(Error("a composition is already in flight".into()));
+        }
         if draws.len() > MAX_LAYERS {
             return Err(Error(format!(
                 "{} layers, at most {MAX_LAYERS}",
                 draws.len()
             )));
         }
+        self.collect_garbage();
         let slot = self
             .ring
             .iter()
@@ -630,11 +937,20 @@ impl Compositor {
         let main_import = match &main {
             Some(f) => Some(unsafe { self.import(f)? }),
             None => {
-                // No main (e.g. the game quit): free its pool's images now
-                // rather than pin them until another producer shows up.
-                self.drop_imports();
+                // No main (e.g. the game quit) and no copy to stand in:
+                // free its pool's images now rather than pin them.
+                if !self.has_base() {
+                    self.drop_imports();
+                }
                 None
             }
+        };
+        let base_pass = match (&main, keep_base) {
+            (Some(f), true) => {
+                unsafe { self.ensure_base(f.width, f.height)? };
+                true
+            }
+            _ => false,
         };
 
         let mut params = Params {
@@ -645,13 +961,16 @@ impl Compositor {
         let mut n = 0;
         for d in draws {
             let (view, w, h, flags) = match d.source {
-                Source::Main => {
-                    let (Some(i), Some(f)) = (main_import, &main) else {
-                        continue;
-                    };
-                    let flags = import_format(f.fourcc).map_or(0, |(_, fl)| fl);
-                    (self.imports[i].image.view, f.width, f.height, flags)
-                }
+                Source::Main => match (main_import, &main, &self.base) {
+                    (Some(i), Some(f), _) => {
+                        let flags = import_format(f.fourcc).map_or(0, |(_, fl)| fl);
+                        (self.imports[i].image.view, f.width, f.height, flags)
+                    }
+                    (None, _, Some(b)) if b.valid => {
+                        (b.image.view, b.width, b.height, FLAG_NO_ALPHA)
+                    }
+                    _ => continue,
+                },
                 Source::Texture(id) => match self.textures.get(&id) {
                     Some(t) => (t.image.view, t.width, t.height, 0),
                     None => continue,
@@ -705,16 +1024,89 @@ impl Compositor {
                 // The ring image stays in GENERAL while sampled.
                 self.bind(1, p.image.view, &pv, vk::ImageLayout::GENERAL);
             }
+            if base_pass && let (Some(i), Some(f), Some(b)) = (main_import, &main, &self.base) {
+                // A 1:1 fetch of `main` into the RGBA copy (alpha dropped).
+                let whole = Draw {
+                    source: Source::Main,
+                    rect: [0.0, 0.0, 1.0, 1.0],
+                    crop: [0.0; 4],
+                    fit: Fit::Stretch,
+                    opacity: 1.0,
+                };
+                let mut l = place(&whole, f.width, f.height, b.width, b.height)
+                    .expect("the main frame is not empty");
+                l.flags[0] |= import_format(f.fourcc).map_or(0, |(_, fl)| fl);
+                let mut bp = Params {
+                    head: [1, 0, 0, 0],
+                    layers: [GpuLayer::default(); MAX_LAYERS],
+                };
+                bp.layers[0] = l;
+                (self.params[2].ptr as *mut Params).write(bp);
+                let mut bv = [self.dummy.image.view; MAX_LAYERS];
+                bv[0] = self.imports[i].image.view;
+                self.bind(
+                    2,
+                    b.image.view,
+                    &bv,
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                );
+            }
             let wait = match &main {
                 Some(f) => self.import_implicit_fence(f),
                 None => false,
             };
-            self.record(slot, main_import, want_preview)?;
-            self.submit_and_wait(wait)?;
+            let base = base_pass
+                .then(|| {
+                    self.base
+                        .as_ref()
+                        .map(|b| (b.image.image, b.width, b.height))
+                })
+                .flatten();
+            self.record(slot, main_import, want_preview, base)?;
+            self.submit_compose(wait)?;
         }
+        if base_pass && let Some(b) = &mut self.base {
+            b.valid = true;
+        }
+        self.in_flight = Some(InFlight {
+            slot,
+            main,
+            preview: want_preview,
+            since: Instant::now(),
+        });
+        Ok(())
+    }
+
+    /// The queued composition's frame once the GPU is done, waiting at most
+    /// `wait` for it; `None` if not done yet. Past the GPU timeout since it
+    /// was queued, the compositor is lost.
+    pub fn poll(&mut self, wait: Duration) -> Result<Option<VideoFrame>> {
+        self.check_alive()?;
+        let Some(f) = &self.in_flight else {
+            return Err(Error("no composition in flight".into()));
+        };
+        let since = f.since;
+        let r = unsafe {
+            self.device.wait_for_fences(
+                &[self.fence],
+                true,
+                wait.as_nanos().min(u128::from(u64::MAX)) as u64,
+            )
+        };
+        match r {
+            Ok(()) => {}
+            Err(vk::Result::TIMEOUT) if since.elapsed() < FENCE_TIMEOUT => return Ok(None),
+            Err(e) => {
+                self.lost = true;
+                return Err(Error(format!("wait for the GPU: {e}")));
+            }
+        }
+        unsafe { self.device.reset_fences(&[self.fence]) }.map_err(err("reset fence"))?;
+        let done = self.in_flight.take().expect("checked above");
         // The GPU has read it: hand the producer its buffer back now.
-        let pts = main.as_ref().map_or(Duration::ZERO, |f| f.pts);
-        drop(main);
+        let pts = done.main.as_ref().map_or(Duration::ZERO, |f| f.pts);
+        drop(done.main);
+        self.collect_garbage();
 
         if let Some((pool, period)) = self.queries {
             let mut ts = [0u64; 2];
@@ -728,19 +1120,21 @@ impl Compositor {
                 )
             });
         }
-        if want_preview && let Some(p) = &mut self.preview {
+        if done.preview
+            && let Some(p) = &mut self.preview
+        {
             p.ready = Some(p.next);
             p.next ^= 1;
             p.wanted = false;
         }
 
-        let s = &self.ring[slot];
+        let s = &self.ring[done.slot];
         let fd =
             s.fd.try_clone()
                 .map_err(|e| Error(format!("dup output fd: {e}")))?;
         s.busy.store(true, Ordering::Release);
         let busy = s.busy.clone();
-        Ok(VideoFrame {
+        Ok(Some(VideoFrame {
             width: self.width,
             height: self.height,
             fourcc: OUTPUT_FOURCC,
@@ -750,19 +1144,65 @@ impl Compositor {
                 offset: s.offset,
                 stride: s.stride,
             }],
-            buffer_id: slot as u32,
+            buffer_id: done.slot as u32,
             pool_generation: self.generation,
             pts,
             release: ReleaseGuard::new(move || busy.store(false, Ordering::Release)),
-        })
+        }))
     }
 
-    /// Frees every imported main frame (nothing is in flight between calls).
+    /// The kept copy of main frames, `width` x `height`.
+    unsafe fn ensure_base(&mut self, width: u32, height: u32) -> Result<()> {
+        if self
+            .base
+            .as_ref()
+            .is_some_and(|b| (b.width, b.height) == (width, height))
+        {
+            return Ok(());
+        }
+        if let Some(old) = self.base.take() {
+            self.graveyard.push(old.image);
+        }
+        let ci = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(vk::Format::R8G8B8A8_UNORM)
+            .extent(vk::Extent3D {
+                width,
+                height,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+        let image = unsafe { self.image(&ci, false)? };
+        self.base = Some(Base {
+            image,
+            width,
+            height,
+            valid: false,
+        });
+        Ok(())
+    }
+
+    /// Frees the kept copy of main frames.
+    pub fn drop_base(&mut self) {
+        if let Some(old) = self.base.take() {
+            self.graveyard.push(old.image);
+        }
+        self.collect_garbage();
+    }
+
+    /// Frees every imported main frame (once no queued work reads them).
     pub fn drop_imports(&mut self) {
         for i in self.imports.drain(..) {
-            unsafe { i.image.destroy(&self.device) };
+            self.graveyard.push(i.image);
         }
         self.import_generation = None;
+        self.collect_garbage();
     }
 
     /// True once a composition timed out (the GPU hung or was reset). Every
@@ -816,7 +1256,13 @@ impl Compositor {
         }
     }
 
-    unsafe fn record(&self, slot: usize, main: Option<usize>, preview: bool) -> Result<()> {
+    unsafe fn record(
+        &self,
+        slot: usize,
+        main: Option<usize>,
+        preview: bool,
+        base: Option<(vk::Image, u32, u32)>,
+    ) -> Result<()> {
         let d = &self.device;
         let cmd = self.cmd;
         let color = vk::ImageSubresourceRange::default()
@@ -874,6 +1320,19 @@ impl Compositor {
                     self.family,
                 ));
             }
+            // The copy is rewritten whole; earlier passes sampling it are
+            // earlier on this queue (execution dependency below).
+            if let Some((image, _, _)) = base {
+                acquire.push(barrier(
+                    image,
+                    vk::ImageLayout::UNDEFINED,
+                    vk::ImageLayout::GENERAL,
+                    vk::AccessFlags::empty(),
+                    vk::AccessFlags::SHADER_WRITE,
+                    ignored,
+                    ignored,
+                ));
+            }
             // Source stage = the semaphore's wait stage: the layout
             // transitions run after the implicit fence.
             d.cmd_pipeline_barrier(
@@ -895,6 +1354,34 @@ impl Compositor {
                 &[],
             );
             d.cmd_dispatch(cmd, self.width.div_ceil(16), self.height.div_ceil(16), 1);
+            if let Some((image, w, h)) = base {
+                d.cmd_bind_descriptor_sets(
+                    cmd,
+                    vk::PipelineBindPoint::COMPUTE,
+                    self.pipeline_layout,
+                    0,
+                    &[self.sets[2]],
+                    &[],
+                );
+                d.cmd_dispatch(cmd, w.div_ceil(16), h.div_ceil(16), 1);
+                d.cmd_pipeline_barrier(
+                    cmd,
+                    stage,
+                    stage,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[barrier(
+                        image,
+                        vk::ImageLayout::GENERAL,
+                        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                        vk::AccessFlags::SHADER_WRITE,
+                        vk::AccessFlags::SHADER_READ,
+                        ignored,
+                        ignored,
+                    )],
+                );
+            }
             if let Some((pool, _)) = self.queries {
                 d.cmd_write_timestamp(cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, pool, 1);
             }
@@ -1073,8 +1560,7 @@ impl Compositor {
         }
     }
 
-    unsafe fn submit_and_wait(&mut self, wait_acquire: bool) -> Result<()> {
-        let d = &self.device;
+    unsafe fn submit_compose(&mut self, wait_acquire: bool) -> Result<()> {
         let cmds = [self.cmd];
         let sems = [self.acquire];
         let stages = [vk::PipelineStageFlags::COMPUTE_SHADER];
@@ -1082,16 +1568,8 @@ impl Compositor {
         if wait_acquire {
             submit = submit.wait_semaphores(&sems).wait_dst_stage_mask(&stages);
         }
-        unsafe {
-            d.queue_submit(self.queue, &[submit], self.fence)
-                .map_err(err("submit"))?;
-            let r = d.wait_for_fences(&[self.fence], true, FENCE_TIMEOUT.as_nanos() as u64);
-            if let Err(e) = r {
-                self.lost = true;
-                return Err(Error(format!("wait for the GPU: {e}")));
-            }
-            d.reset_fences(&[self.fence]).map_err(err("reset fence"))
-        }
+        unsafe { self.device.queue_submit(self.queue, &[submit], self.fence) }
+            .map_err(err("submit"))
     }
 
     /// Index in `imports` of `frame`'s image, importing it on first sight.
@@ -1344,9 +1822,7 @@ impl Compositor {
     }
 
     fn memory_type(&self, bits: u32, flags: vk::MemoryPropertyFlags) -> Option<u32> {
-        let types = &self.memory.memory_types[..self.memory.memory_type_count as usize];
-        (0..types.len() as u32)
-            .find(|&i| bits & (1 << i) != 0 && types[i as usize].property_flags.contains(flags))
+        memory_type(&self.memory, bits, flags)
     }
 
     unsafe fn view(
@@ -1479,76 +1955,22 @@ impl Compositor {
         usage: vk::BufferUsageFlags,
         cached: bool,
     ) -> Result<Buffer> {
-        let d = &self.device;
-        let mut b = Buffer::NULL;
-        let r = unsafe {
-            (|| {
-                b.buffer = d
-                    .create_buffer(
-                        &vk::BufferCreateInfo::default()
-                            .size(size)
-                            .usage(usage)
-                            .sharing_mode(vk::SharingMode::EXCLUSIVE),
-                        None,
-                    )
-                    .map_err(err("create buffer"))?;
-                let reqs = d.get_buffer_memory_requirements(b.buffer);
-                let host =
-                    vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
-                let type_index = cached
-                    .then(|| {
-                        self.memory_type(
-                            reqs.memory_type_bits,
-                            host | vk::MemoryPropertyFlags::HOST_CACHED,
-                        )
-                    })
-                    .flatten()
-                    .or_else(|| self.memory_type(reqs.memory_type_bits, host))
-                    .ok_or_else(|| Error("no host-visible memory".into()))?;
-                b.memory = d
-                    .allocate_memory(
-                        &vk::MemoryAllocateInfo::default()
-                            .allocation_size(reqs.size)
-                            .memory_type_index(type_index),
-                        None,
-                    )
-                    .map_err(err("allocate buffer memory"))?;
-                d.bind_buffer_memory(b.buffer, b.memory, 0)
-                    .map_err(err("bind buffer memory"))?;
-                b.ptr = d
-                    .map_memory(b.memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
-                    .map_err(err("map buffer"))? as *mut u8;
-                Ok(())
-            })()
-        };
-        match r {
-            Ok(()) => Ok(b),
-            Err(e) => {
-                unsafe { b.destroy(d) };
-                Err(e)
-            }
-        }
+        unsafe { self.gpu.buffer(size, usage, cached) }
     }
 
-    /// Uploads premultiplied RGBA with a CPU-built mip chain (a compute
-    /// queue cannot blit).
-    unsafe fn upload(&mut self, width: u32, height: u32, rgba: &[u8]) -> Result<Texture> {
-        let levels = 32 - width.max(height).leading_zeros();
-        let mut chain = vec![(rgba.to_vec(), width as usize, height as usize)];
-        while chain.len() < levels as usize {
-            let (p, w, h) = chain.last().expect("level 0 is there");
-            chain.push(half(p, *w, *h));
-        }
-        let total: usize = chain.iter().map(|(p, _, _)| p.len()).sum();
+    /// Queues the copy of `staged` into a new texture (a compute queue
+    /// cannot blit: the mips were built on the CPU). The previous copy must
+    /// be done ([`Compositor::wait_upload`]).
+    unsafe fn upload(&mut self, staged: Staged) -> Result<Texture> {
         let ci = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
             .format(vk::Format::R8G8B8A8_UNORM)
             .extent(vk::Extent3D {
-                width,
-                height,
+                width: staged.width,
+                height: staged.height,
                 depth: 1,
             })
-            .mip_levels(levels)
+            .mip_levels(staged.levels)
             .array_layers(1)
             .samples(vk::SampleCountFlags::TYPE_1)
             .tiling(vk::ImageTiling::OPTIMAL)
@@ -1556,48 +1978,36 @@ impl Compositor {
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
             .initial_layout(vk::ImageLayout::UNDEFINED);
         unsafe {
-            let staging = self.buffer(total as u64, vk::BufferUsageFlags::TRANSFER_SRC, false)?;
-            let image = match self.image(&ci, false) {
-                Ok(i) => i,
-                Err(e) => {
-                    staging.destroy(&self.device);
-                    return Err(e);
-                }
-            };
-            let mut regions = Vec::new();
-            let mut offset = 0;
-            for (level, (p, w, h)) in chain.iter().enumerate() {
-                std::ptr::copy_nonoverlapping(p.as_ptr(), staging.ptr.add(offset), p.len());
-                regions.push(
-                    vk::BufferImageCopy::default()
-                        .buffer_offset(offset as u64)
-                        .image_subresource(
-                            vk::ImageSubresourceLayers::default()
-                                .aspect_mask(vk::ImageAspectFlags::COLOR)
-                                .mip_level(level as u32)
-                                .layer_count(1),
+            let image = self.image(&ci, false)?;
+            let r = self
+                .record_upload(
+                    staged.buffer.buffer,
+                    image.image,
+                    staged.levels,
+                    &staged.regions,
+                )
+                .and_then(|()| {
+                    let cmds = [self.upload_cmd];
+                    self.device
+                        .queue_submit(
+                            self.queue,
+                            &[vk::SubmitInfo::default().command_buffers(&cmds)],
+                            self.upload_fence,
                         )
-                        .image_extent(vk::Extent3D {
-                            width: *w as u32,
-                            height: *h as u32,
-                            depth: 1,
-                        }),
-                );
-                offset += p.len();
-            }
-            let r = self.record_upload(staging.buffer, image.image, levels, &regions);
-            let r = r.and_then(|()| self.submit_and_wait(false));
-            staging.destroy(&self.device);
+                        .map_err(err("submit texture copy"))
+                });
             match r {
-                Ok(()) => Ok(Texture {
-                    image,
-                    width,
-                    height,
-                }),
+                Ok(()) => {
+                    let texture = Texture {
+                        image,
+                        width: staged.width,
+                        height: staged.height,
+                    };
+                    self.upload_pending = Some(staged);
+                    Ok(texture)
+                }
                 Err(e) => {
-                    if !self.lost {
-                        image.destroy(&self.device);
-                    }
+                    image.destroy(&self.device);
                     Err(e)
                 }
             }
@@ -1612,7 +2022,7 @@ impl Compositor {
         regions: &[vk::BufferImageCopy],
     ) -> Result<()> {
         let d = &self.device;
-        let cmd = self.cmd;
+        let cmd = self.upload_cmd;
         let range = vk::ImageSubresourceRange::default()
             .aspect_mask(vk::ImageAspectFlags::COLOR)
             .level_count(levels)
@@ -1760,6 +2170,13 @@ impl Drop for Compositor {
         unsafe {
             // Frames still out keep their DMA-BUF (their own fd) alive.
             let _ = d.device_wait_idle();
+            self.upload_pending = None;
+            for i in self.graveyard.drain(..) {
+                i.destroy(d);
+            }
+            if let Some(b) = &self.base {
+                b.image.destroy(d);
+            }
             if let Some(p) = &self.preview {
                 p.image.destroy(d);
                 for b in &p.buffers {
@@ -1788,10 +2205,10 @@ impl Drop for Compositor {
                 d.destroy_query_pool(pool, None);
             }
             d.destroy_fence(self.fence, None);
+            d.destroy_fence(self.upload_fence, None);
             d.destroy_semaphore(self.acquire, None);
             d.destroy_command_pool(self.pool, None);
-            d.destroy_device(None);
-            self.instance.destroy_instance(None);
+            // `gpu` (dropped after this) destroys the device and instance.
         }
     }
 }

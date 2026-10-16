@@ -1,6 +1,7 @@
 //! Compositor GPU cost, measured with timestamp queries, at 1440p and 4K:
 //! the main capture alone (1:1 copy) and with a typical overlay set
-//! (webcam corner, logo with alpha, half-transparent text banner).
+//! (webcam corner, logo with alpha, half-transparent text banner), and with
+//! the copy of the main frame kept for redraws without it.
 //!
 //! `cargo run --release -p vesper-compose --example compose_bench [frames]`
 //! (default 120 per case). Short on purpose: the GPU may be busy with a game.
@@ -84,15 +85,17 @@ fn main() {
                 0.8,
             ),
         ];
-        for (name, draws) in [
-            ("main only", &overlays[..1]),
-            ("main + 3 overlays", &overlays[..]),
+        for (name, draws, keep_base) in [
+            ("main only", &overlays[..1], false),
+            ("main + 3 overlays", &overlays[..], false),
+            ("main + 3 overlays + kept copy", &overlays[..], true),
         ] {
             let (mut gpu, mut wall) = (Vec::new(), Vec::new());
             for t in 0..frames {
                 let f = unsafe { producer.frame(t as usize % POOL, t, 0, Duration::ZERO) };
                 let start = Instant::now();
-                let out = c.compose(Some(f), draws).unwrap();
+                c.submit(Some(f), draws, keep_base).unwrap();
+                let out = c.poll(Duration::from_secs(2)).unwrap().expect("done");
                 wall.push(start.elapsed());
                 gpu.push(c.gpu_time().expect("timestamps"));
                 drop(out);

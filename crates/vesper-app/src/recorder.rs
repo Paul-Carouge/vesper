@@ -21,9 +21,10 @@
 //! - Replay threads: each saved replay is muxed on its own thread from a
 //!   snapshot of the ring (shared packet data, no copy).
 //! - Overlay thread (`overlay`), while the active scene is more than the
-//!   capture alone: creates the scene compositor and uploads its images and
-//!   text. The pipeline thread composes each tick under `try_lock`, only
-//!   when the capture or an overlay changed (else the picture repeats).
+//!   capture alone (and 10 s after): creates the scene compositor and
+//!   stages its images and text. The pipeline thread queues compositions
+//!   under `try_lock`, only when the capture or an overlay changed (else the
+//!   picture repeats), and waits at most half a frame for one.
 //! - Live thread (`stream`): sends a live stream's packets. Its video comes
 //!   from the pipeline thread (the recording's packets, or a second encode of
 //!   the same pictures scaled on the GPU), its AAC audio from the mix's tap.
@@ -41,8 +42,8 @@ use std::time::Duration;
 
 use vesper_audio::{Aac, AudioCapture, CHANNELS, Mix, Options, SAMPLE_RATE, Source, TrackState};
 use vesper_capture::Capture;
-use vesper_compose::{Draw, Source as DrawSource};
-use vesper_core::{Codec, DmaBufPlane, EncodedPacket, ReleaseGuard, VideoFrame};
+use vesper_compose::{Compositor, Draw, Source as DrawSource};
+use vesper_core::{Codec, EncodedPacket, VideoFrame};
 use vesper_dsp::{FilterSpec, LiveControl};
 use vesper_encode::{Encoder, RateControl};
 use vesper_gamecapture::{GameCapture, protocol};
@@ -137,6 +138,8 @@ struct Probe {
     compositors: AtomicUsize,
     /// The next composition fails.
     fail: AtomicBool,
+    /// Keep the capture copy as for a damage-driven source.
+    base: AtomicBool,
     /// Compositions, and their GPU time (when measured), ns.
     composed: std::sync::atomic::AtomicU64,
     gpu_ns: std::sync::atomic::AtomicU64,
@@ -1834,37 +1837,62 @@ fn pump(
     }
 }
 
-/// What a composition attempt gave.
-enum Composed {
-    Frame(VideoFrame),
-    /// The overlay thread holds the compositor (an upload): try next tick.
-    Busy,
-    /// No compositor (being created, or failed): show the capture alone.
-    Unavailable,
+/// How long the overlay thread and its compositor stay after leaving a
+/// composed scene: switching back soon reuses them.
+const OVERLAYS_WARM: Duration = Duration::from_secs(10);
+
+/// What the compositor gave this tick.
+enum Out {
+    /// A composition, ready for the encoder.
+    Composed(VideoFrame),
+    /// No composition: this capture frame goes to the encoder as is.
+    Direct(VideoFrame),
+    /// Nothing new: the last picture repeats.
+    Nothing,
 }
 
 /// Turns the tick's capture into the encoder's picture. A scene that shows
 /// the capture alone is a passthrough: frames go to the encoder as without
-/// scenes, and no compositor (no Vulkan device) exists. Otherwise the
-/// compositor draws the scene, only when the capture or an overlay changed;
-/// it holds the latest capture frame (one producer buffer) to redraw an
-/// overlay change without waiting for a new one. Any compositor failure
+/// scenes, and no compositor (no Vulkan device) exists for it. Otherwise
+/// the compositor draws the scene, only when the capture or an overlay
+/// changed. Capture frames go to the compositor by value: their producer
+/// gets them back as soon as the GPU read them. An overlay change without a
+/// new capture frame is drawn from the compositor's copy of the last one
+/// for damage-driven sources (the portal); a game sends frames
+/// continuously, so its redraw waits for the next one (the copy costs
+/// ~0.07 ms of GPU per 4K frame). The tick never waits for the GPU more
+/// than half a frame: a composition still running then is picked up at a
+/// later tick, the last picture repeating meanwhile. Any compositor failure
 /// shows the capture alone (with a notice) and retries later: a recording
 /// never fails because of an overlay.
 struct Stage {
+    /// Longest wait for a composition on the tick.
+    budget: Duration,
     scene_name: String,
     passthrough: bool,
     shows_main: bool,
+    /// Where frames come from: a game window from the portal is
+    /// damage-driven too.
+    game: Option<GameFrames>,
     draws: Vec<Draw>,
     want: Vec<(u32, Key)>,
     /// Texture id of each overlay source seen, stable across scenes.
     ids: Vec<Key>,
     overlays: Option<Overlays>,
+    /// Since when a passthrough scene leaves the overlay thread unused.
+    idle_since: Option<Duration>,
+    /// A retired overlay thread, still freeing its compositor.
+    retiring: Option<JoinHandle<()>>,
     /// The encoder's size, once open.
     canvas: Option<(u32, u32)>,
-    held: Option<VideoFrame>,
+    /// A capture frame waiting while the compositor is busy (a texture
+    /// copy being queued, or the GPU still on the previous composition).
+    next: Option<VideoFrame>,
     /// The picture must be drawn again.
     dirty: bool,
+    /// A capture frame went to the encoder directly since the composition
+    /// in flight was queued: that composition is older, drop it.
+    stale: bool,
     /// The encoder has a picture to repeat.
     pictured: bool,
     /// A new picture went to the encoder since [`Stage::fresh`].
@@ -1882,16 +1910,21 @@ struct Stage {
 impl Stage {
     fn new(settings: &Settings, on_event: &OnEvent) -> Self {
         let mut stage = Self {
+            budget: Duration::from_nanos(500_000_000 / u64::from(settings.fps.max(1))),
             scene_name: String::new(),
             passthrough: true,
             shows_main: true,
+            game: settings.game.clone(),
             draws: Vec::new(),
             want: Vec::new(),
             ids: Vec::new(),
             overlays: None,
+            idle_since: None,
+            retiring: None,
             canvas: None,
-            held: None,
+            next: None,
             dirty: true,
+            stale: false,
             pictured: false,
             encoded: false,
             retry: None,
@@ -1937,12 +1970,13 @@ impl Stage {
         }
         self.scene_name = scene.name;
         if !self.shows_main {
-            self.held = None;
+            self.next = None;
         }
         if self.passthrough {
-            // Frees the compositor and its textures.
-            self.overlays = None;
+            // Kept a while: a quick switch back reuses it.
+            self.idle_since = self.overlays.as_ref().map(|_| monotonic_now());
         } else {
+            self.idle_since = None;
             self.request();
         }
         self.dirty = true;
@@ -1978,6 +2012,13 @@ impl Stage {
             return;
         }
         if self.overlays.is_none() {
+            // The previous thread first frees its device (`poll` asks again).
+            if self.retiring.as_ref().is_some_and(|t| !t.is_finished()) {
+                return;
+            }
+            if let Some(t) = self.retiring.take() {
+                let _ = t.join();
+            }
             match Overlays::start() {
                 Ok(o) => self.overlays = Some(o),
                 Err(e) => return self.fail(format!("no overlay thread: {e}")),
@@ -1996,12 +2037,15 @@ impl Stage {
                 "Scene overlays are off for now: the GPU compositor failed".into(),
             ));
         }
+        if let Some(o) = &self.overlays {
+            o.suspend(self.backoff);
+        }
         self.retry = Some(monotonic_now() + self.backoff);
         self.backoff = (self.backoff * 2).min(RETRY_MAX);
         self.dirty = true;
     }
 
-    /// News from the overlay thread, and a retry when due.
+    /// News from the overlay thread, a retry when due, an idle thread retired.
     fn poll(&mut self) {
         if let Some(o) = &self.overlays {
             #[cfg(test)]
@@ -2016,10 +2060,34 @@ impl Stage {
                 self.fail(format!("could not start: {e}"));
             }
         }
+        if self
+            .idle_since
+            .is_some_and(|t| monotonic_now() - t >= OVERLAYS_WARM)
+        {
+            self.idle_since = None;
+            self.next = None;
+            self.retiring = self.overlays.take().map(Overlays::retire);
+        }
+        let retired = self.retiring.as_ref().is_some_and(JoinHandle::is_finished);
         if self.retry.is_some_and(|t| monotonic_now() >= t) {
             self.retry = None;
             self.request();
+        } else if retired && self.overlays.is_none() {
+            self.request();
         }
+    }
+
+    /// Whether the compositor holds a copy of the capture to redraw from.
+    fn has_base(&self) -> bool {
+        let Some(o) = &self.overlays else {
+            return false;
+        };
+        o.shared
+            .comp
+            .try_lock()
+            .ok()
+            .and_then(|c| c.as_ref().map(Compositor::has_base))
+            .unwrap_or(false)
     }
 
     /// The tick's packets: `frame` (the new capture, if any) drawn into the
@@ -2030,47 +2098,166 @@ impl Stage {
         frame: Option<VideoFrame>,
         pts: Duration,
     ) -> Result<Vec<EncodedPacket>, vesper_encode::Error> {
-        if self.passthrough {
-            // A held frame: the scene just became a passthrough. Released
-            // at once when a new frame came.
-            let held = self.held.take();
-            return match frame.or(held) {
+        self.poll();
+        // Back to the capture alone on a static source: the compositor's
+        // copy shows it until the source's next frame.
+        let redraw = self.passthrough && frame.is_none() && self.dirty && self.has_base();
+        if self.passthrough && !redraw {
+            self.dirty = false;
+            self.next = None;
+            return match frame {
                 Some(mut frame) => {
                     frame.pts = pts;
+                    self.stale = true;
                     self.encode(enc, frame)
                 }
                 None => self.repeat(enc, pts),
             };
         }
-        self.poll();
-        if let Some(f) = frame
-            && self.shows_main
-        {
-            // The previous one goes back to its producer now.
-            self.held = Some(f);
-            self.dirty = true;
-        }
-        if !self.dirty {
-            return self.repeat(enc, pts);
-        }
-        match self.compose(pts) {
-            Composed::Frame(f) => {
-                self.dirty = false;
+        let frame = match frame {
+            Some(f) if self.shows_main => {
+                self.dirty = true;
+                Some(f)
+            }
+            // Not shown: back to its producer at once.
+            Some(_) => None,
+            None => self.next.take(),
+        };
+        match self.compose(frame) {
+            Out::Composed(mut f) | Out::Direct(mut f) => {
+                f.pts = pts;
                 self.encode(enc, f)
             }
-            Composed::Busy if self.pictured => self.repeat(enc, pts),
-            Composed::Busy | Composed::Unavailable => {
-                // The capture alone. A compositor or texture made ready
-                // later sets `changed`: the scene is drawn then.
-                self.dirty = false;
-                match self.held.as_ref().and_then(borrow) {
-                    Some(mut f) => {
-                        f.pts = pts;
-                        self.encode(enc, f)
-                    }
-                    None => self.repeat(enc, pts),
-                }
+            Out::Nothing => self.repeat(enc, pts),
+        }
+    }
+
+    fn compose(&mut self, frame: Option<VideoFrame>) -> Out {
+        // Direct: the frame (if any) as is, no composition.
+        let direct = |stage: &mut Self, frame: Option<VideoFrame>| match frame {
+            Some(f) => {
+                stage.stale = true;
+                stage.dirty = false;
+                Out::Direct(f)
             }
+            None => Out::Nothing,
+        };
+        let Some(shared) = self.overlays.as_ref().map(|o| o.shared.clone()) else {
+            return direct(self, frame);
+        };
+        let mut slot = match shared.comp.try_lock() {
+            Ok(slot) => slot,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                // A texture copy is being queued: next tick.
+                self.next = frame;
+                return Out::Nothing;
+            }
+            Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+        };
+        // Missing, or another size (the overlay thread is replacing it).
+        let Some(comp) = slot
+            .as_mut()
+            .filter(|c| Some((c.width(), c.height())) == self.canvas)
+        else {
+            drop(slot);
+            return direct(self, frame);
+        };
+        let mut out = None;
+        if comp.in_flight() {
+            match comp.poll(Duration::ZERO) {
+                Ok(Some(f)) if !std::mem::take(&mut self.stale) => out = Some(f),
+                Ok(_) => {}
+                Err(e) => return self.broken(slot, e.to_string(), frame),
+            }
+        }
+        if comp.in_flight() {
+            // The GPU is still on it: this frame waits (the older one goes).
+            if frame.is_some() {
+                self.next = frame;
+            }
+            return Out::Nothing;
+        }
+        let can_draw = frame.is_some() || !self.shows_main || comp.has_base();
+        if self.dirty && can_draw {
+            #[cfg(test)]
+            if self
+                .probe
+                .as_ref()
+                .is_some_and(|p| p.fail.swap(false, Ordering::Relaxed))
+            {
+                return self.broken(slot, "injected failure".into(), frame);
+            }
+            // Damage-driven sources keep a copy for redraws without a frame.
+            let keep = frame.is_some() && self.damage_driven();
+            match comp.submit(frame, &self.draws, keep) {
+                Ok(()) => {
+                    (self.dirty, self.stale) = (false, false);
+                    match comp.poll(self.budget) {
+                        Ok(Some(f)) => out = Some(f),
+                        Ok(None) => {}
+                        Err(e) => return self.broken(slot, e.to_string(), None),
+                    }
+                }
+                Err(e) => return self.broken(slot, e.to_string(), None),
+            }
+        } else if frame.is_some() {
+            // Cannot happen (a frame makes the picture dirty): released.
+            drop(frame);
+        }
+        let Some(f) = out else { return Out::Nothing };
+        #[cfg(test)]
+        if let Some(p) = &self.probe {
+            p.composed.fetch_add(1, Ordering::Relaxed);
+            let ns = comp.gpu_time().map_or(0, |t| t.as_nanos() as u64);
+            p.gpu_ns.fetch_add(ns, Ordering::Relaxed);
+        }
+        if std::mem::take(&mut self.told) {
+            log!("scene compositor: back");
+        }
+        self.backoff = RETRY_FIRST;
+        Out::Composed(f)
+    }
+
+    /// Frames come on damage only (portal): nothing may follow the last one.
+    fn damage_driven(&self) -> bool {
+        #[cfg(test)]
+        if self
+            .probe
+            .as_ref()
+            .is_some_and(|p| p.base.load(Ordering::Relaxed))
+        {
+            return true;
+        }
+        self.game
+            .as_ref()
+            .is_none_or(|g| g.0.window.load(Ordering::Relaxed))
+    }
+
+    /// Drops a failed compositor (its teardown waits for the GPU: never on
+    /// the tick) and shows `frame` alone.
+    fn broken(
+        &mut self,
+        mut slot: MutexGuard<'_, Option<Compositor>>,
+        why: String,
+        frame: Option<VideoFrame>,
+    ) -> Out {
+        let lost = slot.as_ref().is_some_and(Compositor::is_lost);
+        let old = slot.take();
+        drop(slot);
+        let _ = std::thread::Builder::new()
+            .name("vesper-compose-drop".into())
+            .spawn(move || drop(old));
+        self.fail(if lost {
+            format!("the GPU stopped answering ({why})")
+        } else {
+            why
+        });
+        match frame {
+            Some(f) => {
+                self.stale = true;
+                Out::Direct(f)
+            }
+            None => Out::Nothing,
         }
     }
 
@@ -2100,101 +2287,6 @@ impl Stage {
         }
         enc.repeat(pts)
     }
-
-    fn compose(&mut self, pts: Duration) -> Composed {
-        let Some(shared) = self.overlays.as_ref().map(|o| o.shared.clone()) else {
-            return Composed::Unavailable;
-        };
-        let mut slot = match shared.comp.try_lock() {
-            Ok(slot) => slot,
-            Err(std::sync::TryLockError::WouldBlock) => return Composed::Busy,
-            Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
-        };
-        // Another size: the overlay thread is replacing it (canvas resize).
-        let Some(comp) = slot
-            .as_mut()
-            .filter(|c| Some((c.width(), c.height())) == self.canvas)
-        else {
-            return Composed::Unavailable;
-        };
-        let main = self.held.as_ref().and_then(borrow);
-        #[cfg(test)]
-        if self
-            .probe
-            .as_ref()
-            .is_some_and(|p| p.fail.swap(false, Ordering::Relaxed))
-        {
-            drop(main);
-            let old = slot.take();
-            drop(slot);
-            drop(old);
-            self.fail("injected failure".into());
-            return Composed::Unavailable;
-        }
-        match comp.compose(main, &self.draws) {
-            Ok(mut f) => {
-                f.pts = pts;
-                #[cfg(test)]
-                if let Some(p) = &self.probe {
-                    p.composed.fetch_add(1, Ordering::Relaxed);
-                    let ns = comp.gpu_time().map_or(0, |t| t.as_nanos() as u64);
-                    p.gpu_ns.fetch_add(ns, Ordering::Relaxed);
-                }
-                if std::mem::take(&mut self.told) {
-                    log!("scene compositor: back");
-                }
-                self.backoff = RETRY_FIRST;
-                Composed::Frame(f)
-            }
-            Err(e) => {
-                let lost = comp.is_lost();
-                // Its teardown waits for the GPU: never on the tick.
-                let old = slot.take();
-                drop(slot);
-                let _ = std::thread::Builder::new()
-                    .name("vesper-compose-drop".into())
-                    .spawn(move || drop(old));
-                let why = if lost {
-                    format!("the GPU stopped answering ({e})")
-                } else {
-                    e.to_string()
-                };
-                self.fail(why);
-                Composed::Unavailable
-            }
-        }
-    }
-}
-
-/// A second handle on `f`'s buffer, released with `f` (not with it): the
-/// held frame is drawn again while the producer keeps it ours.
-fn borrow(f: &VideoFrame) -> Option<VideoFrame> {
-    let planes = f
-        .planes
-        .iter()
-        .map(|p| {
-            Some(DmaBufPlane {
-                fd: p
-                    .fd
-                    .try_clone()
-                    .inspect_err(|e| log!("dup frame fd: {e}"))
-                    .ok()?,
-                offset: p.offset,
-                stride: p.stride,
-            })
-        })
-        .collect::<Option<Vec<_>>>()?;
-    Some(VideoFrame {
-        width: f.width,
-        height: f.height,
-        fourcc: f.fourcc,
-        modifier: f.modifier,
-        planes,
-        buffer_id: f.buffer_id,
-        pool_generation: f.pool_generation,
-        pts: f.pts,
-        release: ReleaseGuard::new(|| {}),
-    })
 }
 
 /// Creates `<folder>/<stem>.mkv`, or `<stem> (2).mkv`, `(3)`... if taken, so

@@ -1,16 +1,18 @@
 //! Overlay sources of a scene, made ready for the compositor on a helper
 //! thread ("vesper-overlay"), never on the pipeline's tick: images decoded
 //! (PNG, JPEG, at most 8192 x 8192), text rasterized (an SVG `<text>`
-//! through resvg), both premultiplied RGBA reduced to at most twice the
-//! canvas, then uploaded. The thread also creates the compositor (opening a
-//! Vulkan device takes a while). The pipeline thread composes under the
-//! same lock with `try_lock`: an upload in progress delays a composition,
-//! it never blocks a tick.
+//! through resvg), both premultiplied RGBA, then staged (mips, staging
+//! copy) without the compositor's lock. Under the lock only the GPU copy is
+//! queued. The thread also creates the compositor (opening a Vulkan device
+//! takes a while). The pipeline thread composes under the same lock with
+//! `try_lock`: it never waits for this thread.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use resvg::{tiny_skia, usvg};
 use vesper_compose::Compositor;
@@ -45,6 +47,8 @@ pub struct Shared {
     changed: AtomicBool,
     /// The compositor could not be created.
     error: Mutex<Option<String>>,
+    /// No compositor is created before then (backoff after a failure).
+    suspended: Mutex<Option<Instant>>,
     /// Compositors created.
     pub created: AtomicUsize,
 }
@@ -55,9 +59,10 @@ struct Job {
     want: Vec<(u32, Key)>,
 }
 
-/// The overlay thread, ended when this is dropped.
+/// The overlay thread, ended when this is dropped (see [`Overlays::retire`]).
 pub struct Overlays {
     jobs: Sender<Job>,
+    thread: JoinHandle<()>,
     pub shared: Arc<Shared>,
 }
 
@@ -66,16 +71,33 @@ impl Overlays {
         let (jobs, rx) = std::sync::mpsc::channel();
         let shared = Arc::new(Shared::default());
         let s = shared.clone();
-        std::thread::Builder::new()
+        let thread = std::thread::Builder::new()
             .name("vesper-overlay".into())
             .spawn(move || run(&rx, &s))?;
-        Ok(Self { jobs, shared })
+        Ok(Self {
+            jobs,
+            thread,
+            shared,
+        })
+    }
+
+    /// Ends the thread; it frees the compositor on its way out. Join the
+    /// handle (or wait for it to finish) before creating another, so two
+    /// devices never coexist.
+    pub fn retire(self) -> JoinHandle<()> {
+        drop(self.jobs);
+        self.thread
     }
 
     /// Makes the compositor (a `canvas` one) hold exactly the textures of
     /// `want`, in the background; only the latest request counts.
     pub fn request(&self, canvas: (u32, u32), want: Vec<(u32, Key)>) {
         let _ = self.jobs.send(Job { canvas, want });
+    }
+
+    /// No compositor is created for `backoff`, whatever the requests.
+    pub fn suspend(&self, backoff: Duration) {
+        *lock(&self.shared.suspended) = Some(Instant::now() + backoff);
     }
 
     /// Something new is drawable since the last call.
@@ -90,9 +112,10 @@ impl Overlays {
 }
 
 fn run(rx: &Receiver<Job>, shared: &Shared) {
-    // Rasters for the current canvas, failures included: a fixed file is
-    // read again once a scene without it was shown, or the canvas changed.
-    let mut cache: Vec<(Key, Option<Arc<Raster>>)> = Vec::new();
+    // Sources that could not be loaded for this canvas: a fixed file is read
+    // again once the canvas or the compositor changes. Loaded ones are not
+    // kept: once uploaded, only the GPU copy remains.
+    let mut failed: Vec<Key> = Vec::new();
     let mut uploaded: Vec<u32> = Vec::new();
     let mut canvas = None;
     while let Ok(mut job) = rx.recv() {
@@ -100,7 +123,7 @@ fn run(rx: &Receiver<Job>, shared: &Shared) {
             job = newer;
         }
         if canvas != Some(job.canvas) {
-            cache.clear();
+            failed.clear();
             canvas = Some(job.canvas);
         }
         let (w, h) = job.canvas;
@@ -108,11 +131,16 @@ fn run(rx: &Receiver<Job>, shared: &Shared) {
             .as_ref()
             .is_none_or(|c| (c.width(), c.height()) != job.canvas);
         if missing {
+            if lock(&shared.suspended).is_some_and(|t| Instant::now() < t) {
+                // The pipeline asks again once the backoff is over.
+                continue;
+            }
             // The old one first: its VRAM is freed before the new one's.
             // Not under the lock: its teardown waits for the GPU.
             let old = lock(&shared.comp).take();
             drop(old);
             uploaded.clear();
+            failed.clear();
             match Compositor::new(w, h) {
                 Ok(c) => {
                     log!("scene compositor: {w}x{h}");
@@ -126,25 +154,30 @@ fn run(rx: &Receiver<Job>, shared: &Shared) {
                 }
             }
         }
+        let Some(uploader) = lock(&shared.comp).as_ref().map(Compositor::uploader) else {
+            continue;
+        };
         for (id, key) in &job.want {
-            if uploaded.contains(id) {
+            if uploaded.contains(id) || failed.contains(key) {
                 continue;
             }
-            let raster = match cache.iter().find(|(k, _)| k == key) {
-                Some((_, r)) => r.clone(),
-                None => {
-                    let r = load(key, job.canvas)
-                        .inspect_err(|e| log!("scene overlay: {e}"))
-                        .ok()
-                        .map(Arc::new);
-                    cache.push((key.clone(), r.clone()));
-                    r
+            // Decoded and staged without the lock.
+            let staged = load(key).and_then(|r| {
+                uploader
+                    .prepare(r.width, r.height, &r.rgba)
+                    .map_err(|e| e.to_string())
+            });
+            let staged = match staged {
+                Ok(s) => s,
+                Err(e) => {
+                    log!("scene overlay: {e}");
+                    failed.push(key.clone());
+                    continue;
                 }
             };
-            let Some(r) = raster else { continue };
             let mut comp = lock(&shared.comp);
             let Some(c) = comp.as_mut() else { break };
-            match c.set_texture(*id, r.width, r.height, &r.rgba) {
+            match c.set_staged(*id, staged) {
                 Ok(()) => {
                     uploaded.push(*id);
                     shared.changed.store(true, Ordering::Release);
@@ -161,25 +194,27 @@ fn run(rx: &Receiver<Job>, shared: &Shared) {
                 keep
             });
         }
-        cache.retain(|(k, _)| job.want.iter().any(|(_, w)| w == k));
     }
-    // The pipeline is gone: the compositor dies here, never on its tick.
+    // The pipeline is done with it: the compositor dies here, never on its
+    // tick.
     let old = lock(&shared.comp).take();
     drop(old);
 }
 
-/// The raster of `key`, reduced for `canvas`.
-fn load(key: &Key, canvas: (u32, u32)) -> Result<Raster, String> {
-    let r = match key {
-        Key::Image(path) => image(path)?,
-        Key::Text(style) => text(style)?,
-    };
-    Ok(reduce(r, canvas))
+fn load(key: &Key) -> Result<Raster, String> {
+    match key {
+        Key::Image(path) => image(path),
+        Key::Text(style) => text(style),
+    }
 }
 
 /// Decodes a PNG or JPEG file, premultiplied.
 pub fn image(path: &Path) -> Result<Raster, String> {
     let what = |e: &dyn std::fmt::Display| format!("{}: {e}", path.display());
+    // Never a FIFO or a device: opening one may block for ever.
+    if !std::fs::metadata(path).map_err(|e| what(&e))?.is_file() {
+        return Err(what(&"not a file"));
+    }
     let mut reader = image::ImageReader::open(path)
         .and_then(image::ImageReader::with_guessed_format)
         .map_err(|e| what(&e))?;
@@ -322,6 +357,13 @@ pub fn text(style: &TextStyle) -> Result<Raster, String> {
     };
     let tree = usvg::Tree::from_str(&text_svg(style), &opt).map_err(|e| format!("text: {e}"))?;
     let bbox = tree.root().abs_layer_bounding_box();
+    if bbox.width() > MAX_IMAGE_SIDE as f32 || bbox.height() > MAX_IMAGE_SIDE as f32 {
+        log!(
+            "text: {:.0}x{:.0} px, cut to {MAX_IMAGE_SIDE} px",
+            bbox.width(),
+            bbox.height()
+        );
+    }
     let side = |v: f32| (v.ceil() as u32).clamp(1, MAX_IMAGE_SIDE);
     let (width, height) = (side(bbox.width()), side(bbox.height()));
     let mut pixmap = tiny_skia::Pixmap::new(width, height).ok_or("text: bad size")?;
@@ -339,39 +381,6 @@ pub fn text(style: &TextStyle) -> Result<Raster, String> {
         height,
         rgba,
     })
-}
-
-/// Halves `r` while it stays at least the canvas size: the compositor never
-/// samples larger levels, and its own reduction would run under the lock.
-fn reduce(mut r: Raster, (cw, ch): (u32, u32)) -> Raster {
-    while r.width / 2 >= cw && r.height / 2 >= ch {
-        r = half(&r);
-    }
-    r
-}
-
-/// 2x2 box filter (an odd last row or column is clamped); premultiplied
-/// alpha averages correctly as is.
-fn half(r: &Raster) -> Raster {
-    let (w, h) = (r.width as usize, r.height as usize);
-    let (nw, nh) = ((w / 2).max(1), (h / 2).max(1));
-    let mut out = vec![0u8; nw * nh * 4];
-    for y in 0..nh {
-        let (y0, y1) = ((2 * y).min(h - 1), (2 * y + 1).min(h - 1));
-        for x in 0..nw {
-            let (x0, x1) = ((2 * x).min(w - 1), (2 * x + 1).min(w - 1));
-            for c in 0..4 {
-                let px = |x: usize, y: usize| u16::from(r.rgba[(y * w + x) * 4 + c]);
-                let sum = px(x0, y0) + px(x1, y0) + px(x0, y1) + px(x1, y1);
-                out[(y * nw + x) * 4 + c] = ((sum + 2) / 4) as u8;
-            }
-        }
-    }
-    Raster {
-        width: nw as u32,
-        height: nh as u32,
-        rgba: out,
-    }
 }
 
 #[cfg(test)]
@@ -412,26 +421,9 @@ mod tests {
         std::fs::write(&path, b"\x89PNG\r\n\x1a\nnot really").unwrap();
         assert!(image(&path).is_err());
         assert!(image(Path::new("/nonexistent/vesper.png")).is_err());
+        assert!(image(Path::new("/dev/null")).is_err());
+        assert!(image(&std::env::temp_dir()).is_err());
         std::fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn large_rasters_are_reduced_to_twice_the_canvas_at_most() {
-        let r = Raster {
-            width: 8000,
-            height: 300,
-            rgba: vec![255; 8000 * 300 * 4],
-        };
-        let r = reduce(r, (1920, 100));
-        assert_eq!((r.width, r.height), (4000, 150));
-        assert!(r.rgba.iter().all(|&v| v == 255));
-        let odd = half(&Raster {
-            width: 3,
-            height: 1,
-            rgba: vec![0, 0, 0, 0, 255, 255, 255, 255, 9, 9, 9, 9],
-        });
-        assert_eq!((odd.width, odd.height), (1, 1));
-        assert_eq!(odd.rgba, [128; 4]);
     }
 
     #[test]
