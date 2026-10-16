@@ -2341,7 +2341,14 @@ impl Stage {
             for (id, feed) in self.cameras.as_ref().map(Cameras::take).unwrap_or_default() {
                 let r = match feed {
                     Feed::Gpu(f) => comp.set_camera_frame(id, f),
-                    Feed::Yuv(s) => comp.set_camera_yuv(id, s),
+                    Feed::Yuv(s) if s.is_for(comp) => comp.set_camera_yuv(id, s),
+                    // Staged for a replaced compositor: freed off the tick.
+                    Feed::Yuv(s) => {
+                        if let Some(c) = &self.cameras {
+                            c.discard(s);
+                        }
+                        Ok(())
+                    }
                     Feed::Gone => {
                         comp.remove_camera(id);
                         Ok(())

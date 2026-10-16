@@ -571,14 +571,14 @@ fn textures_removed_while_their_copy_runs_are_freed_after_it() {
 }
 
 /// Y'CbCr bytes to R'G'B' bytes, in f64: the reference for the shader.
-fn yuv_to_rgb(yuv: [u8; 3], matrix: YuvMatrix, full_range: bool) -> [f64; 3] {
+fn yuv_to_rgb(yuv: [f64; 3], matrix: YuvMatrix, full_range: bool) -> [f64; 3] {
     let (kr, kb) = match matrix {
         YuvMatrix::Bt601 => (0.299, 0.114),
         YuvMatrix::Bt709 => (0.2126, 0.0722),
         YuvMatrix::Bt2020 => (0.2627, 0.0593),
     };
     let kg = 1.0 - kr - kb;
-    let [y, u, v] = yuv.map(f64::from);
+    let [y, u, v] = yuv;
     let (y, cb, cr) = if full_range {
         (y / 255.0, (u - 128.0) / 255.0, (v - 128.0) / 255.0)
     } else {
@@ -701,7 +701,7 @@ fn yuv_camera_pictures_convert_like_the_reference() {
             for by in 0..ch / 8 {
                 for bx in 0..blocks {
                     let (x, y) = (bx * 8 + 3, by * 8 + 5);
-                    let want = yuv_to_rgb(colour(x, y), matrix, full_range);
+                    let want = yuv_to_rgb(colour(x, y).map(f64::from), matrix, full_range);
                     let i = (y * w as usize + x) * 4;
                     for k in 0..3 {
                         assert!(
@@ -711,6 +711,22 @@ fn yuv_camera_pictures_convert_like_the_reference() {
                             &px[i..i + 3]
                         );
                     }
+                }
+            }
+            // The last column of a block sits halfway between its chroma
+            // and the next block's: bilinear, not nearest.
+            for bx in 0..blocks - 1 {
+                let (x, y) = (bx * 8 + 7, 13);
+                let (a, b) = (colour(x, y), colour(x + 1, y));
+                let mid = |k: usize| (f64::from(a[k]) + f64::from(b[k])) / 2.0;
+                let want = yuv_to_rgb([f64::from(a[0]), mid(1), mid(2)], matrix, full_range);
+                let i = (y * w as usize + x) * 4;
+                for k in 0..3 {
+                    assert!(
+                        (f64::from(px[i + k]) - want[k]).abs() <= 2.0,
+                        "{what}: edge of block {bx} is {:?}, want {want:?}",
+                        &px[i..i + 3]
+                    );
                 }
             }
             assert_eq!(

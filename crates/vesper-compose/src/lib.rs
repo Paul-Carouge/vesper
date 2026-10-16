@@ -568,6 +568,13 @@ pub struct StagedYuv {
 // The mapping is only written by `Uploader::prepare_yuv`.
 unsafe impl Send for StagedYuv {}
 
+impl StagedYuv {
+    /// Staged for `c` (else [`Compositor::set_camera_yuv`] refuses it).
+    pub fn is_for(&self, c: &Compositor) -> bool {
+        Arc::ptr_eq(&self.gpu, &c.gpu)
+    }
+}
+
 impl Drop for StagedYuv {
     fn drop(&mut self) {
         unsafe { self.buffer.destroy(&self.gpu.device) };
@@ -696,7 +703,8 @@ pub struct Compositor {
     semaphore_fd: ash::khr::external_semaphore_fd::Device,
     /// Waited by a compose: takes the main frame's pending writes (its
     /// implicit fence), which Vulkan on RADV does not wait for by itself.
-    acquire: vk::Semaphore,
+    /// Index 0 for the main frame, 1 + k for camera pass k.
+    acquire: [vk::Semaphore; 1 + MAX_CAMERAS],
     memory: vk::PhysicalDeviceMemoryProperties,
     physical: vk::PhysicalDevice,
     /// DRM modifiers the device supports per import format.
@@ -794,7 +802,7 @@ impl Compositor {
                 height,
                 memory_fd: ash::khr::external_memory_fd::Device::new(&instance, &device),
                 semaphore_fd: ash::khr::external_semaphore_fd::Device::new(&instance, &device),
-                acquire: vk::Semaphore::null(),
+                acquire: [vk::Semaphore::null(); 1 + MAX_CAMERAS],
                 memory,
                 physical,
                 modifiers: HashMap::new(),
@@ -867,9 +875,11 @@ impl Compositor {
                 )
                 .map_err(err("allocate command buffer"))?;
             (self.cmd, self.upload_cmd) = (cmds[0], cmds[1]);
-            self.acquire = d
-                .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
-                .map_err(err("create semaphore"))?;
+            for sem in &mut self.acquire {
+                *sem = d
+                    .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
+                    .map_err(err("create semaphore"))?;
+            }
             self.fence = d
                 .create_fence(&vk::FenceCreateInfo::default(), None)
                 .map_err(err("create fence"))?;
@@ -1314,6 +1324,7 @@ impl Compositor {
         // Camera pictures new since the last composition: copied first.
         let mut passes = Vec::new();
         let mut inputs = Vec::new();
+        let mut copied = Vec::new();
         let ids: Vec<u32> = self
             .cameras
             .iter()
@@ -1328,6 +1339,7 @@ impl Compositor {
                 Ok(pass) => {
                     passes.push(pass);
                     inputs.push(input);
+                    copied.push(id);
                 }
                 Err(e) => {
                     tracing::warn!("compositor: camera {id} hidden: {e}");
@@ -1361,7 +1373,11 @@ impl Compositor {
                     Some(t) => (t.image.view, t.width, t.height, 0),
                     None => continue,
                 },
-                Source::Camera(id) => match self.cameras.get(&id).filter(|c| c.valid) {
+                Source::Camera(id) => match self
+                    .cameras
+                    .get(&id)
+                    .filter(|c| c.valid || copied.contains(&id))
+                {
                     Some(Camera { image: Some(t), .. }) => (t.image.view, t.width, t.height, 0),
                     _ => continue,
                 },
@@ -1441,10 +1457,24 @@ impl Compositor {
                     vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
                 );
             }
-            let wait = match &main {
-                Some(f) => self.import_implicit_fence(f),
-                None => false,
-            };
+            // The producers' pending writes (their implicit fences): the
+            // main frame's, and the camera pictures' (a VA-VPP picture may
+            // still be drawn when handed over).
+            let mut wait = Vec::new();
+            if let Some(f) = &main
+                && self.import_implicit_fence(f, self.acquire[0])
+            {
+                wait.push(self.acquire[0]);
+            }
+            let frames = inputs.iter().enumerate().filter_map(|(k, i)| match i {
+                Input::Frame(f) => Some((k, f)),
+                Input::Yuv(_) => None,
+            });
+            for (k, f) in frames {
+                if self.import_implicit_fence(f, self.acquire[1 + k]) {
+                    wait.push(self.acquire[1 + k]);
+                }
+            }
             let base = base_pass
                 .then(|| {
                     self.base
@@ -1453,10 +1483,15 @@ impl Compositor {
                 })
                 .flatten();
             self.record(slot, main_import, want_preview, base, &passes)?;
-            self.submit_compose(wait)?;
+            self.submit_compose(&wait)?;
         }
         if base_pass && let Some(b) = &mut self.base {
             b.valid = true;
+        }
+        for id in &copied {
+            if let Some(c) = self.cameras.get_mut(id) {
+                c.valid = true;
+            }
         }
         self.in_flight = Some(InFlight {
             slot,
@@ -1975,10 +2010,10 @@ impl Compositor {
         }
     }
 
-    /// Puts the pending writes to `frame`'s DMA-BUF into `acquire`. False
+    /// Puts the pending writes to `frame`'s DMA-BUF into `sem`. False
     /// when there is nothing to wait for or the kernel cannot tell
     /// (before Linux 6.0): then the producer must be done already.
-    unsafe fn import_implicit_fence(&self, frame: &VideoFrame) -> bool {
+    unsafe fn import_implicit_fence(&self, frame: &VideoFrame, sem: vk::Semaphore) -> bool {
         // struct dma_buf_export_sync_file, DMA_BUF_IOCTL_EXPORT_SYNC_FILE.
         #[repr(C)]
         struct ExportSyncFile {
@@ -1996,14 +2031,14 @@ impl Compositor {
             static WARNED: AtomicBool = AtomicBool::new(false);
             if !WARNED.swap(true, Ordering::Relaxed) {
                 tracing::warn!(
-                    "compositor: no implicit fence from the main frame: {}",
+                    "compositor: no implicit fence from an imported frame: {}",
                     std::io::Error::last_os_error()
                 );
             }
             return false;
         }
         let info = vk::ImportSemaphoreFdInfoKHR::default()
-            .semaphore(self.acquire)
+            .semaphore(sem)
             .flags(vk::SemaphoreImportFlags::TEMPORARY)
             .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD)
             .fd(arg.fd);
@@ -2018,13 +2053,12 @@ impl Compositor {
         }
     }
 
-    unsafe fn submit_compose(&mut self, wait_acquire: bool) -> Result<()> {
+    unsafe fn submit_compose(&mut self, wait: &[vk::Semaphore]) -> Result<()> {
         let cmds = [self.cmd];
-        let sems = [self.acquire];
-        let stages = [vk::PipelineStageFlags::COMPUTE_SHADER];
+        let stages = vec![vk::PipelineStageFlags::COMPUTE_SHADER; wait.len()];
         let mut submit = vk::SubmitInfo::default().command_buffers(&cmds);
-        if wait_acquire {
-            submit = submit.wait_semaphores(&sems).wait_dst_stage_mask(&stages);
+        if !wait.is_empty() {
+            submit = submit.wait_semaphores(wait).wait_dst_stage_mask(&stages);
         }
         unsafe { self.device.queue_submit(self.queue, &[submit], self.fence) }
             .map_err(err("submit"))
@@ -2093,8 +2127,6 @@ impl Compositor {
             Input::Frame(f) => {
                 let cam = self.cameras.get_mut(&id).expect("listed");
                 let mut cache = std::mem::take(&mut cam.imports);
-                // No implicit fence to wait for: the camera hands over
-                // finished pictures (its exporter syncs the surface).
                 let r = unsafe { self.import_into(&mut cache, f) };
                 let cam = self.cameras.get_mut(&id).expect("listed");
                 cam.imports = cache;
@@ -2120,7 +2152,6 @@ impl Compositor {
         };
         unsafe { self.ensure_camera_image(id, width, height)? };
         let cam = self.cameras.get_mut(&id).expect("listed");
-        cam.valid = true;
         let target = cam.image.as_ref().expect("made above");
         let (image, target_view) = (target.image.image, target.image.view);
         unsafe {
@@ -2837,7 +2868,9 @@ impl Drop for Compositor {
             }
             d.destroy_fence(self.fence, None);
             d.destroy_fence(self.upload_fence, None);
-            d.destroy_semaphore(self.acquire, None);
+            for sem in self.acquire {
+                d.destroy_semaphore(sem, None);
+            }
             d.destroy_command_pool(self.pool, None);
             // `gpu` (dropped after this) destroys the device and instance.
         }
