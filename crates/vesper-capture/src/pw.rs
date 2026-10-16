@@ -50,7 +50,7 @@ const ROUNDTRIP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Runs `mainloop` until `finished` holds, which callbacks signal by quitting
 /// the loop. Returns `Ok(false)` if `timeout` passes first.
-fn run_until(
+pub(crate) fn run_until(
     mainloop: &MainLoopRc,
     finished: impl Fn() -> bool,
     timeout: Duration,
@@ -74,7 +74,7 @@ fn run_until(
 }
 
 /// Runs a full roundtrip with the server.
-fn roundtrip(mainloop: &MainLoopRc, core: &CoreRc) -> Result<(), Error> {
+pub(crate) fn roundtrip(mainloop: &MainLoopRc, core: &CoreRc) -> Result<(), Error> {
     let pending = core.sync(0)?.seq();
     let done = Rc::new(Cell::new(false));
     let failed = Rc::new(Cell::new(false));

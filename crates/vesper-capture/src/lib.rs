@@ -4,6 +4,7 @@
 //! then streams it on a dedicated PipeWire thread as DMA-BUF
 //! [`VideoFrame`]s. Each frame holds its PipeWire buffer until dropped.
 
+pub mod camera;
 mod format;
 mod pw;
 
