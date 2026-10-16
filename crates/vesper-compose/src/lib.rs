@@ -14,7 +14,7 @@ use std::fmt;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::os::unix::fs::MetadataExt;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use ash::vk;
@@ -41,10 +41,6 @@ const SPIRV: &[u8] = include_bytes!("../shaders/compose.spv");
 const fn fourcc(c: &[u8; 4]) -> u32 {
     u32::from_le_bytes(*c)
 }
-
-/// Every pool of composed frames gets its own generation, so an encoder
-/// never reuses an import from a previous compositor's ring.
-static GENERATION: AtomicU32 = AtomicU32::new(0);
 
 #[derive(Debug, Clone)]
 pub struct Error(String);
@@ -217,9 +213,9 @@ struct Buffer {
 /// A main frame imported from its DMA-BUF, kept while its producer's pool lives.
 struct Import {
     buffer_id: u32,
-    /// Size, fourcc, modifier and the DMA-BUF's inode: a recycled
-    /// (buffer_id, generation) on another buffer never hits.
-    key: (u32, u32, u32, u64, u64),
+    /// Size, fourcc, modifier, plane 0 offset and stride, and the DMA-BUF's
+    /// inode: a recycled (buffer_id, generation) on another buffer never hits.
+    key: (u32, u32, u32, u64, u32, u32, u64),
     image: Image,
 }
 
@@ -368,7 +364,9 @@ impl Compositor {
                 imports: Vec::new(),
                 import_generation: None,
                 ring: Vec::new(),
-                generation: GENERATION.fetch_add(1, Ordering::Relaxed),
+                // Unique in the process, so an encoder never reuses an import
+                // from another pool.
+                generation: vesper_core::next_pool_generation(),
                 preview: None,
                 lost: false,
             }
@@ -1113,6 +1111,8 @@ impl Compositor {
             frame.height,
             frame.fourcc,
             frame.modifier,
+            first.offset,
+            first.stride,
             inode(&first.fd)?,
         );
         if let Some(i) = self
