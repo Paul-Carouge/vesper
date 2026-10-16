@@ -13,123 +13,14 @@
 //! capture off for that swapchain and passes calls through unchanged.
 
 mod capture;
-mod ipc;
 
 use std::ffi::{CStr, c_char, c_void};
-use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
-use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 
 use ash::vk;
-
-/// Process names never captured: compositors, browsers, Electron apps,
-/// Vesper itself. The layer stays a pure pass-through there.
-const BLOCKLIST: &[&str] = &[
-    "kwin_wayland",
-    "kwin_x11",
-    "plasmashell",
-    "xwayland",
-    "gamescope",
-    "gamescope-wl",
-    "steam",
-    "steamwebhelper",
-    "vesper",
-    "obs",
-    "firefox",
-    "firefox-bin",
-    "librewolf",
-    "chromium",
-    "chrome",
-    "brave",
-    "msedge",
-    "thunderbird",
-    "electron",
-    "code",
-    "discord",
-    "slack",
-    "spotify",
-    "signal-desktop",
-    "obsidian",
-    // Windows launchers and embedded browsers, under Wine/Proton.
-    "battle.net.exe",
-    "eadesktop.exe",
-    "upc.exe",
-    "ubisoftconnect.exe",
-    "epicgameslauncher.exe",
-    "qtwebengineprocess.exe",
-    "cefsharp.browsersubprocess.exe",
-    "steamwebhelper.exe",
-    "steam.exe",
-];
-
-/// Longest process name the kernel keeps (`comm`, TASK_COMM_LEN - 1).
-const COMM_LEN: usize = 15;
-
-/// `name` comes from `/proc/self/comm`: at most 15 bytes, so long entries
-/// (e.g. `epicgameslauncher.exe` -> `EpicGamesLaunch`) match on their first
-/// 15 bytes, ignoring case.
-fn is_blocked(name: &str) -> bool {
-    let name = name.as_bytes();
-    BLOCKLIST.iter().any(|b| {
-        let b = &b.as_bytes()[..b.len().min(COMM_LEN)];
-        b.eq_ignore_ascii_case(name)
-    })
-}
-
-/// Pure pass-through for this process (blocklisted).
-static PASSIVE: LazyLock<bool> =
-    LazyLock::new(|| is_blocked(&vesper_gamecapture::protocol::process_name()));
-
-fn debug_enabled() -> bool {
-    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("VESPER_LAYER_DEBUG").is_some());
-    *ON
-}
-
-/// Writes a line to stderr only if that cannot block: these run on the
-/// game's render thread, and a full pipe must not stall it.
-fn log(msg: &str) {
-    let line = format!("[vesper layer] {msg}\n");
-    let mut pfd = libc::pollfd {
-        fd: 2,
-        events: libc::POLLOUT,
-        revents: 0,
-    };
-    // POLLOUT on a pipe means at least PIPE_BUF bytes free: a short line fits.
-    if line.len() <= libc::PIPE_BUF
-        && unsafe { libc::poll(&mut pfd, 1, 0) } == 1
-        && pfd.revents & libc::POLLOUT != 0
-    {
-        let _ = unsafe { libc::write(2, line.as_ptr().cast(), line.len()) };
-    }
-}
-
-pub(crate) fn warn(msg: &str) {
-    log(msg);
-}
-
-pub(crate) fn debug(msg: &str) {
-    if debug_enabled() {
-        log(msg);
-    }
-}
-
-/// Locks, ignoring poisoning: a panic caught in one hook must not turn
-/// every later call (and the destroy paths) into panics.
-pub(crate) trait LockExt<T> {
-    fn locked(&self) -> MutexGuard<'_, T>;
-}
-
-impl<T> LockExt<T> for Mutex<T> {
-    fn locked(&self) -> MutexGuard<'_, T> {
-        self.lock().unwrap_or_else(|e| e.into_inner())
-    }
-}
-
-/// Runs `f`, turning a panic into `fallback`: unwinding into the loader or
-/// the game would abort it.
-fn guard<R>(fallback: R, f: impl FnOnce() -> R) -> R {
-    catch_unwind(AssertUnwindSafe(f)).unwrap_or(fallback)
-}
+pub(crate) use vesper_gamecapture::client as ipc;
+pub(crate) use vesper_gamecapture::client::{LockExt, debug, guard, warn};
 
 // --- Loader interface (vk_layer.h) ---
 
@@ -307,7 +198,7 @@ unsafe extern "system" fn create_instance(
         };
 
         let mut result = vk::Result::ERROR_INITIALIZATION_FAILED;
-        if !*PASSIVE && api_version < vk::API_VERSION_1_1 {
+        if !ipc::passive() && api_version < vk::API_VERSION_1_1 {
             let names = with_extensions(
                 (*info).pp_enabled_extension_names,
                 (*info).enabled_extension_count,
@@ -423,7 +314,7 @@ unsafe extern "system" fn create_device(
         );
         let mut enabled: Vec<&CStr> = app_names.iter().map(|n| CStr::from_ptr(*n)).collect();
         let mut result = vk::Result::ERROR_INITIALIZATION_FAILED;
-        if !*PASSIVE {
+        if !ipc::passive() {
             let supported = inst
                 .fns
                 .enumerate_device_extension_properties(physical)
@@ -461,7 +352,7 @@ unsafe extern "system" fn create_device(
         }
 
         let handle = *out;
-        let device = capture::Device::new(inst, physical, handle, gdpa, &enabled, *PASSIVE);
+        let device = capture::Device::new(inst, physical, handle, gdpa, &enabled, ipc::passive());
         DEVICES.locked().push((key(handle), Arc::new(device)));
         vk::Result::SUCCESS
     })
@@ -568,21 +459,6 @@ pub unsafe extern "system" fn vkNegotiateLoaderLayerInterfaceVersion(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn blocklist_ignores_case() {
-        assert!(is_blocked("kwin_wayland"));
-        assert!(is_blocked("Xwayland"));
-        assert!(is_blocked("Discord"));
-        assert!(!is_blocked("vkcube"));
-        assert!(!is_blocked("eldenring.exe"));
-        // Wine processes: the .exe name, cut to 15 bytes.
-        assert!(is_blocked("Battle.net.exe"));
-        assert!(is_blocked("EpicGamesLaunch"));
-        assert!(is_blocked("steamwebhelper."));
-        assert!(is_blocked("CefSharp.Browse"));
-        assert!(!is_blocked("EpicGames"));
-    }
 
     #[test]
     fn appends_missing_extensions_once() {

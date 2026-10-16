@@ -1,0 +1,30 @@
+#!/bin/sh
+# Runs a native OpenGL game with Vesper's game capture: preloads
+# libvesper_glcapture.so (the 64-bit or 32-bit build, picked by the dynamic
+# linker through $LIB) into the game only. In Steam, set the game's launch
+# options to:
+#
+#   vesper-gl %command%
+#
+# The libraries are looked up next to this script: <prefix>/bin/vesper-gl
+# with <prefix>/lib/vesper/ and <prefix>/lib32/vesper/ (Arch's $LIB values),
+# e.g. /usr or ~/.local. The game stays a pure pass-through until Vesper
+# records it (same consent as Vulkan games).
+if [ "$#" -eq 0 ]; then
+    echo "usage: $(basename "$0") <game> [args...]" >&2
+    exit 1
+fi
+prefix=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
+case "$prefix" in
+*[' :']*)
+    # LD_PRELOAD splits on spaces and colons: run the game without capture.
+    echo "vesper-gl: install path has a space or a colon: $prefix" >&2
+    exec "$@"
+    ;;
+esac
+# $LIB is expanded by ld.so, not by the shell.
+lib="$prefix/\$LIB/vesper/libvesper_glcapture.so"
+# Not `env`: it would take a game argument with '=' or a leading '-' as its own.
+LD_PRELOAD="${LD_PRELOAD:+$LD_PRELOAD:}$lib"
+export LD_PRELOAD
+exec -- "$@"

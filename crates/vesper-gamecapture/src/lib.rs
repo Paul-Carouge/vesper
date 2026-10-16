@@ -19,6 +19,7 @@
 //! is done; dropping a frame tells the game the buffer is free again. See
 //! [`protocol`] for the wire format.
 
+pub mod client;
 pub mod protocol;
 
 use std::collections::HashMap;

@@ -11,7 +11,7 @@ A fast, bloat-free screen recorder for desktop and gaming, written in Rust. An a
 ## Architecture (Linux / Wayland first)
 
 1. **Capture**: `xdg-desktop-portal` ScreenCast (`ashpd`) to a PipeWire stream (`pipewire`) using DMA-BUF. Cursor as metadata.
-   **Game capture** (Vulkan, incl. Proton): an implicit Vulkan layer (`vesper-vklayer`, opt-in with the *Game capture* switch in the settings) copies each presented image into exported DMA-BUFs and sends them over `/tmp/vesper-<uid>/capture.sock` to `vesper-gamecapture`. The socket is in `/tmp`, not `$XDG_RUNTIME_DIR`, because Proton games run inside the Steam Linux Runtime container (pressure-vessel). That container replaces `$XDG_RUNTIME_DIR` with its own tmpfs but shares the host's `/tmp`. Game only, at the game's frame rate, no portal.
+   **Game capture** (Vulkan, incl. Proton and 32-bit games; native OpenGL games through `vesper-gl`): an implicit Vulkan layer (`vesper-vklayer`, opt-in with the *Game capture* switch in the settings) copies each presented image into exported DMA-BUFs and sends them over `/tmp/vesper-<uid>/capture.sock` to `vesper-gamecapture`. The socket is in `/tmp`, not `$XDG_RUNTIME_DIR`, because Proton games run inside the Steam Linux Runtime container (pressure-vessel). That container replaces `$XDG_RUNTIME_DIR` with its own tmpfs but shares the host's `/tmp`. Game only, at the game's frame rate, no portal.
 2. **Conversion**: RGB to NV12 on the GPU (VA-VPP).
 3. **Encoding**: VAAPI hardware encode (AV1 / HEVC / H.264). Prototype with `cros-codecs`, fall back to `ffmpeg-next`.
 4. **Audio**: up to 8 PipeWire tracks (desktop, microphone, a device by node name, or an application's streams, followed as they come and go), each its own named Opus track, plus an optional mix of them all as the first track. Volume and mute per track, applied live. Built-in filters per track (`vesper-dsp`) run on the track's encode thread, never on PipeWire's real-time thread: parameter changes are lock-free, a new filter list is built off that thread and handed over without a lock or an allocation. A filter's delay (noise suppression 20 ms, limiter lookahead) is removed from the track's timeline, so tracks stay in sync with the video and with each other. The mix goes through a true-peak limiter (-1 dBTP). VST3 effects run in the same chains, each in its own host process (see *VST3 plugins*).
@@ -20,7 +20,7 @@ A fast, bloat-free screen recorder for desktop and gaming, written in Rust. An a
 
 ## Game capture layer: what it does when installed
 
-Installing is an explicit opt-in: the *Game capture (Vulkan layer)* switch in Vesper's settings (or `crates/vesper-vklayer/install.sh`) copies the layer to `~/.local/share/vesper/` and writes its manifest to `~/.local/share/vulkan/implicit_layer.d/vesper_capture.json`; turning the switch off (or `install.sh --uninstall`) removes both. Vesper never installs it otherwise; when the installed layer differs from the one built with Vesper (release builds), the switch offers an Update button. Once installed, the layer loads into **every 64-bit Vulkan app** of the user, not only games. While Vesper is not recording it stays a pass-through, but it is not invisible:
+Installing is an explicit opt-in: the *Game capture (Vulkan layer)* switch in Vesper's settings (or `crates/vesper-vklayer/install.sh`) copies the layer to `~/.local/share/vesper/` (`libvesper_vklayer.so`, and `libvesper_vklayer32.so` when the 32-bit build exists) and writes one manifest per architecture to `~/.local/share/vulkan/implicit_layer.d/` (`vesper_capture_64.json`, `vesper_capture_32.json`; the Vulkan loader picks by `library_arch`); turning the switch off (or `install.sh --uninstall`) removes them all, and the single `vesper_capture.json` of older versions too. Vesper never installs it otherwise; when the installed layer differs from the one built with Vesper (release builds, or a 32-bit layer added), the switch offers an Update button. Once installed, the layer loads into **every Vulkan app** of the user, 64-bit and now also 32-bit ones (when the 32-bit layer is installed), not only games. While Vesper is not recording it stays a pass-through, but it is not invisible:
 
 - It adds `TRANSFER_SRC` to swapchain image usage (only when the surface supports it) and enables the export extensions the driver lists (`VK_KHR_external_memory_fd`, `VK_EXT_external_memory_dma_buf`, `VK_KHR_external_semaphore_fd`, `VK_EXT_image_drm_format_modifier` and their dependencies). If the driver rejects either change, the app's original request is retried unchanged.
 - After the first capturable swapchain (640x360 or larger), it starts one background thread that tries to connect to Vesper once per second.
@@ -32,11 +32,27 @@ Consent prevents accidental captures (a launcher, a tool, the wrong window). It 
 
 Escape hatches: a built-in blocklist keeps compositors, browsers, Electron apps, Steam, gamescope, OBS and Vesper itself a pure pass-through; `VESPER_CAPTURE_DISABLE=1` (e.g. `VESPER_CAPTURE_DISABLE=1 %command%` in Steam) stops the loader from loading the layer for one launch; the settings switch (or `install.sh --uninstall`) removes it.
 
-Risks and limits: anti-cheats (EAC, BattlEye) may flag or reject unknown Vulkan layers, so use the escape hatches for those games. 32-bit games, OpenGL games and HDR output are not captured.
+Risks and limits: anti-cheats (VAC, EAC, BattlEye) may flag or reject unknown Vulkan layers, so use the escape hatches for those games. HDR output is not captured. The 32-bit layer exists only if it was built (see *Install*).
+
+### Native OpenGL games
+
+OpenGL has no layer mechanism, so for the best performance in OpenGL games (Terraria and many FNA/SDL/GLFW indie games, emulators), add `vesper-gl` to the game's launch options in Steam (Properties > General); otherwise Vesper captures the game window:
+
+```
+vesper-gl %command%
+```
+
+`vesper-gl` (installed in `/usr/bin` by the package) preloads `libvesper_glcapture.so` into that game only, the 64-bit or 32-bit build as the dynamic linker picks (`/usr/$LIB/vesper/`, that is `/usr/lib/vesper/` or `/usr/lib32/vesper/`; with a manual install, `<prefix>/bin/vesper-gl` looks in `<prefix>/lib/vesper/` and `<prefix>/lib32/vesper/`). Nothing is ever preloaded globally, and the settings switch is not needed. For a game outside Steam: `vesper-gl ./game`. The preload reaches every process the game's command starts, not only the game: launcher scripts (needed: Terraria starts through one), crash handlers, embedded browser helpers. They stay dormant pass-throughs (no OpenGL swap, or blocklisted), but they do load the library.
+
+**Don't use `vesper-gl` on multiplayer games protected by VAC, EAC or BattlEye: risk of an account ban.** Anti-cheats treat preloaded libraries that hook OpenGL as cheats.
+
+The library interposes `glXSwapBuffers`, `eglSwapBuffers` (and its `WithDamage` variants), and `dlsym`, `glXGetProcAddress(ARB)` and `eglGetProcAddress`, which is how SDL and GLFW find the swap functions after loading OpenGL themselves; every other lookup goes to glibc with the caller's own scope. Same protocol, consent, blocklist and pacing as the Vulkan layer: until Vesper selects the game, a swap costs an atomic load. While recording, the selected context's back buffer is blitted (flipped, GL being bottom-up) into a ring of 4 linear GBM buffers on the game's GPU, imported into its context as GL memory objects (`GL_EXT_memory_object_fd`); the GL state the blit touches (framebuffer bindings, read buffer, scissor test, sRGB writes) is restored. Each frame goes out with a sync_file from a DRM syncobj that the driver signals when the blit is done (`GL_EXT_semaphore_fd`), once the driver has submitted the blit (checked without waiting: Mesa has submitted it by then; otherwise the frame goes out on the next swap). Any failure turns capture off for that context and passes everything through. Measured in the lab (`scripts/robustness/l4_gl_32bit.sh`, uncapped test app at about 50 000 swaps/s): dormant within noise of no library at all, about 6 µs more per swap while recording at 60 fps; `l5_gl_block.sh`: Vesper stopped or killed mid-recording never blocks the game.
+
+Limits: Mesa drivers only (importing a DMA-BUF and a DRM syncobj as opaque fds is Mesa behaviour; NVIDIA and others pass through), GL 3.0 / ES 3.0 or newer with `GL_EXT_memory_object_fd` and `GL_EXT_semaphore_fd`; one context per game is captured (the first to swap a window of 640x360 or more; another one takes over after it stops swapping for 2 s); multisampled windows (an MSAA default framebuffer) are not captured; `glXSwapBuffersMscOML` is not hooked. Games inside a Steam Linux Runtime container (pressure-vessel) get the preload only if the container honours `$LIB` in `LD_PRELOAD`; Terraria (native) runs outside of it. 
 
 ## Done
 
-- Record a screen, a window or a game (Vulkan layer), constant frame rate, AV1 / HEVC / H.264 with constant-quality presets.
+- Record a screen, a window or a game (Vulkan layer, 64 and 32-bit; native OpenGL games with `vesper-gl`), constant frame rate, AV1 / HEVC / H.264 with constant-quality presets.
 - Up to 8 named audio tracks (desktop, mic, devices, applications) with volume and mute, plus a mix track, sample-aligned and drift-corrected. The desktop and microphone devices are chosen in the settings (system default or a specific device, never silently replaced when unplugged), and any track's source can be changed after it was added.
 - Built-in filters per track (noise suppression, expander, compressor, de-esser, limiter, high-pass, gain), changed live, with a one-click voice preset and gain reduction meters.
 - VST3 effects per track, hosted out of process: a plugin that crashes or stalls leaves its track dry, never the recording down.
@@ -55,7 +71,7 @@ Arch (and CachyOS): the package builds the last commit of this checkout (uncommi
 cd packaging/arch && makepkg -si
 ```
 
-It installs `/usr/bin/vesper`, the desktop file, the icons (app and tray), and the game capture layer and the VST3 plugin host (`vesper-vst-host`) in `/usr/lib/vesper/`. The layer stays off: only the settings switch enables it, per user. Uninstall with `sudo pacman -R vesper-git`. Turn the switch off first: otherwise your per-user copy of the layer stays installed and keeps loading into Vulkan apps; remove it by hand with `rm ~/.local/share/vulkan/implicit_layer.d/vesper_capture.json ~/.local/share/vesper/libvesper_vklayer.so`. Each `makepkg` rewrites `pkgver=` in the PKGBUILD (normal for a -git package): `git checkout packaging/arch/PKGBUILD` before committing.
+It installs `/usr/bin/vesper`, `/usr/bin/vesper-gl`, the desktop file, the icons (app and tray), and the game capture layer, the OpenGL capture library and the VST3 plugin host (`vesper-vst-host`) in `/usr/lib/vesper/`, plus the 32-bit layer and OpenGL library in `/usr/lib32/vesper/` when the build machine has the i686 Rust target and a 32-bit C toolchain: `rustup target add i686-unknown-linux-gnu` (no root; or `pacman -S lib32-rust-libs` with Arch's `rust`) and `pacman -S lib32-glibc lib32-gcc-libs` (multilib repository). Without them the package builds without 32-bit game capture. 32-bit Vulkan games also need `lib32-vulkan-icd-loader` and a 32-bit Vulkan driver (`lib32-vulkan-radeon`), which Steam installs anyway. The layer stays off: only the settings switch enables it, per user. Uninstall with `sudo pacman -R vesper-git`. Turn the switch off first: otherwise your per-user copy of the layer stays installed and keeps loading into Vulkan apps; remove it by hand with `rm ~/.local/share/vulkan/implicit_layer.d/vesper_capture*.json ~/.local/share/vesper/libvesper_vklayer*.so`. Each `makepkg` rewrites `pkgver=` in the PKGBUILD (normal for a -git package): `git checkout packaging/arch/PKGBUILD` before committing.
 
 Manual alternative, in your home:
 
@@ -64,11 +80,17 @@ cargo build --release
 install -Dm755 target/release/vesper ~/.local/bin/vesper
 install -Dm644 target/release/libvesper_vklayer.so ~/.local/lib/vesper/libvesper_vklayer.so
 install -Dm755 target/release/vesper-vst-host ~/.local/lib/vesper/vesper-vst-host
+install -Dm644 target/release/libvesper_glcapture.so ~/.local/lib/vesper/libvesper_glcapture.so
+install -Dm755 crates/vesper-glcapture/vesper-gl ~/.local/bin/vesper-gl
+# 32-bit games (optional): rustup target add i686-unknown-linux-gnu, lib32-glibc, lib32-gcc-libs
+cargo build --release --target i686-unknown-linux-gnu -p vesper-vklayer -p vesper-glcapture
+install -Dm644 target/i686-unknown-linux-gnu/release/libvesper_vklayer.so ~/.local/lib32/vesper/libvesper_vklayer.so
+install -Dm644 target/i686-unknown-linux-gnu/release/libvesper_glcapture.so ~/.local/lib32/vesper/libvesper_glcapture.so
 install -Dm644 crates/vesper-app/data/io.github.PaulCarouge.Vesper.desktop -t ~/.local/share/applications/
 mkdir -p ~/.local/share/icons && cp -r crates/vesper-app/data/icons/hicolor ~/.local/share/icons/
 ```
 
-Vesper looks for the layer and the plugin host next to its binary, then in `../lib/vesper/`; the settings switch installs that copy (build with `cargo build --release` at the workspace root, not `-p vesper-app`, so the layer is built too). If `~/.local/bin` is not in the session `PATH`, set `Exec=` to the full path. Without the desktop file, global shortcuts and desktop notifications (sent when a recording or replay is saved, or fails, while the window is in the background) are off; the in-window shortcuts still work. The saved source is forgotten once after updating to this version, since it is now tied to the app id: pick it again. Default global shortcuts: Alt+F9 starts or stops recording, Alt+F10 saves the replay, Alt+F8 goes live or ends the stream. KDE asks to confirm them on first launch; change them later in System Settings > Shortcuts.
+Vesper looks for the layer and the plugin host next to its binary, then in `../lib/vesper/` (the 32-bit layer in `../lib32/vesper/`, or `target/i686-unknown-linux-gnu/<profile>/` for a build in the checkout); the settings switch installs that copy (build with `cargo build --release` at the workspace root, not `-p vesper-app`, so the layer is built too). If `~/.local/bin` is not in the session `PATH`, set `Exec=` to the full path. Without the desktop file, global shortcuts and desktop notifications (sent when a recording or replay is saved, or fails, while the window is in the background) are off; the in-window shortcuts still work. The saved source is forgotten once after updating to this version, since it is now tied to the app id: pick it again. Default global shortcuts: Alt+F9 starts or stops recording, Alt+F10 saves the replay, Alt+F8 goes live or ends the stream. KDE asks to confirm them on first launch; change them later in System Settings > Shortcuts.
 
 Settings are kept in `~/.config/vesper/settings`.
 
@@ -122,7 +144,6 @@ Every feature below must keep recording quality, game performance and compatibil
 1. **VST3 plugin editors**: the plugins' own windows, next to the generic sliders.
 2. **Scenes and profiles**: sources composited on the GPU (VA-VPP / Vulkan) into the encoded picture, saved per profile.
 3. **Overlays**: images, text, webcam, and optional browser sources, on the same GPU compositor.
-4. **Game capture**: 32-bit Vulkan games, native OpenGL games.
 
 Not planned: plugin APIs for the video pipeline itself.
 

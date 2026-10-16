@@ -5170,6 +5170,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "vesper-glcapture"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "vesper-gamecapture",
+]
+
+[[package]]
 name = "vesper-mux"
 version = "0.1.0"
 dependencies = [
