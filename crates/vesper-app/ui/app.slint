@@ -933,6 +933,8 @@ export component AppWindow inherits Window {
     /// `output-folder` as shown: its name ("Vesper") and where it is ("~/Videos").
     in property <string> output-folder-name;
     in property <string> output-folder-parent;
+    /// "Vesper 0.1.0.r45.g4077535", shown at the bottom of the settings.
+    in property <string> version;
 
     // ---- Status line --------------------------------------------------
     in property <string> encoder: "VAAPI";
@@ -2741,11 +2743,22 @@ export component AppWindow inherits Window {
                         vertical-stretch: 1;
                     }
 
-                    Text {
-                        text: "Saved as MKV, which stays readable even if the app crashes.";
-                        font-size: Theme.font-small;
-                        color: Theme.text-faint;
-                        wrap: word-wrap;
+                    VerticalLayout {
+                        spacing: Theme.space-sm;
+                        Text {
+                            text: "Saved as MKV, which stays readable even if the app crashes.";
+                            font-size: Theme.font-small;
+                            color: Theme.text-faint;
+                            wrap: word-wrap;
+                        }
+                        // Read-only input: the version can be selected and copied.
+                        TextInput {
+                            text: root.version;
+                            read-only: true;
+                            font-size: Theme.font-caption;
+                            color: Theme.text-faint;
+                            accessible-label: "Version";
+                        }
                     }
                 }
             }

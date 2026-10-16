@@ -82,7 +82,24 @@ const GAMES_TICK: Duration = Duration::from_millis(500);
 
 slint::include_modules!();
 
+/// "Vesper 0.1.0.r45.g4077535": the Arch pkgver format; just the version
+/// without git history.
+fn version_string(version: &str, git_rev: Option<&str>) -> String {
+    match git_rev {
+        Some(rev) => format!("Vesper {version}.{rev}"),
+        None => format!("Vesper {version}"),
+    }
+}
+
+fn version() -> String {
+    version_string(env!("CARGO_PKG_VERSION"), option_env!("VESPER_GIT_REV"))
+}
+
 fn main() -> Result<(), slint::PlatformError> {
+    if std::env::args().nth(1).as_deref() == Some("--version") {
+        println!("{}", version());
+        return Ok(());
+    }
     // First, before any thread starts, so they all inherit the blocked mask.
     handle_quit_signals();
     // The crates' warnings and errors (and our own info) on stderr; RUST_LOG overrides.
@@ -126,6 +143,7 @@ fn main() -> Result<(), slint::PlatformError> {
     }
 
     let ui = AppWindow::new()?;
+    ui.set_version(version().into());
     // Before anything starts: a second launch only shows the first window.
     let weak = ui.as_weak();
     let instance = match instance::claim(!background, move || {
@@ -1185,6 +1203,16 @@ fn default_output_folder() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn version_matches_the_arch_pkgver() {
+        assert_eq!(
+            version_string("0.1.0", Some("r45.g4077535")),
+            "Vesper 0.1.0.r45.g4077535"
+        );
+        assert_eq!(version_string("0.1.0", None), "Vesper 0.1.0");
+        assert!(version().starts_with(concat!("Vesper ", env!("CARGO_PKG_VERSION"))));
+    }
 
     #[test]
     fn common_failures_read_as_short_sentences() {
