@@ -845,13 +845,36 @@ impl Compositor {
         Ok(())
     }
 
-    /// Frees replaced images once no composition is in flight (texture
-    /// copies never read them).
+    /// Tests: images waiting to be freed.
+    #[doc(hidden)]
+    pub fn garbage(&self) -> usize {
+        self.graveyard.len()
+    }
+
+    /// Tests: the last texture copy is done (or none was queued).
+    #[doc(hidden)]
+    pub fn copies_done(&self) -> bool {
+        self.upload_pending.is_none()
+            || unsafe { self.device.get_fence_status(self.upload_fence) } == Ok(true)
+    }
+
+    /// Frees replaced images once no queued work uses them: no composition
+    /// in flight, and the last texture copy (which may write one) done.
     fn collect_garbage(&mut self) {
-        if self.in_flight.is_none() {
-            for i in self.graveyard.drain(..) {
-                unsafe { i.destroy(&self.device) };
+        if self.in_flight.is_some() || self.graveyard.is_empty() {
+            return;
+        }
+        if self.upload_pending.is_some() {
+            let d = &self.device;
+            if unsafe { d.get_fence_status(self.upload_fence) } != Ok(true)
+                || unsafe { d.reset_fences(&[self.upload_fence]) }.is_err()
+            {
+                return;
             }
+            self.upload_pending = None;
+        }
+        for i in self.graveyard.drain(..) {
+            unsafe { i.destroy(&self.device) };
         }
     }
 
@@ -1575,9 +1598,12 @@ impl Compositor {
     /// Index in `imports` of `frame`'s image, importing it on first sight.
     unsafe fn import(&mut self, frame: &VideoFrame) -> Result<usize> {
         if self.import_generation != Some(frame.pool_generation) {
-            // A new producer pool: the old buffers are gone (nothing is in
-            // flight, `compose` waits for the GPU).
+            // A new producer pool: the old buffers are gone (freed once no
+            // queued work reads them). The kept copy is of the old source.
             self.drop_imports();
+            if let Some(old) = self.base.take() {
+                self.graveyard.push(old.image);
+            }
             self.import_generation = Some(frame.pool_generation);
         }
         let first = frame

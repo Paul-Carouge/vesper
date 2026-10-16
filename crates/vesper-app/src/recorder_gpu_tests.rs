@@ -896,3 +896,76 @@ fn rapid_scene_toggles_reuse_one_compositor() {
     assert!(inspect(&path).0 > 30);
     std::fs::remove_dir_all(out).unwrap();
 }
+
+/// The compositor often busy (texture copies being queued): frames wait
+/// one at a time, a newer one replaces an older, which goes back at once;
+/// the picture never goes back in time.
+#[test]
+fn frames_waiting_for_a_busy_compositor_never_go_back_in_time() {
+    let Some(rig) = Rig::new() else { return };
+    let out = dir("busy");
+    let png = red_png(&out);
+    let settings = Settings {
+        scene: logo_scene(&png),
+        ..settings(&rig.route)
+    };
+    let Some((p, rx)) = record_with(settings, &out) else {
+        return;
+    };
+    let probe = &rig.route.0.probe;
+    // Busy while frames come (one waits), free when a newer one comes, then
+    // ticks without frames: the waiting older one must not be drawn then.
+    for _ in 0..15 {
+        probe.busy.store(true, Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(70));
+        probe.busy.store(false, Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(40));
+        rig.paused.store(true, Ordering::Relaxed);
+        // An overlay change while no frame comes: the scene is redrawn.
+        assert!(p.set_scene(logo_scene(&png)));
+        std::thread::sleep(Duration::from_millis(80));
+        rig.paused.store(false, Ordering::Relaxed);
+    }
+    rig.paused.store(true, Ordering::Relaxed);
+    std::thread::sleep(Duration::from_millis(150));
+    let (sent, released) = (&rig.counts.0, &rig.counts.1);
+    assert_eq!(released.load(Ordering::SeqCst), sent.load(Ordering::SeqCst));
+    assert!(
+        !probe.went_back.load(Ordering::Relaxed),
+        "an older frame composed after a newer"
+    );
+    let path = finish(&p, &rx);
+    p.join();
+    assert!(inspect(&path).0 > 40);
+    std::fs::remove_dir_all(out).unwrap();
+}
+
+/// A composition still in flight (the tick did not wait for it) when the
+/// scene becomes the capture alone: its game frame goes back right away,
+/// not when the idle compositor is retired.
+#[test]
+fn leaving_a_scene_releases_a_composition_still_in_flight() {
+    let Some(rig) = Rig::new() else { return };
+    let out = dir("inflight");
+    let png = red_png(&out);
+    let settings = Settings {
+        scene: logo_scene(&png),
+        ..settings(&rig.route)
+    };
+    let Some((p, rx)) = record_with(settings, &out) else {
+        return;
+    };
+    let probe = &rig.route.0.probe;
+    std::thread::sleep(Duration::from_millis(500));
+    probe.no_wait.store(true, Ordering::Relaxed);
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(p.set_scene(Scene::main()));
+    rig.paused.store(true, Ordering::Relaxed);
+    std::thread::sleep(Duration::from_millis(200));
+    let (sent, released) = (&rig.counts.0, &rig.counts.1);
+    assert_eq!(released.load(Ordering::SeqCst), sent.load(Ordering::SeqCst));
+    let path = finish(&p, &rx);
+    p.join();
+    assert!(inspect(&path).0 > 20);
+    std::fs::remove_dir_all(out).unwrap();
+}

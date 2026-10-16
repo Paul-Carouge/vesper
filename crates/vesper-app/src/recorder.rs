@@ -140,6 +140,14 @@ struct Probe {
     fail: AtomicBool,
     /// Keep the capture copy as for a damage-driven source.
     base: AtomicBool,
+    /// The compositor looks busy (locked by the overlay thread).
+    busy: AtomicBool,
+    /// Never wait for a composition on the tick.
+    no_wait: AtomicBool,
+    /// Producer pts of the newest capture frame composed, and whether an
+    /// older one was composed after it.
+    last_main: std::sync::atomic::AtomicU64,
+    went_back: AtomicBool,
     /// Compositions, and their GPU time (when measured), ns.
     composed: std::sync::atomic::AtomicU64,
     gpu_ns: std::sync::atomic::AtomicU64,
@@ -1841,6 +1849,24 @@ fn pump(
 /// composed scene: switching back soon reuses them.
 const OVERLAYS_WARM: Duration = Duration::from_secs(10);
 
+/// Overlay threads retired (by an idle scene or an ended pipeline), still
+/// freeing their compositor: no new one starts before they end, so two
+/// Vulkan devices never coexist, across pipelines too.
+static RETIRING: Mutex<Vec<JoinHandle<()>>> = Mutex::new(Vec::new());
+
+/// Whether a retired overlay thread still runs; joins the finished ones.
+fn retiring() -> bool {
+    let mut list = lock(&RETIRING);
+    let (done, running): (Vec<_>, Vec<_>) = list.drain(..).partition(JoinHandle::is_finished);
+    *list = running;
+    let busy = !list.is_empty();
+    drop(list);
+    for t in done {
+        let _ = t.join();
+    }
+    busy
+}
+
 /// What the compositor gave this tick.
 enum Out {
     /// A composition, ready for the encoder.
@@ -1849,6 +1875,15 @@ enum Out {
     Direct(VideoFrame),
     /// Nothing new: the last picture repeats.
     Nothing,
+}
+
+impl Drop for Stage {
+    /// The overlay thread frees its compositor on its own; a next pipeline
+    /// waits for it (see [`RETIRING`]).
+    fn drop(&mut self) {
+        self.next = None;
+        self.retire();
+    }
 }
 
 /// Turns the tick's capture into the encoder's picture. A scene that shows
@@ -1881,8 +1916,6 @@ struct Stage {
     overlays: Option<Overlays>,
     /// Since when a passthrough scene leaves the overlay thread unused.
     idle_since: Option<Duration>,
-    /// A retired overlay thread, still freeing its compositor.
-    retiring: Option<JoinHandle<()>>,
     /// The encoder's size, once open.
     canvas: Option<(u32, u32)>,
     /// A capture frame waiting while the compositor is busy (a texture
@@ -1920,7 +1953,6 @@ impl Stage {
             ids: Vec::new(),
             overlays: None,
             idle_since: None,
-            retiring: None,
             canvas: None,
             next: None,
             dirty: true,
@@ -2012,12 +2044,9 @@ impl Stage {
             return;
         }
         if self.overlays.is_none() {
-            // The previous thread first frees its device (`poll` asks again).
-            if self.retiring.as_ref().is_some_and(|t| !t.is_finished()) {
+            // A retired thread first frees its device (`poll` asks again).
+            if retiring() {
                 return;
-            }
-            if let Some(t) = self.retiring.take() {
-                let _ = t.join();
             }
             match Overlays::start() {
                 Ok(o) => self.overlays = Some(o),
@@ -2066,14 +2095,32 @@ impl Stage {
         {
             self.idle_since = None;
             self.next = None;
-            self.retiring = self.overlays.take().map(Overlays::retire);
+            self.retire();
         }
-        let retired = self.retiring.as_ref().is_some_and(JoinHandle::is_finished);
         if self.retry.is_some_and(|t| monotonic_now() >= t) {
             self.retry = None;
             self.request();
-        } else if retired && self.overlays.is_none() {
+        } else if self.overlays.is_none() && !self.passthrough {
+            // Waiting for a retired thread to end.
             self.request();
+        }
+    }
+
+    fn retire(&mut self) {
+        if let Some(o) = self.overlays.take() {
+            lock(&RETIRING).push(o.retire());
+        }
+    }
+
+    /// Picks up and drops a composition still in flight (a direct frame
+    /// now follows it): its capture frame and ring slot go back.
+    fn drain(&mut self) {
+        let Some(o) = &self.overlays else { return };
+        if let Ok(mut slot) = o.shared.comp.try_lock()
+            && let Some(c) = slot.as_mut()
+            && c.in_flight()
+        {
+            let _ = c.poll(Duration::ZERO);
         }
     }
 
@@ -2105,6 +2152,7 @@ impl Stage {
         if self.passthrough && !redraw {
             self.dirty = false;
             self.next = None;
+            self.drain();
             return match frame {
                 Some(mut frame) => {
                     frame.pts = pts;
@@ -2114,14 +2162,17 @@ impl Stage {
                 None => self.repeat(enc, pts),
             };
         }
+        // The newest frame only: a waiting older one goes back now.
+        let waiting = self.next.take();
         let frame = match frame {
             Some(f) if self.shows_main => {
+                drop(waiting);
                 self.dirty = true;
                 Some(f)
             }
             // Not shown: back to its producer at once.
             Some(_) => None,
-            None => self.next.take(),
+            None => waiting,
         };
         match self.compose(frame) {
             Out::Composed(mut f) | Out::Direct(mut f) => {
@@ -2145,7 +2196,19 @@ impl Stage {
         let Some(shared) = self.overlays.as_ref().map(|o| o.shared.clone()) else {
             return direct(self, frame);
         };
-        let mut slot = match shared.comp.try_lock() {
+        #[cfg(test)]
+        let busy = self
+            .probe
+            .as_ref()
+            .is_some_and(|p| p.busy.load(Ordering::Relaxed));
+        #[cfg(not(test))]
+        let busy = false;
+        let locked = if busy {
+            Err(std::sync::TryLockError::WouldBlock)
+        } else {
+            shared.comp.try_lock()
+        };
+        let mut slot = match locked {
             Ok(slot) => slot,
             Err(std::sync::TryLockError::WouldBlock) => {
                 // A texture copy is being queued: next tick.
@@ -2187,12 +2250,31 @@ impl Stage {
             {
                 return self.broken(slot, "injected failure".into(), frame);
             }
+            #[cfg(test)]
+            if let (Some(p), Some(f)) = (&self.probe, &frame) {
+                let t = f.pts.as_nanos() as u64;
+                if p.last_main.fetch_max(t, Ordering::Relaxed) > t {
+                    p.went_back.store(true, Ordering::Relaxed);
+                }
+            }
+            #[cfg(test)]
+            let budget = if self
+                .probe
+                .as_ref()
+                .is_some_and(|p| p.no_wait.load(Ordering::Relaxed))
+            {
+                Duration::ZERO
+            } else {
+                self.budget
+            };
+            #[cfg(not(test))]
+            let budget = self.budget;
             // Damage-driven sources keep a copy for redraws without a frame.
             let keep = frame.is_some() && self.damage_driven();
             match comp.submit(frame, &self.draws, keep) {
                 Ok(()) => {
                     (self.dirty, self.stale) = (false, false);
-                    match comp.poll(self.budget) {
+                    match comp.poll(budget) {
                         Ok(Some(f)) => out = Some(f),
                         Ok(None) => {}
                         Err(e) => return self.broken(slot, e.to_string(), None),

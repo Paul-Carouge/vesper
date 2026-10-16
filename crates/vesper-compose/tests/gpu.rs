@@ -521,3 +521,51 @@ fn textures_staged_elsewhere_are_set_without_waiting() {
     let (_, px) = compose_read(&mut c, None, &draws);
     assert_eq!(px[..4], [0, 255, 0, 255]);
 }
+
+/// A texture removed (or replaced) right after its copy was queued, with or
+/// without a composition in flight, is freed only once the copy is done:
+/// the GPU never writes freed memory (that would fault or lose the device).
+#[test]
+fn textures_removed_while_their_copy_runs_are_freed_after_it() {
+    if !gpu() {
+        return;
+    }
+    let (w, h) = (PREVIEW_WIDTH, PREVIEW_HEIGHT);
+    let mut c = Compositor::new(w, h).unwrap();
+    let big = solid(2048, 2048, [9, 9, 9, 255]);
+    let draws = [full(Source::Texture(2), Fit::Stretch, 1.0)];
+    c.set_texture(2, 4, 4, &solid(4, 4, [0, 0, 255, 255]))
+        .unwrap();
+    for round in 0..20 {
+        // A: queued, then removed at once.
+        let s = c.uploader().prepare(2048, 2048, &big).unwrap();
+        c.set_staged(1, s).unwrap();
+        c.remove_texture(1);
+        // Kept while its copy may still write it.
+        let kept = c.garbage() > 0;
+        assert!(
+            kept || c.copies_done(),
+            "round {round}: freed during its copy"
+        );
+        // B: a composition in flight, a copy queued behind it, removed,
+        // then the composition polled out (which collects garbage).
+        c.submit(None, &draws, false).unwrap();
+        let s = c.uploader().prepare(2048, 2048, &big).unwrap();
+        c.set_staged(3, s).unwrap();
+        c.remove_texture(3);
+        let f = loop {
+            if let Some(f) = c.poll(Duration::from_millis(5)).unwrap() {
+                break f;
+            }
+        };
+        let kept = c.garbage() > 0;
+        assert!(
+            kept || c.copies_done(),
+            "round {round}: freed during its copy"
+        );
+        drop(f);
+        assert!(!c.is_lost(), "round {round}");
+    }
+    let (_, px) = compose_read(&mut c, None, &draws);
+    assert_eq!(px[..4], [0, 0, 255, 255]);
+}
