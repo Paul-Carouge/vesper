@@ -6,18 +6,22 @@
 //! queued. The thread also creates the compositor (opening a Vulkan device
 //! takes a while). The pipeline thread composes under the same lock with
 //! `try_lock`: it never waits for this thread.
+//!
+//! Webcams have a thread of their own ([`Cameras`]).
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use resvg::{tiny_skia, usvg};
-use vesper_compose::Compositor;
+use vesper_capture::camera::{Camera, CameraFrame, CpuFrame, CpuLayout, Matrix, Range};
+use vesper_compose::{Compositor, StagedYuv, YuvLayout, YuvMatrix, YuvPicture};
+use vesper_core::VideoFrame;
 
-use crate::recorder::lock;
+use crate::recorder::{Event, OnEvent, lock};
 use crate::scenes::{Align, TextStyle};
 
 /// Largest image side decoded.
@@ -221,6 +225,479 @@ fn run(rx: &Receiver<Job>, shared: &Shared) {
     drop(old);
 }
 
+/// How long a camera stays open after its scene is left: switching back
+/// soon finds it streaming.
+#[cfg(not(test))]
+pub const CAMERA_WARM: Duration = Duration::from_secs(10);
+#[cfg(test)]
+pub const CAMERA_WARM: Duration = Duration::from_secs(1);
+/// How often open cameras are asked for a picture (`Camera` has no wakeup).
+const CAMERA_POLL: Duration = Duration::from_millis(10);
+const CAMERA_RETRY_FIRST: Duration = Duration::from_secs(1);
+/// Streaming this long, a camera that failed is trusted again.
+const CAMERA_STABLE: Duration = Duration::from_secs(10);
+const CAMERA_RETRY_MAX: Duration = Duration::from_secs(10);
+
+/// A camera's news for the pipeline thread.
+pub enum Feed {
+    /// A picture decoded on the GPU.
+    Gpu(VideoFrame),
+    /// A YUV picture, staged for the compositor.
+    Yuv(StagedYuv),
+    /// No picture any more (the camera failed, or left the scene): hide it.
+    Gone,
+}
+
+#[derive(Default)]
+struct Want {
+    /// `(camera id, node name)` of the cameras the scene shows.
+    list: Vec<(u32, String)>,
+    changed: bool,
+}
+
+/// Between the pipeline thread and the camera thread.
+#[derive(Default)]
+struct CameraShared {
+    want: Mutex<Want>,
+    /// Signalled with `want` changed or `quit` set.
+    wake: Condvar,
+    /// Where YUV pictures are staged.
+    overlays: Mutex<Option<Arc<Shared>>>,
+    /// The latest news of each camera.
+    mailbox: Mutex<Vec<(u32, Feed)>>,
+    news: AtomicBool,
+    /// Staged pictures no compositor took: dropped on the camera thread,
+    /// never on the tick (the last one of a gone compositor frees its
+    /// Vulkan device).
+    trash: Mutex<Vec<StagedYuv>>,
+    quit: AtomicBool,
+}
+
+impl CameraShared {
+    fn publish(&self, id: u32, feed: Feed) {
+        let old = {
+            let mut m = lock(&self.mailbox);
+            match m.iter_mut().find(|(i, _)| *i == id) {
+                Some(slot) => Some(std::mem::replace(&mut slot.1, feed)),
+                None => {
+                    m.push((id, feed));
+                    None
+                }
+            }
+        };
+        // Outside the lock: a GPU picture's release unrefs a VA surface.
+        drop(old);
+        self.news.store(true, Ordering::Release);
+    }
+}
+
+/// The cameras of a pipeline, streamed on their own thread
+/// ("vesper-camfeed"): opened while the scene shows them (and
+/// [`CAMERA_WARM`] after), reopened with a backoff when they fail, closed
+/// when this is dropped. Latest picture wins: older ones go back at once.
+/// YUV pictures are staged there, off the pipeline's tick. Sends
+/// [`Event::Camera`] when the first opens and the last closes, and one
+/// notice per failure streak.
+pub struct Cameras {
+    shared: Arc<CameraShared>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl Cameras {
+    pub fn start(on_event: OnEvent) -> std::io::Result<Self> {
+        let shared = Arc::new(CameraShared::default());
+        let s = shared.clone();
+        let thread = std::thread::Builder::new()
+            .name("vesper-camfeed".into())
+            .spawn(move || feed(&s, &on_event))?;
+        Ok(Self {
+            shared,
+            thread: Some(thread),
+        })
+    }
+
+    /// The cameras the scene shows now.
+    pub fn want(&self, list: Vec<(u32, String)>) {
+        *lock(&self.shared.want) = Want {
+            list,
+            changed: true,
+        };
+        self.shared.wake.notify_all();
+    }
+
+    /// The overlay thread whose compositor YUV pictures are staged for.
+    pub fn set_overlays(&self, overlays: Option<Arc<Shared>>) {
+        let none = overlays.is_none();
+        *lock(&self.shared.overlays) = overlays;
+        if none {
+            // Staged for a compositor on its way out.
+            let stale: Vec<_> = {
+                let mut m = lock(&self.shared.mailbox);
+                let (yuv, keep) = m.drain(..).partition(|(_, f)| matches!(f, Feed::Yuv(_)));
+                *m = keep;
+                yuv
+            };
+            for (_, f) in stale {
+                if let Feed::Yuv(y) = f {
+                    self.discard(y);
+                }
+            }
+        }
+    }
+
+    /// Hands a picture no compositor took back to the camera thread, which
+    /// frees it.
+    pub fn discard(&self, staged: StagedYuv) {
+        lock(&self.shared.trash).push(staged);
+        let _want = lock(&self.shared.want);
+        self.shared.wake.notify_all();
+    }
+
+    /// News since the last call.
+    pub fn news(&self) -> bool {
+        self.shared.news.swap(false, Ordering::AcqRel)
+    }
+
+    /// The latest news of each camera.
+    pub fn take(&self) -> Vec<(u32, Feed)> {
+        std::mem::take(&mut *lock(&self.shared.mailbox))
+    }
+}
+
+impl Drop for Cameras {
+    /// Closes the cameras: `Camera` never waits, so this is quick.
+    fn drop(&mut self) {
+        self.shared.quit.store(true, Ordering::Release);
+        {
+            let _want = lock(&self.shared.want);
+            self.shared.wake.notify_all();
+        }
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+/// A camera as the camera thread uses it (a fake one in tests).
+trait CameraSource: Send {
+    fn take(&self) -> Result<Option<CameraFrame>, String>;
+    fn software_decode(&self) -> bool;
+}
+
+impl CameraSource for Camera {
+    fn take(&self) -> Result<Option<CameraFrame>, String> {
+        Camera::take(self).map_err(|e| e.to_string())
+    }
+
+    fn software_decode(&self) -> bool {
+        Camera::software_decode(self)
+    }
+}
+
+fn open_camera(name: &str) -> Result<Box<dyn CameraSource>, String> {
+    #[cfg(test)]
+    if let Some(c) = fake::open(name) {
+        return c;
+    }
+    // Tests never open a real webcam: only the robustness lab's fake node.
+    #[cfg(test)]
+    if std::env::var("VESPER_LAB_CAMERA").ok().as_deref() != Some(name) {
+        return Err(format!("{name:?} is not a test camera"));
+    }
+    Camera::open(name)
+        .map(|c| Box::new(c) as Box<dyn CameraSource>)
+        .map_err(|e| e.to_string())
+}
+
+struct OpenCamera {
+    id: u32,
+    cam: Box<dyn CameraSource>,
+    /// Out of the scene since then.
+    idle_since: Option<Instant>,
+    cpu_told: bool,
+    /// It sent a picture: it is really streaming (its light is on).
+    live: bool,
+    /// Since its first picture.
+    streaming_since: Option<Instant>,
+}
+
+/// A failed camera: its id, next try, current backoff.
+type Retry = (u32, Instant, Duration);
+
+/// The camera thread.
+fn feed(s: &CameraShared, on_event: &OnEvent) {
+    let mut open: Vec<OpenCamera> = Vec::new();
+    let mut retry: Vec<Retry> = Vec::new();
+    // Cameras the user was told about, until they stream again.
+    let mut told: Vec<u32> = Vec::new();
+    let mut want: Vec<(u32, String)> = Vec::new();
+    let mut on = false;
+    while !s.quit.load(Ordering::Acquire) {
+        {
+            let mut w = lock(&s.want);
+            if std::mem::take(&mut w.changed) {
+                want.clone_from(&w.list);
+            }
+        }
+        let trash = std::mem::take(&mut *lock(&s.trash));
+        drop(trash);
+        let now = Instant::now();
+        let wanted = |id: u32| want.iter().any(|(w, _)| *w == id);
+        for o in &mut open {
+            if wanted(o.id) {
+                o.idle_since = None;
+            } else if o.idle_since.is_none() {
+                o.idle_since = Some(now);
+                s.publish(o.id, Feed::Gone);
+            }
+        }
+        // Closed past the warm delay (dropping a `Camera` never waits).
+        open.retain(|o| o.idle_since.is_none_or(|t| now - t < CAMERA_WARM));
+        // A camera back in a scene is tried at once, its failure told again.
+        retry.retain(|(id, _, _)| wanted(*id));
+        told.retain(|id| wanted(*id));
+        let fail = |id: u32, why: String, retry: &mut Vec<Retry>, told: &mut Vec<u32>| {
+            let backoff = retry
+                .iter()
+                .find(|r| r.0 == id)
+                .map_or(CAMERA_RETRY_FIRST, |r| (r.2 * 2).min(CAMERA_RETRY_MAX));
+            retry.retain(|r| r.0 != id);
+            retry.push((id, now + backoff, backoff));
+            log!("webcam {id}: {why}; retrying in {backoff:?}");
+            if !told.contains(&id) {
+                told.push(id);
+                on_event(Event::Notice(format!(
+                    "Webcam hidden: {why}. Vesper keeps trying."
+                )));
+            }
+            s.publish(id, Feed::Gone);
+        };
+        for (id, name) in &want {
+            let due = retry.iter().all(|r| r.0 != *id || r.1 <= now);
+            if !due || open.iter().any(|o| o.id == *id) {
+                continue;
+            }
+            match open_camera(name) {
+                Ok(cam) => {
+                    log!("webcam {id}: opening {name:?}");
+                    open.push(OpenCamera {
+                        id: *id,
+                        cam,
+                        idle_since: None,
+                        cpu_told: false,
+                        live: false,
+                        streaming_since: None,
+                    });
+                }
+                Err(e) => fail(*id, e, &mut retry, &mut told),
+            }
+        }
+        let mut i = 0;
+        while i < open.len() {
+            let o = &mut open[i];
+            let frame = match o.cam.take() {
+                Ok(f) => f,
+                Err(e) => {
+                    let id = o.id;
+                    open.remove(i);
+                    fail(id, e, &mut retry, &mut told);
+                    continue;
+                }
+            };
+            i += 1;
+            let Some(frame) = frame else { continue };
+            o.live = true;
+            if o.idle_since.is_some() {
+                continue;
+            }
+            // A camera that dies after a picture or two keeps its backoff
+            // and its notice: forgotten only once it streams steadily.
+            let since = *o.streaming_since.get_or_insert(now);
+            if now - since >= CAMERA_STABLE {
+                if let Some(r) = retry.iter().position(|r| r.0 == o.id) {
+                    retry.remove(r);
+                }
+                if let Some(t) = told.iter().position(|t| *t == o.id) {
+                    told.remove(t);
+                    log!("webcam {}: streaming again", o.id);
+                }
+            }
+            if !o.cpu_told && o.cam.software_decode() {
+                o.cpu_told = true;
+                on_event(Event::Notice(
+                    "Webcam decoded on the CPU: the GPU could not decode it".into(),
+                ));
+            }
+            match frame {
+                CameraFrame::Gpu(f) => s.publish(o.id, Feed::Gpu(f)),
+                CameraFrame::Cpu(f) => {
+                    if let Some(staged) = stage_yuv(s, &f) {
+                        s.publish(o.id, Feed::Yuv(staged));
+                    }
+                }
+            }
+        }
+        // On while a camera streams: a missing one being retried is not.
+        let streaming = open.iter().any(|o| o.live);
+        if on != streaming {
+            on = streaming;
+            on_event(Event::Camera(on));
+        }
+        let w = lock(&s.want);
+        if w.changed || s.quit.load(Ordering::Acquire) || !lock(&s.trash).is_empty() {
+            continue;
+        }
+        let next_retry = want
+            .iter()
+            .filter_map(|(id, _)| retry.iter().find(|r| r.0 == *id).map(|r| r.1))
+            .min();
+        let warm = open
+            .iter()
+            .filter_map(|o| o.idle_since)
+            .map(|t| t + CAMERA_WARM)
+            .min();
+        let timeout = if open.iter().any(|o| o.idle_since.is_none()) {
+            Some(CAMERA_POLL)
+        } else {
+            // Idle: only a retry, a warm camera to close or the scene matter.
+            [next_retry, warm]
+                .into_iter()
+                .flatten()
+                .min()
+                .map(|t| t.saturating_duration_since(Instant::now()).max(CAMERA_POLL))
+        };
+        // A poisoned lock only ends the wait.
+        match timeout {
+            Some(t) => drop(s.wake.wait_timeout(w, t)),
+            None => drop(s.wake.wait(w)),
+        }
+    }
+    drop(open);
+    // Everything staged is freed here, not where `Cameras` is dropped.
+    let left = std::mem::take(&mut *lock(&s.mailbox));
+    drop(left);
+    let trash = std::mem::take(&mut *lock(&s.trash));
+    drop(trash);
+    if on {
+        on_event(Event::Camera(false));
+    }
+}
+
+/// Stages a YUV picture for the current compositor; `None` without one (or
+/// while it is busy: the next picture comes soon).
+fn stage_yuv(s: &CameraShared, f: &CpuFrame) -> Option<StagedYuv> {
+    let overlays = lock(&s.overlays).clone()?;
+    let uploader = {
+        let comp = overlays.comp.try_lock().ok()?;
+        comp.as_ref()?.uploader()
+    };
+    let planes: Vec<(usize, usize)> = f.planes.iter().map(|p| (p.offset, p.stride)).collect();
+    let picture = YuvPicture {
+        width: f.width,
+        height: f.height,
+        layout: match f.layout {
+            CpuLayout::Nv12 => YuvLayout::Nv12,
+            CpuLayout::Yuy2 => YuvLayout::Yuy2,
+        },
+        planes: &planes,
+        data: &f.data,
+        matrix: match f.matrix {
+            Matrix::Bt601 => YuvMatrix::Bt601,
+            Matrix::Bt709 => YuvMatrix::Bt709,
+            Matrix::Bt2020 => YuvMatrix::Bt2020,
+        },
+        full_range: f.range == Range::Full,
+    };
+    let staged = uploader.prepare_yuv(&picture);
+    drop(uploader);
+    match staged {
+        // Staged for a compositor retired meanwhile: freed here.
+        Ok(_)
+            if !lock(&s.overlays)
+                .as_ref()
+                .is_some_and(|o| Arc::ptr_eq(o, &overlays)) =>
+        {
+            None
+        }
+        Ok(staged) => Some(staged),
+        Err(e) => {
+            log!("webcam picture dropped: {e}");
+            None
+        }
+    }
+}
+
+/// Fake cameras for the pipeline tests: `fake:` node names.
+#[cfg(test)]
+pub mod fake {
+    use super::*;
+
+    #[derive(Default)]
+    pub struct FakeCamera {
+        /// What the next `take` returns; an error ends the stream.
+        next: Mutex<Option<Result<CameraFrame, String>>>,
+        /// Opens fail with this.
+        pub refuse: Mutex<Option<String>>,
+        pub opens: AtomicUsize,
+        /// Open and not dropped.
+        pub open_now: AtomicUsize,
+    }
+
+    impl FakeCamera {
+        /// A new picture; an unread older one goes back.
+        pub fn send(&self, frame: CameraFrame) {
+            let old = lock(&self.next).replace(Ok(frame));
+            drop(old);
+        }
+
+        /// Ends the stream, as an unplugged camera does.
+        pub fn end(&self, why: &str) {
+            let old = lock(&self.next).replace(Err(why.into()));
+            drop(old);
+        }
+    }
+
+    static CAMERAS: Mutex<Vec<(String, Arc<FakeCamera>)>> = Mutex::new(Vec::new());
+
+    /// A fake camera named `fake:<name>`.
+    pub fn add(name: &str) -> Arc<FakeCamera> {
+        let cam = Arc::new(FakeCamera::default());
+        lock(&CAMERAS).push((format!("fake:{name}"), cam.clone()));
+        cam
+    }
+
+    struct Handle(Arc<FakeCamera>);
+
+    impl Drop for Handle {
+        fn drop(&mut self) {
+            self.0.open_now.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    impl CameraSource for Handle {
+        fn take(&self) -> Result<Option<CameraFrame>, String> {
+            lock(&self.0.next).take().transpose()
+        }
+
+        fn software_decode(&self) -> bool {
+            false
+        }
+    }
+
+    pub(super) fn open(name: &str) -> Option<Result<Box<dyn CameraSource>, String>> {
+        let cam = lock(&CAMERAS)
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, c)| c.clone())?;
+        cam.opens.fetch_add(1, Ordering::SeqCst);
+        if let Some(why) = lock(&cam.refuse).clone() {
+            return Some(Err(why));
+        }
+        cam.open_now.fetch_add(1, Ordering::SeqCst);
+        Some(Ok(Box::new(Handle(cam))))
+    }
+}
+
 fn load(key: &Key) -> Result<Raster, String> {
     match key {
         Key::Image(path) => image(path),
@@ -406,6 +883,91 @@ pub fn text(style: &TextStyle) -> Result<Raster, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn picture() -> CameraFrame {
+        CameraFrame::Cpu(CpuFrame {
+            width: 2,
+            height: 2,
+            layout: CpuLayout::Yuy2,
+            planes: vec![vesper_capture::camera::CpuPlane {
+                offset: 0,
+                stride: 4,
+            }],
+            data: vec![128; 8],
+            matrix: Matrix::Bt601,
+            range: Range::Limited,
+            pts: Duration::ZERO,
+        })
+    }
+
+    /// A camera that dies after each picture is retried with a growing
+    /// backoff, with one notice: not every second with a notice each.
+    #[test]
+    fn a_camera_dying_after_each_picture_backs_off_with_one_notice() {
+        let cam = fake::add("flaky");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let on_event: OnEvent = Arc::new(move |e| {
+            let _ = tx.send(format!("{e:?}"));
+        });
+        let cams = Cameras::start(on_event).unwrap();
+        cams.want(vec![(0, "fake:flaky".into())]);
+        let (start, mut served) = (Instant::now(), 0);
+        while start.elapsed() < Duration::from_millis(3500) {
+            let opens = cam.opens.load(Ordering::SeqCst);
+            if opens > served && cam.open_now.load(Ordering::SeqCst) == 1 {
+                served = opens;
+                cam.send(picture());
+                std::thread::sleep(Duration::from_millis(100));
+                cam.end("dies");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        drop(cams);
+        let events: Vec<String> = rx.try_iter().collect();
+        let notices = events
+            .iter()
+            .filter(|e| e.contains("Webcam hidden"))
+            .count();
+        assert_eq!(notices, 1, "{events:?}");
+        // Opened at 0 s, retried after 1 s then 2 s (then 4 s).
+        assert_eq!(cam.opens.load(Ordering::SeqCst), 3, "{events:?}");
+    }
+
+    /// A camera stays open (light on) for [`CAMERA_WARM`] after its scene
+    /// is left, then closes; dropping [`Cameras`] closes at once.
+    #[test]
+    fn cameras_stay_warm_after_their_scene_then_close() {
+        let cam = fake::add("warm");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let on_event: OnEvent = Arc::new(move |e| {
+            if let Event::Camera(on) = e {
+                let _ = tx.send(on);
+            }
+        });
+        let wait = Duration::from_secs(2);
+        let cams = Cameras::start(on_event).unwrap();
+        cams.want(vec![(0, "fake:warm".into())]);
+        cam.send(picture());
+        assert_eq!(rx.recv_timeout(wait), Ok(true));
+        assert_eq!(cam.open_now.load(Ordering::SeqCst), 1);
+        cams.want(Vec::new());
+        std::thread::sleep(CAMERA_WARM / 2);
+        assert_eq!(cam.open_now.load(Ordering::SeqCst), 1, "kept warm");
+        assert!(
+            matches!(cams.take()[..], [(0, Feed::Gone)]),
+            "hidden at once"
+        );
+        assert_eq!(rx.recv_timeout(wait), Ok(false));
+        assert_eq!(cam.open_now.load(Ordering::SeqCst), 0);
+        // Back in a scene, then the pipeline ends.
+        cams.want(vec![(0, "fake:warm".into())]);
+        cam.send(picture());
+        assert_eq!(rx.recv_timeout(wait), Ok(true));
+        drop(cams);
+        assert_eq!(rx.try_recv(), Ok(false));
+        assert_eq!(cam.open_now.load(Ordering::SeqCst), 0);
+        assert_eq!(cam.opens.load(Ordering::SeqCst), 2);
+    }
 
     fn temp(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("vesper-overlay-{}", std::process::id()));

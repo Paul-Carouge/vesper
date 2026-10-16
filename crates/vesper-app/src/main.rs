@@ -950,6 +950,7 @@ fn on_recorder_event(ui: &AppWindow, generation: u64, event: Event) {
             flash_notice(ui, &format!("{name}: reconnecting…"));
         }
         Event::AudioMissing(text) | Event::Notice(text) => flash_notice(ui, &text),
+        Event::Camera(on) => log!("webcam {}", if on { "on" } else { "off" }),
         Event::AudioTrack(name, TrackState::Running) => {
             flash_notice(ui, &format!("{name}: audio is back"));
         }

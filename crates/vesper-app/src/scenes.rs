@@ -146,12 +146,9 @@ impl Scene {
         }
     }
 
-    /// Layers that draw something: visible, not transparent. Webcams are
-    /// left out until the compositor takes their frames.
+    /// Layers that draw something: visible, not transparent.
     pub fn drawn(&self) -> impl Iterator<Item = &Layer> {
-        self.layers.iter().filter(|l| {
-            l.visible && l.opacity > 0.0 && !matches!(l.source, LayerSource::Camera { .. })
-        })
+        self.layers.iter().filter(|l| l.visible && l.opacity > 0.0)
     }
 
     /// Shows the main capture exactly as a recording without scenes does:
@@ -647,7 +644,7 @@ mod tests {
     fn passthrough_needs_one_plain_main_layer() {
         let mut scene = Scene::main();
         assert!(scene.is_passthrough() && scene.shows_main());
-        // Hidden, transparent and webcam layers draw nothing (yet).
+        // Hidden and transparent layers draw nothing.
         let hidden = Layer {
             source: LayerSource::Image {
                 path: "/a.png".into(),
@@ -660,11 +657,13 @@ mod tests {
             opacity: 0.0,
             ..hidden.clone()
         });
-        scene.layers.push(Layer {
+        assert!(scene.is_passthrough());
+        let mut webcam = scene.clone();
+        webcam.layers.push(Layer {
             source: LayerSource::Camera { node: "c".into() },
             ..Layer::main()
         });
-        assert!(scene.is_passthrough());
+        assert!(!webcam.is_passthrough() && webcam.shows_main());
         scene.layers.push(Layer {
             visible: true,
             ..hidden

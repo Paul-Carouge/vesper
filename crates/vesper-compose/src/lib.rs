@@ -12,6 +12,12 @@
 //! never waits longer than it chooses for a GPU busy with a game.
 //! Textures are prepared (mips, staging copy) by an [`Uploader`] on any
 //! thread; [`Compositor::set_staged`] only queues the GPU copy.
+//!
+//! Cameras are inputs of their own ([`Source::Camera`]): the latest
+//! picture of each, an RGB DMA-BUF ([`Compositor::set_camera_frame`]) or
+//! YUV bytes staged by an [`Uploader`] ([`Compositor::set_camera_yuv`]), is
+//! copied (and converted to RGB) into a compositor-owned image by the next
+//! composition, then released: redraws never pin a camera's buffers.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -26,6 +32,8 @@ use vesper_core::{DmaBufPlane, ReleaseGuard, VideoFrame};
 
 /// Layers drawn per frame, the main capture included.
 pub const MAX_LAYERS: usize = 16;
+/// Cameras one compositor takes.
+pub const MAX_CAMERAS: usize = 4;
 /// Size of the [`Compositor::preview`] image.
 pub const PREVIEW_WIDTH: u32 = 480;
 pub const PREVIEW_HEIGHT: u32 = 270;
@@ -41,6 +49,10 @@ const FLAG_NO_ALPHA: u32 = 1;
 const FLAG_SWAP_RB: u32 = 2;
 const FLAG_EXACT: u32 = 4;
 const SPIRV: &[u8] = include_bytes!("../shaders/compose.spv");
+const CAMERA_SPIRV: &[u8] = include_bytes!("../shaders/camera.spv");
+const MODE_RGB: u32 = 0;
+const MODE_NV12: u32 = 1;
+const MODE_YUY2: u32 = 2;
 
 const fn fourcc(c: &[u8; 4]) -> u32 {
     u32::from_le_bytes(*c)
@@ -70,6 +82,126 @@ pub enum Source {
     Main,
     /// A texture set with [`Compositor::set_texture`].
     Texture(u32),
+    /// The latest picture of a camera set with
+    /// [`Compositor::set_camera_frame`] or [`Compositor::set_camera_yuv`].
+    Camera(u32),
+}
+
+/// Layout of a YUV camera picture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum YuvLayout {
+    /// A Y plane, then interleaved UV at half width and height.
+    Nv12,
+    /// One plane, `Y0 U Y1 V` per two pixels.
+    Yuy2,
+}
+
+/// The YUV to RGB matrix of a camera picture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum YuvMatrix {
+    Bt601,
+    Bt709,
+    Bt2020,
+}
+
+/// A YUV camera picture in system memory, for [`Uploader::prepare_yuv`].
+#[derive(Debug, Clone, Copy)]
+pub struct YuvPicture<'a> {
+    pub width: u32,
+    pub height: u32,
+    pub layout: YuvLayout,
+    /// `(offset, stride)` in `data` of each plane: one for YUY2, two for NV12.
+    pub planes: &'a [(usize, usize)],
+    pub data: &'a [u8],
+    pub matrix: YuvMatrix,
+    /// 0-255 (JPEG) rather than 16-235.
+    pub full_range: bool,
+}
+
+/// The rows of `f` (byte ranges of `data`) in tightly packed order: Y rows
+/// (`width` bytes) then UV rows for NV12, `Y0 U Y1 V` rows for YUY2. Errs
+/// when a plane does not fit in `data`.
+fn yuv_rows(f: &YuvPicture<'_>) -> Result<Vec<std::ops::Range<usize>>> {
+    let (w, h) = (f.width as usize, f.height as usize);
+    if w == 0 || h == 0 || w > 16384 || h > 16384 {
+        return Err(Error(format!("bad camera picture size {w}x{h}")));
+    }
+    let pairs = w.div_ceil(2);
+    // (bytes per row, rows) of each plane.
+    let planes = match f.layout {
+        YuvLayout::Nv12 => vec![(w, h), (pairs * 2, h.div_ceil(2))],
+        YuvLayout::Yuy2 => vec![(pairs * 4, h)],
+    };
+    if f.planes.len() != planes.len() {
+        return Err(Error(format!(
+            "{:?} has {} plane(s), the picture {}",
+            f.layout,
+            planes.len(),
+            f.planes.len()
+        )));
+    }
+    let mut rows = Vec::new();
+    for (&(offset, stride), (bytes, n)) in f.planes.iter().zip(planes) {
+        if stride < bytes {
+            return Err(Error(format!("stride {stride} under {bytes} bytes")));
+        }
+        for r in 0..n {
+            let range = r
+                .checked_mul(stride)
+                .and_then(|o| o.checked_add(offset))
+                .and_then(|s| Some(s..s.checked_add(bytes)?))
+                .filter(|r| r.end <= f.data.len())
+                .ok_or_else(|| Error("camera plane out of its buffer".into()))?;
+            rows.push(range);
+        }
+    }
+    Ok(rows)
+}
+
+/// The camera pass's parameters (std140).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct CameraParams {
+    /// Mode, unused, chroma offset (NV12), chroma (NV12) or row (YUY2) stride.
+    head: [u32; 4],
+    /// Luma offset and scale, unused, chroma scale.
+    range: [f32; 4],
+    /// R from Cr, G from Cb, G from Cr, B from Cb.
+    coef: [f32; 4],
+}
+
+fn yuv_params(
+    layout: YuvLayout,
+    matrix: YuvMatrix,
+    full_range: bool,
+    w: u32,
+    h: u32,
+) -> CameraParams {
+    let (kr, kb) = match matrix {
+        YuvMatrix::Bt601 => (0.299, 0.114),
+        YuvMatrix::Bt709 => (0.2126, 0.0722),
+        YuvMatrix::Bt2020 => (0.2627, 0.0593),
+    };
+    let kg = 1.0 - kr - kb;
+    let pairs = w.div_ceil(2);
+    let (mode, chroma, stride) = match layout {
+        YuvLayout::Nv12 => (MODE_NV12, w * h, pairs * 2),
+        YuvLayout::Yuy2 => (MODE_YUY2, 0, pairs * 4),
+    };
+    CameraParams {
+        head: [mode, 0, chroma, stride],
+        range: if full_range {
+            [0.0, 1.0 / 255.0, 0.0, 1.0 / 255.0]
+        } else {
+            [16.0, 1.0 / 219.0, 0.0, 1.0 / 224.0]
+        },
+        coef: [
+            2.0 * (1.0 - kr),
+            2.0 * kb * (1.0 - kb) / kg,
+            2.0 * kr * (1.0 - kr) / kg,
+            2.0 * (1.0 - kb),
+        ],
+    }
 }
 
 /// How the cropped source fills its rect.
@@ -388,6 +520,98 @@ impl Uploader {
             regions,
         })
     }
+
+    /// Stages a YUV camera picture for [`Compositor::set_camera_yuv`]: its
+    /// rows packed into a GPU-readable buffer (one copy, about 0.3 ms per
+    /// 1080p NV12 picture). The conversion to RGB runs on the GPU.
+    pub fn prepare_yuv(&self, f: &YuvPicture<'_>) -> Result<StagedYuv> {
+        let rows = yuv_rows(f)?;
+        let total: usize = rows.iter().map(ExactSizeIterator::len).sum();
+        // shortcut: one allocation per picture (30 per second); recycle the
+        // buffers if this ever shows up in profiles.
+        // The shader reads whole 32-bit words.
+        let buffer = unsafe {
+            self.gpu.buffer(
+                total.next_multiple_of(4) as u64,
+                vk::BufferUsageFlags::STORAGE_BUFFER,
+                false,
+            )?
+        };
+        let mut offset = 0;
+        for r in rows {
+            let row = &f.data[r];
+            unsafe {
+                std::ptr::copy_nonoverlapping(row.as_ptr(), buffer.ptr.add(offset), row.len())
+            };
+            offset += row.len();
+        }
+        Ok(StagedYuv {
+            gpu: self.gpu.clone(),
+            buffer,
+            width: f.width,
+            height: f.height,
+            params: yuv_params(f.layout, f.matrix, f.full_range, f.width, f.height),
+        })
+    }
+}
+
+/// A camera's YUV picture in a GPU-readable buffer, ready for
+/// [`Compositor::set_camera_yuv`].
+pub struct StagedYuv {
+    gpu: Arc<Gpu>,
+    buffer: Buffer,
+    width: u32,
+    height: u32,
+    params: CameraParams,
+}
+
+// The mapping is only written by `Uploader::prepare_yuv`.
+unsafe impl Send for StagedYuv {}
+
+impl StagedYuv {
+    /// Staged for `c` (else [`Compositor::set_camera_yuv`] refuses it).
+    pub fn is_for(&self, c: &Compositor) -> bool {
+        Arc::ptr_eq(&self.gpu, &c.gpu)
+    }
+}
+
+impl Drop for StagedYuv {
+    fn drop(&mut self) {
+        unsafe { self.buffer.destroy(&self.gpu.device) };
+    }
+}
+
+/// A camera picture waiting for the next composition, then for the GPU to
+/// be done with it.
+enum Input {
+    Frame(VideoFrame),
+    Yuv(StagedYuv),
+}
+
+/// A camera: the copy of its latest picture, and its imported DMA-BUFs.
+#[derive(Default)]
+struct Camera {
+    image: Option<Texture>,
+    /// A copy was queued into `image`.
+    valid: bool,
+    imports: Imports,
+    pending: Option<Input>,
+}
+
+/// The copy of one camera picture, as `record` queues it.
+struct CameraPass {
+    /// The imported DMA-BUF, acquired from its producer for the pass.
+    import: Option<vk::Image>,
+    image: vk::Image,
+    width: u32,
+    height: u32,
+}
+
+/// Imported DMA-BUFs of one producer pool.
+#[derive(Default)]
+struct Imports {
+    generation: Option<u32>,
+    list: Vec<Import>,
 }
 
 /// A copy of the last main frame kept on request (see
@@ -405,6 +629,8 @@ struct InFlight {
     slot: usize,
     /// Released when the GPU is done with it.
     main: Option<VideoFrame>,
+    /// Camera pictures copied by it, released with `main`.
+    inputs: Vec<Input>,
     preview: bool,
     since: Instant,
 }
@@ -477,7 +703,8 @@ pub struct Compositor {
     semaphore_fd: ash::khr::external_semaphore_fd::Device,
     /// Waited by a compose: takes the main frame's pending writes (its
     /// implicit fence), which Vulkan on RADV does not wait for by itself.
-    acquire: vk::Semaphore,
+    /// Index 0 for the main frame, 1 + k for camera pass k.
+    acquire: [vk::Semaphore; 1 + MAX_CAMERAS],
     memory: vk::PhysicalDeviceMemoryProperties,
     physical: vk::PhysicalDevice,
     /// DRM modifiers the device supports per import format.
@@ -509,8 +736,20 @@ pub struct Compositor {
     params: [Buffer; 3],
     dummy: Texture,
     textures: HashMap<u32, Texture>,
-    imports: Vec<Import>,
-    import_generation: Option<u32>,
+    /// The main frame's.
+    imports: Imports,
+    /// Camera copy passes: one descriptor set and parameter buffer per
+    /// camera copied in a composition.
+    camera_set_layout: vk::DescriptorSetLayout,
+    camera_pipeline_layout: vk::PipelineLayout,
+    camera_pipeline: vk::Pipeline,
+    camera_sets: [vk::DescriptorSet; MAX_CAMERAS],
+    camera_params: [Buffer; MAX_CAMERAS],
+    /// Bound as the YUV buffer of RGB copies.
+    dummy_storage: Buffer,
+    cameras: HashMap<u32, Camera>,
+    /// Cameras whose picture could not be used, and why.
+    camera_failures: Vec<(u32, String)>,
     ring: Vec<Slot>,
     generation: u32,
     preview: Option<Preview>,
@@ -563,7 +802,7 @@ impl Compositor {
                 height,
                 memory_fd: ash::khr::external_memory_fd::Device::new(&instance, &device),
                 semaphore_fd: ash::khr::external_semaphore_fd::Device::new(&instance, &device),
-                acquire: vk::Semaphore::null(),
+                acquire: [vk::Semaphore::null(); 1 + MAX_CAMERAS],
                 memory,
                 physical,
                 modifiers: HashMap::new(),
@@ -595,8 +834,15 @@ impl Compositor {
                     height: 1,
                 },
                 textures: HashMap::new(),
-                imports: Vec::new(),
-                import_generation: None,
+                imports: Imports::default(),
+                camera_set_layout: vk::DescriptorSetLayout::null(),
+                camera_pipeline_layout: vk::PipelineLayout::null(),
+                camera_pipeline: vk::Pipeline::null(),
+                camera_sets: [vk::DescriptorSet::null(); MAX_CAMERAS],
+                camera_params: [const { Buffer::NULL }; MAX_CAMERAS],
+                dummy_storage: Buffer::NULL,
+                cameras: HashMap::new(),
+                camera_failures: Vec::new(),
                 ring: Vec::new(),
                 // Unique in the process, so an encoder never reuses an import
                 // from another pool.
@@ -629,9 +875,11 @@ impl Compositor {
                 )
                 .map_err(err("allocate command buffer"))?;
             (self.cmd, self.upload_cmd) = (cmds[0], cmds[1]);
-            self.acquire = d
-                .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
-                .map_err(err("create semaphore"))?;
+            for sem in &mut self.acquire {
+                *sem = d
+                    .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
+                    .map_err(err("create semaphore"))?;
+            }
             self.fence = d
                 .create_fence(&vk::FenceCreateInfo::default(), None)
                 .map_err(err("create fence"))?;
@@ -690,42 +938,66 @@ impl Compositor {
                     None,
                 )
                 .map_err(err("create pipeline layout"))?;
-            let code = ash::util::read_spv(&mut std::io::Cursor::new(SPIRV))
-                .map_err(|e| Error(format!("read SPIR-V: {e}")))?;
-            let module = d
-                .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&code), None)
-                .map_err(err("create shader module"))?;
-            let stage = vk::PipelineShaderStageCreateInfo::default()
-                .stage(vk::ShaderStageFlags::COMPUTE)
-                .module(module)
-                .name(c"main");
-            let pipeline = d.create_compute_pipelines(
-                vk::PipelineCache::null(),
-                &[vk::ComputePipelineCreateInfo::default()
-                    .stage(stage)
-                    .layout(self.pipeline_layout)],
-                None,
-            );
-            d.destroy_shader_module(module, None);
-            self.pipeline = pipeline.map_err(|(_, e)| err("create pipeline")(e))?[0];
+            self.pipeline = self.compute_pipeline(SPIRV, self.pipeline_layout)?;
+            let camera_bindings = [
+                vk::DescriptorSetLayoutBinding::default()
+                    .binding(0)
+                    .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                    .descriptor_count(1)
+                    .stage_flags(vk::ShaderStageFlags::COMPUTE),
+                vk::DescriptorSetLayoutBinding::default()
+                    .binding(1)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .descriptor_count(1)
+                    .stage_flags(vk::ShaderStageFlags::COMPUTE),
+                vk::DescriptorSetLayoutBinding::default()
+                    .binding(2)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .descriptor_count(1)
+                    .stage_flags(vk::ShaderStageFlags::COMPUTE),
+                vk::DescriptorSetLayoutBinding::default()
+                    .binding(3)
+                    .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                    .descriptor_count(1)
+                    .stage_flags(vk::ShaderStageFlags::COMPUTE),
+            ];
+            self.camera_set_layout = d
+                .create_descriptor_set_layout(
+                    &vk::DescriptorSetLayoutCreateInfo::default().bindings(&camera_bindings),
+                    None,
+                )
+                .map_err(err("create descriptor set layout"))?;
+            self.camera_pipeline_layout = d
+                .create_pipeline_layout(
+                    &vk::PipelineLayoutCreateInfo::default().set_layouts(&[self.camera_set_layout]),
+                    None,
+                )
+                .map_err(err("create pipeline layout"))?;
+            self.camera_pipeline =
+                self.compute_pipeline(CAMERA_SPIRV, self.camera_pipeline_layout)?;
+            let cams = MAX_CAMERAS as u32;
             let sizes = [
                 vk::DescriptorPoolSize {
                     ty: vk::DescriptorType::UNIFORM_BUFFER,
-                    descriptor_count: 3,
+                    descriptor_count: 3 + cams,
                 },
                 vk::DescriptorPoolSize {
                     ty: vk::DescriptorType::STORAGE_IMAGE,
-                    descriptor_count: 3,
+                    descriptor_count: 3 + cams,
                 },
                 vk::DescriptorPoolSize {
                     ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-                    descriptor_count: 3 * MAX_LAYERS as u32,
+                    descriptor_count: 3 * MAX_LAYERS as u32 + cams,
+                },
+                vk::DescriptorPoolSize {
+                    ty: vk::DescriptorType::STORAGE_BUFFER,
+                    descriptor_count: cams,
                 },
             ];
             self.descriptor_pool = d
                 .create_descriptor_pool(
                     &vk::DescriptorPoolCreateInfo::default()
-                        .max_sets(3)
+                        .max_sets(3 + cams)
                         .pool_sizes(&sizes),
                     None,
                 )
@@ -756,6 +1028,34 @@ impl Compositor {
                     &[],
                 );
             }
+            let sets = self
+                .device
+                .allocate_descriptor_sets(
+                    &vk::DescriptorSetAllocateInfo::default()
+                        .descriptor_pool(self.descriptor_pool)
+                        .set_layouts(&[self.camera_set_layout; MAX_CAMERAS]),
+                )
+                .map_err(err("allocate descriptor sets"))?;
+            self.camera_sets.copy_from_slice(&sets);
+            for i in 0..MAX_CAMERAS {
+                self.camera_params[i] = self.buffer(
+                    size_of::<CameraParams>() as u64,
+                    vk::BufferUsageFlags::UNIFORM_BUFFER,
+                    false,
+                )?;
+                let info = [vk::DescriptorBufferInfo::default()
+                    .buffer(self.camera_params[i].buffer)
+                    .range(vk::WHOLE_SIZE)];
+                self.device.update_descriptor_sets(
+                    &[vk::WriteDescriptorSet::default()
+                        .dst_set(self.camera_sets[i])
+                        .dst_binding(0)
+                        .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                        .buffer_info(&info)],
+                    &[],
+                );
+            }
+            self.dummy_storage = self.buffer(4, vk::BufferUsageFlags::STORAGE_BUFFER, false)?;
             let staged = self.uploader().prepare(1, 1, &[0; 4])?;
             self.dummy = self.upload(staged)?;
             self.wait_upload()?;
@@ -824,6 +1124,52 @@ impl Compositor {
             self.graveyard.push(old.image);
         }
         self.collect_garbage();
+    }
+
+    /// Camera `id`'s latest picture, an RGB DMA-BUF (`XR24`, `AR24`, `XB24`,
+    /// `AB24`) the producer finished writing: the next composition copies
+    /// it into the compositor's own image, then releases it. A newer picture
+    /// set before then replaces (releases) this one. Fails past
+    /// [`MAX_CAMERAS`] cameras. A picture that cannot be imported hides the
+    /// camera ([`Compositor::take_camera_failures`]), the composition goes on.
+    pub fn set_camera_frame(&mut self, id: u32, frame: VideoFrame) -> Result<()> {
+        self.set_camera(id, Input::Frame(frame))
+    }
+
+    /// Camera `id`'s latest picture, YUV staged by [`Uploader::prepare_yuv`];
+    /// as [`Compositor::set_camera_frame`].
+    pub fn set_camera_yuv(&mut self, id: u32, staged: StagedYuv) -> Result<()> {
+        if !Arc::ptr_eq(&staged.gpu, &self.gpu) {
+            return Err(Error("staged for another compositor".into()));
+        }
+        self.set_camera(id, Input::Yuv(staged))
+    }
+
+    fn set_camera(&mut self, id: u32, input: Input) -> Result<()> {
+        self.check_alive()?;
+        if !self.cameras.contains_key(&id) && self.cameras.len() >= MAX_CAMERAS {
+            return Err(Error(format!("more than {MAX_CAMERAS} cameras")));
+        }
+        // An older picture not copied yet goes back now.
+        self.cameras.entry(id).or_default().pending = Some(input);
+        Ok(())
+    }
+
+    /// Forgets camera `id`: its draws are skipped until it has a picture
+    /// again, its images are freed once no queued work reads them.
+    pub fn remove_camera(&mut self, id: u32) {
+        if let Some(c) = self.cameras.remove(&id) {
+            self.graveyard.extend(c.image.map(|t| t.image));
+            self.graveyard
+                .extend(c.imports.list.into_iter().map(|i| i.image));
+        }
+        self.collect_garbage();
+    }
+
+    /// Cameras hidden since the last call because their picture could not
+    /// be used, with the reason.
+    pub fn take_camera_failures(&mut self) -> Vec<(u32, String)> {
+        std::mem::take(&mut self.camera_failures)
     }
 
     /// Waits for the last texture copy (at most the GPU timeout) and frees
@@ -975,6 +1321,35 @@ impl Compositor {
             }
             _ => false,
         };
+        // Camera pictures new since the last composition: copied first.
+        let mut passes = Vec::new();
+        let mut inputs = Vec::new();
+        let mut copied = Vec::new();
+        let ids: Vec<u32> = self
+            .cameras
+            .iter()
+            .filter(|(_, c)| c.pending.is_some())
+            .map(|(id, _)| *id)
+            .collect();
+        for id in ids {
+            let Some(input) = self.cameras.get_mut(&id).and_then(|c| c.pending.take()) else {
+                continue;
+            };
+            match unsafe { self.camera_pass(id, &input, passes.len()) } {
+                Ok(pass) => {
+                    passes.push(pass);
+                    inputs.push(input);
+                    copied.push(id);
+                }
+                Err(e) => {
+                    tracing::warn!("compositor: camera {id} hidden: {e}");
+                    self.camera_failures.push((id, e.to_string()));
+                    // Its picture goes back with it.
+                    drop(input);
+                    self.remove_camera(id);
+                }
+            }
+        }
 
         let mut params = Params {
             head: [0, 1, 0, 0],
@@ -987,7 +1362,7 @@ impl Compositor {
                 Source::Main => match (main_import, &main, &self.base) {
                     (Some(i), Some(f), _) => {
                         let flags = import_format(f.fourcc).map_or(0, |(_, fl)| fl);
-                        (self.imports[i].image.view, f.width, f.height, flags)
+                        (self.imports.list[i].image.view, f.width, f.height, flags)
                     }
                     (None, _, Some(b)) if b.valid => {
                         (b.image.view, b.width, b.height, FLAG_NO_ALPHA)
@@ -997,6 +1372,14 @@ impl Compositor {
                 Source::Texture(id) => match self.textures.get(&id) {
                     Some(t) => (t.image.view, t.width, t.height, 0),
                     None => continue,
+                },
+                Source::Camera(id) => match self
+                    .cameras
+                    .get(&id)
+                    .filter(|c| c.valid || copied.contains(&id))
+                {
+                    Some(Camera { image: Some(t), .. }) => (t.image.view, t.width, t.height, 0),
+                    _ => continue,
                 },
             };
             if let Some(mut l) = place(d, w, h, self.width, self.height) {
@@ -1066,7 +1449,7 @@ impl Compositor {
                 bp.layers[0] = l;
                 (self.params[2].ptr as *mut Params).write(bp);
                 let mut bv = [self.dummy.image.view; MAX_LAYERS];
-                bv[0] = self.imports[i].image.view;
+                bv[0] = self.imports.list[i].image.view;
                 self.bind(
                     2,
                     b.image.view,
@@ -1074,10 +1457,24 @@ impl Compositor {
                     vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
                 );
             }
-            let wait = match &main {
-                Some(f) => self.import_implicit_fence(f),
-                None => false,
-            };
+            // The producers' pending writes (their implicit fences): the
+            // main frame's, and the camera pictures' (a VA-VPP picture may
+            // still be drawn when handed over).
+            let mut wait = Vec::new();
+            if let Some(f) = &main
+                && self.import_implicit_fence(f, self.acquire[0])
+            {
+                wait.push(self.acquire[0]);
+            }
+            let frames = inputs.iter().enumerate().filter_map(|(k, i)| match i {
+                Input::Frame(f) => Some((k, f)),
+                Input::Yuv(_) => None,
+            });
+            for (k, f) in frames {
+                if self.import_implicit_fence(f, self.acquire[1 + k]) {
+                    wait.push(self.acquire[1 + k]);
+                }
+            }
             let base = base_pass
                 .then(|| {
                     self.base
@@ -1085,15 +1482,21 @@ impl Compositor {
                         .map(|b| (b.image.image, b.width, b.height))
                 })
                 .flatten();
-            self.record(slot, main_import, want_preview, base)?;
-            self.submit_compose(wait)?;
+            self.record(slot, main_import, want_preview, base, &passes)?;
+            self.submit_compose(&wait)?;
         }
         if base_pass && let Some(b) = &mut self.base {
             b.valid = true;
         }
+        for id in &copied {
+            if let Some(c) = self.cameras.get_mut(id) {
+                c.valid = true;
+            }
+        }
         self.in_flight = Some(InFlight {
             slot,
             main,
+            inputs,
             preview: want_preview,
             since: Instant::now(),
         });
@@ -1129,6 +1532,7 @@ impl Compositor {
         // The GPU has read it: hand the producer its buffer back now.
         let pts = done.main.as_ref().map_or(Duration::ZERO, |f| f.pts);
         drop(done.main);
+        drop(done.inputs);
         self.collect_garbage();
 
         if let Some((pool, period)) = self.queries {
@@ -1221,10 +1625,10 @@ impl Compositor {
 
     /// Frees every imported main frame (once no queued work reads them).
     pub fn drop_imports(&mut self) {
-        for i in self.imports.drain(..) {
+        for i in self.imports.list.drain(..) {
             self.graveyard.push(i.image);
         }
-        self.import_generation = None;
+        self.imports.generation = None;
         self.collect_garbage();
     }
 
@@ -1285,6 +1689,7 @@ impl Compositor {
         main: Option<usize>,
         preview: bool,
         base: Option<(vk::Image, u32, u32)>,
+        cameras: &[CameraPass],
     ) -> Result<()> {
         let d = &self.device;
         let cmd = self.cmd;
@@ -1334,7 +1739,7 @@ impl Compositor {
             // family keeps compression metadata (DCC) valid.
             if let Some(i) = main {
                 acquire.push(barrier(
-                    self.imports[i].image.image,
+                    self.imports.list[i].image.image,
                     vk::ImageLayout::GENERAL,
                     vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
                     vk::AccessFlags::empty(),
@@ -1356,6 +1761,30 @@ impl Compositor {
                     ignored,
                 ));
             }
+            // Camera copies: their whole image is rewritten (earlier passes
+            // sampling it are earlier on this queue).
+            for c in cameras {
+                if let Some(import) = c.import {
+                    acquire.push(barrier(
+                        import,
+                        vk::ImageLayout::GENERAL,
+                        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                        vk::AccessFlags::empty(),
+                        vk::AccessFlags::SHADER_READ,
+                        foreign,
+                        self.family,
+                    ));
+                }
+                acquire.push(barrier(
+                    c.image,
+                    vk::ImageLayout::UNDEFINED,
+                    vk::ImageLayout::GENERAL,
+                    vk::AccessFlags::empty(),
+                    vk::AccessFlags::SHADER_WRITE,
+                    ignored,
+                    ignored,
+                ));
+            }
             // Source stage = the semaphore's wait stage: the layout
             // transitions run after the implicit fence.
             d.cmd_pipeline_barrier(
@@ -1367,6 +1796,43 @@ impl Compositor {
                 &[],
                 &acquire,
             );
+            if !cameras.is_empty() {
+                d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.camera_pipeline);
+                for (k, c) in cameras.iter().enumerate() {
+                    d.cmd_bind_descriptor_sets(
+                        cmd,
+                        vk::PipelineBindPoint::COMPUTE,
+                        self.camera_pipeline_layout,
+                        0,
+                        &[self.camera_sets[k]],
+                        &[],
+                    );
+                    d.cmd_dispatch(cmd, c.width.div_ceil(16), c.height.div_ceil(16), 1);
+                }
+                let written: Vec<_> = cameras
+                    .iter()
+                    .map(|c| {
+                        barrier(
+                            c.image,
+                            vk::ImageLayout::GENERAL,
+                            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                            vk::AccessFlags::SHADER_WRITE,
+                            vk::AccessFlags::SHADER_READ,
+                            ignored,
+                            ignored,
+                        )
+                    })
+                    .collect();
+                d.cmd_pipeline_barrier(
+                    cmd,
+                    stage,
+                    stage,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &written,
+                );
+            }
             d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.pipeline);
             d.cmd_bind_descriptor_sets(
                 cmd,
@@ -1516,9 +1982,13 @@ impl Compositor {
                 self.family,
                 foreign,
             )];
-            if let Some(i) = main {
+            let imports = main
+                .map(|i| self.imports.list[i].image.image)
+                .into_iter()
+                .chain(cameras.iter().filter_map(|c| c.import));
+            for image in imports {
                 release.push(barrier(
-                    self.imports[i].image.image,
+                    image,
                     vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
                     vk::ImageLayout::GENERAL,
                     vk::AccessFlags::SHADER_READ,
@@ -1540,10 +2010,10 @@ impl Compositor {
         }
     }
 
-    /// Puts the pending writes to `frame`'s DMA-BUF into `acquire`. False
+    /// Puts the pending writes to `frame`'s DMA-BUF into `sem`. False
     /// when there is nothing to wait for or the kernel cannot tell
     /// (before Linux 6.0): then the producer must be done already.
-    unsafe fn import_implicit_fence(&self, frame: &VideoFrame) -> bool {
+    unsafe fn import_implicit_fence(&self, frame: &VideoFrame, sem: vk::Semaphore) -> bool {
         // struct dma_buf_export_sync_file, DMA_BUF_IOCTL_EXPORT_SYNC_FILE.
         #[repr(C)]
         struct ExportSyncFile {
@@ -1561,14 +2031,14 @@ impl Compositor {
             static WARNED: AtomicBool = AtomicBool::new(false);
             if !WARNED.swap(true, Ordering::Relaxed) {
                 tracing::warn!(
-                    "compositor: no implicit fence from the main frame: {}",
+                    "compositor: no implicit fence from an imported frame: {}",
                     std::io::Error::last_os_error()
                 );
             }
             return false;
         }
         let info = vk::ImportSemaphoreFdInfoKHR::default()
-            .semaphore(self.acquire)
+            .semaphore(sem)
             .flags(vk::SemaphoreImportFlags::TEMPORARY)
             .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD)
             .fd(arg.fd);
@@ -1583,13 +2053,12 @@ impl Compositor {
         }
     }
 
-    unsafe fn submit_compose(&mut self, wait_acquire: bool) -> Result<()> {
+    unsafe fn submit_compose(&mut self, wait: &[vk::Semaphore]) -> Result<()> {
         let cmds = [self.cmd];
-        let sems = [self.acquire];
-        let stages = [vk::PipelineStageFlags::COMPUTE_SHADER];
+        let stages = vec![vk::PipelineStageFlags::COMPUTE_SHADER; wait.len()];
         let mut submit = vk::SubmitInfo::default().command_buffers(&cmds);
-        if wait_acquire {
-            submit = submit.wait_semaphores(&sems).wait_dst_stage_mask(&stages);
+        if !wait.is_empty() {
+            submit = submit.wait_semaphores(wait).wait_dst_stage_mask(&stages);
         }
         unsafe { self.device.queue_submit(self.queue, &[submit], self.fence) }
             .map_err(err("submit"))
@@ -1597,14 +2066,25 @@ impl Compositor {
 
     /// Index in `imports` of `frame`'s image, importing it on first sight.
     unsafe fn import(&mut self, frame: &VideoFrame) -> Result<usize> {
-        if self.import_generation != Some(frame.pool_generation) {
-            // A new producer pool: the old buffers are gone (freed once no
-            // queued work reads them). The kept copy is of the old source.
-            self.drop_imports();
+        if self.imports.generation != Some(frame.pool_generation) {
+            // A new producer pool: the kept copy is of the old source.
             if let Some(old) = self.base.take() {
                 self.graveyard.push(old.image);
             }
-            self.import_generation = Some(frame.pool_generation);
+        }
+        let mut cache = std::mem::take(&mut self.imports);
+        let r = unsafe { self.import_into(&mut cache, frame) };
+        self.imports = cache;
+        r
+    }
+
+    /// Index in `cache` of `frame`'s image, importing it on first sight.
+    unsafe fn import_into(&mut self, cache: &mut Imports, frame: &VideoFrame) -> Result<usize> {
+        if cache.generation != Some(frame.pool_generation) {
+            // A new producer pool: the old buffers are gone (freed once no
+            // queued work reads them).
+            self.graveyard.extend(cache.list.drain(..).map(|i| i.image));
+            cache.generation = Some(frame.pool_generation);
         }
         let first = frame
             .planes
@@ -1619,25 +2099,139 @@ impl Compositor {
             first.stride,
             inode(&first.fd)?,
         );
-        if let Some(i) = self
-            .imports
+        if let Some(i) = cache
+            .list
             .iter()
             .position(|i| i.buffer_id == frame.buffer_id)
         {
-            if self.imports[i].key == key {
+            if cache.list[i].key == key {
                 return Ok(i);
             }
-            let old = self.imports.swap_remove(i);
+            let old = cache.list.swap_remove(i);
             unsafe { old.image.destroy(&self.device) };
         }
         unsafe { self.check_importable(frame)? };
         let image = unsafe { self.import_dmabuf(frame)? };
-        self.imports.push(Import {
+        cache.list.push(Import {
             buffer_id: frame.buffer_id,
             key,
             image,
         });
-        Ok(self.imports.len() - 1)
+        Ok(cache.list.len() - 1)
+    }
+
+    /// Prepares the copy of camera `id`'s `input` into its image, with
+    /// descriptor set `index`.
+    unsafe fn camera_pass(&mut self, id: u32, input: &Input, index: usize) -> Result<CameraPass> {
+        let (import, view, buffer, params, width, height) = match input {
+            Input::Frame(f) => {
+                let cam = self.cameras.get_mut(&id).expect("listed");
+                let mut cache = std::mem::take(&mut cam.imports);
+                let r = unsafe { self.import_into(&mut cache, f) };
+                let cam = self.cameras.get_mut(&id).expect("listed");
+                cam.imports = cache;
+                let image = &cam.imports.list[r?].image;
+                let params = CameraParams {
+                    head: [MODE_RGB, 0, 0, 0],
+                    ..CameraParams::default()
+                };
+                let buffer = self.dummy_storage.buffer;
+                (
+                    Some(image.image),
+                    image.view,
+                    buffer,
+                    params,
+                    f.width,
+                    f.height,
+                )
+            }
+            Input::Yuv(s) => {
+                let view = self.dummy.image.view;
+                (None, view, s.buffer.buffer, s.params, s.width, s.height)
+            }
+        };
+        unsafe { self.ensure_camera_image(id, width, height)? };
+        let cam = self.cameras.get_mut(&id).expect("listed");
+        let target = cam.image.as_ref().expect("made above");
+        let (image, target_view) = (target.image.image, target.image.view);
+        unsafe {
+            (self.camera_params[index].ptr as *mut CameraParams).write(params);
+            let buffers = [vk::DescriptorBufferInfo::default()
+                .buffer(buffer)
+                .range(vk::WHOLE_SIZE)];
+            let source = [vk::DescriptorImageInfo::default()
+                .sampler(self.sampler)
+                .image_view(view)
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+            let out = [vk::DescriptorImageInfo::default()
+                .image_view(target_view)
+                .image_layout(vk::ImageLayout::GENERAL)];
+            let set = self.camera_sets[index];
+            self.device.update_descriptor_sets(
+                &[
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(set)
+                        .dst_binding(1)
+                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                        .buffer_info(&buffers),
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(set)
+                        .dst_binding(2)
+                        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                        .image_info(&source),
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(set)
+                        .dst_binding(3)
+                        .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                        .image_info(&out),
+                ],
+                &[],
+            );
+        }
+        Ok(CameraPass {
+            import,
+            image,
+            width,
+            height,
+        })
+    }
+
+    /// Camera `id`'s image, `width` x `height`.
+    unsafe fn ensure_camera_image(&mut self, id: u32, width: u32, height: u32) -> Result<()> {
+        let cam = self.cameras.get_mut(&id).expect("listed");
+        if cam
+            .image
+            .as_ref()
+            .is_some_and(|t| (t.width, t.height) == (width, height))
+        {
+            return Ok(());
+        }
+        if let Some(old) = cam.image.take() {
+            cam.valid = false;
+            self.graveyard.push(old.image);
+        }
+        let ci = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(vk::Format::R8G8B8A8_UNORM)
+            .extent(vk::Extent3D {
+                width,
+                height,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+        let image = unsafe { self.image(&ci, false)? };
+        self.cameras.get_mut(&id).expect("listed").image = Some(Texture {
+            image,
+            width,
+            height,
+        });
+        Ok(())
     }
 
     /// Rejects what the driver cannot import, before it reads the frame's
@@ -1849,6 +2443,34 @@ impl Compositor {
 
     fn memory_type(&self, bits: u32, flags: vk::MemoryPropertyFlags) -> Option<u32> {
         memory_type(&self.memory, bits, flags)
+    }
+
+    unsafe fn compute_pipeline(
+        &self,
+        spirv: &[u8],
+        layout: vk::PipelineLayout,
+    ) -> Result<vk::Pipeline> {
+        let d = &self.device;
+        let code = ash::util::read_spv(&mut std::io::Cursor::new(spirv))
+            .map_err(|e| Error(format!("read SPIR-V: {e}")))?;
+        unsafe {
+            let module = d
+                .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&code), None)
+                .map_err(err("create shader module"))?;
+            let stage = vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::COMPUTE)
+                .module(module)
+                .name(c"main");
+            let pipeline = d.create_compute_pipelines(
+                vk::PipelineCache::null(),
+                &[vk::ComputePipelineCreateInfo::default()
+                    .stage(stage)
+                    .layout(layout)],
+                None,
+            );
+            d.destroy_shader_module(module, None);
+            Ok(pipeline.map_err(|(_, e)| err("create pipeline")(e))?[0])
+        }
     }
 
     unsafe fn view(
@@ -2212,27 +2834,43 @@ impl Drop for Compositor {
             for s in &self.ring {
                 s.image.destroy(d);
             }
-            for i in &self.imports {
+            for i in &self.imports.list {
                 i.image.destroy(d);
             }
+            for c in self.cameras.values() {
+                if let Some(t) = &c.image {
+                    t.image.destroy(d);
+                }
+                for i in &c.imports.list {
+                    i.image.destroy(d);
+                }
+            }
+            // Pictures still pending go back to their producers.
+            self.cameras.clear();
             for t in self.textures.values() {
                 t.image.destroy(d);
             }
             self.dummy.image.destroy(d);
-            for b in &self.params {
+            for b in self.params.iter().chain(&self.camera_params) {
                 b.destroy(d);
             }
+            self.dummy_storage.destroy(d);
             d.destroy_descriptor_pool(self.descriptor_pool, None);
             d.destroy_pipeline(self.pipeline, None);
             d.destroy_pipeline_layout(self.pipeline_layout, None);
             d.destroy_descriptor_set_layout(self.set_layout, None);
+            d.destroy_pipeline(self.camera_pipeline, None);
+            d.destroy_pipeline_layout(self.camera_pipeline_layout, None);
+            d.destroy_descriptor_set_layout(self.camera_set_layout, None);
             d.destroy_sampler(self.sampler, None);
             if let Some((pool, _)) = self.queries {
                 d.destroy_query_pool(pool, None);
             }
             d.destroy_fence(self.fence, None);
             d.destroy_fence(self.upload_fence, None);
-            d.destroy_semaphore(self.acquire, None);
+            for sem in self.acquire {
+                d.destroy_semaphore(sem, None);
+            }
             d.destroy_command_pool(self.pool, None);
             // `gpu` (dropped after this) destroys the device and instance.
         }
@@ -2544,5 +3182,35 @@ mod tests {
         assert_eq!(OUTPUT_FOURCC, 0x3432_5258);
         assert!(import_format(fourcc(b"XR24")).is_some());
         assert!(import_format(fourcc(b"NV12")).is_none());
+    }
+
+    #[test]
+    fn yuv_rows_pack_tightly_and_stay_in_the_buffer() {
+        let data = [0u8; 100];
+        let pic = |layout, w, h, planes: &'static [(usize, usize)]| YuvPicture {
+            width: w,
+            height: h,
+            layout,
+            planes,
+            data: &data,
+            matrix: YuvMatrix::Bt601,
+            full_range: false,
+        };
+        // 3 x 3 NV12: Y rows of 3, UV rows of 4 (2 pairs), 2 of them.
+        let rows = yuv_rows(&pic(YuvLayout::Nv12, 3, 3, &[(1, 5), (40, 6)])).unwrap();
+        assert_eq!(rows, [1..4, 6..9, 11..14, 40..44, 46..50]);
+        // 3 x 2 YUY2: rows of 8 bytes.
+        let rows = yuv_rows(&pic(YuvLayout::Yuy2, 3, 2, &[(0, 10)])).unwrap();
+        assert_eq!(rows, [0..8, 10..18]);
+        for bad in [
+            pic(YuvLayout::Yuy2, 3, 2, &[(0, 7)]),
+            pic(YuvLayout::Yuy2, 3, 2, &[(90, 8)]),
+            pic(YuvLayout::Yuy2, 3, 2, &[(usize::MAX - 4, 8)]),
+            pic(YuvLayout::Yuy2, 3, 2, &[(0, 8), (0, 8)]),
+            pic(YuvLayout::Nv12, 3, 3, &[(0, 3)]),
+            pic(YuvLayout::Yuy2, 0, 2, &[(0, 8)]),
+        ] {
+            assert!(yuv_rows(&bad).is_err(), "{bad:?}");
+        }
     }
 }

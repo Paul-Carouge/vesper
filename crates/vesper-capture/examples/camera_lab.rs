@@ -1,8 +1,9 @@
 //! Camera checks for the robustness lab (`scripts/robustness/c1_camera.sh`),
 //! never for a real session: the lab's PipeWire has no real device.
 //!
-//! - `camera_lab fake mjpeg <file.jpg>` / `camera_lab fake yuy2`: a fake
-//!   camera node (`lab_camera`) sending that picture at 30 fps.
+//! - `camera_lab fake mjpeg <file.jpg> [WxH]` / `camera_lab fake yuy2`: a
+//!   fake camera node (`lab_camera`) sending that picture at 30 fps (MJPEG
+//!   announced as 1280x720 unless told).
 //! - `camera_lab list`: the cameras found.
 //! - `camera_lab open <node.name> <seconds>`: streams it, prints what came.
 
@@ -30,15 +31,11 @@ fn main() -> vesper_capture::Result<()> {
             Ok(())
         }
         ["open", node, secs] => open(node, secs.parse()?),
-        ["fake", "mjpeg", file] => fake(
-            Mode {
-                encoding: Encoding::Mjpeg,
-                width: 1280,
-                height: 720,
-                fps: (30, 1),
-            },
-            std::fs::read(file)?,
-        ),
+        ["fake", "mjpeg", file] => fake(mjpeg(1280, 720), std::fs::read(file)?),
+        ["fake", "mjpeg", file, size] => {
+            let (w, h) = size.split_once('x').ok_or("size: WxH")?;
+            fake(mjpeg(w.parse()?, h.parse()?), std::fs::read(file)?)
+        }
         ["fake", "yuy2"] => {
             let (w, h) = (640usize, 480usize);
             // BT.601 limited (Y 81, U 90, V 240): pure red.
@@ -53,9 +50,10 @@ fn main() -> vesper_capture::Result<()> {
                 picture,
             )
         }
-        _ => {
-            Err("usage: camera_lab list | open <node> <secs> | fake mjpeg <jpg> | fake yuy2".into())
-        }
+        _ => Err(
+            "usage: camera_lab list | open <node> <secs> | fake mjpeg <jpg> [WxH] | fake yuy2"
+                .into(),
+        ),
     }
 }
 
@@ -91,6 +89,15 @@ fn open(node: &str, secs: u64) -> vesper_capture::Result<()> {
     drop(cam);
     println!("closed in {:?}", closing.elapsed());
     Ok(())
+}
+
+fn mjpeg(width: u32, height: u32) -> Mode {
+    Mode {
+        encoding: Encoding::Mjpeg,
+        width,
+        height,
+        fps: (30, 1),
+    }
 }
 
 fn describe(frame: &CameraFrame) {

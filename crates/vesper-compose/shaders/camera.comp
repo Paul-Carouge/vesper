@@ -1,0 +1,80 @@
+// Copies a camera picture into the compositor's own RGBA image, so the
+// camera's buffer goes back at once and later compositions redraw from the
+// copy. Regenerate camera.spv with scripts/shaders.sh after editing.
+//
+// MODE_RGB: a 1:1 fetch of the imported RGB DMA-BUF (alpha dropped).
+// MODE_NV12 / MODE_YUY2: YUV bytes, tightly packed in a buffer, converted
+// with the camera's matrix and range (chroma interpolated bilinearly).
+// Colours stay in their (sRGB-like) transfer encoding: Y'CbCr -> R'G'B',
+// as the camera meant them.
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set = 0, binding = 0, std140) uniform Params {
+    uvec4 head;  // x: MODE_*, z: chroma offset (NV12, bytes), w: chroma row stride (NV12) or row stride (YUY2)
+    vec4 range;  // x: luma offset, y: luma scale, w: chroma scale (around 128)
+    vec4 coef;   // R from Cr, G from Cb, G from Cr, B from Cb
+};
+layout(set = 0, binding = 1, std430) readonly buffer Yuv {
+    uint data[];
+};
+layout(set = 0, binding = 2) uniform sampler2D rgb;
+layout(set = 0, binding = 3, rgba8) uniform writeonly image2D out_image;
+
+const uint MODE_RGB = 0u;
+const uint MODE_NV12 = 1u;
+const uint MODE_YUY2 = 2u;
+
+float byte_at(uint i) {
+    return float((data[i >> 2] >> ((i & 3u) * 8u)) & 0xffu);
+}
+
+// Cb, Cr of chroma sample (cx, cy).
+vec2 chroma_at(uint cx, uint cy) {
+    uint i = head.x == MODE_NV12 ? head.z + cy * head.w + cx * 2u : cy * head.w + cx * 4u + 1u;
+    return vec2(byte_at(i), byte_at(i + 2u - (head.x == MODE_NV12 ? 1u : 0u)));
+}
+
+// Chroma at chroma-plane position c (texel units), bilinear, edges clamped.
+vec2 chroma(vec2 c, uvec2 size) {
+    c = clamp(c, vec2(0.0), vec2(size - 1u));
+    uvec2 a = uvec2(floor(c));
+    uvec2 b = min(a + 1u, size - 1u);
+    vec2 f = c - vec2(a);
+    return mix(mix(chroma_at(a.x, a.y), chroma_at(b.x, a.y), f.x),
+               mix(chroma_at(a.x, b.y), chroma_at(b.x, b.y), f.x), f.y);
+}
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(out_image);
+    if (any(greaterThanEqual(p, size))) {
+        return;
+    }
+    vec3 c;
+    if (head.x == MODE_RGB) {
+        c = texelFetch(rgb, p, 0).rgb;
+    } else {
+        uint x = uint(p.x);
+        uint y = uint(p.y);
+        uvec2 csize = uvec2((uint(size.x) + 1u) / 2u, uint(size.y));
+        float l;
+        vec2 uv;
+        // Chroma sited with the even column (MPEG-2, V4L2), and between
+        // the two rows it covers for 4:2:0.
+        if (head.x == MODE_NV12) {
+            csize.y = (csize.y + 1u) / 2u;
+            l = byte_at(y * uint(size.x) + x);
+            uv = chroma(vec2(float(x) * 0.5, float(y) * 0.5 - 0.25), csize);
+        } else {
+            l = byte_at(y * head.w + (x / 2u) * 4u + (x & 1u) * 2u);
+            uv = chroma(vec2(float(x) * 0.5, float(y)), csize);
+        }
+        float yy = (l - range.x) * range.y;
+        float cb = (uv.x - 128.0) * range.w;
+        float cr = (uv.y - 128.0) * range.w;
+        c = clamp(vec3(yy + coef.x * cr, yy - coef.y * cb - coef.z * cr, yy + coef.w * cb), 0.0, 1.0);
+    }
+    imageStore(out_image, p, vec4(c, 1.0));
+}
