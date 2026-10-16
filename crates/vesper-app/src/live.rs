@@ -46,6 +46,8 @@ fn show_store(ui: &AppWindow, store: Option<Store>) {
 /// nothing is unlocked for that. A late answer for another service is
 /// dropped.
 pub fn show_key_state(ui: &AppWindow) {
+    // "Saved" was about the key and service shown before.
+    show_save(ui, "", false);
     let Some(id) = secret::key_id(&settings(ui)) else {
         show_store(ui, None);
         return;
@@ -76,20 +78,31 @@ fn store_key(ui: &AppWindow, key: StreamKey, done: &'static str) {
 /// Saves `key` for `id`, shown next to the key field; `done`: said too.
 fn save_key(ui: &AppWindow, id: String, key: StreamKey, done: Option<&'static str>) {
     show_save(ui, "Saving…", false);
+    let draft = (id.clone(), key.clone());
     off_ui(
         ui,
         move || secret::store(&id, &key),
-        move |ui, result| match result {
-            Ok(_) => {
-                show_save(ui, "Saved", false);
-                show_key_state(ui);
-                if let Some(done) = done {
-                    flash_notice(ui, done);
+        move |ui, result| {
+            // The note is about the service shown, not one switched away from.
+            let shown = secret::key_id(&settings(ui)).as_ref() == Some(&draft.0);
+            match result {
+                Ok(_) => {
+                    show_key_state(ui);
+                    if shown {
+                        show_save(ui, "Saved", false);
+                    }
+                    if let Some(done) = done {
+                        flash_notice(ui, done);
+                    }
                 }
-            }
-            Err(e) => {
-                show_save(ui, &e, true);
-                flash_notice(ui, &e);
+                Err(e) => {
+                    // Confirming the same key again tries again.
+                    DRAFT.with(|d| d.borrow_mut().failed(&draft));
+                    if shown {
+                        show_save(ui, &e, true);
+                    }
+                    flash_notice(ui, &e);
+                }
             }
         },
     );
@@ -115,6 +128,13 @@ impl Draft {
         self.pending = id
             .zip(StreamKey::new(text))
             .filter(|draft| self.sent.as_ref() != Some(draft));
+    }
+
+    /// The save of `draft` failed: it is not saved.
+    fn failed(&mut self, draft: &(String, StreamKey)) {
+        if self.sent.as_ref() == Some(draft) {
+            self.sent = None;
+        }
     }
 
     /// The draft to save now, if any.
@@ -406,6 +426,8 @@ pub fn wire(ui: &AppWindow, recording: &Shared, games: &Games) {
             return;
         };
         log!("live-key-removed");
+        // The same key pasted again is saved again.
+        DRAFT.with(|d| d.borrow_mut().sent = None);
         off_ui(
             &ui,
             move || secret::clear(&id),
@@ -577,6 +599,27 @@ mod tests {
         assert_eq!(d.take(), None);
         d.edited(None, "k");
         assert_eq!(d.take(), None);
+    }
+
+    /// A save that failed (locked, no answer) or a key removed: the same
+    /// key confirmed again is saved again, never taken as saved.
+    #[test]
+    fn the_same_key_is_saved_again_after_a_failure_or_a_removal() {
+        let mut d = Draft::default();
+        d.edited(Some("youtube".into()), "yt_key");
+        let sent = d.take().unwrap();
+        d.failed(&sent);
+        d.edited(Some("youtube".into()), "yt_key");
+        assert_eq!(d.take(), draft("youtube", "yt_key"));
+        // A failure of an older save does not forget a newer one.
+        d.edited(Some("youtube".into()), "yt_key2");
+        let newer = d.take().unwrap();
+        d.failed(&sent);
+        assert_eq!(d.sent, Some(newer));
+        // Removed: as on_live_key_removed does.
+        d.sent = None;
+        d.edited(Some("youtube".into()), "yt_key2");
+        assert_eq!(d.take(), draft("youtube", "yt_key2"));
     }
 
     /// Paste, then quit before the pause ends: the draft is still there for

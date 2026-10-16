@@ -283,8 +283,22 @@ async fn keyring_store(id: &str, key: &StreamKey) -> Result<()> {
     if !prompt(&conn, &p).await? {
         return Err("the keyring refused the key".into());
     }
-    keep_only(&conn, &service, &session, id, key).await
+    // Saved: an older copy left behind is said, not taken for a failed save.
+    keep_only(&conn, &service, &session, id, key)
+        .await
+        .map_err(|e| {
+            if e == NOT_KEPT {
+                e
+            } else {
+                log!("secret service: {e}");
+                STALE_LEFT.to_owned()
+            }
+        })
 }
+
+/// The error of a save whose key is in the keyring, next to an older copy
+/// that could not be removed.
+const STALE_LEFT: &str = "an older key could not be removed";
 
 /// The error of a keyring that answered a save but does not hold the key.
 const NOT_KEPT: &str = "the keyring did not keep the key";
@@ -630,6 +644,10 @@ pub fn store(id: &str, key: &StreamKey) -> std::result::Result<Store, String> {
             log!("secret service: {e}");
             Err("The keyring did not answer: key not saved".into())
         }
+        Err(e) if e == STALE_LEFT => {
+            file_clear(id);
+            Err("Stream key saved, but an older key could not be removed from the keyring".into())
+        }
         Err(e) if e == NOT_KEPT => {
             log!("secret service: {e}");
             Err("The keyring did not keep the key: not saved".into())
@@ -834,6 +852,20 @@ mod tests {
         let service = block_on(proxy(&conn, SERVICE, "org.freedesktop.Secret.Service")).unwrap();
         let (unlocked, locked) = block_on(items(&service, attributes(id))).unwrap();
         assert_eq!(unlocked.len() + locked.len(), 1);
+        clear(id);
+    }
+
+    /// With the fake started as `FAIL_GET=1`: the item is created but cannot
+    /// be read back, so the save says so instead of "not saved".
+    #[test]
+    #[ignore = "needs the fake Secret Service with FAIL_GET=1"]
+    fn keyring_saved_but_not_checked_says_so() {
+        let id = "test-fail-get";
+        assert_eq!(
+            store(id, &key("live_test_key_123")),
+            Err("Stream key saved, but an older key could not be removed from the keyring".into())
+        );
+        assert!(block_on(keyring_has(id)).unwrap());
         clear(id);
     }
 

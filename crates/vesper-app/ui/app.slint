@@ -1250,7 +1250,14 @@ export component AppWindow inherits Window {
         game-layer-switch.focus();
     }
 
+    // Saves a key typed in the settings before they close or change under
+    // it (the field keeps the focus when hidden).
+    public function commit-live-key() {
+        live-key-field.commit();
+    }
+
     public function open-scenes() {
+        live-key-field.commit();
         root.settings-open = false;
         root.profile-menu = false;
         SceneStore.open = true;

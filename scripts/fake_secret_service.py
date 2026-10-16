@@ -28,6 +28,8 @@ was started but hangs (for `a_hung_keyring_gives_up_quickly`).
 `NO_REPLACE=1` ignores `CreateItem`'s replace flag and adds an item each
 time, like keyrings that do not honour it (for
 `keyring_store_keeps_only_the_new_key`).
+`FAIL_GET=1` fails every `GetSecrets`, like a keyring that saved an item
+but cannot read it back (for `keyring_saved_but_not_checked_says_so`).
 """
 import os
 
@@ -156,6 +158,8 @@ class Service(dbus.service.Object):
 
     @dbus.service.method(SERVICE, in_signature="aoo", out_signature="a{o(oayays)}")
     def GetSecrets(self, items, session):
+        if os.environ.get("FAIL_GET") == "1":
+            raise dbus.exceptions.DBusException("failed", name="org.freedesktop.DBus.Error.Failed")
         out = {}
         for path in items:
             item = self.items.get(path)
