@@ -152,6 +152,7 @@ fn main() -> Result<(), slint::PlatformError> {
     let instance = match instance::claim(!background, move || {
         let _ = weak.upgrade_in_event_loop(|ui| {
             let _ = ui.show();
+            scene_ui::window_shown(&ui);
             ui.invoke_tray_state_changed();
             ui.invoke_meters_wake();
         });
@@ -591,11 +592,12 @@ fn spawn_tray(ui: &AppWindow) -> Option<Tray> {
         log!("tray: {command:?}");
         let _ = weak.upgrade_in_event_loop(move |ui| match command {
             tray::Command::ToggleWindow => {
-                let _ = if ui.window().is_visible() {
-                    ui.hide()
+                if ui.window().is_visible() {
+                    let _ = ui.hide();
                 } else {
-                    ui.show()
-                };
+                    let _ = ui.show();
+                    scene_ui::window_shown(&ui);
+                }
                 ui.invoke_tray_state_changed();
                 ui.invoke_meters_wake();
             }
