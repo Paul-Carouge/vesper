@@ -418,3 +418,151 @@ fn huge_textures_are_reduced_and_still_drawn() {
     let i = ((135 * w + 240) * 4) as usize;
     assert_eq!(px[i..i + 4], [10, 200, 30, 255]);
 }
+
+/// A kept copy of the main frame stands in for it, bit-exact, once the
+/// frame itself went back to its producer.
+#[test]
+fn the_kept_copy_redraws_main_after_its_release() {
+    if !gpu() {
+        return;
+    }
+    let (w, h) = (PREVIEW_WIDTH, PREVIEW_HEIGHT);
+    let producer = unsafe { Producer::new(w, h) };
+    let mut c = Compositor::new(w, h).unwrap();
+    let main_draw = [full(Source::Main, Fit::Contain, 1.0)];
+    let main = unsafe { producer.frame(0, 3, 0, Duration::ZERO) };
+    c.submit(Some(main), &main_draw, true).unwrap();
+    let first = loop {
+        if let Some(f) = c.poll(Duration::from_millis(5)).unwrap() {
+            break f;
+        }
+    };
+    drop(first);
+    assert!(c.has_base());
+    // No main: the copy, plus an overlay drawn over it.
+    c.set_texture(1, 8, 8, &solid(8, 8, [0, 0, 255, 255]))
+        .unwrap();
+    let mut draws = main_draw.to_vec();
+    draws.push(Draw {
+        rect: [0.0, 0.0, 0.25, 0.25],
+        ..full(Source::Texture(1), Fit::Stretch, 1.0)
+    });
+    let (_, px) = compose_read(&mut c, None, &draws);
+    for (x, y) in [(200u32, 200u32), (479, 269), (130, 10)] {
+        let i = ((y * w + x) * 4) as usize;
+        let [b, g, r] = pattern(w, h, 3, x, y);
+        assert_eq!(px[i..i + 4], [r, g, b, 255], "pixel ({x}, {y})");
+    }
+    assert_eq!(px[..4], [0, 0, 255, 255], "overlay");
+    c.drop_base();
+    assert!(!c.has_base());
+}
+
+/// `submit` returns at once; one composition at a time; `poll` hands the
+/// frame over and releases main by then.
+#[test]
+fn submit_does_not_wait_and_poll_releases_main() {
+    if !gpu() {
+        return;
+    }
+    let (w, h) = (640, 360);
+    let producer = unsafe { Producer::new(w, h) };
+    let mut c = Compositor::new(w, h).unwrap();
+    let released = Arc::new(AtomicUsize::new(0));
+    let mut main = unsafe { producer.frame(0, 0, 0, Duration::from_secs(7)) };
+    let r = released.clone();
+    main.release = ReleaseGuard::new(move || {
+        r.fetch_add(1, Ordering::SeqCst);
+    });
+    let draws = [full(Source::Main, Fit::Contain, 1.0)];
+    c.submit(Some(main), &draws, false).unwrap();
+    assert!(c.in_flight());
+    assert!(c.submit(None, &draws, false).is_err(), "one at a time");
+    let f = loop {
+        if let Some(f) = c.poll(Duration::ZERO).unwrap() {
+            break f;
+        }
+        std::thread::sleep(Duration::from_micros(200));
+    };
+    assert_eq!(released.load(Ordering::SeqCst), 1);
+    assert_eq!(f.pts, Duration::from_secs(7));
+    assert!(!c.in_flight());
+    assert!(c.poll(Duration::ZERO).is_err(), "nothing in flight");
+}
+
+/// Textures are staged on another thread and queued while a composition
+/// is in flight; the replaced one stays valid for it.
+#[test]
+fn textures_staged_elsewhere_are_set_without_waiting() {
+    if !gpu() {
+        return;
+    }
+    let (w, h) = (PREVIEW_WIDTH, PREVIEW_HEIGHT);
+    let mut c = Compositor::new(w, h).unwrap();
+    let up = c.uploader();
+    let staged = std::thread::spawn(move || up.prepare(4, 4, &solid(4, 4, [255, 0, 0, 255])))
+        .join()
+        .unwrap()
+        .unwrap();
+    c.set_staged(1, staged).unwrap();
+    let draws = [full(Source::Texture(1), Fit::Stretch, 1.0)];
+    c.submit(None, &draws, false).unwrap();
+    let green = c
+        .uploader()
+        .prepare(4, 4, &solid(4, 4, [0, 255, 0, 255]))
+        .unwrap();
+    c.set_staged(1, green).unwrap();
+    let f = loop {
+        if let Some(f) = c.poll(Duration::from_millis(5)).unwrap() {
+            break f;
+        }
+    };
+    drop(f);
+    let (_, px) = compose_read(&mut c, None, &draws);
+    assert_eq!(px[..4], [0, 255, 0, 255]);
+}
+
+/// A texture removed (or replaced) right after its copy was queued, with or
+/// without a composition in flight, is freed only once the copy is done:
+/// the GPU never writes freed memory (that would fault or lose the device).
+#[test]
+fn textures_removed_while_their_copy_runs_are_freed_after_it() {
+    if !gpu() {
+        return;
+    }
+    let (w, h) = (PREVIEW_WIDTH, PREVIEW_HEIGHT);
+    let mut c = Compositor::new(w, h).unwrap();
+    let big = solid(2048, 2048, [9, 9, 9, 255]);
+    let draws = [full(Source::Texture(2), Fit::Stretch, 1.0)];
+    c.set_texture(2, 4, 4, &solid(4, 4, [0, 0, 255, 255]))
+        .unwrap();
+    for round in 0..20 {
+        // A: queued, then removed at once.
+        let s = c.uploader().prepare(2048, 2048, &big).unwrap();
+        c.set_staged(1, s).unwrap();
+        c.remove_texture(1);
+        // Kept while its copy may still write it (checked in this order:
+        // nothing frees it between the two calls).
+        if !c.copies_done() {
+            assert!(c.garbage() > 0, "round {round}: freed during its copy");
+        }
+        // B: a composition in flight, a copy queued behind it, removed,
+        // then the composition polled out (which collects garbage).
+        c.submit(None, &draws, false).unwrap();
+        let s = c.uploader().prepare(2048, 2048, &big).unwrap();
+        c.set_staged(3, s).unwrap();
+        c.remove_texture(3);
+        let f = loop {
+            if let Some(f) = c.poll(Duration::from_millis(5)).unwrap() {
+                break f;
+            }
+        };
+        if !c.copies_done() {
+            assert!(c.garbage() > 0, "round {round}: freed during its copy");
+        }
+        drop(f);
+        assert!(!c.is_lost(), "round {round}");
+    }
+    let (_, px) = compose_read(&mut c, None, &draws);
+    assert_eq!(px[..4], [0, 0, 255, 255]);
+}
