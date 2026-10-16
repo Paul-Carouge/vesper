@@ -35,7 +35,7 @@ use std::time::{Duration, Instant};
 
 use protocol::{Msg, Plane};
 use tracing::{debug, info, warn};
-use vesper_core::{DmaBufPlane, ReleaseGuard, VideoFrame};
+use vesper_core::{DmaBufPlane, ReleaseGuard, VideoFrame, next_pool_generation};
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 pub type Result<T> = std::result::Result<T, Error>;
@@ -614,7 +614,7 @@ impl Server {
                         generation,
                         buffers: HashMap::new(),
                     });
-                    self.pool_generation = self.pool_generation.wrapping_add(1);
+                    self.pool_generation = next_pool_generation();
                     info!("capturing {} ({}): {width}x{height}", c.exe, c.pid);
                 }
                 let ring = c.ring.as_mut().expect("ring set above");

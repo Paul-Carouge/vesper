@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use common::{POOL, Producer};
-use vesper_core::{Codec, ReleaseGuard};
+use vesper_core::{Codec, ReleaseGuard, next_pool_generation};
 use vesper_encode::{Encoder, RateControl};
 
 #[test]
@@ -179,6 +179,36 @@ fn scales_frames_of_other_sizes_to_the_encoder_size() {
         row(native, 2) > 20.0 || col(native, 2) > 20.0,
         "no bars at native size"
     );
+}
+
+/// Two producers of one size (the game window, then the game's layer) both
+/// hand out buffer 0: each is imported, never the other's stale picture.
+#[test]
+fn another_producer_with_the_same_buffer_id_is_imported_anew() {
+    if !Path::new("/dev/dri/renderD128").exists() {
+        eprintln!("no GPU, skipping");
+        return;
+    }
+    let (w, h) = (640, 360);
+    let mut enc = Encoder::new(Codec::Hevc, w, h, 30, RateControl::ConstantQp(30)).unwrap();
+    let ms = |t: u64| Duration::from_millis(1_000 + t * 33);
+    let mut packets = Vec::new();
+    for (t, pattern) in [(0, 0), (1, 40)] {
+        let producer = unsafe { Producer::new(w, h) };
+        let frame = unsafe { producer.frame(0, pattern, next_pool_generation(), ms(t)) };
+        packets.extend(enc.encode(frame).unwrap());
+    }
+    packets.extend(enc.flush().unwrap());
+    let frames = unsafe { decode_luma(enc.extradata(), &packets) };
+    assert_eq!(frames.len(), 2);
+    let diff = frames[0]
+        .y
+        .iter()
+        .zip(&frames[1].y)
+        .map(|(a, b)| a.abs_diff(*b) as f64)
+        .sum::<f64>()
+        / frames[0].y.len() as f64;
+    assert!(diff > 10.0, "second producer's picture not encoded: {diff}");
 }
 
 /// A scaled encoder (a live stream) follows its source's pictures, repeats

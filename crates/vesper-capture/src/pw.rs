@@ -13,7 +13,7 @@ use pw::spa::sys as spa_sys;
 use pw::sys::pw_buffer;
 use pw::{core::CoreRc, main_loop::MainLoopRc, registry::RegistryRc, stream::StreamRc};
 use tracing::{error, info, warn};
-use vesper_core::{DmaBufPlane, ReleaseGuard, VideoFrame};
+use vesper_core::{DmaBufPlane, ReleaseGuard, VideoFrame, next_pool_generation};
 
 use crate::Error;
 use crate::format;
@@ -360,7 +360,7 @@ pub fn run<F>(
     let setup = (|| -> Result<_, Error> {
         let context = pw::context::ContextRc::new(&mainloop, None)?;
         let core = context.connect_fd_rc(fd, None)?;
-        let generation = Rc::new(Cell::new(0u32));
+        let generation = Rc::new(Cell::new(next_pool_generation()));
         // An AUTOCONNECT stream only pauses when its source node goes away
         // (sharing stopped, window closed): watch the node itself from now on.
         // Disconnecting moves the stream to Unconnected, which ends the capture.
@@ -379,7 +379,7 @@ pub fn run<F>(
                     removed.set(true);
                     // Releases still queued in this loop iteration must not
                     // requeue buffers that the disconnect frees.
-                    generation.set(generation.get().wrapping_add(1));
+                    generation.set(next_pool_generation());
                     if let Some(stream) = stream_slot.get()
                         && let Err(e) = stream.disconnect()
                     {
@@ -454,7 +454,7 @@ pub fn run<F>(
             })
             .remove_buffer(|_, state, _| {
                 // The pool is being replaced: frames still out must not requeue.
-                state.generation.set(state.generation.get().wrapping_add(1));
+                state.generation.set(next_pool_generation());
                 state.next_buffer_id = 0;
             })
             .process(|stream, state| {
