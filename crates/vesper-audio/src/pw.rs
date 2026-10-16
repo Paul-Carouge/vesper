@@ -284,7 +284,8 @@ pub fn run(
         let _ = timer.update_timer(Some(wait), None);
         let waiting = Instant::now();
         // A device is retried as soon as it is back, not up to 2 s later.
-        let back = match (&source, on_return) {
+        // The first step gains nothing: a return waits it out anyway.
+        let back = match (&source, on_return && wait > BACKOFF_FIRST) {
             (Source::Input(node) | Source::Output(node), true) => Returns::watch(&mainloop, node)
                 .inspect_err(|e| debug!("{source:?}: cannot watch for its return: {e}"))
                 .ok(),
@@ -304,9 +305,8 @@ pub fn run(
     }
 }
 
-/// Leaves the loop when a node targeted as `target` (its `node.name` or
-/// `object.serial`) is added to the graph after the watch began. Dropping
-/// it stops watching.
+/// Leaves the loop when a node named `target` (`node.name`) is added to the
+/// graph after the watch began. Dropping it stops watching.
 ///
 /// Fields drop in declaration order: listeners before their proxies.
 struct Returns {
@@ -335,8 +335,7 @@ impl Returns {
                     let Some(props) = global.props else { return };
                     if synced.get()
                         && global.type_ == ObjectType::Node
-                        && (props.get(*pw::keys::NODE_NAME) == Some(target.as_str())
-                            || props.get(*pw::keys::OBJECT_SERIAL) == Some(target.as_str()))
+                        && props.get(*pw::keys::NODE_NAME) == Some(target.as_str())
                     {
                         debug!("{target}: back in the graph");
                         mainloop.quit();
