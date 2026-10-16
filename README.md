@@ -34,9 +34,15 @@ Escape hatches: a built-in blocklist keeps compositors, browsers, Electron apps,
 
 Risks and limits: anti-cheats (VAC, EAC, BattlEye) may flag or reject unknown Vulkan layers, so use the escape hatches for those games. HDR output is not captured. The 32-bit layer exists only if it was built (see *Install*).
 
+### Without the layer: the game window
+
+When game mode needs a source and no game is captured by the layer or `vesper-gl` (the layer is off, a native OpenGL game without `vesper-gl`, a game it cannot capture), Vesper captures the game's window through the ScreenCast portal, windows only. The source card says how the game is captured: *Game (Vulkan)*, *Game (OpenGL)* (from the capture library loaded in the game), or *Game window*. The portal only asks when something needs it: a recording or a stream you start (after 2 s, so a layer game starting with it connects first), or the replay buffer while a Steam game has been running for 10 s (never while no game runs). KDE's picker shows once per game: its restore token is kept per game in `~/.config/vesper/window-tokens` (mode 0600), keyed by the game's Steam id (`SteamAppId`, else `SteamGameId` for a non-Steam shortcut, read from the environment of the user's processes: no game is connected to tell its name, the portal names no app, and unlike a process name it never mixes two Proton games); games outside Steam share one token. A token the portal refuses is replaced once the picker asks again; a D-Bus failure keeps it. A game waiting for *Allow* holds the picker back (its prompt shows instead). A cancelled picker, or a window that closes, is not asked again for that game until another game runs or you start a recording or a stream: never a picker in a loop.
+
+A layer game always wins: when one is captured, the window capture stops (a picker still open is closed with its portal session); when it disconnects while its process still runs for 2 s more, its window takes over 2 s later, without stopping the recording: the last picture repeats meanwhile, and a size change is scaled to the file's size on the GPU, as for a resized game. Its process is watched until its window is captured: if it exits first, the recording stops and its window is not asked for (a picker already open is closed). A game that quits stops the recording as before, and so does the captured window closing. The window goes through the compositor, so the layer (or `vesper-gl`) stays the better choice: no compositor in between, the game's own frame rate.
+
 ### Native OpenGL games
 
-OpenGL has no layer mechanism, so for the best performance in OpenGL games (Terraria and many FNA/SDL/GLFW indie games, emulators), add `vesper-gl` to the game's launch options in Steam (Properties > General); otherwise Vesper captures the game window:
+OpenGL has no layer mechanism, so for the best performance in OpenGL games (Terraria and many FNA/SDL/GLFW indie games, emulators), add `vesper-gl` to the game's launch options in Steam (Properties > General); otherwise Vesper captures the game window (see above):
 
 ```
 vesper-gl %command%
@@ -98,7 +104,7 @@ Settings are kept in `~/.config/vesper/settings`.
 
 The icons (`crates/vesper-app/data/icons/`) come from `scripts/icons.py`: edit it and run `python3 scripts/icons.py` (needs `rsvg-convert`) to regenerate the SVGs and PNGs. Preview: `docs/screenshots/icons.png`.
 
-Failure-injection lab (disk full, game crash, portal or PipeWire gone...): `scripts/robustness/go <name> <scenario>.sh` runs a scenario against a debug build in a private user/mount/pid namespace with its own D-Bus, PipeWire (no real device) and headless gamescope; see `scripts/robustness/run.sh`.
+Failure-injection lab (disk full, game crash, portal or PipeWire gone...): `scripts/robustness/go <name> <scenario>.sh` runs a scenario against a debug build in a private user/mount/pid namespace with its own D-Bus, PipeWire (no real device) and headless gamescope; see `scripts/robustness/run.sh`. The real session's sockets (`/run/user`) are hidden and the bus starts with the lab's `HOME` and XDG directories, so the services it activates (portal, kwalletd, permission store) never reach the real compositor, wallet or files. `w1_window_fallback.sh`: a Steam game without the layer and a recording ask the (absent) portal for its window once, never in a loop.
 
 ## VST3 plugins
 

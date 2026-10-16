@@ -134,7 +134,6 @@ pub fn wire(ui: &AppWindow, recording: &Shared, games: &Games) {
 
     let weak = ui.as_weak();
     let rec = recording.clone();
-    let g = games.clone();
     ui.on_toggle_live(move || {
         let Some(ui) = weak.upgrade() else { return };
         if ui.get_live_state() != LiveState::Off {
@@ -155,15 +154,6 @@ pub fn wire(ui: &AppWindow, recording: &Shared, games: &Games) {
         };
         if let Err(e) = check.url() {
             flash_notice(&ui, &e);
-            return;
-        }
-        if ui.get_source_kind() == crate::SourceKind::Game
-            && !g
-                .borrow()
-                .as_ref()
-                .is_some_and(crate::game::GameSource::has_game)
-        {
-            flash_notice(&ui, "No game to stream yet");
             return;
         }
         log!("go-live: {settings:?}");

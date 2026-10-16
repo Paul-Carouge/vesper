@@ -97,6 +97,10 @@ struct GameRoute {
     slot: Mutex<Option<(Arc<Mailbox>, u32)>>,
     /// Weak: the capture's frame callback holds this route.
     capture: OnceLock<Weak<GameCapture>>,
+    /// The game's window (portal) feeds the route: no layer game needed.
+    window: AtomicBool,
+    /// The game window's picker is open: a recording waits for it.
+    picking: AtomicBool,
     /// Tests: the game is gone, without a capture server.
     #[cfg(test)]
     gone: AtomicBool,
@@ -109,8 +113,8 @@ impl GameFrames {
         capture.set_active(self.fps());
     }
 
-    /// Recording rate of the attached pipeline.
-    fn fps(&self) -> Option<u32> {
+    /// Recording rate of the attached pipeline, `None` while none is.
+    pub fn fps(&self) -> Option<u32> {
         lock(&self.0.slot).as_ref().map(|(_, fps)| *fps)
     }
 
@@ -128,12 +132,30 @@ impl GameFrames {
     /// then drops it, though still connected), and none replaced it yet. A
     /// paused game that keeps its swapchain stays captured: not gone.
     fn gone(&self) -> bool {
+        // A static window sends no frame: its picture repeats.
+        if self.0.window.load(Ordering::Relaxed) {
+            return false;
+        }
         #[cfg(test)]
         if self.0.gone.load(Ordering::Relaxed) {
             return true;
         }
         let capture = self.0.capture.get().and_then(Weak::upgrade);
         capture.is_some_and(|c| c.captured().is_none())
+    }
+
+    /// The game's window feeds the route (see [`crate::game`]).
+    pub fn set_window(&self, on: bool) {
+        self.0.window.store(on, Ordering::Relaxed);
+    }
+
+    /// The game window's picker is open: no first-frame timeout meanwhile.
+    pub fn set_picking(&self, on: bool) {
+        self.0.picking.store(on, Ordering::Relaxed);
+    }
+
+    fn picking(&self) -> bool {
+        self.0.picking.load(Ordering::Relaxed)
     }
 
     /// Never called under the slot lock: dropping the upgraded capture may
@@ -1468,6 +1490,10 @@ fn pump(
             };
             // No frame at all (the game quit or stopped presenting): give up
             // on the recording and the stream; the replay buffer keeps waiting.
+            // The game window's picker restarts the wait: the user is picking.
+            if settings.game.as_ref().is_some_and(GameFrames::picking) {
+                waiting_since = None;
+            }
             waiting_since = (video.is_none() && (c.record.is_some() || c.stream.is_some()))
                 .then(|| waiting_since.unwrap_or_else(monotonic_now));
             if waiting_since.is_some_and(|t| monotonic_now() - t >= FIRST_FRAME_TIMEOUT) {
@@ -2200,6 +2226,36 @@ mod tests {
             "no folder or file for a recording that never started"
         );
         p.join();
+    }
+
+    #[test]
+    fn a_recording_waits_while_the_game_window_is_picked() {
+        let dir = temp_dir("picking");
+        let s = settings();
+        // Shares its route with the pipeline's.
+        let game = s.game.clone().unwrap();
+        game.set_picking(true);
+        let (p, rx) = start(None, Some(dir.clone()), s);
+        // Well past the first-frame timeout: the user is still picking.
+        let waited = rx.recv_timeout(FIRST_FRAME_TIMEOUT * 5);
+        assert!(waited.is_err(), "{waited:?}");
+        // Cancelled: the usual timeout applies again.
+        game.set_picking(false);
+        match next(&rx, FIRST_FRAME_TIMEOUT.as_secs() + 3) {
+            Event::Finished(Err(e)) => assert!(e.contains("No frame"), "{e}"),
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(next(&rx, 3), Event::Stopped(None)));
+        p.join();
+    }
+
+    #[test]
+    fn a_game_window_is_never_gone() {
+        let game = GameFrames::default();
+        game.0.gone.store(true, Ordering::Relaxed);
+        assert!(game.gone());
+        game.set_window(true);
+        assert!(!game.gone(), "a static window repeats its picture");
     }
 
     fn stream_request() -> StreamRequest {

@@ -1,14 +1,23 @@
 """A throwaway, in-memory org.freedesktop.secrets for testing the stream key
 storage on a private bus, never the user's keyring:
 
-    dbus-run-session -- bash -c 'python3 -I scripts/fake_secret_service.py &
+    T=$(mktemp -d)
+    env -u WAYLAND_DISPLAY -u DISPLAY -u XAUTHORITY -u XDG_STATE_HOME -u XDG_CONFIG_DIRS \
+        CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" \
+        HOME=$T XDG_RUNTIME_DIR=$T XDG_CONFIG_HOME=$T/config XDG_DATA_HOME=$T/data \
+        dbus-run-session -- bash -c 'python3 -I scripts/fake_secret_service.py &
         until dbus-send --session --print-reply --dest=org.freedesktop.DBus /org/freedesktop/DBus \
             org.freedesktop.DBus.NameHasOwner string:org.freedesktop.secrets | grep -q true;
         do sleep 0.1; done
         cargo test -p vesper-app secret::tests::keyring_ -- --ignored'
+    rm -rf "$T"
 
-Wait for the name as above, not a fixed sleep: a call made before the fake
-owns it would make the bus start the real keyring daemon.
+The bus must start with a throwaway HOME, XDG directories and runtime dir
+and no display: any service it activates (the real keyring daemon, a
+portal) runs with that environment, and would otherwise open the user's
+real wallet, files and compositor. Wait for the name as above, not a fixed
+sleep: a call made before the fake owns it would make the bus start the
+real keyring daemon (then on the throwaway HOME, with nothing to read).
 
 The default collection starts locked: `Unlock` goes through a prompt that
 completes at once (`DISMISS=1` dismisses it instead). `SEED_OLD=<key>`

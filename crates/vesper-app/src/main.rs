@@ -14,6 +14,7 @@ mod autostart;
 mod desktop;
 #[cfg(debug_assertions)]
 mod dev;
+mod fallback;
 mod filters;
 mod game;
 mod instance;
@@ -320,12 +321,7 @@ fn wire_callbacks(ui: &AppWindow, recording: &Shared, games: &Games) {
             flash_notice(&ui, "Choose an output folder first");
             return;
         }
-        if ui.get_source_kind() == SourceKind::Game
-            && !g.borrow().as_ref().is_some_and(GameSource::has_game)
-        {
-            flash_notice(&ui, "No game to record yet");
-            return;
-        }
+        // Game mode without a layer game records the game's window.
         let folder = PathBuf::from(ui.get_output_folder().as_str());
         log!("start-recording: {}", folder.display());
         ui.set_rec_state(RecState::Starting);

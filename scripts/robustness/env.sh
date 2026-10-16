@@ -32,7 +32,7 @@ context.objects = [
 ]
 J
 # Never the session's display, nor its X cookie.
-unset WAYLAND_DISPLAY DISPLAY XAUTHORITY
+unset WAYLAND_DISPLAY DISPLAY XAUTHORITY XDG_STATE_HOME XDG_CONFIG_DIRS PIPEWIRE_REMOTE PULSE_SERVER
 export VESPER=$R/target/debug/vesper
 cat > $L/layers/vesper_capture.json <<J
 {"file_format_version":"1.2.1","layer":{"name":"VK_LAYER_VESPER_capture","type":"GLOBAL","library_path":"$R/target/debug/libvesper_vklayer.so","library_arch":"64","api_version":"1.4.0","implementation_version":"1","description":"lab","disable_environment":{"VESPER_CAPTURE_DISABLE":"1"}}}
