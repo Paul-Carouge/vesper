@@ -60,6 +60,9 @@ static GENERATION: AtomicU64 = AtomicU64::new(0);
 
 /// The recording was stopped because the captured game closed.
 static GAME_CLOSED: AtomicBool = AtomicBool::new(false);
+/// The stream was ended with it: its notice says so (the stream's own would
+/// replace the recording's, and its Open and Play buttons).
+static GAME_CLOSED_STREAM: AtomicBool = AtomicBool::new(false);
 
 /// The file the notice's Open and Play buttons act on.
 static NOTICE_FILE: Mutex<Option<PathBuf>> = Mutex::new(None);
@@ -208,12 +211,21 @@ fn main() -> Result<(), slint::PlatformError> {
                     failures = 0;
                 }
                 // A game that quit would leave a frozen picture recording
-                // forever; a paused one stays connected and keeps recording.
+                // and streaming forever; a paused one stays connected and
+                // keeps going.
                 let closed = g.borrow_mut().as_mut().is_some_and(GameSource::take_closed);
-                if closed && ui.get_rec_state() == RecState::Recording {
-                    log!("captured game closed: stopping the recording");
-                    GAME_CLOSED.store(true, Ordering::Relaxed);
-                    ui.invoke_stop_recording();
+                if closed {
+                    let (stop_recording, end_stream, announce_stream) =
+                        ends_on_game_closed(ui.get_rec_state(), ui.get_live_state());
+                    if stop_recording {
+                        log!("captured game closed: stopping the recording");
+                        GAME_CLOSED.store(true, Ordering::Relaxed);
+                        GAME_CLOSED_STREAM.store(end_stream, Ordering::Relaxed);
+                        ui.invoke_stop_recording();
+                    }
+                    if end_stream {
+                        live::end_for_closed_game(&ui, announce_stream);
+                    }
                 }
                 return;
             }
@@ -284,6 +296,19 @@ fn main() -> Result<(), slint::PlatformError> {
         rec.join();
     }
     result
+}
+
+/// What the captured game quitting ends: (the recording, the stream,
+/// whether the stream's end has a message of its own). One being stopped or
+/// ended already is left alone. With both, the recording's message says it
+/// all: a second one would replace it and its Open and Play buttons.
+fn ends_on_game_closed(rec: RecState, live: LiveState) -> (bool, bool, bool) {
+    let recording = rec == RecState::Recording;
+    let stream = matches!(
+        live,
+        LiveState::Connecting | LiveState::Live | LiveState::Reconnecting
+    );
+    (recording, stream, stream && !recording)
 }
 
 /// Handlers.
@@ -872,15 +897,17 @@ fn on_recorder_event(ui: &AppWindow, generation: u64, event: Event) {
             match result {
                 Ok(path) => {
                     log!("saved {}", path.display());
-                    let title = if GAME_CLOSED.swap(false, Ordering::Relaxed) {
-                        "Game closed, recording saved"
-                    } else {
-                        "Recording saved"
+                    let stream = GAME_CLOSED_STREAM.swap(false, Ordering::Relaxed);
+                    let title = match (GAME_CLOSED.swap(false, Ordering::Relaxed), stream) {
+                        (true, true) => "Game closed: recording saved, stream ended",
+                        (true, false) => "Game closed, recording saved",
+                        (false, _) => "Recording saved",
                     };
                     announce_saved(ui, title, path);
                 }
                 Err(e) => {
                     GAME_CLOSED.store(false, Ordering::Relaxed);
+                    GAME_CLOSED_STREAM.store(false, Ordering::Relaxed);
                     log!("recording failed: {e}");
                     announce_failure(ui, "Recording failed", &e);
                 }
@@ -1190,6 +1217,43 @@ mod tests {
         ] {
             assert_eq!(friendly(raw), text);
         }
+    }
+
+    #[test]
+    fn a_closed_game_ends_the_recording_and_the_stream() {
+        use LiveState as L;
+        use RecState as R;
+        // Both: only the recording's message, which keeps its file buttons.
+        assert_eq!(
+            ends_on_game_closed(R::Recording, L::Live),
+            (true, true, false)
+        );
+        assert_eq!(
+            ends_on_game_closed(R::Recording, L::Connecting),
+            (true, true, false)
+        );
+        assert_eq!(ends_on_game_closed(R::Idle, L::Live), (false, true, true));
+        assert_eq!(
+            ends_on_game_closed(R::Idle, L::Connecting),
+            (false, true, true)
+        );
+        assert_eq!(
+            ends_on_game_closed(R::Stopping, L::Reconnecting),
+            (false, true, true)
+        );
+        assert_eq!(
+            ends_on_game_closed(R::Recording, L::Off),
+            (true, false, false)
+        );
+        // Already ending: not asked twice.
+        assert_eq!(
+            ends_on_game_closed(R::Stopping, L::Ending),
+            (false, false, false)
+        );
+        assert_eq!(
+            ends_on_game_closed(R::Starting, L::Off),
+            (false, false, false)
+        );
     }
 
     #[test]

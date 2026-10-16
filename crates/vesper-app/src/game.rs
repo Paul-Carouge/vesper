@@ -231,6 +231,13 @@ impl GameSource {
         std::mem::take(&mut self.closed)
     }
 
+    /// Pid of the game the layer captures, if any (for the dev entries,
+    /// which run without the UI's `refresh`).
+    #[cfg(debug_assertions)]
+    pub fn captured_pid(&self) -> Option<u32> {
+        self.capture.captured().map(|g| g.pid)
+    }
+
     /// Allows `exe` now and in later sessions. False if the name is not a
     /// plausible process name.
     pub fn allow(&self, exe: &str) -> bool {

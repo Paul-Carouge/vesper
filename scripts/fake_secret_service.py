@@ -23,7 +23,8 @@ The default collection starts locked: `Unlock` goes through a prompt that
 completes at once (`DISMISS=1` dismisses it instead). `SEED_OLD=<key>`
 starts with an item as versions before per-service stream keys saved it
 (no `service` attribute), e.g. for `keyring_locked_keeps_the_old_key` with
-`DISMISS=1`.
+`DISMISS=1`. `HANG=1` never answers `OpenSession`, like a keyring that
+was started but hangs (for `a_hung_keyring_gives_up_quickly`).
 """
 import os
 
@@ -120,11 +121,15 @@ class Service(dbus.service.Object):
             attributes = {"application": "io.github.PaulCarouge.Vesper", "type": "stream-key"}
             self.items[path] = Item(self, path, attributes, seed.encode())
 
-    @dbus.service.method(SERVICE, in_signature="sv", out_signature="vo")
-    def OpenSession(self, algorithm, value):
+    @dbus.service.method(SERVICE, in_signature="sv", out_signature="vo",
+                         async_callbacks=("reply", "error"))
+    def OpenSession(self, algorithm, value, reply, error):
+        if os.environ.get("HANG") == "1":
+            return
         if algorithm != "plain":
-            raise dbus.exceptions.DBusException("unsupported", name="org.freedesktop.DBus.Error.NotSupported")
-        return dbus.String("", variant_level=1), "/org/freedesktop/secrets/session/1"
+            error(dbus.exceptions.DBusException("unsupported", name="org.freedesktop.DBus.Error.NotSupported"))
+            return
+        reply(dbus.String("", variant_level=1), "/org/freedesktop/secrets/session/1")
 
     @dbus.service.method(SERVICE, in_signature="s", out_signature="o")
     def ReadAlias(self, name):

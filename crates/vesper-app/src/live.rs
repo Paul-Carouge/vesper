@@ -4,6 +4,7 @@
 //! never block the UI.
 
 use std::cell::RefCell;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 
 use slint::ComponentHandle;
@@ -170,7 +171,10 @@ pub fn wire(ui: &AppWindow, recording: &Shared, games: &Games) {
             match ui.get_live_state() {
                 LiveState::Connecting => {}
                 // Ended while the key was read: nothing was started.
-                LiveState::Ending => return reset(ui),
+                LiveState::Ending => {
+                    reset_after_game(ui);
+                    return;
+                }
                 _ => return,
             }
             let request = StreamRequest { settings, key };
@@ -234,6 +238,51 @@ pub fn wire(ui: &AppWindow, recording: &Shared, games: &Games) {
     });
 }
 
+/// Why the stream is ending: [`NOT_GAME`], or the captured game closed and
+/// [`GAME_SAID`] (said once it ended) or [`GAME_QUIET`] (the recording's
+/// message says it).
+static GAME_CLOSED: AtomicU8 = AtomicU8::new(NOT_GAME);
+const NOT_GAME: u8 = 0;
+const GAME_SAID: u8 = 1;
+const GAME_QUIET: u8 = 2;
+const GAME_CLOSED_TEXT: &str = "Game closed: stream ended";
+
+/// Ends the stream because the captured game quit (a frozen picture would go
+/// out forever), the way End does: the stream is flushed and closed.
+/// `announce`: says so once it ended; otherwise nothing is said.
+pub fn end_for_closed_game(ui: &AppWindow, announce: bool) {
+    log!("captured game closed: ending the stream");
+    let why = if announce { GAME_SAID } else { GAME_QUIET };
+    GAME_CLOSED.store(why, Ordering::Relaxed);
+    ui.invoke_toggle_live();
+    // No pipeline any more: ended at once (and the reason reset).
+    if ui.get_live_state() == LiveState::Off && announce {
+        announce_game_closed(ui);
+    }
+}
+
+/// Resets the Live card, then tells why if the game closed. False when
+/// nothing more may be said: that, or the recording's message, told.
+fn reset_after_game(ui: &AppWindow) -> bool {
+    let why = GAME_CLOSED.load(Ordering::Relaxed);
+    reset(ui);
+    match why {
+        GAME_SAID => {
+            announce_game_closed(ui);
+            false
+        }
+        GAME_QUIET => false,
+        _ => true,
+    }
+}
+
+fn announce_game_closed(ui: &AppWindow) {
+    if !crate::window_focused(ui) {
+        crate::desktop::notify("Vesper".into(), GAME_CLOSED_TEXT.into(), None);
+    }
+    crate::show_notice(ui, GAME_CLOSED_TEXT, None);
+}
+
 /// Shows a state change of the stream.
 pub fn on_state(ui: &AppWindow, state: StreamState) {
     log!("live: {state:?}");
@@ -267,7 +316,12 @@ pub fn on_state(ui: &AppWindow, state: StreamState) {
         }
         StreamState::Ended(error) => {
             let was_on_air = ui.get_live_seconds() > 0;
-            reset(ui);
+            if !reset_after_game(ui) {
+                if let Some(e) = error {
+                    log!("stream ended: {e}");
+                }
+                return;
+            }
             match error {
                 Some(e) => crate::announce_failure(ui, "Stream ended", &e),
                 None if was_on_air => flash_notice(ui, "Stream ended"),
@@ -286,6 +340,7 @@ pub fn on_stats(ui: &AppWindow, elapsed: Duration, bitrate: u64, dropped: u64) {
 
 /// No stream any more (it ended, or its pipeline did).
 pub fn reset(ui: &AppWindow) {
+    GAME_CLOSED.store(NOT_GAME, Ordering::Relaxed);
     ui.set_live_state(LiveState::Off);
     ui.set_live_seconds(0);
     ui.set_live_detail("".into());
