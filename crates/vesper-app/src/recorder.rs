@@ -285,7 +285,15 @@ pub enum Event {
     /// The pipeline ended, with the error that ended it if any. A recording
     /// still running then is lost only if the pipeline crashed.
     Stopped(Option<String>),
+    /// A small copy of the composed picture, while [`PREVIEW`] is set.
+    Preview(slint::SharedPixelBuffer<slint::Rgba8Pixel>),
 }
+
+/// The scene editor shows the recorded scene: composed pictures come as
+/// [`Event::Preview`], [`PREVIEW_PERIOD`] apart. Off the hot path: a
+/// 480 x 270 downscale read back only while this is set.
+pub static PREVIEW: AtomicBool = AtomicBool::new(false);
+const PREVIEW_PERIOD: Duration = Duration::from_millis(100);
 
 /// Most audio tracks a recording has, the mix aside.
 pub const MAX_TRACKS: usize = 8;
@@ -1958,6 +1966,13 @@ struct Stage {
     told: bool,
     /// The user was told a previous compositor is stuck.
     stuck_told: bool,
+    /// When the next preview is due.
+    preview_at: Duration,
+    /// The scene shown, to skip the same one sent again.
+    shown: Option<Scene>,
+    /// Draws still showing their previous texture until the new one is
+    /// uploaded: (draw, new texture id).
+    swaps: Vec<(usize, u32)>,
     on_event: OnEvent,
     #[cfg(test)]
     probe: Option<Arc<Probe>>,
@@ -1989,6 +2004,9 @@ impl Stage {
             backoff: RETRY_FIRST,
             told: false,
             stuck_told: false,
+            preview_at: Duration::ZERO,
+            shown: None,
+            swaps: Vec::new(),
             on_event: on_event.clone(),
             #[cfg(test)]
             probe: settings.game.as_ref().map(|g| g.0.probe.clone()),
@@ -1998,14 +2016,26 @@ impl Stage {
     }
 
     fn set_scene(&mut self, scene: Scene) {
-        if !self.scene_name.is_empty() || !scene.is_passthrough() {
+        // The editor sends the scene on every change: the same again is
+        // nothing new.
+        if self.shown.as_ref() == Some(&scene) {
+            return;
+        }
+        let renamed = scene.name != self.scene_name;
+        if renamed && (!self.scene_name.is_empty() || !scene.is_passthrough()) {
             log!("scene: {:?}", scene.name);
         }
         self.passthrough = scene.is_passthrough();
         self.shows_main = scene.shows_main();
-        self.draws.clear();
+        let old = std::mem::take(&mut self.draws);
         self.want.clear();
         let mut cameras: Vec<(u32, String)> = Vec::new();
+        self.swaps.clear();
+        let done = self
+            .overlays
+            .as_ref()
+            .map(|o| lock(&o.shared.done).clone())
+            .unwrap_or_default();
         for l in scene.drawn() {
             let source = match &l.source {
                 LayerSource::Main => DrawSource::Main,
@@ -2029,6 +2059,20 @@ impl Stage {
                     DrawSource::Camera(id)
                 }
             };
+            // An edited image or text keeps its old texture until the new
+            // one is uploaded: an edit never blanks it in the recording.
+            let n = self.draws.len();
+            let source = match (source, old.get(n).map(|d| (d.source, d.rect))) {
+                (DrawSource::Texture(new), Some((DrawSource::Texture(prev), rect)))
+                    if !renamed && prev != new && rect == l.rect && !done.contains(&new) =>
+                {
+                    self.swaps.push((n, new));
+                    let key = self.ids[prev as usize].clone();
+                    self.want.push((prev, key));
+                    DrawSource::Texture(prev)
+                }
+                (source, _) => source,
+            };
             self.draws.push(Draw {
                 source,
                 rect: l.rect,
@@ -2037,7 +2081,7 @@ impl Stage {
                 opacity: l.opacity,
             });
         }
-        self.scene_name = scene.name;
+        self.scene_name.clone_from(&scene.name);
         if !cameras.is_empty() && self.cameras.is_none() {
             match Cameras::start(self.on_event.clone()) {
                 Ok(c) => {
@@ -2050,6 +2094,7 @@ impl Stage {
         if let Some(c) = &self.cameras {
             c.want(cameras);
         }
+        self.shown = Some(scene);
         if !self.shows_main {
             self.next = None;
         }
@@ -2152,6 +2197,32 @@ impl Stage {
             }
             if let Some(e) = o.error() {
                 self.fail(format!("could not start: {e}"));
+            }
+        }
+        let done = self
+            .overlays
+            .as_ref()
+            .filter(|_| !self.swaps.is_empty())
+            .map(|o| lock(&o.shared.done).clone());
+        if let Some(done) = done {
+            let before = self.swaps.len();
+            let draws = &mut self.draws;
+            self.swaps.retain(|&(n, new)| {
+                let ready = done.contains(&new);
+                if ready && let Some(d) = draws.get_mut(n) {
+                    d.source = DrawSource::Texture(new);
+                }
+                !ready
+            });
+            if self.swaps.len() != before {
+                // The old textures go.
+                let (draws, swaps) = (&self.draws, &self.swaps);
+                self.want.retain(|(id, _)| {
+                    draws.iter().any(|d| d.source == DrawSource::Texture(*id))
+                        || swaps.iter().any(|s| s.1 == *id)
+                });
+                self.dirty = true;
+                self.request();
             }
         }
         if self
@@ -2293,6 +2364,20 @@ impl Stage {
             drop(slot);
             return direct(self, frame);
         };
+        if PREVIEW.load(Ordering::Relaxed) && monotonic_now() >= self.preview_at {
+            self.preview_at = monotonic_now() + PREVIEW_PERIOD;
+            if let Some(px) = comp.preview() {
+                let (w, h) = (
+                    vesper_compose::PREVIEW_WIDTH,
+                    vesper_compose::PREVIEW_HEIGHT,
+                );
+                let buffer = slint::SharedPixelBuffer::clone_from_slice(px, w, h);
+                (self.on_event)(Event::Preview(buffer));
+            }
+            // The next composition carries the preview pass, even of a
+            // picture that would otherwise repeat.
+            self.dirty = true;
+        }
         let mut out = None;
         if comp.in_flight() {
             match comp.poll(Duration::ZERO) {

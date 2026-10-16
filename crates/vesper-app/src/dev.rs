@@ -15,6 +15,11 @@
 //!   profile menu, `profile-new` with a new profile's name field,
 //!   `profile-delete` with the delete confirmation; `profile:<slug>`
 //!   switches to that profile.
+//!   `scenes-look` shows three demo scenes (an image from
+//!   `VESPER_DEMO_IMAGE`, text, a webcam), `scene-editor` opens the editor,
+//!   `scene-layer:<i>` selects layer `i` of the edited scene, `camera-look`
+//!   shows the webcam mark;
+//!   `click:<x>:<y>` clicks there, `type:<text>` types it then.
 //! - `VESPER_SNAPSHOT=<file.ppm>` saves the window as a PPM image once the
 //!   demo settled, then quits. Nothing outside the window is captured.
 //! - `VESPER_DEMO_DELAY=<ms>` runs `VESPER_DEMO` that long after launch
@@ -277,6 +282,43 @@ pub fn apply(ui: &AppWindow) {
                 "track-source" => ui.invoke_open_track_source(0),
                 "desktop-devices" => ui.invoke_open_device_list(1),
                 "mic-devices" => ui.invoke_open_device_list(2),
+                // Not a look: shown once, edits made by later steps stay.
+                "scenes-look" => crate::scene_ui::show(&ui, &demo_scenes()),
+                "scene-editor" => ui.invoke_open_scenes(),
+                step if step.starts_with("scene-layer:") => {
+                    let i = step["scene-layer:".len()..].parse().unwrap_or(-1);
+                    ui.global::<crate::SceneStore>().set_selected(i);
+                }
+                // `click:<x>:<y>` (logical px) and `type:<text>`, a while after
+                // the other steps (a scroll settles first).
+                step if step.starts_with("click:") || step.starts_with("type:") => {
+                    let (weak, step) = (ui.as_weak(), step.to_owned());
+                    let after = if step.starts_with("type:") { 900 } else { 700 };
+                    slint::Timer::single_shot(Duration::from_millis(after), move || {
+                        let Some(ui) = weak.upgrade() else { return };
+                        if let Some(text) = step.strip_prefix("type:") {
+                            // A headless compositor may not activate the window.
+                            ui.window()
+                                .dispatch_event(WindowEvent::WindowActiveChanged(true));
+                            for c in text.chars() {
+                                press_key(&ui, c.to_string().into(), false);
+                            }
+                            return;
+                        }
+                        let mut xy = step["click:".len()..]
+                            .split(':')
+                            .map(|v| v.parse().unwrap_or(0.0));
+                        let position = slint::LogicalPosition::new(
+                            xy.next().unwrap_or(0.0),
+                            xy.next().unwrap_or(0.0),
+                        );
+                        let button = slint::platform::PointerEventButton::Left;
+                        let window = ui.window();
+                        window.dispatch_event(WindowEvent::PointerMoved { position });
+                        window.dispatch_event(WindowEvent::PointerPressed { position, button });
+                        window.dispatch_event(WindowEvent::PointerReleased { position, button });
+                    });
+                }
                 "profiles" => ui.invoke_open_profile_menu(0),
                 "profile-new" => ui.invoke_open_profile_menu(1),
                 "profile-delete" => ui.invoke_open_profile_menu(4),
@@ -431,11 +473,71 @@ fn look(ui: &AppWindow, step: &str) -> bool {
             ui.set_live_detail("Connection lost · next try in 4 s".into());
         }
         "live-key-look" => ui.set_live_key_state("Saved in the system keyring".into()),
+        "camera-look" => ui.global::<crate::SceneStore>().set_camera_on(true),
         "replay-on" => ui.set_replay_enabled(true),
         "replay-off" => ui.set_replay_enabled(false),
         _ => return false,
     }
     true
+}
+
+/// Gameplay (capture, logo, caption, webcam), Be right back, Starting soon.
+fn demo_scenes() -> crate::scenes::Scenes {
+    use crate::scenes::{Canvas, Fit, Layer, LayerSource, Scene, Scenes, TextStyle};
+    let logo = std::env::var_os("VESPER_DEMO_IMAGE").map(PathBuf::from);
+    let image = |rect| {
+        logo.clone().map(|path| Layer {
+            source: LayerSource::Image { path },
+            rect,
+            ..Layer::main()
+        })
+    };
+    let text = |text: &str, size, rect| Layer {
+        source: LayerSource::Text(TextStyle {
+            text: text.into(),
+            size,
+            outline: Some((0x0000_00c0, 3.0)),
+            shadow: Some(0x0000_0080),
+            ..TextStyle::default()
+        }),
+        rect,
+        ..Layer::main()
+    };
+    let gameplay = [
+        Some(Layer::main()),
+        image([0.025, 0.04, 0.07, 0.125]),
+        Some(text("vesper · live", 48.0, [0.03, 0.86, 0.4, 0.09])),
+        Some(Layer {
+            source: LayerSource::Camera {
+                node: "Webcam C920".into(),
+            },
+            rect: [0.74, 0.7, 0.24, 0.27],
+            fit: Fit::Cover,
+            ..Layer::main()
+        }),
+    ];
+    let brb = [
+        image([0.45, 0.22, 0.1, 0.18]),
+        Some(text("Be right back", 96.0, [0.15, 0.42, 0.7, 0.16])),
+    ];
+    Scenes {
+        canvas: Canvas::Fixed(2560, 1440),
+        active: "Gameplay".into(),
+        list: vec![
+            Scene {
+                name: "Gameplay".into(),
+                layers: gameplay.into_iter().flatten().collect(),
+            },
+            Scene {
+                name: "Be right back".into(),
+                layers: brb.into_iter().flatten().collect(),
+            },
+            Scene {
+                name: "Starting soon".into(),
+                layers: vec![text("Starting soon", 96.0, [0.15, 0.42, 0.7, 0.16])],
+            },
+        ],
+    }
 }
 
 fn demo_file() -> PathBuf {

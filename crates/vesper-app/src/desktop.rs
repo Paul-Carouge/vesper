@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock, PoisonError};
 
-use ashpd::desktop::file_chooser::SelectedFiles;
+use ashpd::desktop::file_chooser::{FileFilter, SelectedFiles};
 use ashpd::desktop::notification::{Button, Notification, NotificationProxy, Priority};
 use futures_lite::StreamExt;
 use futures_lite::future::block_on;
@@ -77,6 +77,37 @@ async fn choose_folder(current: &Path) -> ashpd::Result<Option<PathBuf>> {
         .multiple(false);
     if current.is_dir() {
         request = request.current_folder(current)?;
+    }
+    match request.send().await?.response() {
+        Ok(files) => Ok(files.uris().first().and_then(|uri| uri_path(uri.as_str()))),
+        Err(ashpd::Error::Response(ashpd::desktop::ResponseError::Cancelled)) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Asks for a PNG or JPEG file through the FileChooser portal, starting in
+/// `current`'s folder. `done` gets the file, `Ok(None)` when cancelled.
+pub fn pick_image(
+    current: Option<PathBuf>,
+    done: impl FnOnce(Result<Option<PathBuf>, String>) + Send + 'static,
+) {
+    spawn("vesper-image", move || {
+        done(block_on(choose_image(current.as_deref())).map_err(|e| e.to_string()));
+    });
+}
+
+async fn choose_image(current: Option<&Path>) -> ashpd::Result<Option<PathBuf>> {
+    let images = FileFilter::new("PNG or JPEG images")
+        .mimetype("image/png")
+        .mimetype("image/jpeg");
+    let mut request = SelectedFiles::open_file()
+        .title("Choose an image")
+        .accept_label("Choose")
+        .multiple(false)
+        .filter(images.clone())
+        .current_filter(images);
+    if let Some(folder) = current.and_then(Path::parent).filter(|f| f.is_dir()) {
+        request = request.current_folder(folder)?;
     }
     match request.send().await?.response() {
         Ok(files) => Ok(files.uris().first().and_then(|uri| uri_path(uri.as_str()))),

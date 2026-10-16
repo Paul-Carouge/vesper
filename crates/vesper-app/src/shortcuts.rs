@@ -30,16 +30,33 @@ pub enum Action {
     ToggleRecording,
     SaveReplay,
     ToggleLive,
+    NextScene,
+    /// Scene 1 to 4, in the profile's order.
+    Scene(u8),
 }
 
 impl Action {
-    const ALL: [Self; 3] = [Self::ToggleRecording, Self::SaveReplay, Self::ToggleLive];
+    const ALL: [Self; 8] = [
+        Self::ToggleRecording,
+        Self::SaveReplay,
+        Self::ToggleLive,
+        Self::NextScene,
+        Self::Scene(1),
+        Self::Scene(2),
+        Self::Scene(3),
+        Self::Scene(4),
+    ];
 
     fn id(self) -> &'static str {
         match self {
             Self::ToggleRecording => "toggle-recording",
             Self::SaveReplay => "save-replay",
             Self::ToggleLive => "toggle-live",
+            Self::NextScene => "next-scene",
+            Self::Scene(1) => "scene-1",
+            Self::Scene(2) => "scene-2",
+            Self::Scene(3) => "scene-3",
+            Self::Scene(_) => "scene-4",
         }
     }
 
@@ -48,12 +65,14 @@ impl Action {
     }
 
     /// ShadowPlay's keys (Alt+F8 is its broadcast key); none is bound by a
-    /// default KDE Plasma 6 setup. Format of the XDG shortcuts spec.
-    fn preferred_trigger(self) -> &'static str {
+    /// default KDE Plasma 6 setup. Format of the XDG shortcuts spec. Scenes
+    /// get none: the user binds the ones they use.
+    fn preferred_trigger(self) -> Option<&'static str> {
         match self {
-            Self::ToggleRecording => "ALT+F9",
-            Self::SaveReplay => "ALT+F10",
-            Self::ToggleLive => "ALT+F8",
+            Self::ToggleRecording => Some("ALT+F9"),
+            Self::SaveReplay => Some("ALT+F10"),
+            Self::ToggleLive => Some("ALT+F8"),
+            Self::NextScene | Self::Scene(_) => None,
         }
     }
 
@@ -62,6 +81,11 @@ impl Action {
             Self::ToggleRecording => "Start/stop recording",
             Self::SaveReplay => "Save replay",
             Self::ToggleLive => "Go live/end stream",
+            Self::NextScene => "Next scene",
+            Self::Scene(1) => "Scene 1",
+            Self::Scene(2) => "Scene 2",
+            Self::Scene(3) => "Scene 3",
+            Self::Scene(_) => "Scene 4",
         }
     }
 }

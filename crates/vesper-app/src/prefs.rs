@@ -14,8 +14,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use vesper_audio::{MAX_DB, MIN_DB, Source};
 
 use crate::outputs::{Kind, SourceLabel};
-use crate::recorder::{MAX_FILTERS, MAX_TRACKS, Track, TrackFilter, lock};
-use crate::scenes::{self, SCENES, Scenes};
+use crate::recorder::{MAX_FILTERS, MAX_TRACKS, Track, TrackFilter};
+use crate::scenes::{self, Scenes};
 use crate::stream::{Service, StreamSettings};
 use crate::{AppWindow, LiveService, QualityPreset, SourceKind, VideoCodec};
 
@@ -82,7 +82,7 @@ impl Prefs {
             live: crate::live::settings(ui),
             profile: ui.get_profile_slug().into(),
             profile_name: ui.get_profile_name().into(),
-            scenes: lock(&SCENES).clone(),
+            scenes: crate::scene_ui::from_ui(ui),
         }
     }
 
@@ -124,7 +124,7 @@ impl Prefs {
         });
         ui.set_profile_slug(self.profile.as_str().into());
         ui.set_profile_name(self.profile_name.as_str().into());
-        lock(&SCENES).clone_from(&self.scenes);
+        crate::scene_ui::show(ui, &self.scenes);
     }
 
     /// `self` with the app's own settings of `app`: the ones no profile has.

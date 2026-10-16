@@ -1,0 +1,1830 @@
+// Scenes: the chips under the source card and the scene editor. The backend
+// (scene_ui.rs) owns the scenes and writes them into `SceneStore`; the UI
+// shows them and sends intents.
+
+import { Theme, Icons } from "theme.slint";
+import { Icon, Card, Button, IconButton, Switch, Segmented, SectionLabel, FocusRing, Slider, TextField, SelectField } from "components.slint";
+
+export enum LayerKind { main, camera, image, text }
+
+/// One layer of a scene, as `scenes::Layer`. Rect and crop in fractions;
+/// `fit` 0 contain, 1 cover, 2 stretch; `align` 0 left, 1 center, 2 right.
+/// `value`: the image's path, the camera's node or the text. `label` names
+/// it in the list; `raster` is the image or text as drawn, for the preview.
+export struct LayerRow {
+    kind: LayerKind,
+    label: string,
+    visible: bool,
+    opacity: float,
+    x: float,
+    y: float,
+    w: float,
+    h: float,
+    crop-left: float,
+    crop-top: float,
+    crop-right: float,
+    crop-bottom: float,
+    fit: int,
+    value: string,
+    font: string,
+    size: float,
+    color: color,
+    outline: bool,
+    outline-color: color,
+    outline-width: float,
+    shadow: bool,
+    shadow-color: color,
+    align: int,
+    raster: image,
+}
+
+export struct SceneRow { name: string, layers: [LayerRow] }
+
+/// A webcam: its PipeWire `node.name` and description.
+export struct CameraChoice { node: string, label: string }
+
+export global SceneStore {
+    in property <[SceneRow]> scenes;
+    // The scene recorded; -1 without scenes (the capture alone).
+    in property <int> active: -1;
+    // The editor is shown.
+    in-out property <bool> open;
+    // The scene shown in the editor and its selected layer (-1: none).
+    in-out property <int> editing;
+    in-out property <int> selected: -1;
+    in property <bool> canvas-fixed;
+    in property <int> canvas-width: 1920;
+    in property <int> canvas-height: 1080;
+    // The preview shows the composed picture (`live-image`).
+    in property <bool> live;
+    in property <image> live-image;
+    // Lines a dragged layer snapped to, canvas fractions; -1: none.
+    in property <float> guide-x: -1;
+    in property <float> guide-y: -1;
+    // Font families matching the search, and webcams found.
+    in property <[string]> fonts;
+    in property <bool> fonts-loading;
+    in property <[CameraChoice]> cameras;
+    // 0 not looked for, 1 looking, 2 listed.
+    in property <int> cameras-state;
+    in-out property <string> name-error;
+    // A webcam of the recorded scene is streaming.
+    in property <bool> camera-on;
+
+    // Records scene `i` from now on (also while recording or streaming).
+    callback switch(int);
+    // The editor was shown or hidden, or shows another scene.
+    callback shown();
+    callback add-scene();
+    callback duplicate-scene(int);
+    // Renames scene `i`; false (with `name-error`) if the name is refused.
+    callback rename-scene(int, string) -> bool;
+    callback delete-scene(int);
+    // Adds a layer above the others; `value` is the camera's node.
+    callback add-layer(LayerKind, string);
+    callback remove-layer(int);
+    // Moves layer `i` up (towards the top) or down.
+    callback move-layer(int, bool);
+    callback layer-changed(int, LayerRow);
+    // Picks the image of layer `i`, or of a new layer (-1).
+    callback pick-image(int);
+    // A drag on the preview: layer, handle (0 move, then N, S, E, W, NE, NW,
+    // SE, SW), snap distances; then the pointer's move since the press
+    // (canvas fractions), Shift, snapping on; then its end.
+    callback drag-start(int, int, float, float);
+    callback drag(float, float, bool, bool);
+    callback drag-end();
+    callback search-fonts(string);
+    callback list-cameras();
+    callback canvas-changed(bool, int, int);
+
+    // The canvas proportions, 16:9 while automatic.
+    out property <float> ratio: root.canvas-fixed && root.canvas-height > 0 ? root.canvas-width / root.canvas-height : 16 / 9;
+
+    public pure function kind-icon(kind: LayerKind) -> string {
+        kind == LayerKind.main ? Icons.monitor : kind == LayerKind.camera ? Icons.camera : kind == LayerKind.image ? Icons.image : Icons.text
+    }
+
+    public pure function kind-name(kind: LayerKind) -> string {
+        kind == LayerKind.main ? "Capture" : kind == LayerKind.camera ? "Camera" : kind == LayerKind.image ? "Image" : "Text"
+    }
+}
+
+// ---- Main window: the scene chips -----------------------------------------
+
+component SceneChip inherits FocusScope {
+    in property <string> name;
+    in property <bool> active;
+    callback clicked;
+
+    focus-on-click: false;
+    accessible-role: radio-button;
+    accessible-label: root.name;
+    accessible-checkable: true;
+    accessible-checked: root.active;
+    accessible-action-default => {
+        root.clicked();
+    }
+
+    key-pressed(event) => {
+        if (event.text == Key.Space || event.text == Key.Return) {
+            root.clicked();
+            return accept;
+        }
+        reject
+    }
+
+    FocusRing {
+        visible-ring: root.has-focus;
+        radius: Theme.radius-sm;
+    }
+
+    Rectangle {
+        border-radius: Theme.radius-sm;
+        border-width: 1px;
+        border-color: root.active ? Theme.accent : Theme.border-strong;
+        background: root.active ? Theme.accent-soft : touch.pressed ? Theme.surface-pressed : touch.has-hover ? Theme.surface-hover : Theme.surface-raised;
+        animate background, border-color { duration: Theme.fast; }
+    }
+
+    HorizontalLayout {
+        padding-left: Theme.space-sm;
+        padding-right: Theme.space-sm;
+        spacing: 6px;
+        alignment: center;
+        if root.active: VerticalLayout {
+            alignment: center;
+            Rectangle {
+                width: 6px;
+                height: 6px;
+                border-radius: 3px;
+                background: Theme.accent;
+            }
+        }
+        Text {
+            text: root.name;
+            vertical-alignment: center;
+            font-size: Theme.font-small;
+            font-weight: root.active ? 600 : 500;
+            color: root.active ? Theme.accent : Theme.text;
+            overflow: elide;
+        }
+    }
+
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => {
+            root.clicked();
+        }
+    }
+}
+
+// The scenes as equal chips in rows (a click records that scene), with the
+// way to the editor.
+export component SceneBar inherits Card {
+    callback edit();
+
+    property <int> count: SceneStore.scenes.length;
+    property <length> gap: Theme.space-sm;
+    property <length> chip-height: 32px;
+    property <length> inner: self.width - 2 * Theme.card-padding;
+    property <int> columns: Math.max(1, Math.min(root.count, Math.floor((root.inner + root.gap) / (112px + root.gap))));
+    property <int> rows: Math.ceil(root.count / root.columns);
+    property <length> cell: (root.inner - (root.columns - 1) * root.gap) / root.columns;
+
+    accessible-role: groupbox;
+    accessible-label: "Scenes";
+
+    VerticalLayout {
+        padding: Theme.card-padding;
+        padding-top: Theme.space-md;
+        spacing: Theme.space-sm;
+        HorizontalLayout {
+            spacing: Theme.space-sm;
+            SectionLabel {
+                horizontal-stretch: 1;
+                text: "SCENE";
+                vertical-alignment: center;
+            }
+            if SceneStore.camera-on: HorizontalLayout {
+                horizontal-stretch: 0;
+                spacing: 6px;
+                accessible-role: text;
+                accessible-label: "Camera on";
+                VerticalLayout {
+                    alignment: center;
+                    Rectangle {
+                        width: 6px;
+                        height: 6px;
+                        border-radius: 3px;
+                        background: Theme.rec;
+                    }
+                }
+                Text {
+                    horizontal-stretch: 0;
+                    text: "Camera on";
+                    vertical-alignment: center;
+                    font-size: Theme.font-caption;
+                    font-weight: 600;
+                    color: Theme.text-muted;
+                }
+            }
+            Button {
+                text: "Edit";
+                icon: Icons.layers;
+                kind: "ghost";
+                small: true;
+                accessible-label: "Edit the scenes";
+                clicked => {
+                    root.edit();
+                }
+            }
+        }
+        Rectangle {
+            height: root.rows * root.chip-height + (root.rows - 1) * root.gap;
+            accessible-role: list;
+            for scene[i] in SceneStore.scenes: SceneChip {
+                x: Math.mod(i, root.columns) * (root.cell + root.gap);
+                y: Math.floor(i / root.columns) * (root.chip-height + root.gap);
+                width: root.cell;
+                height: root.chip-height;
+                name: scene.name;
+                active: i == SceneStore.active;
+                clicked => {
+                    SceneStore.switch(i);
+                }
+            }
+        }
+    }
+}
+
+// ---- Editor building blocks ------------------------------------------------
+
+// A plain row of a list: an icon, a label, an optional badge.
+component ListRow inherits FocusScope {
+    in property <string> text;
+    in property <string> icon;
+    in property <string> badge;
+    in property <bool> selected;
+    callback clicked;
+
+    focus-on-click: false;
+    height: 36px;
+    accessible-role: list-item;
+    accessible-label: root.badge != "" ? "\{root.text} (\{root.badge})" : root.text;
+    accessible-item-selectable: true;
+    accessible-item-selected: root.selected;
+    accessible-action-default => {
+        root.clicked();
+    }
+
+    key-pressed(event) => {
+        if (event.text == Key.Space || event.text == Key.Return) {
+            root.clicked();
+            return accept;
+        }
+        reject
+    }
+
+    FocusRing {
+        visible-ring: root.has-focus;
+        radius: Theme.radius-sm;
+    }
+
+    Rectangle {
+        border-radius: Theme.radius-sm;
+        background: root.selected ? Theme.accent-soft : touch.pressed ? Theme.surface-pressed : touch.has-hover ? Theme.surface-hover : transparent;
+        animate background { duration: Theme.fast; }
+    }
+
+    HorizontalLayout {
+        padding-left: Theme.space-sm;
+        padding-right: Theme.space-sm;
+        spacing: Theme.space-sm;
+        if root.icon != "": Icon {
+            y: (parent.height - self.height) / 2;
+            width: 18px;
+            height: 18px;
+            data: root.icon;
+            tint: root.selected ? Theme.accent : Theme.text-muted;
+        }
+        Text {
+            horizontal-stretch: 1;
+            text: root.text;
+            vertical-alignment: center;
+            font-size: Theme.font-body;
+            font-weight: root.selected ? 600 : 400;
+            color: Theme.text;
+            overflow: elide;
+        }
+        if root.badge != "": VerticalLayout {
+            alignment: center;
+            Rectangle {
+                height: 20px;
+                width: badge-text.preferred-width + 14px;
+                border-radius: 10px;
+                background: Theme.accent-soft;
+                badge-text := Text {
+                    text: root.badge;
+                    font-size: Theme.font-caption;
+                    font-weight: 600;
+                    color: Theme.accent;
+                }
+            }
+        }
+    }
+
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => {
+            root.clicked();
+        }
+    }
+}
+
+// A labelled slider with its value.
+component PropSlider inherits HorizontalLayout {
+    in property <string> label;
+    in property <float> value;
+    in property <float> minimum: 0;
+    in property <float> maximum: 1;
+    in property <float> step: 0.01;
+    in property <float> default-value;
+    in property <string> value-text;
+    callback changed(float);
+
+    spacing: Theme.space-sm;
+    Text {
+        width: 64px;
+        text: root.label;
+        vertical-alignment: center;
+        font-size: Theme.font-small;
+        color: Theme.text-muted;
+        overflow: elide;
+    }
+    Slider {
+        horizontal-stretch: 1;
+        y: (parent.height - self.height) / 2;
+        value: root.value;
+        minimum: root.minimum;
+        maximum: root.maximum;
+        step: root.step;
+        page-step: (root.maximum - root.minimum) / 10;
+        default-value: root.default-value;
+        label: root.label;
+        value-text: root.value-text;
+        changed(v) => {
+            root.changed(v);
+        }
+    }
+    Text {
+        width: 48px;
+        text: root.value-text;
+        horizontal-alignment: right;
+        vertical-alignment: center;
+        font-size: Theme.font-small;
+        color: Theme.text;
+    }
+}
+
+// A titled control of the layer's properties.
+component PropField inherits VerticalLayout {
+    in property <string> title;
+    spacing: Theme.space-xs;
+    Text {
+        text: root.title;
+        font-size: Theme.font-small;
+        font-weight: 600;
+        color: Theme.text;
+    }
+    @children
+}
+
+// A row of colour swatches; the current one is ringed.
+component Swatches inherits HorizontalLayout {
+    in property <color> current;
+    in property <string> label;
+    in property <bool> enabled: true;
+    callback picked(color);
+
+    property <[color]> palette: [#FFFFFF, #000000, #8A8D99, #9A8CFF, #FF5C52, #F2B84B, #4CC38A, #4A9EFF];
+
+    spacing: 6px;
+    alignment: start;
+    for c in root.palette: FocusScope {
+        // Compared without alpha: an outline keeps its own.
+        property <bool> chosen: c.with-alpha(1) == root.current.with-alpha(1);
+        width: 26px;
+        height: 26px;
+        focus-on-click: false;
+        enabled: root.enabled;
+        accessible-role: radio-button;
+        accessible-label: "\{root.label} colour \{c == #FFFFFF ? "white" : c == #000000 ? "black" : c == #8A8D99 ? "grey" : c == #9A8CFF ? "violet" : c == #FF5C52 ? "red" : c == #F2B84B ? "amber" : c == #4CC38A ? "green" : "blue"}";
+        accessible-checkable: true;
+        accessible-checked: self.chosen;
+        accessible-action-default => {
+            root.picked(c);
+        }
+        key-pressed(event) => {
+            if (event.text == Key.Space || event.text == Key.Return) {
+                root.picked(c);
+                return accept;
+            }
+            reject
+        }
+        FocusRing {
+            visible-ring: parent.has-focus;
+            radius: 13px;
+        }
+        Rectangle {
+            border-radius: 13px;
+            border-width: 2px;
+            border-color: parent.chosen ? Theme.accent : transparent;
+            opacity: root.enabled ? 1 : 0.4;
+            Rectangle {
+                width: 18px;
+                height: 18px;
+                border-radius: 9px;
+                background: c;
+                border-width: 1px;
+                border-color: Theme.border-strong;
+            }
+        }
+        TouchArea {
+            mouse-cursor: pointer;
+            clicked => {
+                root.picked(c);
+            }
+        }
+    }
+}
+
+// Multi-line text entry: every change is reported.
+component TextBox inherits Rectangle {
+    in property <string> text;
+    in property <string> label;
+    callback edited(string);
+
+    // A change from elsewhere (another layer selected) shows.
+    changed text => {
+        if (input.text != root.text) {
+            input.text = root.text;
+        }
+    }
+
+    forward-focus: input;
+    height: 72px;
+    border-radius: Theme.radius-sm;
+    background: Theme.surface-raised;
+    border-width: 1px;
+    border-color: input.has-focus ? Theme.accent : Theme.border-strong;
+
+    input := TextInput {
+        x: Theme.space-sm + 2px;
+        y: 6px;
+        width: parent.width - 2 * self.x;
+        height: parent.height - 12px;
+        text: root.text;
+        single-line: false;
+        wrap: word-wrap;
+        font-size: Theme.font-body;
+        color: Theme.text;
+        selection-background-color: Theme.accent-soft;
+        selection-foreground-color: Theme.text;
+        accessible-label: root.label;
+        edited => {
+            root.edited(self.text);
+        }
+    }
+}
+
+// The canvas with the layers drawn (or the composed picture), the selected
+// layer's frame and handles, and the snap guides. Drags report the
+// pointer's move since the press: the backend places and snaps the layer.
+component SceneCanvas inherits Rectangle {
+    in property <[LayerRow]> layers;
+    in property <int> selected;
+    in property <float> ratio: 16 / 9;
+    in property <bool> live;
+    in property <image> live-image;
+    in property <float> guide-x: -1;
+    in property <float> guide-y: -1;
+    in property <bool> interactive: true;
+    callback select(int);
+
+    // Handles hang over the canvas edges: room for them.
+    property <length> margin: 6px;
+    property <length> cw: Math.max(1px, Math.min(self.width - 2 * root.margin, (self.height - 2 * root.margin) * root.ratio));
+    property <length> ch: root.cw / root.ratio;
+    property <length> ox: (self.width - root.cw) / 2;
+    property <length> oy: (self.height - root.ch) / 2;
+    property <length> press-x;
+    property <length> press-y;
+    property <bool> dragging;
+    property <bool> has-selection: root.selected >= 0 && root.selected < root.layers.length && root.layers[root.selected].visible;
+
+    height: (self.width - 2 * root.margin) / root.ratio + 2 * root.margin;
+    accessible-role: image;
+    accessible-label: "Scene preview";
+
+    function begin(layer: int, handle: int, x: length, y: length) {
+        root.press-x = x;
+        root.press-y = y;
+        root.dragging = true;
+        SceneStore.drag-start(layer, handle, 8px / root.cw, 8px / root.ch);
+    }
+
+    function pointer(event: PointerEvent, x: length, y: length) {
+        if (event.kind == PointerEventKind.move && root.dragging) {
+            SceneStore.drag((x - root.press-x) / root.cw, (y - root.press-y) / root.ch, event.modifiers.shift, !event.modifiers.control);
+        }
+        if (root.dragging && (event.kind == PointerEventKind.up || event.kind == PointerEventKind.cancel)) {
+            root.dragging = false;
+            SceneStore.drag-end();
+        }
+    }
+
+    canvas := Rectangle {
+        x: root.ox;
+        y: root.oy;
+        width: root.cw;
+        height: root.ch;
+        clip: true;
+        // What the recording shows under the layers.
+        background: #000000;
+        border-radius: 2px;
+
+        TouchArea {
+            enabled: root.interactive;
+            clicked => {
+                root.select(-1);
+            }
+        }
+
+        if root.live: Image {
+            width: 100%;
+            height: 100%;
+            source: root.live-image;
+            image-fit: fill;
+        }
+
+        for layer[i] in root.layers: Rectangle {
+            visible: layer.visible && !root.live;
+            x: layer.x * root.cw;
+            y: layer.y * root.ch;
+            width: layer.w * root.cw;
+            height: layer.h * root.ch;
+            opacity: layer.opacity;
+
+            // The capture and webcams: a labelled stand-in.
+            if layer.kind == LayerKind.main || layer.kind == LayerKind.camera || layer.raster.width == 0: Rectangle {
+                clip: true;
+                background: layer.kind == LayerKind.main ? @linear-gradient(135deg, #2D2766 0%, #1A2440 100%) : layer.kind == LayerKind.camera ? @linear-gradient(135deg, #1D3B38 0%, #1A2A33 100%) : #FFFFFF14;
+                border-width: 1px;
+                border-color: #FFFFFF26;
+                VerticalLayout {
+                    alignment: center;
+                    spacing: 4px;
+                    padding: 4px;
+                    HorizontalLayout {
+                        alignment: center;
+                        Icon {
+                            width: Math.min(28px, Math.max(12px, layer.h * root.ch / 4));
+                            height: self.width;
+                            data: SceneStore.kind-icon(layer.kind);
+                            tint: #FFFFFFB0;
+                        }
+                    }
+                    if layer.h * root.ch > 44px: Text {
+                        text: layer.label;
+                        horizontal-alignment: center;
+                        font-size: Theme.font-caption;
+                        color: #FFFFFFB0;
+                        overflow: elide;
+                    }
+                }
+            }
+            if layer.raster.width > 0 && (layer.kind == LayerKind.image || layer.kind == LayerKind.text): Image {
+                width: 100%;
+                height: 100%;
+                source: layer.raster;
+                image-fit: layer.fit == 0 ? ImageFit.contain : layer.fit == 1 ? ImageFit.cover : ImageFit.fill;
+                source-clip-x: layer.raster.width * layer.crop-left;
+                source-clip-y: layer.raster.height * layer.crop-top;
+                source-clip-width: layer.raster.width * (1 - layer.crop-left - layer.crop-right);
+                source-clip-height: layer.raster.height * (1 - layer.crop-top - layer.crop-bottom);
+            }
+        }
+
+        // Hit areas, the top layer last: it takes the press.
+        for layer[i] in root.layers: TouchArea {
+            visible: layer.visible;
+            enabled: root.interactive;
+            x: layer.x * root.cw;
+            y: layer.y * root.ch;
+            width: layer.w * root.cw;
+            height: layer.h * root.ch;
+            mouse-cursor: move;
+            pointer-event(event) => {
+                let px = self.absolute-position.x - canvas.absolute-position.x + self.mouse-x;
+                let py = self.absolute-position.y - canvas.absolute-position.y + self.mouse-y;
+                if (event.kind == PointerEventKind.down && event.button == PointerEventButton.left) {
+                    root.select(i);
+                    root.begin(i, 0, px, py);
+                }
+                root.pointer(event, px, py);
+            }
+        }
+
+        if root.guide-x >= 0: Rectangle {
+            x: root.guide-x * root.cw - 0.5px;
+            width: 1px;
+            background: #FF5FD2;
+        }
+        if root.guide-y >= 0: Rectangle {
+            y: root.guide-y * root.ch - 0.5px;
+            height: 1px;
+            background: #FF5FD2;
+        }
+    }
+
+    // The selected layer's frame and handles, over the canvas edges too.
+    if root.has-selection: Rectangle {
+        property <LayerRow> l: root.layers[root.selected];
+        x: root.ox + self.l.x * root.cw;
+        y: root.oy + self.l.y * root.ch;
+        width: self.l.w * root.cw;
+        height: self.l.h * root.ch;
+        border-width: 1.5px;
+        border-color: Theme.accent;
+
+        for h[k] in [
+            { x: 0.5, y: 0, cursor: MouseCursor.ns-resize },
+            { x: 0.5, y: 1, cursor: MouseCursor.ns-resize },
+            { x: 1, y: 0.5, cursor: MouseCursor.ew-resize },
+            { x: 0, y: 0.5, cursor: MouseCursor.ew-resize },
+            { x: 1, y: 0, cursor: MouseCursor.nesw-resize },
+            { x: 0, y: 0, cursor: MouseCursor.nwse-resize },
+            { x: 1, y: 1, cursor: MouseCursor.nwse-resize },
+            { x: 0, y: 1, cursor: MouseCursor.nesw-resize },
+        ]: TouchArea {
+            // A 16px grip around an 8px square. Small layers keep their
+            // corners only.
+            visible: k < 2 ? parent.width > 40px : k < 4 ? parent.height > 40px : true;
+            x: parent.width * h.x - 8px;
+            y: parent.height * h.y - 8px;
+            width: 16px;
+            height: 16px;
+            enabled: root.interactive;
+            mouse-cursor: h.cursor;
+            pointer-event(event) => {
+                let px = self.absolute-position.x - canvas.absolute-position.x + self.mouse-x;
+                let py = self.absolute-position.y - canvas.absolute-position.y + self.mouse-y;
+                if (event.kind == PointerEventKind.down && event.button == PointerEventButton.left) {
+                    root.begin(root.selected, k + 1, px, py);
+                }
+                root.pointer(event, px, py);
+            }
+            Rectangle {
+                width: 8px;
+                height: 8px;
+                border-radius: 2px;
+                background: #FFFFFF;
+                border-width: 1.5px;
+                border-color: Theme.accent;
+            }
+        }
+    }
+}
+
+// The layer list's row: its kind, name, and actions.
+component LayerItem inherits FocusScope {
+    in property <LayerRow> layer;
+    in property <bool> selected;
+    // Top and bottom of the stack: no way further.
+    in property <bool> top;
+    in property <bool> bottom;
+    callback clicked;
+    callback toggle-visible;
+    callback up;
+    callback down;
+    callback remove;
+
+    focus-on-click: false;
+    height: 40px;
+    accessible-role: list-item;
+    accessible-label: root.layer.label + (root.layer.visible ? "" : " (hidden)");
+    accessible-item-selectable: true;
+    accessible-item-selected: root.selected;
+    accessible-action-default => {
+        root.clicked();
+    }
+
+    key-pressed(event) => {
+        if (event.text == Key.Space || event.text == Key.Return) {
+            root.clicked();
+            return accept;
+        }
+        reject
+    }
+
+    FocusRing {
+        visible-ring: root.has-focus;
+        radius: Theme.radius-sm;
+    }
+
+    Rectangle {
+        border-radius: Theme.radius-sm;
+        background: root.selected ? Theme.accent-soft : touch.has-hover ? Theme.surface-hover : transparent;
+        animate background { duration: Theme.fast; }
+    }
+
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => {
+            root.clicked();
+        }
+    }
+
+    HorizontalLayout {
+        padding-left: Theme.space-sm;
+        spacing: Theme.space-sm;
+        Icon {
+            y: (parent.height - self.height) / 2;
+            width: 18px;
+            height: 18px;
+            data: SceneStore.kind-icon(root.layer.kind);
+            tint: root.selected ? Theme.accent : Theme.text-muted;
+        }
+        Text {
+            horizontal-stretch: 1;
+            text: root.layer.label;
+            vertical-alignment: center;
+            font-size: Theme.font-body;
+            font-weight: root.selected ? 600 : 400;
+            color: root.layer.visible ? Theme.text : Theme.text-faint;
+            overflow: elide;
+        }
+        HorizontalLayout {
+            spacing: 0px;
+            IconButton {
+                y: (parent.height - self.height) / 2;
+                width: 32px;
+                height: 32px;
+                icon: root.layer.visible ? Icons.eye : Icons.eye-off;
+                label: (root.layer.visible ? "Hide " : "Show ") + root.layer.label;
+                clicked => {
+                    root.toggle-visible();
+                }
+            }
+            IconButton {
+                y: (parent.height - self.height) / 2;
+                width: 32px;
+                height: 32px;
+                icon: Icons.arrow-up;
+                label: "Move \{root.layer.label} up";
+                enabled: !root.top;
+                opacity: self.enabled ? 1 : 0.35;
+                clicked => {
+                    root.up();
+                }
+            }
+            IconButton {
+                y: (parent.height - self.height) / 2;
+                width: 32px;
+                height: 32px;
+                icon: Icons.arrow-down;
+                label: "Move \{root.layer.label} down";
+                enabled: !root.bottom;
+                opacity: self.enabled ? 1 : 0.35;
+                clicked => {
+                    root.down();
+                }
+            }
+            IconButton {
+                y: (parent.height - self.height) / 2;
+                width: 32px;
+                height: 32px;
+                icon: Icons.trash;
+                label: "Remove \{root.layer.label}";
+                clicked => {
+                    root.remove();
+                }
+            }
+        }
+    }
+}
+
+// A choice in an inline menu.
+component MenuItem inherits FocusScope {
+    in property <string> text;
+    in property <string> icon;
+    in property <string> detail;
+    callback clicked;
+
+    focus-on-click: false;
+    height: 36px;
+    accessible-role: button;
+    accessible-label: root.text;
+    accessible-enabled: root.enabled;
+    accessible-action-default => {
+        if (root.enabled) {
+            root.clicked();
+        }
+    }
+
+    key-pressed(event) => {
+        if (event.text == Key.Space || event.text == Key.Return) {
+            if (root.enabled) {
+                root.clicked();
+            }
+            return accept;
+        }
+        reject
+    }
+
+    FocusRing {
+        visible-ring: root.has-focus;
+        radius: Theme.radius-sm;
+    }
+
+    Rectangle {
+        border-radius: Theme.radius-sm;
+        background: touch.pressed ? Theme.surface-pressed : touch.has-hover ? Theme.surface-hover : transparent;
+        animate background { duration: Theme.fast; }
+    }
+
+    HorizontalLayout {
+        padding-left: Theme.space-sm;
+        padding-right: Theme.space-sm;
+        spacing: Theme.space-sm;
+        opacity: root.enabled ? 1 : 0.45;
+        if root.icon != "": Icon {
+            y: (parent.height - self.height) / 2;
+            width: 18px;
+            height: 18px;
+            data: root.icon;
+            tint: Theme.text-muted;
+        }
+        Text {
+            horizontal-stretch: 1;
+            text: root.text;
+            vertical-alignment: center;
+            font-size: Theme.font-body;
+            color: Theme.text;
+            overflow: elide;
+        }
+        if root.detail != "": Text {
+            text: root.detail;
+            vertical-alignment: center;
+            font-size: Theme.font-caption;
+            color: Theme.text-muted;
+        }
+    }
+
+    touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: self.enabled ? pointer : default;
+        clicked => {
+            root.clicked();
+        }
+    }
+}
+
+component Divider inherits Rectangle {
+    height: 1px;
+    background: Theme.border;
+}
+
+// ---- Editor cards ----------------------------------------------------------
+
+// The scenes: pick the one to edit, add, duplicate, rename, delete, record.
+component ScenesCard inherits Card {
+    // 0 the list, 1 renaming, 2 confirming the delete.
+    property <int> mode;
+    property <string> draft;
+    property <string> name: SceneStore.editing < SceneStore.scenes.length ? SceneStore.scenes[SceneStore.editing].name : "";
+    property <bool> any: SceneStore.scenes.length > 0;
+
+    function edit(i: int) {
+        SceneStore.editing = i;
+        SceneStore.selected = -1;
+        root.mode = 0;
+        SceneStore.shown();
+    }
+
+    function submit() {
+        if (SceneStore.rename-scene(SceneStore.editing, root.draft)) {
+            root.mode = 0;
+        }
+    }
+
+    accessible-role: groupbox;
+    accessible-label: "Scenes";
+
+    VerticalLayout {
+        padding: Theme.space-sm;
+        spacing: Theme.space-xs;
+        HorizontalLayout {
+            padding-left: Theme.space-sm;
+            padding-top: Theme.space-xs;
+            padding-bottom: Theme.space-xs;
+            SectionLabel {
+                text: "SCENES";
+            }
+        }
+        if !root.any: VerticalLayout {
+            padding: Theme.space-sm;
+            spacing: Theme.space-md;
+            Text {
+                text: "No scenes yet: the capture is recorded alone. A scene adds images, text or a webcam over it.";
+                font-size: Theme.font-small;
+                color: Theme.text-muted;
+                wrap: word-wrap;
+            }
+            HorizontalLayout {
+                alignment: start;
+                Button {
+                    text: "New scene";
+                    icon: Icons.plus;
+                    kind: "primary";
+                    small: true;
+                    clicked => {
+                        SceneStore.add-scene();
+                    }
+                }
+            }
+        }
+        if root.any: VerticalLayout {
+            spacing: 2px;
+            accessible-role: list;
+            accessible-label: "Scenes";
+            for scene[i] in SceneStore.scenes: ListRow {
+                text: scene.name;
+                selected: i == SceneStore.editing;
+                badge: i == SceneStore.active ? "Recorded" : "";
+                clicked => {
+                    root.edit(i);
+                }
+            }
+        }
+        if root.any: Divider { }
+        if root.any && root.mode == 0: HorizontalLayout {
+            spacing: Theme.space-xs;
+            alignment: start;
+            Button {
+                text: "New";
+                small: true;
+                kind: "ghost";
+                enabled: SceneStore.scenes.length < 16;
+                accessible-label: "New scene";
+                clicked => {
+                    SceneStore.add-scene();
+                }
+            }
+            Button {
+                text: "Duplicate";
+                small: true;
+                kind: "ghost";
+                enabled: SceneStore.scenes.length < 16;
+                accessible-label: "Duplicate \{root.name}";
+                clicked => {
+                    SceneStore.duplicate-scene(SceneStore.editing);
+                }
+            }
+            Button {
+                text: "Rename";
+                small: true;
+                kind: "ghost";
+                accessible-label: "Rename \{root.name}";
+                clicked => {
+                    SceneStore.name-error = "";
+                    root.draft = root.name;
+                    root.mode = 1;
+                }
+            }
+            Button {
+                text: "Delete";
+                small: true;
+                kind: "ghost";
+                accessible-label: "Delete \{root.name}";
+                clicked => {
+                    root.mode = 2;
+                }
+            }
+        }
+        if root.mode == 1: VerticalLayout {
+            padding: Theme.space-sm;
+            spacing: Theme.space-sm;
+            TextField {
+                text: root.draft;
+                label: "Scene name";
+                placeholder: "Scene name";
+                init => {
+                    self.focus();
+                }
+                edited(text) => {
+                    root.draft = text;
+                }
+                accepted(text) => {
+                    root.draft = text;
+                    root.submit();
+                }
+            }
+            Text {
+                max-height: SceneStore.name-error == "" ? 0px : 1000px;
+                text: SceneStore.name-error;
+                font-size: Theme.font-small;
+                color: Theme.warn;
+                wrap: word-wrap;
+                accessible-role: text;
+                accessible-live-region: AccessibleLiveness.assertive;
+            }
+            HorizontalLayout {
+                alignment: end;
+                spacing: Theme.space-sm;
+                Button {
+                    text: "Cancel";
+                    small: true;
+                    kind: "ghost";
+                    clicked => {
+                        root.mode = 0;
+                    }
+                }
+                Button {
+                    text: "Rename";
+                    small: true;
+                    kind: "primary";
+                    clicked => {
+                        root.submit();
+                    }
+                }
+            }
+        }
+        if root.mode == 2: VerticalLayout {
+            padding: Theme.space-sm;
+            spacing: Theme.space-sm;
+            Text {
+                text: SceneStore.scenes.length > 1 ? "Delete “\{root.name}”?" : "Delete “\{root.name}”? Without scenes, the capture is recorded alone.";
+                font-size: Theme.font-small;
+                color: Theme.text;
+                wrap: word-wrap;
+            }
+            HorizontalLayout {
+                alignment: end;
+                spacing: Theme.space-sm;
+                Button {
+                    text: "Cancel";
+                    small: true;
+                    kind: "ghost";
+                    init => {
+                        self.focus();
+                    }
+                    clicked => {
+                        root.mode = 0;
+                    }
+                }
+                Button {
+                    text: "Delete";
+                    small: true;
+                    kind: "danger";
+                    accessible-label: "Delete \{root.name}";
+                    clicked => {
+                        root.mode = 0;
+                        SceneStore.delete-scene(SceneStore.editing);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// The preview, what it shows, and the canvas size.
+component PreviewCard inherits Card {
+    in property <bool> locked;
+    property <bool> any: SceneStore.scenes.length > 0;
+    property <[LayerRow]> layers: root.any && SceneStore.editing < SceneStore.scenes.length ? SceneStore.scenes[SceneStore.editing].layers : [{ kind: LayerKind.main, label: "Capture", visible: true, opacity: 1, w: 1, h: 1 }];
+    property <int> preset: !SceneStore.canvas-fixed ? 0
+        : SceneStore.canvas-width == 1920 && SceneStore.canvas-height == 1080 ? 1
+        : SceneStore.canvas-width == 2560 && SceneStore.canvas-height == 1440 ? 2
+        : SceneStore.canvas-width == 3840 && SceneStore.canvas-height == 2160 ? 3 : 4;
+    // "Custom" chosen, its size not typed yet.
+    property <bool> custom-open;
+    property <bool> custom: root.custom-open || root.preset == 4;
+
+    VerticalLayout {
+        padding: Theme.card-padding;
+        spacing: Theme.space-md;
+        HorizontalLayout {
+            spacing: Theme.space-sm;
+            SectionLabel {
+                horizontal-stretch: 1;
+                text: "PREVIEW";
+                vertical-alignment: center;
+            }
+            Text {
+                text: SceneStore.live ? "Live" : "Layout";
+                vertical-alignment: center;
+                font-size: Theme.font-caption;
+                font-weight: 600;
+                color: SceneStore.live ? Theme.rec : Theme.text-faint;
+            }
+        }
+        SceneCanvas {
+            layers: root.layers;
+            selected: root.any ? SceneStore.selected : -1;
+            ratio: SceneStore.ratio;
+            live: SceneStore.live;
+            live-image: SceneStore.live-image;
+            guide-x: SceneStore.guide-x;
+            guide-y: SceneStore.guide-y;
+            interactive: root.any;
+            select(i) => {
+                SceneStore.selected = i;
+            }
+        }
+        if root.any && SceneStore.editing != SceneStore.active: HorizontalLayout {
+            spacing: Theme.space-md;
+            Text {
+                horizontal-stretch: 1;
+                text: "Not recorded now.";
+                vertical-alignment: center;
+                font-size: Theme.font-small;
+                color: Theme.text-muted;
+                overflow: elide;
+            }
+            Button {
+                text: "Record this scene";
+                small: true;
+                clicked => {
+                    SceneStore.switch(SceneStore.editing);
+                }
+            }
+        }
+        Divider { }
+        PropField {
+            title: "Canvas";
+            Segmented {
+                label: "Canvas size";
+                enabled: !root.locked;
+                options: ["Auto", "1080p", "1440p", "2160p", "Custom"];
+                selected: root.custom ? 4 : root.preset;
+                changed(i) => {
+                    root.custom-open = i == 4;
+                    if (i != 4) {
+                        SceneStore.canvas-changed(i != 0, i == 1 ? 1920 : i == 2 ? 2560 : 3840, i == 1 ? 1080 : i == 2 ? 1440 : 2160);
+                    }
+                }
+            }
+            if root.custom: HorizontalLayout {
+                spacing: Theme.space-sm;
+                TextField {
+                    horizontal-stretch: 1;
+                    enabled: !root.locked;
+                    label: "Canvas width";
+                    text: SceneStore.canvas-width;
+                    accepted(text) => {
+                        SceneStore.canvas-changed(true, text.to-float(), SceneStore.canvas-height);
+                    }
+                }
+                Text {
+                    text: "×";
+                    vertical-alignment: center;
+                    color: Theme.text-muted;
+                }
+                TextField {
+                    horizontal-stretch: 1;
+                    enabled: !root.locked;
+                    label: "Canvas height";
+                    text: SceneStore.canvas-height;
+                    accepted(text) => {
+                        SceneStore.canvas-changed(true, SceneStore.canvas-width, text.to-float());
+                    }
+                }
+            }
+            Text {
+                text: root.locked ? "Locked while recording or streaming." : root.preset == 0 ? "The size of the captured source." : "The capture is fitted into it.";
+                font-size: Theme.font-small;
+                color: Theme.text-muted;
+                wrap: word-wrap;
+            }
+        }
+    }
+}
+
+// The edited scene's layers, top first, and the menu that adds one.
+component LayersCard inherits Card {
+    property <[LayerRow]> layers: SceneStore.editing < SceneStore.scenes.length ? SceneStore.scenes[SceneStore.editing].layers : [];
+    property <int> n: root.layers.length;
+    // 0 closed, 1 the kinds, 2 the cameras.
+    property <int> menu;
+    property <LayerRow> draft;
+
+    accessible-role: groupbox;
+    accessible-label: "Layers";
+
+    VerticalLayout {
+        padding: Theme.space-sm;
+        spacing: Theme.space-xs;
+        HorizontalLayout {
+            padding-left: Theme.space-sm;
+            spacing: Theme.space-sm;
+            SectionLabel {
+                horizontal-stretch: 1;
+                text: "LAYERS";
+                vertical-alignment: center;
+            }
+            Button {
+                text: root.menu == 0 ? "Add" : "Close";
+                icon: root.menu == 0 ? Icons.plus : "";
+                kind: "ghost";
+                small: true;
+                enabled: root.menu != 0 || root.n < 16;
+                accessible-label: root.menu == 0 ? "Add a layer" : "Close the menu";
+                clicked => {
+                    root.menu = root.menu == 0 ? 1 : 0;
+                }
+            }
+        }
+        if root.menu == 1: VerticalLayout {
+            spacing: 2px;
+            MenuItem {
+                text: "Capture";
+                icon: Icons.monitor;
+                detail: "Screen, window or game";
+                clicked => {
+                    root.menu = 0;
+                    SceneStore.add-layer(LayerKind.main, "");
+                }
+            }
+            MenuItem {
+                text: "Image…";
+                icon: Icons.image;
+                detail: "PNG or JPEG";
+                clicked => {
+                    root.menu = 0;
+                    SceneStore.pick-image(-1);
+                }
+            }
+            MenuItem {
+                text: "Text";
+                icon: Icons.text;
+                clicked => {
+                    root.menu = 0;
+                    SceneStore.add-layer(LayerKind.text, "");
+                }
+            }
+            MenuItem {
+                text: "Camera";
+                icon: Icons.camera;
+                clicked => {
+                    root.menu = 2;
+                    SceneStore.list-cameras();
+                }
+            }
+            Divider { }
+        }
+        if root.menu == 2: VerticalLayout {
+            spacing: 2px;
+            if SceneStore.cameras-state != 2 || SceneStore.cameras.length == 0: Text {
+                height: 36px;
+                x: Theme.space-sm;
+                text: SceneStore.cameras-state != 2 ? "Looking for cameras…" : "No camera found";
+                vertical-alignment: center;
+                font-size: Theme.font-small;
+                color: Theme.text-muted;
+            }
+            for c in SceneStore.cameras: MenuItem {
+                text: c.label;
+                icon: Icons.camera;
+                clicked => {
+                    root.menu = 0;
+                    SceneStore.add-layer(LayerKind.camera, c.node);
+                }
+            }
+            Divider { }
+        }
+        if root.n == 0: Text {
+            x: Theme.space-sm;
+            height: 36px;
+            text: "Empty: the scene records black.";
+            vertical-alignment: center;
+            font-size: Theme.font-small;
+            color: Theme.text-muted;
+        }
+        VerticalLayout {
+            spacing: 2px;
+            accessible-role: list;
+            accessible-label: "Layers, top first";
+            for k in root.n: LayerItem {
+                property <int> i: root.n - 1 - k;
+                layer: root.layers[self.i];
+                selected: self.i == SceneStore.selected;
+                top: k == 0;
+                bottom: k == root.n - 1;
+                clicked => {
+                    SceneStore.selected = self.i;
+                }
+                toggle-visible => {
+                    root.draft = root.layers[self.i];
+                    root.draft.visible = !root.draft.visible;
+                    SceneStore.layer-changed(self.i, root.draft);
+                }
+                up => {
+                    SceneStore.move-layer(self.i, true);
+                }
+                down => {
+                    SceneStore.move-layer(self.i, false);
+                }
+                remove => {
+                    SceneStore.remove-layer(self.i);
+                }
+            }
+        }
+    }
+}
+
+// The selected layer's settings.
+component PropsCard inherits Card {
+    in property <LayerRow> layer;
+    in property <int> index;
+    property <bool> text: root.layer.kind == LayerKind.text;
+    // The font list is shown.
+    property <bool> fonts-open;
+    property <LayerRow> draft;
+
+    function set(row: LayerRow) {
+        SceneStore.layer-changed(root.index, row);
+    }
+
+    accessible-role: groupbox;
+    accessible-label: "\{root.layer.label} settings";
+
+    VerticalLayout {
+        padding: Theme.card-padding;
+        spacing: Theme.space-lg;
+        HorizontalLayout {
+            spacing: Theme.space-sm;
+            Icon {
+                y: (parent.height - self.height) / 2;
+                width: 18px;
+                height: 18px;
+                data: SceneStore.kind-icon(root.layer.kind);
+                tint: Theme.accent;
+            }
+            Text {
+                horizontal-stretch: 1;
+                text: root.layer.label;
+                vertical-alignment: center;
+                font-size: Theme.font-body;
+                font-weight: 600;
+                color: Theme.text;
+                overflow: elide;
+            }
+            Text {
+                text: SceneStore.kind-name(root.layer.kind);
+                vertical-alignment: center;
+                font-size: Theme.font-caption;
+                color: Theme.text-faint;
+            }
+        }
+
+        if root.layer.kind == LayerKind.image: PropField {
+            title: "File";
+            HorizontalLayout {
+                spacing: Theme.space-sm;
+                Text {
+                    horizontal-stretch: 1;
+                    text: root.layer.value;
+                    vertical-alignment: center;
+                    font-size: Theme.font-small;
+                    color: Theme.text-muted;
+                    overflow: elide;
+                }
+                Button {
+                    text: "Change";
+                    small: true;
+                    accessible-label: "Change the image";
+                    clicked => {
+                        SceneStore.pick-image(root.index);
+                    }
+                }
+            }
+        }
+
+        if root.layer.kind == LayerKind.camera: PropField {
+            title: "Camera";
+            camera-field := SelectField {
+                property <bool> open;
+                label: "Camera";
+                text: root.layer.label;
+                icon: Icons.camera;
+                expanded: self.open;
+                clicked => {
+                    self.open = !self.open;
+                    if (self.open) {
+                        SceneStore.list-cameras();
+                    }
+                }
+            }
+            if camera-field.open: VerticalLayout {
+                spacing: 2px;
+                if SceneStore.cameras-state != 2 || SceneStore.cameras.length == 0: Text {
+                    height: 36px;
+                    x: Theme.space-sm;
+                    text: SceneStore.cameras-state != 2 ? "Looking for cameras…" : "No camera found";
+                    vertical-alignment: center;
+                    font-size: Theme.font-small;
+                    color: Theme.text-muted;
+                }
+                for c in SceneStore.cameras: ListRow {
+                    text: c.label;
+                    icon: Icons.camera;
+                    selected: c.node == root.layer.value;
+                    clicked => {
+                        camera-field.open = false;
+                        root.draft = root.layer;
+                        root.draft.value = c.node;
+                        root.draft.label = c.label;
+                        root.set(root.draft);
+                    }
+                }
+            }
+        }
+
+        if root.text: PropField {
+            title: "Text";
+            TextBox {
+                text: root.layer.value;
+                label: "Text";
+                edited(t) => {
+                    root.draft = root.layer;
+                    root.draft.value = t;
+                    root.set(root.draft);
+                }
+            }
+        }
+
+        if root.text: PropField {
+            title: "Font";
+            font-field := SelectField {
+                label: "Font";
+                text: root.layer.font == "" ? "Default (sans-serif)" : root.layer.font;
+                expanded: root.fonts-open;
+                clicked => {
+                    root.fonts-open = !root.fonts-open;
+                    if (root.fonts-open) {
+                        SceneStore.search-fonts("");
+                    }
+                }
+            }
+            if root.fonts-open: VerticalLayout {
+                spacing: Theme.space-xs;
+                TextField {
+                    label: "Search fonts";
+                    placeholder: "Search fonts";
+                    init => {
+                        self.focus();
+                    }
+                    edited(t) => {
+                        SceneStore.search-fonts(t);
+                    }
+                }
+                Rectangle {
+                    height: 200px;
+                    border-radius: Theme.radius-sm;
+                    border-width: 1px;
+                    border-color: Theme.border;
+                    clip: true;
+                    if SceneStore.fonts-loading: Text {
+                        text: "Loading the fonts…";
+                        font-size: Theme.font-small;
+                        color: Theme.text-muted;
+                    }
+                    Flickable {
+                        content-height: font-list.preferred-height;
+                        font-list := VerticalLayout {
+                            padding: 4px;
+                            spacing: 2px;
+                            ListRow {
+                                text: "Default (sans-serif)";
+                                selected: root.layer.font == "";
+                                clicked => {
+                                    root.fonts-open = false;
+                                    root.draft = root.layer;
+                                    root.draft.font = "";
+                                    root.set(root.draft);
+                                }
+                            }
+                            for f in SceneStore.fonts: ListRow {
+                                text: f;
+                                selected: f == root.layer.font;
+                                clicked => {
+                                    root.fonts-open = false;
+                                    root.draft = root.layer;
+                                    root.draft.font = f;
+                                    root.set(root.draft);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if root.text: PropSlider {
+            label: "Size";
+            value: root.layer.size;
+            minimum: 8;
+            maximum: 256;
+            step: 1;
+            default-value: 48;
+            value-text: "\{Math.round(root.layer.size)} px";
+            changed(v) => {
+                root.draft = root.layer;
+                root.draft.size = Math.round(v);
+                root.set(root.draft);
+            }
+        }
+
+        if root.text: PropField {
+            title: "Colour";
+            Swatches {
+                label: "Text";
+                current: root.layer.color;
+                picked(c) => {
+                    root.draft = root.layer;
+                    root.draft.color = c;
+                    root.set(root.draft);
+                }
+            }
+        }
+
+        if root.text: VerticalLayout {
+            spacing: Theme.space-sm;
+            HorizontalLayout {
+                Text {
+                    horizontal-stretch: 1;
+                    text: "Outline";
+                    vertical-alignment: center;
+                    font-size: Theme.font-small;
+                    font-weight: 600;
+                    color: Theme.text;
+                }
+                Switch {
+                    label: "Outline";
+                    checked: root.layer.outline;
+                    toggled(on) => {
+                        root.draft = root.layer;
+                        root.draft.outline = on;
+                        root.set(root.draft);
+                    }
+                }
+            }
+            if root.layer.outline: Swatches {
+                label: "Outline";
+                current: root.layer.outline-color;
+                picked(c) => {
+                    root.draft = root.layer;
+                    root.draft.outline-color = c.with-alpha(root.layer.outline-color.to-hsv().alpha);
+                    root.set(root.draft);
+                }
+            }
+            if root.layer.outline: PropSlider {
+                label: "Width";
+                value: root.layer.outline-width;
+                minimum: 0.5;
+                maximum: 16;
+                step: 0.5;
+                default-value: 3;
+                value-text: "\{Math.round(root.layer.outline-width * 2) / 2} px";
+                changed(v) => {
+                    root.draft = root.layer;
+                    root.draft.outline-width = Math.round(v * 2) / 2;
+                    root.set(root.draft);
+                }
+            }
+        }
+
+        if root.text: VerticalLayout {
+            spacing: Theme.space-sm;
+            HorizontalLayout {
+                Text {
+                    horizontal-stretch: 1;
+                    text: "Shadow";
+                    vertical-alignment: center;
+                    font-size: Theme.font-small;
+                    font-weight: 600;
+                    color: Theme.text;
+                }
+                Switch {
+                    label: "Shadow";
+                    checked: root.layer.shadow;
+                    toggled(on) => {
+                        root.draft = root.layer;
+                        root.draft.shadow = on;
+                        root.set(root.draft);
+                    }
+                }
+            }
+            if root.layer.shadow: Swatches {
+                label: "Shadow";
+                current: root.layer.shadow-color;
+                picked(c) => {
+                    root.draft = root.layer;
+                    root.draft.shadow-color = c.with-alpha(root.layer.shadow-color.to-hsv().alpha);
+                    root.set(root.draft);
+                }
+            }
+        }
+
+        if root.text: PropField {
+            title: "Alignment";
+            Segmented {
+                label: "Alignment";
+                options: ["Left", "Center", "Right"];
+                selected: root.layer.align;
+                changed(i) => {
+                    root.draft = root.layer;
+                    root.draft.align = i;
+                    root.set(root.draft);
+                }
+            }
+        }
+
+        PropSlider {
+            label: "Opacity";
+            value: root.layer.opacity;
+            step: 0.05;
+            default-value: 1;
+            value-text: "\{Math.round(root.layer.opacity * 100)} %";
+            changed(v) => {
+                root.draft = root.layer;
+                root.draft.opacity = v;
+                root.set(root.draft);
+            }
+        }
+
+        PropField {
+            title: "Fit";
+            Segmented {
+                label: "Fit";
+                options: ["Contain", "Cover", "Stretch"];
+                selected: root.layer.fit;
+                changed(i) => {
+                    root.draft = root.layer;
+                    root.draft.fit = i;
+                    root.set(root.draft);
+                }
+            }
+        }
+
+        PropField {
+            title: "Crop";
+            for side[s] in ["Left", "Top", "Right", "Bottom"]: PropSlider {
+                property <float> v: s == 0 ? root.layer.crop-left : s == 1 ? root.layer.crop-top : s == 2 ? root.layer.crop-right : root.layer.crop-bottom;
+                label: side;
+                value: self.v;
+                maximum: 0.45;
+                step: 0.01;
+                value-text: "\{Math.round(self.v * 100)} %";
+                changed(v) => {
+                    root.draft = root.layer;
+                    if (s == 0) {
+                        root.draft.crop-left = v;
+                    } else if (s == 1) {
+                        root.draft.crop-top = v;
+                    } else if (s == 2) {
+                        root.draft.crop-right = v;
+                    } else {
+                        root.draft.crop-bottom = v;
+                    }
+                    root.set(root.draft);
+                }
+            }
+        }
+    }
+}
+
+// The scene editor: a page over the window. Wide windows get three
+// columns (scenes and layers, preview, settings), narrow ones one.
+export component SceneEditor inherits Rectangle {
+    // Recording or streaming: the canvas stays.
+    in property <bool> locked;
+    callback close();
+
+    property <bool> wide: self.width >= 1100px;
+    property <bool> any: SceneStore.scenes.length > 0;
+    property <[LayerRow]> layers: root.any && SceneStore.editing < SceneStore.scenes.length ? SceneStore.scenes[SceneStore.editing].layers : [];
+    property <bool> has-layer: SceneStore.selected >= 0 && SceneStore.selected < root.layers.length;
+
+    background: Theme.window-bg;
+    accessible-role: groupbox;
+    accessible-label: "Scene editor";
+
+    // Swallows clicks so they do not reach the window below.
+    TouchArea { }
+
+    VerticalLayout {
+        HorizontalLayout {
+            padding-left: Theme.page-padding;
+            padding-right: Theme.page-padding;
+            padding-top: Theme.space-md;
+            padding-bottom: Theme.space-sm;
+            spacing: Theme.space-md;
+            VerticalLayout {
+                alignment: center;
+                Icon {
+                    data: Icons.layers;
+                    tint: Theme.accent;
+                }
+            }
+            Text {
+                horizontal-stretch: 1;
+                text: "Scenes";
+                vertical-alignment: center;
+                font-size: Theme.font-title;
+                font-weight: 700;
+                color: Theme.text;
+            }
+            close-button := IconButton {
+                icon: Icons.close;
+                label: "Close the scene editor";
+                clicked => {
+                    root.close();
+                }
+            }
+        }
+
+        // Mouse drags move layers: only the wheel scrolls.
+        flick := Flickable {
+            mouse-drag-pan-enabled: false;
+            content-width: self.width;
+            content-height: Math.max(self.height, body.preferred-height);
+            body := VerticalLayout {
+            width: flick.width;
+            height: flick.content-height;
+            if root.wide: HorizontalLayout {
+                padding: Theme.page-padding;
+                padding-top: Theme.space-sm;
+                spacing: Theme.section-gap;
+                VerticalLayout {
+                    width: 300px;
+                    spacing: Theme.section-gap;
+                    alignment: start;
+                    ScenesCard { }
+                    if root.any: LayersCard { }
+                }
+                VerticalLayout {
+                    horizontal-stretch: 1;
+                    alignment: start;
+                    PreviewCard {
+                        locked: root.locked;
+                    }
+                }
+                VerticalLayout {
+                    width: 320px;
+                    alignment: start;
+                    if root.has-layer: PropsCard {
+                        layer: root.layers[SceneStore.selected];
+                        index: SceneStore.selected;
+                    }
+                    if !root.has-layer && root.any: Card {
+                        VerticalLayout {
+                            padding: Theme.card-padding;
+                            Text {
+                                text: "Select a layer in the list or on the preview to change it.";
+                                font-size: Theme.font-small;
+                                color: Theme.text-muted;
+                                wrap: word-wrap;
+                            }
+                        }
+                    }
+                }
+            }
+            if !root.wide: HorizontalLayout {
+                // At most 720px wide, centered.
+                padding-left: Math.max(0px, (root.width - 720px) / 2);
+                padding-right: self.padding-left;
+                VerticalLayout {
+                    padding: Theme.page-padding;
+                    padding-top: Theme.space-sm;
+                    spacing: Theme.section-gap;
+                    alignment: start;
+                    // Without scenes, the way to make one comes first.
+                    if !root.any: ScenesCard { }
+                    PreviewCard {
+                        locked: root.locked;
+                    }
+                    if root.any: ScenesCard { }
+                    if root.any: LayersCard { }
+                    if root.has-layer: PropsCard {
+                        layer: root.layers[SceneStore.selected];
+                        index: SceneStore.selected;
+                    }
+                }
+            }
+            }
+        }
+    }
+}

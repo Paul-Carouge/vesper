@@ -6,7 +6,7 @@
 use std::sync::{Arc, mpsc};
 
 use ksni::blocking::{Handle, TrayMethods};
-use ksni::menu::{CheckmarkItem, StandardItem};
+use ksni::menu::{CheckmarkItem, RadioGroup, RadioItem, StandardItem, SubMenu};
 use ksni::{Icon, MenuItem, ToolTip};
 
 use crate::shortcuts::APP_ID;
@@ -19,11 +19,13 @@ pub enum Command {
     SaveReplay,
     ToggleReplay,
     ToggleLive,
+    /// Record scene `n` (the profile's order).
+    Scene(usize),
     Quit,
 }
 
 /// What the tray shows.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct State {
     pub window_visible: bool,
     pub recording: bool,
@@ -34,6 +36,9 @@ pub struct State {
     pub live: bool,
     /// The stream is ending: toggling it is ignored.
     pub live_busy: bool,
+    /// The profile's scenes (none: no Scene menu), and the recorded one.
+    pub scenes: Vec<String>,
+    pub active_scene: Option<usize>,
 }
 
 type OnCommand = Arc<dyn Fn(Command) + Send + Sync>;
@@ -50,7 +55,7 @@ enum Look {
 impl Look {
     const ALL: [Self; 4] = [Self::Idle, Self::Replay, Self::Recording, Self::Live];
 
-    fn of(state: State) -> Self {
+    fn of(state: &State) -> Self {
         if state.live {
             Self::Live
         } else if state.recording {
@@ -109,11 +114,11 @@ impl ksni::Tray for Item {
     }
 
     fn icon_name(&self) -> String {
-        Look::of(self.state).icon_name()
+        Look::of(&self.state).icon_name()
     }
 
     fn icon_pixmap(&self) -> Vec<Icon> {
-        self.pixmaps[Look::of(self.state) as usize].clone()
+        self.pixmaps[Look::of(&self.state) as usize].clone()
     }
 
     fn tool_tip(&self) -> ToolTip {
@@ -141,7 +146,7 @@ impl ksni::Tray for Item {
     }
 
     fn menu(&self) -> Vec<MenuItem<Self>> {
-        let s = self.state;
+        let s = &self.state;
         let item = |label: &str, enabled: bool, command: Command| {
             StandardItem {
                 label: label.into(),
@@ -151,7 +156,32 @@ impl ksni::Tray for Item {
             }
             .into()
         };
-        vec![
+        let scenes = (!s.scenes.is_empty()).then(|| {
+            SubMenu {
+                label: "Scene".into(),
+                submenu: vec![
+                    RadioGroup {
+                        selected: s.active_scene.unwrap_or(usize::MAX),
+                        select: Box::new(|item: &mut Self, i| {
+                            (item.on_command)(Command::Scene(i));
+                        }),
+                        options: s
+                            .scenes
+                            .iter()
+                            .map(|name| RadioItem {
+                                // An underscore marks an access key.
+                                label: name.replace('_', "__"),
+                                ..Default::default()
+                            })
+                            .collect(),
+                    }
+                    .into(),
+                ],
+                ..Default::default()
+            }
+            .into()
+        });
+        let mut menu = vec![
             item(
                 if s.window_visible {
                     "Hide window"
@@ -184,6 +214,9 @@ impl ksni::Tray for Item {
                 ..Default::default()
             }
             .into(),
+        ];
+        menu.extend(scenes);
+        menu.extend([
             MenuItem::Separator,
             StandardItem {
                 label: "Quit".into(),
@@ -192,7 +225,8 @@ impl ksni::Tray for Item {
                 ..Default::default()
             }
             .into(),
-        ]
+        ]);
+        menu
     }
 }
 
@@ -308,10 +342,10 @@ mod tests {
             live,
             ..Default::default()
         };
-        assert_eq!(Look::of(s(false, false, false)), Look::Idle);
-        assert_eq!(Look::of(s(false, true, false)), Look::Replay);
-        assert_eq!(Look::of(s(true, true, false)), Look::Recording);
-        assert_eq!(Look::of(s(true, true, true)), Look::Live);
+        assert_eq!(Look::of(&s(false, false, false)), Look::Idle);
+        assert_eq!(Look::of(&s(false, true, false)), Look::Replay);
+        assert_eq!(Look::of(&s(true, true, false)), Look::Recording);
+        assert_eq!(Look::of(&s(true, true, true)), Look::Live);
         assert_eq!(Look::Idle.icon_name(), format!("{APP_ID}-symbolic"));
     }
 
