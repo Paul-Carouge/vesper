@@ -20,7 +20,7 @@ export struct FilterKind { kind: string, title: string }
 /// One audio track. `source` is the backend's id of what it records;
 /// `source-label` names it ("Desktop audio", "Headset", "Firefox") and
 /// `device` is the device it records, if named ("Speakers (USB DAC)").
-export struct AudioTrack { name: string, source: string, source-label: string, device: string, kind: TrackKind, enabled: bool, muted: bool, volume-db: float, filters: [FilterRow], voice: bool, duck: bool, duck-level: int, music: bool, music-level: int }
+export struct AudioTrack { name: string, source: string, source-label: string, device: string, kind: TrackKind, enabled: bool, muted: bool, volume-db: float, filters: [FilterRow], voice: bool, duck: bool, duck-level: int, music: bool, music-level: int, leave-desktop: bool, without: string }
 /// A source a picker offers. `section` heads the first of a group; `added`:
 /// a track records it; `detail` is shown after the label ("Default",
 /// "Disconnected").
@@ -259,7 +259,10 @@ component AudioRow inherits HorizontalLayout {
             text: !root.track.enabled ? @tr("Not recorded")
                 : root.track.muted ? @tr("Muted")
                 : root.ducked ? @tr("Lowered")
-                : root.track.volume-db != 0 ? TrackText.volume(root.track.volume-db) : TrackText.source(root.track);
+                : root.track.volume-db != 0 ? TrackText.volume(root.track.volume-db)
+                : root.track.without == "" ? TrackText.source(root.track)
+                : root.track.device == "" ? @tr("Without {}", root.track.without)
+                : @tr("{} · without {}", root.track.device, root.track.without);
             font-size: Theme.font-caption;
             font-weight: root.track.muted && root.track.enabled ? 600 : 400;
             color: root.track.muted && root.track.enabled ? Theme.rec
@@ -1029,6 +1032,8 @@ export component AppWindow inherits Window {
     callback track-renamed(int, string);
     callback track-enabled-changed(int, bool);
     callback track-removed(int);
+    /// Track, its app left out of the desktop and output tracks.
+    callback track-leave-desktop-changed(int, bool);
     /// Track, a voice, lower when I speak and how much, background music and its level.
     callback track-ducking-changed(int, bool, bool, int, bool, int);
     /// A list of sources or devices is shown (or none any more): the backend
@@ -2183,6 +2188,18 @@ export component AppWindow inherits Window {
                                         vertical-alignment: center;
                                         font-size: Theme.font-small;
                                         color: Theme.text-muted;
+                                    }
+                                }
+                                // Not recorded twice: once here, once in the desktop.
+                                if track.kind == TrackKind.app: DuckOption {
+                                    title: @tr("Leave out of desktop audio");
+                                    hint: root.active ? @tr("Applies once the recording ends.")
+                                        : @tr("Desktop audio does not record this app a second time.");
+                                    label: @tr("{} left out of desktop audio", track.name);
+                                    checked: track.leave-desktop;
+                                    levels: [];
+                                    toggled(on) => {
+                                        root.track-leave-desktop-changed(i, on);
                                     }
                                 }
                                 // Under the voice; an input may be the voice.

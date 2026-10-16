@@ -200,6 +200,7 @@ impl Health {
 /// `on_state`; the encode thread fills the gap with silence meanwhile.
 pub fn run(
     source: Source,
+    except: Vec<String>,
     tx: mpsc::SyncSender<Chunk>,
     stop: pw::channel::Receiver<()>,
     ready: mpsc::Sender<Result<(), Error>>,
@@ -238,7 +239,7 @@ pub fn run(
                 }
             }
         };
-        match Session::open(&mainloop, &source, tx.clone(), &health, running) {
+        match Session::open(&mainloop, &source, &except, tx.clone(), &health, running) {
             Ok(session) => {
                 if let Some(ready) = ready.take() {
                     let _ = ready.send(Ok(()));
@@ -393,6 +394,7 @@ impl Session {
     fn open(
         mainloop: &pw::main_loop::MainLoopRc,
         source: &Source,
+        except: &[String],
         tx: mpsc::SyncSender<Chunk>,
         health: &Rc<Health>,
         running: impl Fn() + 'static,
@@ -421,7 +423,7 @@ impl Session {
         // them to the default sink (monitor) or source, and moves them when
         // the default changes. A device is targeted by name, never replaced
         // by the default while it is missing. An app's streams are linked by
-        // us (`AppLinks`).
+        // us (`AppLinks`), and so are the desktop's when it leaves apps out.
         let (name, target) = match &source {
             Source::Desktop => ("vesper-desktop-audio", None),
             Source::Microphone => ("vesper-microphone", None),
@@ -429,7 +431,15 @@ impl Session {
             Source::Input(node) => ("vesper-device-audio", Some(node)),
             Source::App(_) => ("vesper-app-audio", None),
         };
-        if matches!(source, Source::Desktop | Source::Output(_)) {
+        let wanted = match source {
+            Source::App(app) => Some(Wanted::App(app.clone())),
+            Source::Desktop | Source::Output(_) if !except.is_empty() => Some(Wanted::SinkExcept {
+                sink: target.cloned(),
+                apps: except.to_vec(),
+            }),
+            _ => None,
+        };
+        if wanted.is_none() && matches!(source, Source::Desktop | Source::Output(_)) {
             props.insert(*pw::keys::STREAM_CAPTURE_SINK, "true");
         }
         if let Some(node) = target {
@@ -439,10 +449,7 @@ impl Session {
         let input = source.is_input();
         // How the sink an app plays to stamps its monitor; unused otherwise.
         let timing = Rc::new(AppTiming::default());
-        let app = match &source {
-            Source::App(app) => Some(AppLinks::new(app.clone(), timing.clone())),
-            _ => None,
-        };
+        let app = wanted.map(|w| AppLinks::new(w, timing.clone()));
         let stream = pw::stream::StreamRc::new(core.clone(), name, props)?;
         let listener = stream
             .add_local_listener_with_user_data(tx)
@@ -519,7 +526,7 @@ impl Session {
         let pod = format_pod();
         let mut params = [Pod::from_bytes(&pod).ok_or("invalid audio format pod")?];
         let mut flags = pw::stream::StreamFlags::MAP_BUFFERS;
-        if !matches!(source, Source::App(_)) {
+        if app.is_none() {
             flags |= pw::stream::StreamFlags::AUTOCONNECT;
         }
         stream.connect(spa::utils::Direction::Input, None, flags, &mut params)?;
@@ -650,13 +657,83 @@ fn parse_latency(pod: &Pod) -> Option<Latency> {
     output.then_some(latency)
 }
 
-/// Links every playback stream of one application to our capture stream,
-/// following streams as they come and go. Several streams mix on our ports.
+/// Which playback streams `AppLinks` links to our capture stream.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Wanted {
+    /// Every playback stream of this application.
+    App(String),
+    /// A sink's monitor without these applications (they have their own
+    /// track): every other playback stream on the sink (`node.name`, `None`:
+    /// the default one), never one of ours.
+    SinkExcept {
+        sink: Option<String>,
+        apps: Vec<String>,
+    },
+}
+
+impl Wanted {
+    /// Whether a node with these properties may be linked (the desktop's
+    /// streams must also play to the default sink, see `AppLinks::update`).
+    /// `own_pid` is our process id: our own nodes are never recorded.
+    fn matches(&self, props: &spa::utils::dict::DictRef, own_pid: &str) -> bool {
+        match self {
+            Self::App(app) => crate::nodes::is_app_stream(app, props),
+            // Any node: the monitor had whatever plays to the sink, not
+            // only streams (a loopback, a node linked by hand).
+            Self::SinkExcept { apps, .. } => {
+                props.get(*pw::keys::APP_PROCESS_ID) != Some(own_pid)
+                    && !apps
+                        .iter()
+                        .any(|app| crate::nodes::is_app_stream(app, props))
+            }
+        }
+    }
+}
+
+/// For logs.
+impl std::fmt::Display for Wanted {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            Self::App(app) => f.write_str(app),
+            Self::SinkExcept { sink, apps } => write!(
+                f,
+                "{} except {}",
+                sink.as_deref().unwrap_or("desktop"),
+                apps.join(", ")
+            ),
+        }
+    }
+}
+
+/// The streams to link among `nodes` (the ones `Wanted` matches): all of an
+/// app's; for the desktop, those with a link in `graph` (output node, input
+/// node) to `sink`, the default sink.
+fn streams_to_link<'a>(
+    wanted: &Wanted,
+    nodes: &HashSet<u32>,
+    graph: impl IntoIterator<Item = &'a (u32, u32)>,
+    sink: Option<u32>,
+) -> HashSet<u32> {
+    match wanted {
+        Wanted::App(_) => nodes.clone(),
+        Wanted::SinkExcept { .. } => graph
+            .into_iter()
+            .filter(|(out, inp)| Some(*inp) == sink && nodes.contains(out))
+            .map(|&(out, _)| out)
+            .collect(),
+    }
+}
+
+/// Links every playback stream of one application (or, for the desktop,
+/// every other one on the default sink) to our capture stream, following
+/// streams as they come, go and move. Several streams mix on our ports.
 ///
-/// Also follows the sink the app plays to, for `AppTiming`.
+/// Also follows the sink they play to, for `AppTiming`.
 pub(crate) struct AppLinks {
-    app: String,
-    /// The application's playback stream nodes.
+    wanted: Wanted,
+    /// Our process id, as in `application.process.id`.
+    own_pid: String,
+    /// The playback stream nodes `wanted` matches.
     nodes: HashSet<u32>,
     ports: HashMap<u32, Port>,
     /// Ours, by (output port, input port).
@@ -673,6 +750,10 @@ pub(crate) struct AppLinks {
     /// latency, and the timing-only capture of its monitor.
     sink: Option<SinkWatch>,
     timing: Rc<AppTiming>,
+    /// The default sink's `node.name`, for the desktop.
+    default_sink: Option<String>,
+    /// The "default" metadata, followed for `default_sink`.
+    metadata: Option<(pw::metadata::MetadataListener, pw::metadata::Metadata)>,
     registry: Option<pw::registry::RegistryRc>,
     core: Option<pw::core::CoreRc>,
 }
@@ -698,9 +779,10 @@ impl Drop for SinkWatch {
 }
 
 impl AppLinks {
-    pub(crate) fn new(app: String, timing: Rc<AppTiming>) -> Rc<RefCell<Self>> {
+    pub(crate) fn new(wanted: Wanted, timing: Rc<AppTiming>) -> Rc<RefCell<Self>> {
         Rc::new(RefCell::new(Self {
-            app,
+            wanted,
+            own_pid: std::process::id().to_string(),
             nodes: HashSet::new(),
             ports: HashMap::new(),
             links: HashMap::new(),
@@ -710,6 +792,8 @@ impl AppLinks {
             graph: HashMap::new(),
             sink: None,
             timing,
+            default_sink: None,
+            metadata: None,
             registry: None,
             core: None,
         }))
@@ -733,9 +817,17 @@ impl AppLinks {
                     let mut s = state.borrow_mut();
                     let get = |k: &str| props.get(k).unwrap_or_default();
                     match global.type_ {
-                        ObjectType::Node if crate::nodes::is_app_stream(&s.app, props) => {
-                            info!("{}: linking stream node {}", s.app, global.id);
-                            s.nodes.insert(global.id);
+                        ObjectType::Metadata
+                            if matches!(s.wanted, Wanted::SinkExcept { sink: None, .. })
+                                && props.get("metadata.name") == Some("default") =>
+                        {
+                            match s.watch_default_sink(global, &state, &core, &stream) {
+                                Ok(m) => s.metadata = Some(m),
+                                Err(e) => {
+                                    warn!("{}: cannot follow the default sink: {e}", s.wanted)
+                                }
+                            }
+                            return;
                         }
                         ObjectType::Node if get(*pw::keys::MEDIA_CLASS) == "Audio/Sink" => {
                             // WirePlumber did not find the monitor by serial
@@ -747,6 +839,11 @@ impl AppLinks {
                                 name
                             };
                             s.sinks.insert(global.id, target.to_owned());
+                        }
+                        // After the sinks: a sink is never one of the streams.
+                        ObjectType::Node if s.wanted.matches(props, &s.own_pid) => {
+                            info!("{}: following stream node {}", s.wanted, global.id);
+                            s.nodes.insert(global.id);
                         }
                         ObjectType::Port => {
                             let Ok(node) = get(*pw::keys::NODE_ID).parse() else {
@@ -776,7 +873,7 @@ impl AppLinks {
                 }
             })
             .global_remove({
-                let state = state.clone();
+                let (state, core, stream) = (state.clone(), core.clone(), stream.clone());
                 move |id| {
                     let mut s = state.borrow_mut();
                     s.nodes.remove(&id);
@@ -790,25 +887,69 @@ impl AppLinks {
                     if s.sink.as_ref().is_some_and(|w| w.id == id || w.port == id) {
                         s.sink = None;
                     }
-                    s.follow_sink();
+                    // A stream moved off the default sink is unlinked.
+                    s.update(&core, stream.node_id());
                 }
             })
             .register();
         Ok(listener)
     }
 
-    /// Creates the links still missing, and follows the app's sink.
+    /// Follows the default sink in the "default" metadata.
+    fn watch_default_sink(
+        &self,
+        global: &GlobalObject<&spa::utils::dict::DictRef>,
+        state: &Rc<RefCell<Self>>,
+        core: &pw::core::CoreRc,
+        stream: &pw::stream::StreamRc,
+    ) -> Result<(pw::metadata::MetadataListener, pw::metadata::Metadata), Error> {
+        let registry = self.registry.as_ref().ok_or("no registry")?;
+        let proxy: pw::metadata::Metadata = registry.bind(global)?;
+        // Weak: the state owns this listener.
+        let (state, core, stream) = (Rc::downgrade(state), core.clone(), stream.clone());
+        let listener = proxy
+            .add_listener_local()
+            .property(move |subject, key, _, value| {
+                let default = match key {
+                    Some("default.audio.sink") => value.and_then(crate::nodes::default_name),
+                    // Every key removed.
+                    None => None,
+                    Some(_) => return 0,
+                };
+                if subject == pw::core::PW_ID_CORE
+                    && let Some(state) = state.upgrade()
+                {
+                    let mut s = state.borrow_mut();
+                    if s.default_sink != default {
+                        info!("{}: default sink {default:?}", s.wanted);
+                        s.default_sink = default;
+                        s.update(&core, stream.node_id());
+                    }
+                }
+                0
+            })
+            .register();
+        Ok((listener, proxy))
+    }
+
+    /// Creates the links still missing, removes the ones no longer wanted,
+    /// and follows the sink.
     pub(crate) fn update(&mut self, core: &pw::core::Core, own: u32) {
-        self.follow_sink();
+        let sink = self.follow_sink();
         let Self {
+            wanted,
             nodes,
             ports,
             links,
-            app,
+            graph,
             ..
         } = self;
+        let linked = streams_to_link(wanted, nodes, graph.values(), sink);
+        // Moved to another sink, or the default changed: dropping our proxy
+        // removes the link.
+        links.retain(|(out_id, _), _| ports.get(out_id).is_some_and(|p| linked.contains(&p.node)));
         for (&out_id, out) in ports.iter() {
-            if !out.output || !nodes.contains(&out.node) {
+            if !out.output || !linked.contains(&out.node) {
                 continue;
             }
             for target in link_targets(&out.channel) {
@@ -831,19 +972,28 @@ impl AppLinks {
                     Ok(link) => {
                         links.insert((out_id, in_id), link);
                     }
-                    Err(e) => warn!("{app}: could not link port {out_id}: {e}"),
+                    Err(e) => warn!("{wanted}: could not link port {out_id}: {e}"),
                 }
             }
         }
     }
 
-    /// Follows the sink the app plays to (the lowest id if several): binds
-    /// a monitor port for its latency and opens a timing-only capture of its
-    /// monitor. A new sink keeps the old timing until its own arrives.
-    fn follow_sink(&mut self) {
-        let sink = app_sink(self.graph.values(), &self.nodes, |id| {
-            self.sinks.contains_key(&id)
-        });
+    /// Follows the sink the app plays to (the lowest id if several), or the
+    /// default sink for the desktop, and returns it: binds a monitor port
+    /// for its latency and opens a timing-only capture of its monitor. A new
+    /// sink keeps the old timing until its own arrives.
+    fn follow_sink(&mut self) -> Option<u32> {
+        let sink = match &self.wanted {
+            Wanted::App(_) => app_sink(self.graph.values(), &self.nodes, |id| {
+                self.sinks.contains_key(&id)
+            }),
+            Wanted::SinkExcept { sink, .. } => self
+                .sinks
+                .iter()
+                .filter(|(_, name)| sink.as_ref().or(self.default_sink.as_ref()) == Some(*name))
+                .map(|(&id, _)| id)
+                .min(),
+        };
         if sink != self.failed {
             self.failed = None;
         }
@@ -851,10 +1001,10 @@ impl AppLinks {
             self.sink = None;
             self.timing.monitor.set(Latency::default());
             self.timing.reference_ns.set(None);
-            return;
+            return None;
         };
         if self.sink.as_ref().is_some_and(|w| w.id == sink) || self.failed == Some(sink) {
-            return;
+            return Some(sink);
         }
         let port = self
             .monitors
@@ -863,15 +1013,16 @@ impl AppLinks {
             .min()
             .copied();
         let (Some(port), Some(registry), Some(core)) = (port, &self.registry, &self.core) else {
-            return;
+            return Some(sink);
         };
         match self.watch_sink(sink, port, registry.clone(), core.clone()) {
             Ok(w) => self.sink = Some(w),
             Err(e) => {
-                warn!("{}: cannot follow sink {sink}: {e}", self.app);
+                warn!("{}: cannot follow sink {sink}: {e}", self.wanted);
                 self.failed = Some(sink);
             }
         }
+        Some(sink)
     }
 
     fn watch_sink(
@@ -882,7 +1033,7 @@ impl AppLinks {
         core: pw::core::CoreRc,
     ) -> Result<SinkWatch, Error> {
         let proxy = registry.bind::<pw::port::Port, _>(&self.monitors[&port])?;
-        let (timing, app) = (self.timing.clone(), self.app.clone());
+        let (timing, app) = (self.timing.clone(), self.wanted.to_string());
         let port_listener = proxy
             .add_listener_local()
             .param(move |_, _, _, _, pod| {
@@ -908,7 +1059,7 @@ impl AppLinks {
         };
         let reference = pw::stream::StreamRc::new(core, "vesper-app-timing", props)?;
         let timing = self.timing.clone();
-        let app = self.app.clone();
+        let app = self.wanted.to_string();
         let reference_listener = reference
             .add_local_listener_with_user_data(())
             .state_changed(move |_, _, _, new| match new {
@@ -1078,6 +1229,65 @@ mod tests {
         assert_eq!(app_sink(&links, &nodes, is_sink), Some(57));
         assert_eq!(app_sink(&links[2..], &nodes, is_sink), None);
         assert_eq!(app_sink(&[], &nodes, is_sink), None);
+    }
+
+    #[test]
+    fn desktop_leaves_out_the_apps_with_a_track_and_our_own_streams() {
+        let node = |props: &[(&str, &str)]| PropertiesBox::from_iter(props.iter().copied());
+        let firefox = node(&[
+            ("media.class", "Stream/Output/Audio"),
+            ("application.name", "Firefox"),
+            ("node.name", "Firefox"),
+        ]);
+        let spotify = node(&[
+            ("media.class", "Stream/Output/Audio"),
+            ("application.name", "spotify"),
+            ("application.process.id", "41"),
+        ]);
+        let ours = node(&[
+            ("media.class", "Stream/Output/Audio"),
+            ("application.process.id", "7"),
+        ]);
+        let capture = node(&[("media.class", "Stream/Input/Audio")]);
+        let desktop = Wanted::SinkExcept {
+            sink: None,
+            apps: vec!["Firefox".into()],
+        };
+        // Excluded by the same rule that gives the Firefox track its streams.
+        let app = Wanted::App("Firefox".into());
+        assert!(app.matches(firefox.as_ref(), "7"));
+        assert!(!desktop.matches(firefox.as_ref(), "7"));
+        assert!(desktop.matches(spotify.as_ref(), "7"));
+        assert!(!app.matches(spotify.as_ref(), "7"));
+        // Never our own nodes (no feedback loop).
+        assert!(!desktop.matches(ours.as_ref(), "7"));
+        assert!(desktop.matches(ours.as_ref(), "8"));
+        // Followed, but only linked if it plays to the sink, which a
+        // capture stream never does.
+        assert!(desktop.matches(capture.as_ref(), "7"));
+        assert!(!app.matches(capture.as_ref(), "7"));
+        assert_eq!(desktop.to_string(), "desktop except Firefox");
+    }
+
+    #[test]
+    fn desktop_links_only_the_streams_on_its_sink() {
+        let desktop = Wanted::SinkExcept {
+            sink: None,
+            apps: vec!["Firefox".into()],
+        };
+        // Streams 10 and 11 play to sink 50, 12 to sink 60; 13 is not
+        // followed (an excluded app); 99 is our capture stream.
+        let nodes = HashSet::from([10, 11, 12]);
+        let graph = [(10, 50), (11, 50), (12, 60), (13, 50), (10, 99)];
+        let linked = |sink| streams_to_link(&desktop, &nodes, &graph, sink);
+        assert_eq!(linked(Some(50)), HashSet::from([10, 11]));
+        // The default moved: the other streams.
+        assert_eq!(linked(Some(60)), HashSet::from([12]));
+        // No default sink known: nothing.
+        assert!(linked(None).is_empty());
+        // An app track links all of its streams, whatever their sink.
+        let app = Wanted::App("x".into());
+        assert_eq!(streams_to_link(&app, &nodes, &graph, None), nodes);
     }
 
     #[test]

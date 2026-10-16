@@ -204,6 +204,12 @@ pub struct Options {
     pub speaks: bool,
     /// Ducking and background music of a track that is not a voice.
     pub ducking: DuckSettings,
+    /// Applications left out of a [`Source::Desktop`] or [`Source::Output`]
+    /// track, matched as [`Source::App`] matches them (they have their own
+    /// track): the track then links the sink's other playback streams to
+    /// itself instead of reading its monitor. Empty: the monitor, as is.
+    /// Ignored by the other sources.
+    pub desktop_except: Vec<String>,
 }
 
 /// See [`Options::on_signal`].
@@ -376,10 +382,10 @@ impl AudioCapture {
             .spawn(move || encode_loop(enc, chunk_rx))?;
         let (stop, stop_rx) = ::pipewire::channel::channel();
         let (ready_tx, ready_rx) = mpsc::channel();
-        let on_state = options.on_state;
+        let (on_state, except) = (options.on_state, options.desktop_except);
         let pw_thread = std::thread::Builder::new()
             .name("vesper-audio-pw".into())
-            .spawn(move || pw::run(source, chunk_tx, stop_rx, ready_tx, on_state))?;
+            .spawn(move || pw::run(source, except, chunk_tx, stop_rx, ready_tx, on_state))?;
         let capture = Self {
             shared,
             extradata,

@@ -324,6 +324,9 @@ pub struct Track {
     pub filters: Vec<TrackFilter>,
     /// Voice ducking and background music (not for voice tracks).
     pub ducking: Ducking,
+    /// An app track's streams are left out of the desktop and output
+    /// tracks, so they are not recorded twice.
+    pub leave_desktop: bool,
 }
 
 /// How much, for [`Ducking`]: the duck's depth, the music's loudness.
@@ -409,9 +412,24 @@ impl Track {
             volume_db: 0.0,
             filters: Vec::new(),
             ducking: Ducking::for_source(&source),
+            leave_desktop: true,
             source,
         }
     }
+}
+
+/// The apps the desktop and output tracks leave out: those of the enabled
+/// app tracks that ask to. A disabled track does not record its app, so the
+/// desktop keeps it.
+pub fn desktop_except(tracks: &[Track]) -> Vec<String> {
+    tracks
+        .iter()
+        .filter(|t| t.enabled && t.leave_desktop)
+        .filter_map(|t| match &t.source {
+            Source::App(app) => Some(app.clone()),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Audio tracks and their captures, shared with the UI thread. One lock, so
@@ -1026,6 +1044,9 @@ fn start_audio(sources: &AudioSources, sinks: &SharedSinks, on_event: &OnEvent) 
     let mut controls = Vec::new();
     // The microphones speak into it, the other tracks duck under it.
     let voice = Arc::new(VoiceKey::default());
+    // shortcut: an app track that fails to start still leaves its app out of
+    // the desktop; start app tracks first if that ever happens in practice.
+    let except = desktop_except(&tracks);
     let mut failed = Vec::new();
     for (input, &i) in inputs.iter_mut().zip(&enabled) {
         let track = &tracks[i];
@@ -1053,6 +1074,7 @@ fn start_audio(sources: &AudioSources, sinks: &SharedSinks, on_event: &OnEvent) 
             voice: Some(voice.clone()),
             ducking: track.ducking.settings(),
             speaks: track.ducking.voice,
+            desktop_except: except.clone(),
         };
         match AudioCapture::start(track.source.clone(), options, move |packet| {
             write_audio(&sinks, index.get(), packet)
@@ -3046,6 +3068,31 @@ mod tests {
         let mut ring = filled(3, 4000);
         ring.push_video(packet(6000, false));
         assert_eq!(ring.video.back().unwrap().pts, Duration::from_millis(6000));
+    }
+
+    #[test]
+    fn desktop_leaves_out_the_enabled_app_tracks_that_ask() {
+        let app = |name: &str| Track::new(name, Source::App(name.into()));
+        let tracks = [
+            Track::new("Desktop", Source::Desktop),
+            Track::new("Mic", Source::Microphone),
+            app("Firefox"),
+            Track {
+                leave_desktop: false,
+                ..app("mpv")
+            },
+            Track {
+                enabled: false,
+                ..app("Spotify")
+            },
+            // Muted still records nothing of it: still left out.
+            Track {
+                muted: true,
+                ..app("Discord")
+            },
+        ];
+        assert_eq!(desktop_except(&tracks), ["Firefox", "Discord"]);
+        assert!(desktop_except(&tracks[..2]).is_empty());
     }
 
     #[test]

@@ -196,6 +196,32 @@ fn row(ui: &AppWindow, track: &Track) -> AudioTrack {
         duck_level: level_index(track.ducking.duck_level),
         music: track.ducking.music,
         music_level: level_index(track.ducking.music_level),
+        leave_desktop: track.leave_desktop,
+        without: SharedString::new(),
+    }
+}
+
+/// The apps a desktop or output track leaves out, for its subtitle.
+fn without(source: &Source, except: &[String]) -> String {
+    match source {
+        Source::Desktop | Source::Output(_) => except.join(", "),
+        _ => String::new(),
+    }
+}
+
+/// Updates the rows' `without` from their tracks, in place.
+fn show_without(ui: &AppWindow) {
+    let tracks = tracks_from_ui(ui);
+    let except = crate::recorder::desktop_except(&tracks);
+    let model = ui.get_tracks();
+    for (i, t) in tracks.iter().enumerate() {
+        let text = without(&t.source, &except);
+        if let Some(mut row) = model.row_data(i)
+            && row.without != text.as_str()
+        {
+            row.without = text.into();
+            model.set_row_data(i, row);
+        }
     }
 }
 
@@ -236,13 +262,21 @@ pub fn tracks_from_ui(ui: &AppWindow) -> Vec<Track> {
                 volume_db: t.volume_db,
                 filters: crate::filters::from_rows(&t.filters),
                 ducking,
+                leave_desktop: t.leave_desktop,
             })
         })
         .collect()
 }
 
 pub fn show_tracks(ui: &AppWindow, tracks: &[Track]) {
-    let rows: Vec<_> = tracks.iter().map(|t| row(ui, t)).collect();
+    let except = crate::recorder::desktop_except(tracks);
+    let rows: Vec<_> = tracks
+        .iter()
+        .map(|t| AudioTrack {
+            without: without(&t.source, &except).into(),
+            ..row(ui, t)
+        })
+        .collect();
     ui.set_tracks(ModelRc::new(VecModel::from(rows)));
     ui.set_max_tracks(MAX_TRACKS as i32);
 }
@@ -574,7 +608,20 @@ pub fn wire(ui: &AppWindow, rec: &Shared) {
     ui.on_track_enabled_changed(move |i, on| {
         let Some(ui) = weak.upgrade() else { return };
         if edit_row(&ui, i, |t| t.enabled = on).is_some() {
+            show_without(&ui);
             Prefs::from_ui(&ui).save();
+            apply_tracks(&ui, &r);
+        }
+    });
+
+    let weak = ui.as_weak();
+    let r = rec.clone();
+    ui.on_track_leave_desktop_changed(move |i, on| {
+        let Some(ui) = weak.upgrade() else { return };
+        if edit_row(&ui, i, |t| t.leave_desktop = on).is_some() {
+            show_without(&ui);
+            Prefs::from_ui(&ui).save();
+            // The desktop track restarts with it, once nothing records.
             apply_tracks(&ui, &r);
         }
     });
