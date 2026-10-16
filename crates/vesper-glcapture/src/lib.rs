@@ -216,8 +216,12 @@ extern "C" fn dlsym_hook(handle: *mut c_void, name: *const c_char) -> *mut c_voi
             return ptr::null_mut();
         };
         let found = real_dlsym(handle, hook.name());
-        if found.is_null() {
-            // glibc answers, with the caller's scope.
+        // Not found, or found in the global scope (RTLD_DEFAULT, a
+        // dlopen(NULL) handle): glibc answers, with the caller's scope. The
+        // global scope's function is ours or that of an interposer preloaded
+        // before us, which reaches us through RTLD_NEXT; remembering it as
+        // the real one would loop.
+        if found.is_null() || found == real_dlsym(libc::RTLD_DEFAULT, hook.name()) {
             return ptr::null_mut();
         }
         remember(hook, found);

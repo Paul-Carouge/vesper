@@ -24,4 +24,7 @@ case "$prefix" in
 esac
 # $LIB is expanded by ld.so, not by the shell.
 lib="$prefix/\$LIB/vesper/libvesper_glcapture.so"
-exec env LD_PRELOAD="${LD_PRELOAD:+$LD_PRELOAD:}$lib" "$@"
+# Not `env`: it would take a game argument with '=' or a leading '-' as its own.
+LD_PRELOAD="${LD_PRELOAD:+$LD_PRELOAD:}$lib"
+export LD_PRELOAD
+exec "$@"

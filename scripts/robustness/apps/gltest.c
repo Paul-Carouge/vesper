@@ -1,4 +1,6 @@
-// gltest <glx|glx-dlopen|egl> <frames | seconds"s"> [WxH]
+// gltest <glx|glx-dlopen|egl|egl-es-srgb> <frames | seconds"s"> [WxH]
+// egl-es-srgb: OpenGL ES 3 on an sRGB EGL surface (writes are encoded:
+// the background green 0.2 is stored as about 124/255).
 // Clears with a cycling color and draws a moving white box with the scissor
 // test, leaving the scissor ON at swap (checks the interposer restores it).
 // Prints the average frame time. No vsync (swap interval 0).
@@ -34,17 +36,20 @@ int main(int argc, char **argv) {
     Window win;
     EGLDisplay edpy = 0; EGLSurface esurf = 0;
     swap_fn swap = NULL;
-    if (strcmp(mode, "egl") == 0) {
+    int es = strcmp(mode, "egl-es-srgb") == 0;
+    if (es || strcmp(mode, "egl") == 0) {
         win = XCreateWindow(dpy, root, 0, 0, W, H, 0, CopyFromParent, InputOutput, CopyFromParent, 0, &swa);
         XMapWindow(dpy, win);
         edpy = eglGetDisplay((EGLNativeDisplayType)dpy);
         eglInitialize(edpy, NULL, NULL);
-        eglBindAPI(EGL_OPENGL_API);
-        EGLint attr[] = {EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_SURFACE_TYPE, EGL_WINDOW_BIT, EGL_RENDERABLE_TYPE, EGL_OPENGL_BIT, EGL_NONE};
+        eglBindAPI(es ? EGL_OPENGL_ES_API : EGL_OPENGL_API);
+        EGLint attr[] = {EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_SURFACE_TYPE, EGL_WINDOW_BIT, EGL_RENDERABLE_TYPE, es ? EGL_OPENGL_ES3_BIT : EGL_OPENGL_BIT, EGL_NONE};
         EGLConfig cfg; EGLint n;
         eglChooseConfig(edpy, attr, &cfg, 1, &n);
-        EGLContext ctx = eglCreateContext(edpy, cfg, EGL_NO_CONTEXT, NULL);
-        esurf = eglCreateWindowSurface(edpy, cfg, (EGLNativeWindowType)win, NULL);
+        EGLint cattr[] = {EGL_CONTEXT_MAJOR_VERSION, 3, EGL_NONE};
+        EGLContext ctx = eglCreateContext(edpy, cfg, EGL_NO_CONTEXT, es ? cattr : NULL);
+        EGLint sattr[] = {EGL_GL_COLORSPACE, EGL_GL_COLORSPACE_SRGB, EGL_NONE};
+        esurf = eglCreateWindowSurface(edpy, cfg, (EGLNativeWindowType)win, es ? sattr : NULL);
         eglMakeCurrent(edpy, esurf, esurf, ctx);
         eglSwapInterval(edpy, 0);
     } else {

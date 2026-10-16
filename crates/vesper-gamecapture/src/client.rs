@@ -90,7 +90,7 @@ fn debug_enabled() -> bool {
 /// Writes a line to stderr only if that cannot block: these run on the
 /// game's render thread, and a full pipe must not stall it.
 fn log(msg: &str) {
-    let line = format!("[vesper layer] {msg}\n");
+    let line = format!("[vesper capture] {msg}\n");
     let mut pfd = libc::pollfd {
         fd: 2,
         events: libc::POLLOUT,
@@ -209,7 +209,7 @@ pub fn ensure_thread() {
             libc::sigfillset(&mut all);
             libc::pthread_sigmask(libc::SIG_BLOCK, &all, &mut old);
             let r = std::thread::Builder::new()
-                .name("vesper-layer".into())
+                .name("vesper-capture".into())
                 .spawn(run);
             libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut());
             r

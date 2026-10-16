@@ -2645,7 +2645,7 @@ export component AppWindow inherits Window {
 
                     SettingGroup {
                         label: "OPENGL GAMES";
-                        hint: "Native OpenGL games (Terraria, many indie games, emulators) are captured per game: put this in the game's launch options in Steam (Properties > General). Only that game loads the capture library, with the same consent as Vulkan games; the switch above is not needed.";
+                        hint: "For the best performance in OpenGL games (Terraria, many indie games, emulators), add vesper-gl %command% to the game's launch options in Steam (Properties > General); otherwise Vesper captures the game window. Only that game loads the capture library, with the same consent as Vulkan games. Don't use it on multiplayer games protected by VAC, EAC or BattlEye: risk of an account ban.";
                         Labeled {
                             title: "vesper-gl %command%";
                             wrap-subtitle: true;

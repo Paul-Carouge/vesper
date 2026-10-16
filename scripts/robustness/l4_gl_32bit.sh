@@ -34,10 +34,10 @@ game() {
   gamescope --backend headless -W ${SIZE%x*} -H ${SIZE#*x} -- env SteamAppId=1 vblank_mode=0 VESPER_LAYER_DEBUG=1 \
     "${wrap[@]}" "${cmd[@]}" > $L/log/game-$1-$2.log 2>&1
   echo "  $2: $(grep -E '^frames' $L/log/game-$1-$2.log)"
-  grep -E "vesper layer|ERROR" $L/log/game-$1-$2.log | sort | uniq -c | head -5
+  grep -E "vesper capture|ERROR" $L/log/game-$1-$2.log | sort | uniq -c | head -5
 }
 
-for c in ${CASES:-vk32 gl64-glx gl64-glx-dlopen gl64-egl gl32-glx gl32-glx-dlopen gl32-egl}; do
+for c in ${CASES:-vk32 gl64-glx gl64-glx-dlopen gl64-egl gl64-egl-es-srgb gl32-glx gl32-glx-dlopen gl32-egl}; do
   echo "== $c"
   game $c none
   game $c dormant

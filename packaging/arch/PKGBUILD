@@ -75,7 +75,9 @@ build() {
   export CARGO_TARGET_DIR=target
   cargo build --release --locked --frozen --workspace
   if _lib32; then
-    cargo build --release --locked --frozen --target $_i686 -p vesper-vklayer -p vesper-glcapture
+    # A failed 32-bit build must not leave stale libraries to package.
+    cargo build --release --locked --frozen --target $_i686 -p vesper-vklayer -p vesper-glcapture \
+      || { echo "32-bit build failed: no 32-bit game capture" >&2; rm -rf target/$_i686; }
   else
     echo "No i686 Rust target or 32-bit toolchain: no 32-bit game capture" >&2
   fi
@@ -97,7 +99,8 @@ package() {
   # OpenGL games: only through `vesper-gl %command%`, per game (LD_PRELOAD).
   install -Dm644 target/release/libvesper_glcapture.so -t "$pkgdir/usr/lib/vesper/"
   install -Dm755 crates/vesper-glcapture/vesper-gl -t "$pkgdir/usr/bin/"
-  if [ -f target/$_i686/release/libvesper_vklayer.so ]; then
+  if _lib32 && [ -f target/$_i686/release/libvesper_vklayer.so ] \
+    && [ -f target/$_i686/release/libvesper_glcapture.so ]; then
     install -Dm644 target/$_i686/release/libvesper_vklayer.so \
       target/$_i686/release/libvesper_glcapture.so -t "$pkgdir/usr/lib32/vesper/"
   fi

@@ -63,6 +63,7 @@ const GL_NUM_EXTENSIONS: u32 = 0x821D;
 const GL_TEXTURE_2D: u32 = 0x0DE1;
 const GL_TEXTURE_BINDING_2D: u32 = 0x8069;
 const GL_RGBA8: u32 = 0x8058;
+const GL_SRGB8_ALPHA8: u32 = 0x8C43;
 const GL_READ_FRAMEBUFFER: u32 = 0x8CA8;
 const GL_DRAW_FRAMEBUFFER: u32 = 0x8CA9;
 const GL_READ_FRAMEBUFFER_BINDING: u32 = 0x8CAA;
@@ -89,6 +90,8 @@ const GLX_RENDERER_DEVICE_ID_MESA: c_int = 0x8184;
 const EGL_WIDTH: i32 = 0x3057;
 const EGL_HEIGHT: i32 = 0x3056;
 const EGL_DRAW: i32 = 0x3059;
+const EGL_GL_COLORSPACE: i32 = 0x309D;
+const EGL_GL_COLORSPACE_SRGB: i32 = 0x3089;
 const EGL_DEVICE_EXT: i32 = 0x322C;
 const EGL_DRM_RENDER_NODE_FILE_EXT: i32 = 0x3377;
 
@@ -256,6 +259,17 @@ impl Funcs {
         }
     }
 
+    /// Whether `drawable` is an sRGB EGL surface.
+    fn srgb_surface(&self, dpy: *mut c_void, drawable: usize) -> bool {
+        let Wsi::Egl(f, _) = &self.wsi else {
+            return false;
+        };
+        let mut cs = 0;
+        let ok =
+            unsafe { (f.query_surface)(dpy, drawable as *mut c_void, EGL_GL_COLORSPACE, &mut cs) };
+        ok != 0 && cs == EGL_GL_COLORSPACE_SRGB
+    }
+
     /// Render node of the GPU the current context renders on.
     fn render_node(&self, dpy: *mut c_void) -> PathBuf {
         let node = unsafe {
@@ -311,6 +325,11 @@ fn node_for_pci(drm: &Path, vendor: u32, device: u32) -> Option<PathBuf> {
         .map(|n| Path::new("/dev/dri").join(n))
 }
 
+/// Mesa names itself in `GL_VERSION` ("4.6 (Compatibility Profile) Mesa 26.2.4").
+fn is_mesa(version: &str) -> bool {
+    version.split_whitespace().any(|w| w == "Mesa")
+}
+
 /// `(major, ES)` from `GL_VERSION`: "4.6 (Compatibility Profile) Mesa ...",
 /// "OpenGL ES 3.2 Mesa ...".
 fn parse_version(v: &str) -> Option<(u32, bool)> {
@@ -341,9 +360,12 @@ unsafe impl Sync for GbmLib {}
 const GBM_BO_USE_RENDERING: u32 = 1 << 2;
 const GBM_BO_USE_LINEAR: u32 = 1 << 4;
 
-fn gbm() -> Option<&'static GbmLib> {
-    static LIB: OnceLock<Option<GbmLib>> = OnceLock::new();
-    LIB.get_or_init(|| {
+static GBM: OnceLock<Option<GbmLib>> = OnceLock::new();
+
+/// Loads libgbm once. Never under `STATE`: dlopen takes the loader lock,
+/// which a thread in a destructor may hold while destroying a context.
+fn load_gbm() {
+    GBM.get_or_init(|| {
         // Loaded only when a ring is first made, and kept (never dlclosed).
         let h = unsafe { libc::dlopen(c"libgbm.so.1".as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
         if h.is_null() {
@@ -351,8 +373,7 @@ fn gbm() -> Option<&'static GbmLib> {
             return None;
         }
         GbmLib::load(&|name| crate::real_dlsym(h, name))
-    })
-    .as_ref()
+    });
 }
 
 /// A GBM device on a render node. Dropped after its buffers.
@@ -364,8 +385,12 @@ struct GbmDevice {
 }
 
 impl GbmDevice {
-    fn open(node: &Path) -> Result<GbmDevice, String> {
-        let lib = gbm().ok_or("no libgbm")?;
+    /// `Ok(None)`: libgbm not loaded yet (`load_gbm` runs on a later swap).
+    fn open(node: &Path) -> Result<Option<GbmDevice>, String> {
+        let lib = match GBM.get() {
+            None => return Ok(None),
+            Some(lib) => lib.as_ref().ok_or("no libgbm")?,
+        };
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -375,11 +400,11 @@ impl GbmDevice {
         if dev.is_null() {
             return Err(format!("no GBM device on {}", node.display()));
         }
-        Ok(GbmDevice {
+        Ok(Some(GbmDevice {
             lib,
             dev,
             node: file,
-        })
+        }))
     }
 }
 
@@ -412,6 +437,10 @@ struct Ring {
     size: (u32, u32),
     /// OpenGL ES context (no `GL_FRAMEBUFFER_SRGB`).
     es: bool,
+    /// Storage format of the ring textures: `GL_SRGB8_ALPHA8` for an ES
+    /// context on an sRGB EGL surface (ES blits decode an sRGB source; an
+    /// sRGB target encodes back, so the bytes are copied unchanged).
+    format: u32,
     gbm: GbmDevice,
     slots: Vec<Slot>,
     pacer: protocol::Pacer,
@@ -550,9 +579,7 @@ pub fn before_swap(api: Api, dpy: *mut c_void, drawable: usize) {
         return;
     }
     if IPC.capturing.load(Ordering::Relaxed) {
-        // Loaded (once) before taking STATE: dlopen takes the loader lock,
-        // which a thread in a destructor may hold while destroying a context.
-        gbm();
+        load_gbm();
     }
     let mut st = STATE.locked();
     if st.disabled.contains(&(api, ctx)) {
@@ -620,7 +647,7 @@ pub fn before_swap(api: Api, dpy: *mut c_void, drawable: usize) {
         }
         return;
     }
-    if let Err(e) = capture(f, owner, dpy) {
+    if let Err(e) = capture(f, owner, dpy, drawable) {
         warn(&format!("capture off for this OpenGL context: {e}"));
         let owner = st.owner.take().expect("set above");
         if let Some(ring) = owner.ring {
@@ -676,7 +703,7 @@ pub fn context_destroyed(api: Api, ctx: usize) {
 
 /// Copies this swap's frame if it is due. Err disables capture for the
 /// context.
-fn capture(f: &Funcs, owner: &mut Owner, dpy: *mut c_void) -> Result<(), String> {
+fn capture(f: &Funcs, owner: &mut Owner, dpy: *mut c_void, drawable: usize) -> Result<(), String> {
     let start = IPC.start_id.load(Ordering::SeqCst);
     if owner
         .ring
@@ -693,7 +720,7 @@ fn capture(f: &Funcs, owner: &mut Owner, dpy: *mut c_void) -> Result<(), String>
             return Ok(());
         }
         owner.next_ring = Some(now + RING_RETRY);
-        match create_ring(f, owner.size, start, dpy)? {
+        match create_ring(f, owner.size, start, dpy, drawable)? {
             Some(r) => owner.ring = Some(r),
             // Socket full: try again later.
             None => return Ok(()),
@@ -712,7 +739,9 @@ fn capture(f: &Funcs, owner: &mut Owner, dpy: *mut c_void) -> Result<(), String>
         if !ring.sent_any {
             return Err("the driver never signaled the copy's semaphore".into());
         }
-        debug("copy never submitted: frame dropped");
+        // Its syncobj may still get this copy's fence: not reused in this ring.
+        ring.slots[p.index].free = false;
+        debug("copy never submitted: frame dropped, ring image retired");
     }
     if let Some((sync, at)) = &ring.timing
         && signaled(sync.as_fd())
@@ -800,6 +829,11 @@ unsafe fn check_context(gl: &Gl) -> Result<bool, String> {
             return Err("no GL version".into());
         }
         let v = CStr::from_ptr(v).to_string_lossy();
+        // Importing a DMA-BUF and a DRM syncobj as "opaque" fds is what
+        // Mesa does; other drivers (NVIDIA) mean something else by them.
+        if !is_mesa(&v) {
+            return Err(format!("not a Mesa driver ({v})"));
+        }
         let (major, es) = parse_version(&v).ok_or(format!("unknown GL version {v}"))?;
         if major < 3 {
             return Err(format!("GL {v} is older than 3.0"));
@@ -836,15 +870,25 @@ fn create_ring(
     size: (u32, u32),
     start: u64,
     dpy: *mut c_void,
+    drawable: usize,
 ) -> Result<Option<Ring>, String> {
     let es = unsafe { check_context(&f.gl)? };
+    let format = if es && f.srgb_surface(dpy, drawable) {
+        GL_SRGB8_ALPHA8
+    } else {
+        GL_RGBA8
+    };
     let node = f.render_node(dpy);
     let mut ring = Ring {
         start_id: start,
         generation: GENERATION.fetch_add(1, Ordering::SeqCst).wrapping_add(1),
         size,
         es,
-        gbm: GbmDevice::open(&node)?,
+        format,
+        gbm: match GbmDevice::open(&node)? {
+            Some(g) => g,
+            None => return Ok(None),
+        },
         slots: Vec::new(),
         pacer: protocol::Pacer::new(ipc::fps()),
         timing: None,
@@ -948,7 +992,7 @@ fn create_slot(gl: &Gl, ring: &mut Ring, index: u32) -> Result<Msg, String> {
         (gl.tex_storage_mem_2d)(
             GL_TEXTURE_2D,
             1,
-            GL_RGBA8,
+            ring.format,
             width as i32,
             h as i32,
             slot.mem,
@@ -1114,6 +1158,14 @@ unsafe impl Send for GbmDevice {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_mesa_is_captured() {
+        assert!(is_mesa("4.6 (Compatibility Profile) Mesa 26.2.4-arch3.1"));
+        assert!(is_mesa("OpenGL ES 3.2 Mesa 26.2.4"));
+        assert!(!is_mesa("4.6.0 NVIDIA 580.95.05"));
+        assert!(!is_mesa("OpenGL ES 3.2 NVIDIA 580.95.05"));
+    }
 
     #[test]
     fn parses_gl_versions() {
