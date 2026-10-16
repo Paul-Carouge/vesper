@@ -158,20 +158,22 @@ pub fn stream_game(seconds: u64, url: String, mut settings: Settings) {
     // Ends early when the captured game quits, as the app does: no frozen
     // picture streamed until the time is up.
     let end = std::time::Instant::now() + Duration::from_secs(seconds);
-    let mut seen = false;
+    let mut seen = None;
     while let Some(left) = end.checked_duration_since(std::time::Instant::now()) {
         match rx.recv_timeout(left.min(Duration::from_millis(500))) {
             Ok(event) => log!("{event:?}"),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
-        match source.captured_pid() {
-            Some(_) => seen = true,
-            None if seen => {
+        // Gone with its process, as the app tells: a layer reconnecting
+        // (swapchain recreated) is not a quit.
+        match (source.captured_pid(), seen) {
+            (Some(pid), _) => seen = Some(pid),
+            (None, Some(pid)) if !crate::fallback::alive(pid) => {
                 log!("captured game closed: ending the stream");
                 break;
             }
-            None => {}
+            _ => {}
         }
     }
     p.stop_stream();

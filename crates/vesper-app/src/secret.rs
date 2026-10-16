@@ -108,7 +108,7 @@ async fn proxy<'a>(
 ) -> Result<zbus::Proxy<'a>> {
     zbus::Proxy::new(conn, DEST, path, iface)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(call_error)
 }
 
 /// The error of every call when the session has no Secret Service.
@@ -147,6 +147,18 @@ fn absent(e: &zbus::Error) -> bool {
     }
 }
 
+/// A D-Bus error as the callers tell them: [`ABSENT`], [`NO_ANSWER`], or
+/// the error itself.
+fn call_error(e: zbus::Error) -> String {
+    if absent(&e) {
+        ABSENT.to_owned()
+    } else if timed_out(&e) {
+        NO_ANSWER.to_owned()
+    } else {
+        e.to_string()
+    }
+}
+
 /// A connection and a "plain" session (the bus is local: no transport
 /// encryption needed). [`ABSENT`] when there is no service, [`NO_ANSWER`]
 /// when it does not answer within [`CALL_TIMEOUT`].
@@ -160,15 +172,7 @@ async fn open() -> Result<(zbus::Connection, OwnedObjectPath)> {
     let (_, session): (OwnedValue, OwnedObjectPath) = service
         .call("OpenSession", &("plain", Value::from("")))
         .await
-        .map_err(|e| {
-            if absent(&e) {
-                ABSENT.to_owned()
-            } else if timed_out(&e) {
-                NO_ANSWER.to_owned()
-            } else {
-                e.to_string()
-            }
-        })?;
+        .map_err(call_error)?;
     Ok((conn, session))
 }
 
@@ -179,16 +183,10 @@ async fn prompt(conn: &zbus::Connection, prompt: &OwnedObjectPath) -> Result<boo
         return Ok(true);
     }
     let p = proxy(conn, prompt.clone(), "org.freedesktop.Secret.Prompt").await?;
-    let mut completed = p
-        .receive_signal("Completed")
-        .await
-        .map_err(|e| e.to_string())?;
-    p.call_method("Prompt", &("",))
-        .await
-        .map_err(|e| e.to_string())?;
+    let mut completed = p.receive_signal("Completed").await.map_err(call_error)?;
+    p.call_method("Prompt", &("",)).await.map_err(call_error)?;
     let signal = completed.next().await.ok_or("the prompt went away")?;
-    let (dismissed, _): (bool, OwnedValue) =
-        signal.body().deserialize().map_err(|e| e.to_string())?;
+    let (dismissed, _): (bool, OwnedValue) = signal.body().deserialize().map_err(call_error)?;
     Ok(!dismissed)
 }
 
@@ -201,7 +199,7 @@ async fn unlock(
     let (_, p): (Vec<OwnedObjectPath>, OwnedObjectPath) = service
         .call("Unlock", &(paths,))
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(call_error)?;
     prompt(conn, &p).await
 }
 
@@ -213,7 +211,7 @@ async fn items(
     service
         .call("SearchItems", &(attributes,))
         .await
-        .map_err(|e| e.to_string())
+        .map_err(call_error)
 }
 
 /// The secret of the first of `found` (unlocked, locked), unlocking them
@@ -235,7 +233,7 @@ async fn first_secret(
     let secrets: HashMap<OwnedObjectPath, Secret> = service
         .call("GetSecrets", &(&found, session))
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(call_error)?;
     Ok(found
         .iter()
         .find_map(|item| secrets.get(item))
@@ -255,7 +253,7 @@ async fn keyring_store(id: &str, key: &StreamKey) -> Result<()> {
     let collection: OwnedObjectPath = service
         .call("ReadAlias", &("default",))
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(call_error)?;
     // A service without a keyring to store in: as good as none.
     if collection.as_str() == "/" {
         return Err(ABSENT.into());
@@ -281,7 +279,7 @@ async fn keyring_store(id: &str, key: &StreamKey) -> Result<()> {
     let (_, p): (OwnedObjectPath, OwnedObjectPath) = c
         .call("CreateItem", &(properties, secret, true))
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(call_error)?;
     if !prompt(&conn, &p).await? {
         return Err("the keyring refused the key".into());
     }
@@ -291,7 +289,7 @@ async fn keyring_store(id: &str, key: &StreamKey) -> Result<()> {
 async fn delete_items(conn: &zbus::Connection, paths: &[OwnedObjectPath]) -> Result<()> {
     for item in paths {
         let i = proxy(conn, item.clone(), "org.freedesktop.Secret.Item").await?;
-        let p: OwnedObjectPath = i.call("Delete", &()).await.map_err(|e| e.to_string())?;
+        let p: OwnedObjectPath = i.call("Delete", &()).await.map_err(call_error)?;
         prompt(conn, &p).await?;
     }
     Ok(())
@@ -324,7 +322,7 @@ async fn legacy_items(
             let value: OwnedValue = p
                 .call("Get", &("org.freedesktop.Secret.Item", "Attributes"))
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(call_error)?;
             let attributes =
                 HashMap::<String, String>::try_from(value).map_err(|e| e.to_string())?;
             if !attributes.contains_key("service") {
