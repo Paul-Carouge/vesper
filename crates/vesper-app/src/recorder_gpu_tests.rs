@@ -6,7 +6,10 @@ use super::producer::{POOL, Producer};
 use super::*;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::Instant;
+use vesper_capture::camera::{CameraFrame, CpuFrame, CpuLayout, CpuPlane, Matrix, Range};
 use vesper_core::ReleaseGuard;
+
+use crate::overlay::fake;
 
 const W: u32 = 640;
 const H: u32 = 360;
@@ -612,8 +615,8 @@ fn switching_scenes_keeps_one_constant_file() {
     std::fs::remove_dir_all(out).unwrap();
 }
 
-/// A scene that shows the capture alone (hidden or webcam layers aside)
-/// records as without scenes: no compositor, no Vulkan device.
+/// A scene that shows the capture alone (hidden layers aside) records as
+/// without scenes: no compositor, no Vulkan device.
 #[test]
 fn a_capture_only_scene_creates_no_compositor() {
     let Some(rig) = Rig::new() else { return };
@@ -629,6 +632,7 @@ fn a_capture_only_scene_creates_no_compositor() {
         source: LayerSource::Camera {
             node: "some-camera".into(),
         },
+        visible: false,
         ..Layer::main()
     });
     let out = dir("plain");
@@ -967,5 +971,341 @@ fn leaving_a_scene_releases_a_composition_still_in_flight() {
     let path = finish(&p, &rx);
     p.join();
     assert!(inspect(&path).0 > 20);
+    std::fs::remove_dir_all(out).unwrap();
+}
+
+/// The capture with webcam `node` at x 0.5..0.75, y 0.5..0.75 (where
+/// `assert_logo` looks).
+fn webcam_scene(node: &str) -> Scene {
+    Scene {
+        name: "Webcam".into(),
+        layers: vec![
+            Layer::main(),
+            Layer {
+                source: LayerSource::Camera { node: node.into() },
+                rect: [0.5, 0.5, 0.25, 0.25],
+                fit: Fit::Stretch,
+                ..Layer::main()
+            },
+        ],
+    }
+}
+
+/// A 64 x 48 YUY2 picture: pure red in BT.601 limited range.
+fn red_yuy2() -> CameraFrame {
+    let (w, h) = (64u32, 48u32);
+    CameraFrame::Cpu(CpuFrame {
+        width: w,
+        height: h,
+        layout: CpuLayout::Yuy2,
+        planes: vec![CpuPlane {
+            offset: 0,
+            stride: w as usize * 2,
+        }],
+        data: [81u8, 90, 81, 240].repeat((w / 2 * h) as usize),
+        matrix: Matrix::Bt601,
+        range: Range::Limited,
+        pts: monotonic_now(),
+    })
+}
+
+/// Sends `make()` to `cam` 30 times per second while `live`.
+fn camera_feeder(
+    cam: Arc<fake::FakeCamera>,
+    live: Arc<AtomicBool>,
+    mut make: impl FnMut() -> CameraFrame + Send + 'static,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        while live.load(Ordering::Relaxed) {
+            cam.send(make());
+            std::thread::sleep(Duration::from_millis(33));
+        }
+    })
+}
+
+/// Starts a pipeline recording into `out`, keeping webcam news and
+/// notices in `seen`; `None` without an encoder.
+fn record_seeing(
+    settings: Settings,
+    out: &Path,
+    seen: &mut Vec<Event>,
+) -> Option<(Pipeline, Receiver<Event>)> {
+    let (tx, rx) = mpsc::channel();
+    let p = Pipeline::start(settings, None, Some(out.into()), None, move |e| {
+        drop(tx.send(e))
+    })
+    .unwrap();
+    loop {
+        match event(&rx)? {
+            Event::Started => return Some((p, rx)),
+            e @ (Event::Camera(_) | Event::Notice(_)) => seen.push(e),
+            other => panic!("{other:?}"),
+        }
+    }
+}
+
+/// Stops the recording and the pipeline: its file, webcam news in `seen`.
+fn finish_seeing(p: Pipeline, rx: &Receiver<Event>, seen: &mut Vec<Event>) -> PathBuf {
+    p.stop_recording();
+    let path = loop {
+        match event(rx) {
+            Some(Event::Finished(Ok(f))) => break f,
+            Some(e @ (Event::Camera(_) | Event::Notice(_))) => seen.push(e),
+            other => panic!("{other:?}"),
+        }
+    };
+    p.join();
+    // News sent while it stopped.
+    seen.extend(
+        rx.try_iter()
+            .filter(|e| matches!(e, Event::Camera(_) | Event::Notice(_))),
+    );
+    path
+}
+
+/// The webcam news in `seen`, in order.
+fn camera_states(seen: &[Event]) -> Vec<bool> {
+    seen.iter()
+        .filter_map(|e| match e {
+            Event::Camera(on) => Some(*on),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A webcam layer (YUV pictures) is drawn where its rect says; unplugged,
+/// it is hidden with one notice while the recording goes on, its light off.
+#[test]
+fn a_webcam_is_recorded_at_its_place_and_hidden_when_unplugged() {
+    let Some(rig) = Rig::new() else { return };
+    let cam = fake::add("red");
+    let live = Arc::new(AtomicBool::new(true));
+    let feeder = camera_feeder(cam.clone(), live.clone(), red_yuy2);
+    let out = dir("webcam");
+    let settings = Settings {
+        scene: webcam_scene("fake:red"),
+        ..settings(&rig.route)
+    };
+    let mut seen = Vec::new();
+    let Some((p, rx)) = record_seeing(settings, &out, &mut seen) else {
+        live.store(false, Ordering::Relaxed);
+        return;
+    };
+    let started = Instant::now();
+    std::thread::sleep(Duration::from_millis(1500));
+    // Unplugged: the stream ends, reopening fails.
+    *lock(&cam.refuse) = Some("no such camera".into());
+    live.store(false, Ordering::Relaxed);
+    feeder.join().unwrap();
+    cam.end("unplugged");
+    std::thread::sleep(Duration::from_millis(1500));
+    let wall = started.elapsed().as_secs_f64();
+    let path = finish_seeing(p, &rx, &mut seen);
+    let frames = decode_all(&path);
+    assert!(frames.len() as f64 > wall * 28.0, "{} frames", frames.len());
+    assert_logo(&frames[frames.len() / 3], "while the webcam streams");
+    let last = frames.last().unwrap();
+    let (w, h) = (W as usize, H as usize);
+    let inside = [
+        (w * 5 / 8, h * 5 / 8),
+        (w / 2 + 16, h / 2 + 16),
+        (w * 3 / 4 - 16, h * 3 / 4 - 16),
+    ];
+    assert!(
+        inside
+            .iter()
+            .filter(|&&(x, y)| is_red(last.at(x, y)))
+            .count()
+            <= 1,
+        "hidden once unplugged"
+    );
+    let notices = seen
+        .iter()
+        .filter(|e| matches!(e, Event::Notice(n) if n.contains("Webcam hidden")))
+        .count();
+    assert_eq!(notices, 1, "{seen:?}");
+    assert_eq!(camera_states(&seen), [true, false], "{seen:?}");
+    assert!(cam.opens.load(Ordering::SeqCst) >= 2, "reopened");
+    assert_eq!(cam.open_now.load(Ordering::SeqCst), 0);
+    std::fs::remove_dir_all(out).unwrap();
+}
+
+/// Is BT.709 limited white, as the encoder converts.
+fn is_white(yuv: [u8; 3]) -> bool {
+    (0..3).all(|k| (f64::from(yuv[k]) - [235.0, 128.0, 128.0][k]).abs() <= 16.0)
+}
+
+/// Pictures decoded on the GPU (DMA-BUFs) are drawn and go back to their
+/// producer within a tick or so; the webcam closes with the pipeline.
+#[test]
+fn webcam_pictures_from_the_gpu_are_drawn_and_go_back_promptly() {
+    let Some(rig) = Rig::new() else { return };
+    let cam = fake::add("gpu");
+    let live = Arc::new(AtomicBool::new(true));
+    let counts = Arc::new((AtomicUsize::new(0), AtomicUsize::new(0)));
+    let feeder = {
+        let (cam, live, counts) = (cam.clone(), live.clone(), counts.clone());
+        std::thread::spawn(move || {
+            // 258 x 258: the producer's white box covers all but a 2 px edge.
+            let producer = unsafe { Producer::new(258, 258) };
+            let generation = vesper_core::next_pool_generation();
+            let mut t = 0u32;
+            while live.load(Ordering::Relaxed) {
+                let mut f =
+                    unsafe { producer.frame(t as usize % POOL, t, generation, monotonic_now()) };
+                counts.0.fetch_add(1, Ordering::SeqCst);
+                let c = counts.clone();
+                f.release = ReleaseGuard::new(move || {
+                    c.1.fetch_add(1, Ordering::SeqCst);
+                });
+                cam.send(CameraFrame::Gpu(f));
+                t += 1;
+                std::thread::sleep(Duration::from_millis(33));
+            }
+        })
+    };
+    let out = dir("webcam-gpu");
+    let settings = Settings {
+        scene: webcam_scene("fake:gpu"),
+        ..settings(&rig.route)
+    };
+    let mut seen = Vec::new();
+    let Some((p, rx)) = record_seeing(settings, &out, &mut seen) else {
+        live.store(false, Ordering::Relaxed);
+        return;
+    };
+    std::thread::sleep(Duration::from_millis(500));
+    let (sent, released) = (&counts.0, &counts.1);
+    // The fake's slot, the mailbox, the compositor's pending one and the
+    // one being copied at most.
+    for _ in 0..20 {
+        std::thread::sleep(Duration::from_millis(37));
+        let held = sent.load(Ordering::SeqCst) - released.load(Ordering::SeqCst);
+        assert!(held <= 4, "{held} webcam pictures held");
+    }
+    live.store(false, Ordering::Relaxed);
+    feeder.join().unwrap();
+    let path = finish_seeing(p, &rx, &mut seen);
+    // The last one sent, never read.
+    cam.end("done");
+    let t = Instant::now();
+    while released.load(Ordering::SeqCst) < sent.load(Ordering::SeqCst)
+        && t.elapsed() < Duration::from_secs(3)
+    {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(released.load(Ordering::SeqCst), sent.load(Ordering::SeqCst));
+    assert_eq!(
+        cam.open_now.load(Ordering::SeqCst),
+        0,
+        "closed with the pipeline"
+    );
+    assert_eq!(camera_states(&seen), [true, false], "{seen:?}");
+    let frames = decode_all(&path);
+    let f = frames.last().unwrap();
+    let (w, h) = (W as usize, H as usize);
+    for (x, y) in [
+        (w * 5 / 8, h * 5 / 8),
+        (w / 2 + 8, h / 2 + 8),
+        (w * 3 / 4 - 8, h * 3 / 4 - 8),
+    ] {
+        assert!(is_white(f.at(x, y)), "({x}, {y}) is {:?}", f.at(x, y));
+    }
+    std::fs::remove_dir_all(out).unwrap();
+}
+
+/// BT.709 limited Y'CbCr of R'G'B' bytes, as the encoder converts.
+fn yuv709(rgb: [f64; 3]) -> [f64; 3] {
+    let [r, g, b] = rgb.map(|v| v / 255.0);
+    let y = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    [
+        16.0 + 219.0 * y,
+        128.0 + 224.0 * (b - y) / 1.8556,
+        128.0 + 224.0 * (r - y) / 1.5748,
+    ]
+}
+
+/// Through PipeWire and the GPU JPEG decoder: the robustness lab's fake
+/// camera node (`scripts/robustness/c2_camera_scene.sh` sets
+/// `VESPER_LAB_CAMERA` and `VESPER_LAB_RGB`), never a real webcam. Skipped
+/// elsewhere. Also prints the cost of the webcam layer at 1440p against
+/// the capture alone.
+#[test]
+fn a_lab_webcam_is_recorded_with_its_colour() {
+    let Ok(node) = std::env::var("VESPER_LAB_CAMERA") else {
+        return;
+    };
+    let rgb: Vec<f64> = std::env::var("VESPER_LAB_RGB")
+        .expect("VESPER_LAB_RGB=r,g,b")
+        .split(',')
+        .map(|v| v.parse().unwrap())
+        .collect();
+    let want = yuv709([rgb[0], rgb[1], rgb[2]]);
+    let Some(rig) = Rig::new() else { return };
+    *lock(&rig.size) = (2560, 1440);
+    std::thread::sleep(Duration::from_millis(300));
+    let out = dir("lab-webcam");
+    let probe = &rig.route.0.probe;
+    let threads = [
+        "vesper-recorder",
+        "vesper-camfeed",
+        "vesper-camera",
+        "vesper-camera-d",
+    ];
+    for (what, scene) in [
+        ("capture alone", Scene::main()),
+        ("webcam", webcam_scene(&node)),
+    ] {
+        let settings = Settings {
+            scene,
+            ..settings(&rig.route)
+        };
+        let mut seen = Vec::new();
+        let Some((p, rx)) = record_seeing(settings, &out, &mut seen) else {
+            return;
+        };
+        std::thread::sleep(Duration::from_secs(2));
+        let cpu0 = threads.map(thread_cpu);
+        let (n0, g0, wall0) = (
+            probe.composed.load(Ordering::Relaxed),
+            probe.gpu_ns.load(Ordering::Relaxed),
+            Instant::now(),
+        );
+        std::thread::sleep(Duration::from_secs(4));
+        let cpu = threads.map(thread_cpu);
+        let wall = wall0.elapsed().as_secs_f64();
+        let n = probe.composed.load(Ordering::Relaxed) - n0;
+        let g = probe.gpu_ns.load(Ordering::Relaxed) - g0;
+        let path = finish_seeing(p, &rx, &mut seen);
+        let pct: Vec<String> = threads
+            .iter()
+            .zip(cpu.iter().zip(cpu0))
+            .map(|(t, (c, c0))| format!("{t} {:.1}%", (*c - c0).as_secs_f64() / wall * 100.0))
+            .collect();
+        eprintln!(
+            "{what}: {}; {n} compositions, {:.3} ms GPU each",
+            pct.join(", "),
+            if n > 0 {
+                g as f64 / n as f64 / 1e6
+            } else {
+                0.0
+            }
+        );
+        if what == "webcam" {
+            assert_eq!(camera_states(&seen), [true, false], "{seen:?}");
+            let f = decode_all(&path).pop().unwrap();
+            let (w, h) = (2560usize, 1440usize);
+            for (x, y) in [(w * 5 / 8, h * 5 / 8), (w / 2 + 40, h / 2 + 40)] {
+                let got = f.at(x, y);
+                eprintln!("webcam at ({x}, {y}): yuv {got:?}, want {want:.0?}");
+                for k in 0..3 {
+                    assert!(
+                        (f64::from(got[k]) - want[k]).abs() <= 12.0,
+                        "{got:?} vs {want:?}"
+                    );
+                }
+            }
+        }
+    }
     std::fs::remove_dir_all(out).unwrap();
 }

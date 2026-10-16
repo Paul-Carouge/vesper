@@ -25,6 +25,10 @@
 //!   stages its images and text. The pipeline thread queues compositions
 //!   under `try_lock`, only when the capture or an overlay changed (else the
 //!   picture repeats), and waits at most half a frame for one.
+//! - Camera thread (`overlay::Cameras`), while the active scene shows a
+//!   webcam (and 10 s after): streams them, stages their YUV pictures, and
+//!   hands the latest picture of each to the pipeline thread, which gives
+//!   it to the compositor (copied, then released, by the next composition).
 //! - Live thread (`stream`): sends a live stream's packets. Its video comes
 //!   from the pipeline thread (the recording's packets, or a second encode of
 //!   the same pictures scaled on the GPU), its AAC audio from the mix's tap.
@@ -49,7 +53,7 @@ use vesper_encode::{Encoder, RateControl};
 use vesper_gamecapture::{GameCapture, protocol};
 use vesper_mux::{AudioTrack, Muxer, VideoTrack};
 
-use crate::overlay::{Key, Overlays};
+use crate::overlay::{Cameras, Feed, Key, Overlays};
 use crate::scenes::{Canvas, LayerSource, Scene};
 use crate::stream::{AudioTap, LiveSink, StreamRequest, StreamState, live_audio, stream_size};
 
@@ -265,6 +269,8 @@ pub enum Event {
     AudioMissing(String),
     /// Something to tell the user that changes nothing for the recording.
     Notice(String),
+    /// A webcam is open (true, its light is on), or none is any more.
+    Camera(bool),
     /// The live stream's state changed.
     Stream(StreamState),
     /// Sent every second while the stream is on air.
@@ -427,7 +433,7 @@ struct Control {
     saves: Vec<JoinHandle<()>>,
 }
 
-type OnEvent = Arc<dyn Fn(Event) + Send + Sync>;
+pub(crate) type OnEvent = Arc<dyn Fn(Event) + Send + Sync>;
 
 pub struct Pipeline {
     control: Arc<Mutex<Control>>,
@@ -1923,6 +1929,12 @@ struct Stage {
     /// Texture id of each overlay source seen, stable across scenes.
     ids: Vec<Key>,
     overlays: Option<Overlays>,
+    /// Camera id of each webcam seen (its node name), stable across scenes.
+    camera_ids: Vec<String>,
+    /// Started by the first scene with a webcam, for the pipeline's life.
+    cameras: Option<Cameras>,
+    /// The user was told a webcam picture could not be drawn.
+    camera_told: bool,
     /// Since when a passthrough scene leaves the overlay thread unused.
     idle_since: Option<Duration>,
     /// The encoder's size, once open.
@@ -1963,6 +1975,9 @@ impl Stage {
             want: Vec::new(),
             ids: Vec::new(),
             overlays: None,
+            camera_ids: Vec::new(),
+            cameras: None,
+            camera_told: false,
             idle_since: None,
             canvas: None,
             next: None,
@@ -1986,23 +2001,33 @@ impl Stage {
         if !self.scene_name.is_empty() || !scene.is_passthrough() {
             log!("scene: {:?}", scene.name);
         }
-        if scene
-            .layers
-            .iter()
-            .any(|l| l.visible && matches!(l.source, LayerSource::Camera { .. }))
-        {
-            log!("scene {:?}: webcam layers are not drawn yet", scene.name);
-        }
         self.passthrough = scene.is_passthrough();
         self.shows_main = scene.shows_main();
         self.draws.clear();
         self.want.clear();
+        let mut cameras: Vec<(u32, String)> = Vec::new();
         for l in scene.drawn() {
             let source = match &l.source {
                 LayerSource::Main => DrawSource::Main,
                 LayerSource::Image { path } => self.texture(Key::Image(path.clone())),
                 LayerSource::Text(style) => self.texture(Key::Text(style.clone())),
-                LayerSource::Camera { .. } => continue,
+                LayerSource::Camera { node } => {
+                    let id = match self.camera_ids.iter().position(|n| n == node) {
+                        Some(i) => i,
+                        None => {
+                            self.camera_ids.push(node.clone());
+                            self.camera_ids.len() - 1
+                        }
+                    } as u32;
+                    if !cameras.iter().any(|(i, _)| *i == id) {
+                        if cameras.len() == vesper_compose::MAX_CAMERAS {
+                            log!("scene {:?}: webcam {node:?} left out", scene.name);
+                            continue;
+                        }
+                        cameras.push((id, node.clone()));
+                    }
+                    DrawSource::Camera(id)
+                }
             };
             self.draws.push(Draw {
                 source,
@@ -2013,6 +2038,18 @@ impl Stage {
             });
         }
         self.scene_name = scene.name;
+        if !cameras.is_empty() && self.cameras.is_none() {
+            match Cameras::start(self.on_event.clone()) {
+                Ok(c) => {
+                    c.set_overlays(self.overlays.as_ref().map(|o| o.shared.clone()));
+                    self.cameras = Some(c);
+                }
+                Err(e) => log!("no camera thread: {e}"),
+            }
+        }
+        if let Some(c) = &self.cameras {
+            c.want(cameras);
+        }
         if !self.shows_main {
             self.next = None;
         }
@@ -2069,7 +2106,12 @@ impl Stage {
                 _ => {}
             }
             match Overlays::start() {
-                Ok(o) => self.overlays = Some(o),
+                Ok(o) => {
+                    if let Some(c) = &self.cameras {
+                        c.set_overlays(Some(o.shared.clone()));
+                    }
+                    self.overlays = Some(o);
+                }
                 Err(e) => return self.fail(format!("no overlay thread: {e}")),
             }
         }
@@ -2105,6 +2147,9 @@ impl Stage {
             if o.changed() {
                 self.dirty = true;
             }
+            if self.cameras.as_ref().is_some_and(Cameras::news) {
+                self.dirty = true;
+            }
             if let Some(e) = o.error() {
                 self.fail(format!("could not start: {e}"));
             }
@@ -2127,6 +2172,9 @@ impl Stage {
     }
 
     fn retire(&mut self) {
+        if let Some(c) = &self.cameras {
+            c.set_overlays(None);
+        }
         if let Some(o) = self.overlays.take() {
             retire_thread(o.retire());
         }
@@ -2289,6 +2337,20 @@ impl Stage {
             };
             #[cfg(not(test))]
             let budget = self.budget;
+            // The latest webcam pictures, copied by this composition.
+            for (id, feed) in self.cameras.as_ref().map(Cameras::take).unwrap_or_default() {
+                let r = match feed {
+                    Feed::Gpu(f) => comp.set_camera_frame(id, f),
+                    Feed::Yuv(s) => comp.set_camera_yuv(id, s),
+                    Feed::Gone => {
+                        comp.remove_camera(id);
+                        Ok(())
+                    }
+                };
+                if let Err(e) = r {
+                    log!("webcam {id}: picture dropped: {e}");
+                }
+            }
             // Damage-driven sources keep a copy for redraws without a frame.
             let keep = frame.is_some() && self.damage_driven();
             match comp.submit(frame, &self.draws, keep) {
@@ -2301,6 +2363,16 @@ impl Stage {
                     }
                 }
                 Err(e) => return self.broken(slot, e.to_string(), None),
+            }
+            // A webcam picture the GPU could not take hides that webcam;
+            // the next one may work.
+            for (id, why) in comp.take_camera_failures() {
+                log!("webcam {id}: hidden: {why}");
+                if !std::mem::replace(&mut self.camera_told, true) {
+                    (self.on_event)(Event::Notice(
+                        "A webcam is hidden: the GPU could not use its picture".into(),
+                    ));
+                }
             }
         } else if frame.is_some() {
             // Cannot happen (a frame makes the picture dirty): released.
