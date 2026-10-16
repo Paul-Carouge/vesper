@@ -287,6 +287,13 @@ fn describe(kind: LiveErrorKind, host: &str, live_before: bool) -> String {
         LiveErrorKind::Insecure => {
             format!("The secure connection to {host} failed: its certificate is not trusted")
         }
+        LiveErrorKind::NotTls => {
+            // Never suggest rtmp://: an interception can fake this answer.
+            format!(
+                "{host} does not answer in TLS: check the URL and port, \
+                 or the network may be intercepting the connection"
+            )
+        }
         LiveErrorKind::Aborted => "Stopped".into(),
     }
 }
