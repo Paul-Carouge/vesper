@@ -18,3 +18,5 @@ shot live-reconnecting-dark dark screen-look,replay-on,live-reconnecting-look
 shot live-dropping-light light screen-look,replay-on,live-dropping-look
 shot live-settings-dark dark screen-look,settings,live-key-look,scroll:${SCROLL:-560}
 shot live-settings-light light screen-look,settings,scroll:${SCROLL:-560}
+shot settings-end-dark dark screen-look,settings,scroll-end
+shot settings-end-light light screen-look,settings,scroll-end
