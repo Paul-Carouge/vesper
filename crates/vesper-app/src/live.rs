@@ -62,26 +62,123 @@ pub fn show_key_state(ui: &AppWindow) {
     );
 }
 
+const NO_SERVER: &str = "Enter the server URL first: the key is saved for that server";
+
 /// Saves `key` for the selected service, then says `done`.
 fn store_key(ui: &AppWindow, key: StreamKey, done: &'static str) {
     let Some(id) = secret::key_id(&settings(ui)) else {
-        flash_notice(
-            ui,
-            "Enter the server URL first: the key is saved for that server",
-        );
+        flash_notice(ui, NO_SERVER);
         return;
     };
+    save_key(ui, id, key, Some(done));
+}
+
+/// Saves `key` for `id`, shown next to the key field; `done`: said too.
+fn save_key(ui: &AppWindow, id: String, key: StreamKey, done: Option<&'static str>) {
+    show_save(ui, "Saving…", false);
     off_ui(
         ui,
         move || secret::store(&id, &key),
         move |ui, result| match result {
             Ok(_) => {
+                show_save(ui, "Saved", false);
                 show_key_state(ui);
-                flash_notice(ui, done);
+                if let Some(done) = done {
+                    flash_notice(ui, done);
+                }
             }
-            Err(e) => flash_notice(ui, &e),
+            Err(e) => {
+                show_save(ui, &e, true);
+                flash_notice(ui, &e);
+            }
         },
     );
+}
+
+fn show_save(ui: &AppWindow, state: &str, failed: bool) {
+    ui.set_live_key_save_state(state.into());
+    ui.set_live_key_save_failed(failed);
+}
+
+/// The key typed in the field and not saved yet, with the service it was
+/// typed for: switching service before it is saved never moves it.
+#[derive(Default)]
+struct Draft {
+    pending: Option<(String, StreamKey)>,
+    /// The last one handed to a save: confirming it again saves nothing.
+    sent: Option<(String, StreamKey)>,
+}
+
+impl Draft {
+    /// The field now reads `text`, for `id`.
+    fn edited(&mut self, id: Option<String>, text: &str) {
+        self.pending = id
+            .zip(StreamKey::new(text))
+            .filter(|draft| self.sent.as_ref() != Some(draft));
+    }
+
+    /// The draft to save now, if any.
+    fn take(&mut self) -> Option<(String, StreamKey)> {
+        let draft = self.pending.take()?;
+        self.sent = Some(draft.clone());
+        Some(draft)
+    }
+}
+
+/// The key field now reads `text`; true when it holds a key to save.
+fn draft_edited(ui: &AppWindow, text: &str) -> bool {
+    let id = secret::key_id(&settings(ui));
+    if id.is_none() && StreamKey::new(text).is_some() {
+        show_save(ui, NO_SERVER, true);
+    }
+    DRAFT.with(|d| {
+        let mut d = d.borrow_mut();
+        d.edited(id, text);
+        d.pending.is_some()
+    })
+}
+
+/// How long typing must pause before the key is saved.
+const KEY_DEBOUNCE: Duration = Duration::from_millis(800);
+
+thread_local! {
+    static DRAFT: RefCell<Draft> = RefCell::new(Draft::default());
+    static DRAFT_TIMER: slint::Timer = slint::Timer::default();
+}
+
+/// Saves the key typed in the field, if not saved yet (Enter, focus out,
+/// a pause in typing, Go live, quit).
+fn save_draft(ui: &AppWindow) {
+    DRAFT_TIMER.with(slint::Timer::stop);
+    if let Some((id, key)) = DRAFT.with(|d| d.borrow_mut().take()) {
+        save_key(ui, id, key, None);
+    }
+}
+
+/// Saves the key still being typed and waits (at most `limit`) for the
+/// keyring work given before: called once the event loop ended, so no
+/// answer reaches the UI. Never logs the key.
+pub fn flush_on_quit(limit: Duration) {
+    if let Some((id, key)) = DRAFT.with(|d| d.borrow_mut().take()) {
+        log!("saving the stream key typed before quitting");
+        in_order(Box::new(move || {
+            if let Err(e) = secret::store(&id, &key) {
+                log!("stream key not saved: {e}");
+            }
+        }));
+    }
+    if !drain(limit) {
+        log!("the keyring did not finish in time");
+    }
+}
+
+/// Waits until the keyring work given so far is done; false after `limit`.
+fn drain(limit: Duration) -> bool {
+    let (tx, rx) = std::sync::mpsc::channel();
+    in_order(Box::new(move || {
+        let _ = tx.send(());
+    }));
+    rx.recv_timeout(limit).is_ok()
 }
 
 /// Runs `work` on the keyring thread, then `done` with its result on the
@@ -195,6 +292,8 @@ pub fn wire(ui: &AppWindow, recording: &Shared, games: &Games) {
             }
             return;
         }
+        // A key still being typed is saved first: the read below follows it.
+        save_draft(&ui);
         let settings = settings(&ui);
         // Checked before the key is read: a URL error needs no unlock.
         let check = StreamRequest {
@@ -275,11 +374,29 @@ pub fn wire(ui: &AppWindow, recording: &Shared, games: &Games) {
     let weak = ui.as_weak();
     ui.on_live_key_entered(move |key| {
         let Some(ui) = weak.upgrade() else { return };
-        let Some(key) = StreamKey::new(&key) else {
+        if !draft_edited(&ui, &key) {
             return;
-        };
+        }
         log!("live-key-entered");
-        store_key(&ui, key, "Stream key saved");
+        save_draft(&ui);
+    });
+
+    // Saved once typing pauses: a pasted key never waits for Enter.
+    let weak = ui.as_weak();
+    ui.on_live_key_edited(move |key| {
+        let Some(ui) = weak.upgrade() else { return };
+        if !draft_edited(&ui, &key) {
+            DRAFT_TIMER.with(slint::Timer::stop);
+            return;
+        }
+        let weak = ui.as_weak();
+        DRAFT_TIMER.with(|t| {
+            t.start(slint::TimerMode::SingleShot, KEY_DEBOUNCE, move || {
+                if let Some(ui) = weak.upgrade() {
+                    save_draft(&ui);
+                }
+            });
+        });
     });
 
     let weak = ui.as_weak();
@@ -436,6 +553,74 @@ mod tests {
         assert_eq!(no_key(&request(Service::YouTube, Some("k")), None), None);
         // A custom server may take no key.
         assert_eq!(no_key(&request(Service::Custom, None), None), None);
+    }
+
+    fn draft(id: &str, k: &str) -> Option<(String, StreamKey)> {
+        Some((id.to_owned(), StreamKey::new(k).unwrap()))
+    }
+
+    /// Paste, no Enter, Go live: Go live takes the draft to save it before
+    /// the key is read; the focus leaving later saves nothing again.
+    #[test]
+    fn a_pasted_key_is_saved_without_enter() {
+        let mut d = Draft::default();
+        d.edited(Some("youtube".into()), "  yt_key ");
+        assert_eq!(d.take(), draft("youtube", "yt_key"));
+        assert_eq!(d.take(), None);
+        d.edited(Some("youtube".into()), "yt_key");
+        assert_eq!(d.take(), None);
+        // A new key is saved again.
+        d.edited(Some("youtube".into()), "yt_key2");
+        assert_eq!(d.take(), draft("youtube", "yt_key2"));
+        // Cleared, or for a custom URL without a host: nothing to save.
+        d.edited(Some("youtube".into()), "  ");
+        assert_eq!(d.take(), None);
+        d.edited(None, "k");
+        assert_eq!(d.take(), None);
+    }
+
+    /// Paste, then quit before the pause ends: the draft is still there for
+    /// the quit flush, with the service it was typed for.
+    #[test]
+    fn a_key_pasted_right_before_quitting_is_kept_for_its_service() {
+        let mut d = Draft::default();
+        d.edited(Some("youtube".into()), "yt_key");
+        assert_eq!(d.pending, draft("youtube", "yt_key"));
+        assert_eq!(d.take(), draft("youtube", "yt_key"));
+    }
+
+    #[test]
+    fn drain_waits_for_the_work_given_before() {
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let d = done.clone();
+        in_order(Box::new(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            d.store(true, Ordering::SeqCst);
+        }));
+        assert!(drain(Duration::from_secs(5)));
+        assert!(done.load(Ordering::SeqCst));
+    }
+
+    /// Paste then Go live, and paste then quit, against the fake Secret
+    /// Service on a private bus (see `secret`'s keyring tests).
+    #[test]
+    #[ignore = "needs a throwaway Secret Service on a private session bus"]
+    fn keyring_pasted_key_reaches_go_live_and_survives_quit() {
+        let id = "test-draft";
+        // Go live: the draft's save is given before the read.
+        DRAFT.with(|d| d.borrow_mut().edited(Some(id.into()), "first_key"));
+        let (draft_id, key) = DRAFT.with(|d| d.borrow_mut().take()).unwrap();
+        in_order(Box::new(move || {
+            secret::store(&draft_id, &key).unwrap();
+        }));
+        let (tx, rx) = std::sync::mpsc::channel();
+        in_order(Box::new(move || tx.send(secret::load(id)).unwrap()));
+        assert_eq!(rx.recv().unwrap(), StreamKey::new("first_key"));
+        // Quit before the pause: flushed and waited for.
+        DRAFT.with(|d| d.borrow_mut().edited(Some(id.into()), "second_key"));
+        flush_on_quit(Duration::from_secs(10));
+        assert_eq!(secret::load(id), StreamKey::new("second_key"));
+        secret::clear(id);
     }
 
     /// A slow save given before a read finishes first: the read gets the

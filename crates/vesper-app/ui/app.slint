@@ -1005,6 +1005,9 @@ export component AppWindow inherits Window {
     in-out property <VideoCodec> live-codec: VideoCodec.h264;
     // Where the stream key is kept ("" when there is none).
     in property <string> live-key-state;
+    // The key typed in the field: "Saving…", "Saved", "Not saved: <why>", or "".
+    in property <string> live-key-save-state;
+    in property <bool> live-key-save-failed;
     // Why the custom URL may send the key in clear ("" when it does not).
     in property <string> live-url-warning;
     in property <LiveState> live-state: LiveState.off;
@@ -1017,6 +1020,7 @@ export component AppWindow inherits Window {
     callback toggle-live();
     callback live-settings-changed();
     callback live-key-entered(string);
+    callback live-key-edited(string);
     callback live-key-removed();
 
     // Background: "Start with the session" (autostart entry), and whether a
@@ -2534,6 +2538,8 @@ export component AppWindow inherits Window {
                                 options: ["Twitch", "YouTube", "Custom"];
                                 selected: root.live-service == LiveService.twitch ? 0 : root.live-service == LiveService.youtube ? 1 : 2;
                                 changed(i) => {
+                                    // A key being typed belongs to the service it was typed for.
+                                    live-key-field.commit();
                                     root.live-service = i == 0 ? LiveService.twitch : i == 1 ? LiveService.youtube : LiveService.custom;
                                     root.live-settings-changed();
                                 }
@@ -2575,11 +2581,20 @@ export component AppWindow inherits Window {
                             live-key-field := TextField {
                                 label: "New stream key";
                                 password: true;
-                                placeholder: root.live-key-state != "" ? "Paste a new key to replace it" : "Paste the key, then press Enter";
+                                placeholder: root.live-key-state != "" ? "Paste a new key to replace it" : "Paste the key";
                                 enabled: root.live-off;
                                 accepted(key) => {
                                     root.live-key-entered(key);
                                 }
+                                edited(key) => {
+                                    root.live-key-edited(key);
+                                }
+                            }
+                            if root.live-key-save-state != "": Text {
+                                text: root.live-key-save-state;
+                                font-size: Theme.font-small;
+                                color: root.live-key-save-failed ? Theme.warn : Theme.text-faint;
+                                wrap: word-wrap;
                             }
                             Field {
                                 title: "Resolution";

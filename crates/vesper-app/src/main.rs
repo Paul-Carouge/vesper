@@ -305,6 +305,8 @@ fn main() -> Result<(), slint::PlatformError> {
     let result = slint::run_event_loop_until_quit();
     // Changes still waiting for a delayed save (volume, filters, scenes).
     Prefs::from_ui(&ui).save();
+    // A stream key typed but not saved yet, and saves still under way.
+    live::flush_on_quit(std::time::Duration::from_secs(10));
     if let Some(conn) = instance {
         instance::release(conn);
     }
