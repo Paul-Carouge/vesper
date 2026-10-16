@@ -4,6 +4,7 @@
 //! never block the UI.
 
 use std::cell::RefCell;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use slint::ComponentHandle;
@@ -234,6 +235,29 @@ pub fn wire(ui: &AppWindow, recording: &Shared, games: &Games) {
     });
 }
 
+/// The stream is ended because the captured game closed: said once it is.
+static GAME_CLOSED: AtomicBool = AtomicBool::new(false);
+const GAME_CLOSED_TEXT: &str = "Game closed: stream ended";
+
+/// Ends the stream because the captured game quit (a frozen picture would go
+/// out forever), the way End does: the stream is flushed and closed.
+pub fn end_for_closed_game(ui: &AppWindow) {
+    log!("captured game closed: ending the stream");
+    GAME_CLOSED.store(true, Ordering::Relaxed);
+    ui.invoke_toggle_live();
+    // No pipeline any more: ended at once.
+    if ui.get_live_state() == LiveState::Off {
+        announce_game_closed(ui);
+    }
+}
+
+fn announce_game_closed(ui: &AppWindow) {
+    if !crate::window_focused(ui) {
+        crate::desktop::notify("Vesper".into(), GAME_CLOSED_TEXT.into(), None);
+    }
+    crate::show_notice(ui, GAME_CLOSED_TEXT, None);
+}
+
 /// Shows a state change of the stream.
 pub fn on_state(ui: &AppWindow, state: StreamState) {
     log!("live: {state:?}");
@@ -267,9 +291,11 @@ pub fn on_state(ui: &AppWindow, state: StreamState) {
         }
         StreamState::Ended(error) => {
             let was_on_air = ui.get_live_seconds() > 0;
+            let game_closed = GAME_CLOSED.load(Ordering::Relaxed);
             reset(ui);
             match error {
                 Some(e) => crate::announce_failure(ui, "Stream ended", &e),
+                None if game_closed => announce_game_closed(ui),
                 None if was_on_air => flash_notice(ui, "Stream ended"),
                 None => {}
             }
@@ -286,6 +312,7 @@ pub fn on_stats(ui: &AppWindow, elapsed: Duration, bitrate: u64, dropped: u64) {
 
 /// No stream any more (it ended, or its pipeline did).
 pub fn reset(ui: &AppWindow) {
+    GAME_CLOSED.store(false, Ordering::Relaxed);
     ui.set_live_state(LiveState::Off);
     ui.set_live_seconds(0);
     ui.set_live_detail("".into());

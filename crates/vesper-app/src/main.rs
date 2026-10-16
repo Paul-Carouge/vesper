@@ -208,12 +208,20 @@ fn main() -> Result<(), slint::PlatformError> {
                     failures = 0;
                 }
                 // A game that quit would leave a frozen picture recording
-                // forever; a paused one stays connected and keeps recording.
+                // and streaming forever; a paused one stays connected and
+                // keeps going.
                 let closed = g.borrow_mut().as_mut().is_some_and(GameSource::take_closed);
-                if closed && ui.get_rec_state() == RecState::Recording {
-                    log!("captured game closed: stopping the recording");
-                    GAME_CLOSED.store(true, Ordering::Relaxed);
-                    ui.invoke_stop_recording();
+                if closed {
+                    let (stop_recording, end_stream) =
+                        ends_on_game_closed(ui.get_rec_state(), ui.get_live_state());
+                    if stop_recording {
+                        log!("captured game closed: stopping the recording");
+                        GAME_CLOSED.store(true, Ordering::Relaxed);
+                        ui.invoke_stop_recording();
+                    }
+                    if end_stream {
+                        live::end_for_closed_game(&ui);
+                    }
                 }
                 return;
             }
@@ -284,6 +292,18 @@ fn main() -> Result<(), slint::PlatformError> {
         rec.join();
     }
     result
+}
+
+/// What the captured game quitting ends: (the recording, the stream). One
+/// being stopped or ended already is left alone.
+fn ends_on_game_closed(rec: RecState, live: LiveState) -> (bool, bool) {
+    (
+        rec == RecState::Recording,
+        matches!(
+            live,
+            LiveState::Connecting | LiveState::Live | LiveState::Reconnecting
+        ),
+    )
 }
 
 /// Handlers.
@@ -1190,6 +1210,20 @@ mod tests {
         ] {
             assert_eq!(friendly(raw), text);
         }
+    }
+
+    #[test]
+    fn a_closed_game_ends_the_recording_and_the_stream() {
+        use LiveState as L;
+        use RecState as R;
+        assert_eq!(ends_on_game_closed(R::Recording, L::Live), (true, true));
+        assert_eq!(ends_on_game_closed(R::Idle, L::Live), (false, true));
+        assert_eq!(ends_on_game_closed(R::Idle, L::Connecting), (false, true));
+        assert_eq!(ends_on_game_closed(R::Idle, L::Reconnecting), (false, true));
+        assert_eq!(ends_on_game_closed(R::Recording, L::Off), (true, false));
+        // Already ending: not asked twice.
+        assert_eq!(ends_on_game_closed(R::Stopping, L::Ending), (false, false));
+        assert_eq!(ends_on_game_closed(R::Starting, L::Off), (false, false));
     }
 
     #[test]

@@ -155,11 +155,23 @@ pub fn stream_game(seconds: u64, url: String, mut settings: Settings) {
         move |event| drop(tx.send(event)),
     )
     .expect("spawn");
+    // Ends early when the captured game quits, as the app does: no frozen
+    // picture streamed until the time is up.
     let end = std::time::Instant::now() + Duration::from_secs(seconds);
+    let mut seen = false;
     while let Some(left) = end.checked_duration_since(std::time::Instant::now()) {
-        match rx.recv_timeout(left) {
+        match rx.recv_timeout(left.min(Duration::from_millis(500))) {
             Ok(event) => log!("{event:?}"),
-            Err(_) => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+        match source.captured_pid() {
+            Some(_) => seen = true,
+            None if seen => {
+                log!("captured game closed: ending the stream");
+                break;
+            }
+            None => {}
         }
     }
     p.stop_stream();
