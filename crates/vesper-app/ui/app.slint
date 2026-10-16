@@ -874,6 +874,9 @@ export component AppWindow inherits Window {
     in property <string> source-name;
     /// Extra detail shown under the source name, e.g. "2560 × 1440".
     in property <string> source-detail;
+    /// Game mode: how the game is captured: "Vulkan", "OpenGL" (layer or
+    /// interposer), "window" (portal fallback), or "" when unknown.
+    in property <string> game-source;
     /// Game mode: other allowed games, to capture instead of the current one.
     in property <[GameEntry]> other-games;
     /// Process name of a game asking for consent; empty hides the prompt.
@@ -1622,20 +1625,22 @@ export component AppWindow inherits Window {
                                     : root.source-kind == SourceKind.none ? "No source selected" : root.source-name;
                                 subtitle: root.game
                                     ? (root.source-name != ""
-                                        ? "Game" + (root.source-detail != "" ? " · " + root.source-detail : "")
-                                        : root.game-layer-installed || root.pending-game != "" ? "Start a game" : root.game-layer-available ? "Turn on game capture in settings" : "Game capture layer not built")
+                                        ? (root.game-source == "window" ? "Game window" : root.game-source != "" ? "Game (" + root.game-source + ")" : "Game")
+                                            + (root.source-detail != "" ? " · " + root.source-detail : "")
+                                        : root.game-layer-installed || root.pending-game != "" ? "Start a game" : "Start a game: its window is captured")
                                     : root.source-kind == SourceKind.none
                                         ? "Pick a screen or a window to record"
                                         : root.source-detail != "" ? root.source-detail : root.source-kind == SourceKind.screen ? "Screen" : "Window";
                                 accessible-role: text;
                                 accessible-label: root.game
-                                    ? (root.source-name != "" ? "Game: " + root.source-name : "Waiting for a game")
+                                    ? (root.source-name != "" ? "Game: " + root.source-name + ", " + self.subtitle : "Waiting for a game")
                                     : root.source-kind == SourceKind.none
                                         ? "No source selected"
                                         : "Source: " + self.title + ", " + self.subtitle;
                             }
-                            // In game mode without the layer: the way to set it up.
-                            if !root.game || !root.game-layer-installed: VerticalLayout {
+                            // In game mode without the layer: the way to set it up,
+                            // until a game (its window) is captured.
+                            if !root.game || (!root.game-layer-installed && root.source-name == ""): VerticalLayout {
                                 alignment: center;
                                 Button {
                                     text: root.game ? "Set up" : root.source-kind == SourceKind.none ? "Choose" : "Change";
@@ -2608,7 +2613,7 @@ export component AppWindow inherits Window {
 
                     SettingGroup {
                         label: "GAME CAPTURE";
-                        hint: "Records Vulkan games (Proton and 32-bit included) at their own frame rate, without the screen picker. Installs a small layer that loads into your Vulkan apps and stays idle until Vesper captures a game you allowed. Some anti-cheats may reject it: launch those games with VESPER_CAPTURE_DISABLE=1.";
+                        hint: "Records Vulkan games (Proton and 32-bit included) at their own frame rate, without the screen picker (off, Vesper captures the game window: the picker asks once per game). Installs a small layer that loads into your Vulkan apps and stays idle until Vesper captures a game you allowed. Some anti-cheats may reject it: launch those games with VESPER_CAPTURE_DISABLE=1.";
                         HorizontalLayout {
                             spacing: Theme.space-md;
                             Labeled {
@@ -2645,7 +2650,7 @@ export component AppWindow inherits Window {
 
                     SettingGroup {
                         label: "OPENGL GAMES";
-                        hint: "For the best performance in OpenGL games (Terraria, many indie games, emulators), add vesper-gl %command% to the game's launch options in Steam (Properties > General); otherwise Vesper captures the game window. Only that game loads the capture library, with the same consent as Vulkan games. Don't use it on multiplayer games protected by VAC, EAC or BattlEye: risk of an account ban.";
+                        hint: "For the best performance in OpenGL games (Terraria, many indie games, emulators), add vesper-gl %command% to the game's launch options in Steam (Properties > General); otherwise Vesper captures the game window (the picker asks once per game). Only that game loads the capture library, with the same consent as Vulkan games. Don't use it on multiplayer games protected by VAC, EAC or BattlEye: risk of an account ban.";
                         Labeled {
                             title: "vesper-gl %command%";
                             wrap-subtitle: true;

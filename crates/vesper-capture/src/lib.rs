@@ -13,6 +13,7 @@ use std::thread::JoinHandle;
 pub use ashpd::desktop::screencast::SourceType;
 use ashpd::desktop::screencast::{CursorMode, Screencast, SelectSourcesOptions};
 use ashpd::desktop::{PersistMode, Session};
+use ashpd::enumflags2::BitFlags;
 use futures_lite::future::block_on;
 use tracing::warn;
 use vesper_core::VideoFrame;
@@ -60,7 +61,27 @@ impl Capture {
         max_fps: u32,
         on_frame: impl FnMut(Result<VideoFrame>) + Send + 'static,
     ) -> Result<Self> {
-        let (session, node_id, fd, restore_token, source) = block_on(open_portal(restore_token))?;
+        let sources = SourceType::Monitor | SourceType::Window;
+        Self::start_with(sources, restore_token, max_fps, on_frame)
+    }
+
+    /// [`Capture::start`], offering windows only (a game's window).
+    pub fn start_window(
+        restore_token: Option<&str>,
+        max_fps: u32,
+        on_frame: impl FnMut(Result<VideoFrame>) + Send + 'static,
+    ) -> Result<Self> {
+        Self::start_with(SourceType::Window.into(), restore_token, max_fps, on_frame)
+    }
+
+    fn start_with(
+        sources: BitFlags<SourceType>,
+        restore_token: Option<&str>,
+        max_fps: u32,
+        on_frame: impl FnMut(Result<VideoFrame>) + Send + 'static,
+    ) -> Result<Self> {
+        let (session, node_id, fd, restore_token, source) =
+            block_on(open_portal(sources, restore_token))?;
         let (control, rx) = ::pipewire::channel::channel();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let tx = control.clone();
@@ -132,7 +153,17 @@ type Opened = (
     SourceInfo,
 );
 
-async fn open_portal(restore_token: Option<&str>) -> Result<Opened> {
+/// Whether `error` is the user closing the picker without picking.
+pub fn is_cancelled(error: &Error) -> bool {
+    matches!(
+        error.downcast_ref::<ashpd::Error>(),
+        Some(ashpd::Error::Response(
+            ashpd::desktop::ResponseError::Cancelled
+        ))
+    )
+}
+
+async fn open_portal(sources: BitFlags<SourceType>, restore_token: Option<&str>) -> Result<Opened> {
     let proxy = Screencast::new().await?;
     let cursor = if proxy
         .available_cursor_modes()
@@ -151,7 +182,7 @@ async fn open_portal(restore_token: Option<&str>) -> Result<Opened> {
                 &session,
                 SelectSourcesOptions::default()
                     .set_cursor_mode(cursor)
-                    .set_sources(SourceType::Monitor | SourceType::Window)
+                    .set_sources(sources)
                     .set_multiple(false)
                     .set_persist_mode(PersistMode::ExplicitlyRevoked)
                     .set_restore_token(restore_token),

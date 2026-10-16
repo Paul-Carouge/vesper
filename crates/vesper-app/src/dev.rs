@@ -6,7 +6,7 @@
 //!   `saved` shows the saved-file notice and `notify` sends the desktop
 //!   notification, both for `VESPER_DEMO_FILE`.
 //!   Looks without a capture or a game, for screenshots: `screen-look`,
-//!   `game-look`, `consent-look`, `starting-look`, `stopping-look`, `layer-installed`, `layer-missing`,
+//!   `game-look`, `game-window-look`, `consent-look`, `starting-look`, `stopping-look`, `layer-installed`, `layer-missing`,
 //!   `replay-on`, `replay-off`, `filters-look`, `live-look`, `live-dropping-look`,
 //!   `live-reconnecting-look`, `live-key-look`; `scroll-end` scrolls the settings
 //!   to the end, `scroll:<px>` that far.
@@ -324,11 +324,18 @@ fn look(ui: &AppWindow, step: &str) -> bool {
             ui.set_game_layer_installed(true);
             ui.set_source_name("eldenring.exe".into());
             ui.set_source_detail("3840 × 2160".into());
+            ui.set_game_source("Vulkan".into());
             let others = [crate::GameEntry {
                 name: "factorio".into(),
                 pid: 4242,
             }];
             ui.set_other_games(std::rc::Rc::new(slint::VecModel::from(others.to_vec())).into());
+        }
+        "game-window-look" => {
+            ui.set_source_kind(crate::SourceKind::Game);
+            ui.set_source_name("Terraria".into());
+            ui.set_source_detail("1920 × 1080".into());
+            ui.set_game_source("window".into());
         }
         "consent-look" => {
             ui.set_game_layer_installed(true);
