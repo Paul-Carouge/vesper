@@ -645,15 +645,19 @@ impl Pipeline {
             .running
             .iter()
             .find(|(i, _)| *i == index)
-            .map_or(Peaks::default(), |(_, capture)| capture.take_peaks())
+            .map_or(Peaks::SILENT, |(_, capture)| capture.take_peaks())
     }
 
     /// The meters rest: the next track louder than their floor sends
-    /// [`Event::AudioSignal`], once.
-    pub fn wake_meters_on_signal(&self) {
-        for (_, capture) in &lock(&self.audio).running {
-            capture.wake_on_signal();
-        }
+    /// [`Event::AudioSignal`], once. Returns true when a track was already
+    /// louder since the last take: the meters must keep ticking.
+    pub fn wake_meters_on_signal(&self) -> bool {
+        let audio = lock(&self.audio);
+        // Every track is asked, even after a loud one.
+        audio
+            .running
+            .iter()
+            .fold(false, |loud, (_, capture)| capture.wake_on_signal() | loud)
     }
 
     /// Stops and waits for the recording, if any, to be finalized.

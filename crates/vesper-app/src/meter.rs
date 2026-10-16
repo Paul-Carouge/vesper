@@ -138,6 +138,16 @@ impl MeterState {
         self.stereo |= peaks.stereo;
     }
 
+    /// Back to rest, levels and held peaks dropped (the window was away);
+    /// the clip latch and the bar count stay.
+    pub fn reset(&mut self) {
+        *self = Self {
+            clip: self.clip,
+            stereo: self.stereo,
+            ..Self::default()
+        };
+    }
+
     pub fn clear_clip(&mut self) {
         self.clip = false;
     }
@@ -309,6 +319,37 @@ mod tests {
         assert_eq!(m.shown(), shown, "no dip between blocks");
         m.feed(peaks(0.0, 0.0), TICK);
         assert!(m.shown().left < shown.left, "real silence releases");
+    }
+
+    #[test]
+    fn a_track_that_stops_running_comes_to_rest() {
+        let mut m = MeterState::new(true);
+        m.feed(peaks(0.5, 0.5), TICK);
+        // What the pipeline reports for a track it does not run.
+        for _ in 0..100 {
+            m.feed(Peaks::SILENT, TICK);
+        }
+        assert!(m.rested());
+    }
+
+    #[test]
+    fn reset_drops_levels_but_keeps_the_clip() {
+        let mut m = MeterState::new(false);
+        m.feed(
+            Peaks {
+                clipped: true,
+                stereo: true,
+                ..peaks(1.0, 0.5)
+            },
+            TICK,
+        );
+        m.reset();
+        assert!(m.rested());
+        let shown = m.shown();
+        assert!(shown.clip && shown.stereo);
+        // The last peaks are gone too: a tick without a block stays at rest.
+        m.feed(Peaks::default(), TICK);
+        assert!(m.rested());
     }
 
     #[test]

@@ -487,7 +487,6 @@ fn look(ui: &AppWindow, step: &str) -> bool {
     true
 }
 
-/// Gameplay (capture, logo, caption, webcam), Be right back, Starting soon.
 /// Meters at these levels and held peaks (dBFS, left and right), stereo,
 /// clipped.
 type DemoMeter = ((f32, f32), (f32, f32), bool, bool);
@@ -508,6 +507,7 @@ fn demo_meters(meters: &[DemoMeter]) -> slint::ModelRc<crate::TrackMeter> {
     std::rc::Rc::new(slint::VecModel::from(meters)).into()
 }
 
+/// Gameplay (capture, logo, caption, webcam), Be right back, Starting soon.
 fn demo_scenes() -> crate::scenes::Scenes {
     use crate::scenes::{Canvas, Fit, Layer, LayerSource, Scene, Scenes, TextStyle};
     let logo = std::env::var_os("VESPER_DEMO_IMAGE").map(PathBuf::from);

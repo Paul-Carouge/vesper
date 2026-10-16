@@ -166,6 +166,18 @@ pub struct Peaks {
     pub fresh: bool,
 }
 
+impl Peaks {
+    /// Silence, as a block would report it: what a track that does not run
+    /// shows (`Default` is "no block came", which keeps the last peaks).
+    pub const SILENT: Self = Self {
+        left: 0.0,
+        right: 0.0,
+        clipped: false,
+        stereo: false,
+        fresh: true,
+    };
+}
+
 /// Where a running track's source is at, for [`Options::on_state`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TrackState {
@@ -220,6 +232,17 @@ impl Shared {
             stereo: self.stereo.load(Ordering::Relaxed),
             fresh: self.fresh.swap(false, Ordering::Relaxed),
         }
+    }
+
+    /// See [`AudioCapture::wake_on_signal`].
+    fn wake_on_signal(&self) -> bool {
+        self.wake.store(true, Ordering::Relaxed);
+        // A block stored between the last take and the store above did not
+        // see the request: look at what it left.
+        let loud = |a: &AtomicU32| f32::from_bits(a.load(Ordering::Relaxed)) > SIGNAL_PEAK;
+        // Taking the request back: the encode thread may have just fired it,
+        // then the event wakes the meter anyway.
+        (loud(&self.left) || loud(&self.right)) && self.wake.swap(false, Ordering::Relaxed)
     }
 }
 
@@ -293,9 +316,11 @@ impl AudioCapture {
     }
 
     /// The next block louder than the meter's floor calls
-    /// [`Options::on_signal`]: a resting meter needs no polling.
-    pub fn wake_on_signal(&self) {
-        self.shared.wake.store(true, Ordering::Relaxed);
+    /// [`Options::on_signal`]: a resting meter needs no polling. Returns
+    /// true, without arming, when such a block already came since the
+    /// peaks were last taken: the meter must not rest.
+    pub fn wake_on_signal(&self) -> bool {
+        self.shared.wake_on_signal()
     }
 
     /// `OpusHead` for the container's codec private data.
@@ -1021,6 +1046,22 @@ mod tests {
         enc.push(&block(-1.0, 1.0));
         assert!(shared.take_peaks().clipped);
         assert!(!shared.take_peaks().clipped, "taken");
+    }
+
+    #[test]
+    fn a_signal_before_the_request_is_not_lost() {
+        let shared = Arc::new(Shared::default());
+        let mut enc = test_encoder(&shared);
+        enc.push(&vec![0.0; FRAME * 2]);
+        shared.take_peaks();
+        assert!(!shared.wake_on_signal(), "silent: armed");
+        assert!(shared.wake.load(Ordering::Relaxed));
+        shared.take_peaks();
+        shared.wake.store(false, Ordering::Relaxed);
+        // A block lands between the last take and the request.
+        enc.push(&vec![0.5; FRAME * 2]);
+        assert!(shared.wake_on_signal(), "the meter keeps ticking");
+        assert!(!shared.wake.load(Ordering::Relaxed), "not armed");
     }
 
     #[test]

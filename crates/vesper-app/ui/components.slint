@@ -448,6 +448,8 @@ component MeterBar inherits Rectangle {
 export component Meter inherits Rectangle {
     in property <TrackMeter> meter;
     in property <bool> muted;
+    // The track's name, for the clip button's label.
+    in property <string> name;
     callback clear-clip();
 
     property <length> bar: root.meter.stereo ? 3px : 6px;
@@ -508,15 +510,32 @@ export component Meter inherits Rectangle {
         opacity: root.muted ? 0.5 : 1;
     }
 
-    if root.clipped: TouchArea {
-        mouse-cursor: pointer;
+    // Clipped, the meter is a button (mouse, Tab then Space or Enter).
+    if root.clipped: FocusScope {
+        focus-on-click: false;
         accessible-role: button;
-        accessible-label: @tr("Clear the clip indicator");
+        accessible-label: @tr("Clear the clip indicator of {}", root.name);
         accessible-action-default => {
             root.clear-clip();
         }
-        clicked => {
-            root.clear-clip();
+        key-pressed(event) => {
+            if (event.text == Key.Space || event.text == Key.Return) {
+                root.clear-clip();
+                return accept;
+            }
+            reject
+        }
+
+        FocusRing {
+            visible-ring: parent.has-focus;
+            radius: Theme.radius-sm;
+        }
+
+        TouchArea {
+            mouse-cursor: pointer;
+            clicked => {
+                root.clear-clip();
+            }
         }
     }
 }

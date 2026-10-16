@@ -269,6 +269,7 @@ component AudioRow inherits HorizontalLayout {
         horizontal-stretch: 1;
         Meter {
             meter: root.meter;
+            name: root.track.name;
             muted: root.silent;
             clear-clip => {
                 root.clear-clip();

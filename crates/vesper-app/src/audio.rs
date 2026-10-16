@@ -9,14 +9,14 @@
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use slint::{ComponentHandle, Model, ModelRc, VecModel};
+use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
 use vesper_audio::{MAX_DB, MIN_DB, Node, NodeWatch, Peaks, Source};
 
 use crate::meter::MeterState;
 use crate::prefs::{self, Device, Prefs};
-use crate::recorder::{MAX_TRACKS, Track};
+use crate::recorder::{MAX_TRACKS, Pipeline, Track};
 use crate::{
     AppWindow, AudioTrack, DeviceChoice, METER_TICK, Shared, SourceOption, TrackKind, TrackMeter,
 };
@@ -657,7 +657,7 @@ pub fn wire(ui: &AppWindow, rec: &Shared) {
 /// Feeds the meters from the pipeline's peaks at ~30 Hz, only while the
 /// window is on screen. The timer stops once the meters rest (the tracks
 /// then wake it on their next signal, see
-/// [`crate::recorder::Pipeline::wake_meters_on_signal`])
+/// [`Pipeline::wake_meters_on_signal`])
 /// or the window is hidden, minimized or covered; `meters-wake` restarts it.
 /// Keep the timer.
 pub fn start_meters(ui: &AppWindow, rec: &Shared) -> Rc<slint::Timer> {
@@ -677,26 +677,43 @@ pub fn start_meters(ui: &AppWindow, rec: &Shared) -> Rc<slint::Timer> {
     // Ticks in a row at rest: a few before stopping, so a replaced filter
     // chain gets freed (`take_peaks`) and noise near the floor does not flap.
     let mut quiet = 0;
+    // The tracks the meters are for: another list, or the same count with
+    // other sources, starts them over (a clip stays with its track).
+    let mut sources: Vec<(TrackKind, SharedString)> = Vec::new();
+    let mut last_tick: Option<Instant> = None;
     tick.start(slint::TimerMode::Repeated, METER_TICK, move || {
         let Some(ui) = weak.upgrade() else { return };
         let mut meters = m.borrow_mut();
         let tracks = ui.get_tracks();
-        if meters.len() != tracks.row_count() {
-            *meters = tracks
+        let same = sources.len() == tracks.row_count()
+            && tracks
                 .iter()
-                .map(|t| MeterState::new(stereo_source(t.kind)))
+                .zip(&sources)
+                .all(|(t, (kind, source))| t.kind == *kind && t.source == *source);
+        if !same {
+            sources = tracks.iter().map(|t| (t.kind, t.source)).collect();
+            *meters = sources
+                .iter()
+                .map(|(kind, _)| MeterState::new(stereo_source(*kind)))
                 .collect();
             model.set_vec(meters.iter().map(MeterState::shown).collect::<Vec<_>>());
         }
+        // The real time since the last tick (timers slip under load), at
+        // most a few ticks: the first one after a stop is not a long silence.
+        let now = Instant::now();
+        let dt = last_tick.map_or(METER_TICK, |t| (now - t).min(MAX_TICK));
+        last_tick = Some(now);
         crate::filters::feed_reductions(&ui, &rec, &reductions);
         let rec = rec.borrow();
         let stale = was_away.replace(false);
         for (i, meter) in meters.iter_mut().enumerate() {
-            let mut peaks = rec.as_ref().map_or(Peaks::default(), |r| r.take_peaks(i));
+            let mut peaks = rec.as_ref().map_or(Peaks::SILENT, |r| r.take_peaks(i));
             if stale {
+                // Back on screen: what came while away is not replayed.
+                meter.reset();
                 (peaks.left, peaks.right, peaks.fresh) = (0.0, 0.0, true);
             }
-            meter.feed(peaks, METER_TICK);
+            meter.feed(peaks, dt);
             // Only visible steps redraw.
             let now = meter.shown();
             if model.row_data(i).as_ref() != Some(&now) {
@@ -708,11 +725,14 @@ pub fn start_meters(ui: &AppWindow, rec: &Shared) -> Rc<slint::Timer> {
         let on_screen = crate::scene_ui::shown_on_screen(&ui);
         if quiet >= REST_TICKS || !on_screen {
             quiet = 0;
+            // A track got loud since this tick's take: keep ticking.
+            if on_screen && rec.as_ref().is_some_and(Pipeline::wake_meters_on_signal) {
+                return;
+            }
             if !on_screen {
                 was_away.set(true);
-            } else if let Some(p) = rec.as_ref() {
-                p.wake_meters_on_signal();
             }
+            last_tick = None;
             if let Some(tick) = this.upgrade() {
                 tick.stop();
             }
@@ -739,6 +759,8 @@ pub fn start_meters(ui: &AppWindow, rec: &Shared) -> Rc<slint::Timer> {
 
 /// Ticks at rest (~330 ms) before the meters stop.
 const REST_TICKS: u32 = 10;
+/// Longest time one meter tick accounts for.
+const MAX_TICK: Duration = Duration::from_millis(100);
 
 /// Sources that are stereo by nature get two bars at once; the others
 /// (microphones, input devices) split once their channels differ.
