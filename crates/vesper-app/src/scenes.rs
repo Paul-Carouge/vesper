@@ -210,7 +210,7 @@ impl Scenes {
     /// `base` if free, else `base 2`, `base 3`... (shortened to stay valid).
     pub fn free_name(&self, base: &str) -> String {
         let base = if base.trim().is_empty() {
-            "Scene"
+            tr!("Scene")
         } else {
             base
         };
@@ -233,11 +233,11 @@ impl Scenes {
     pub fn check_name(&self, name: &str, except: Option<usize>) -> Result<String, &'static str> {
         let name = name.trim();
         if name.is_empty() {
-            Err("Type a name")
+            Err(tr!("Type a name"))
         } else if !valid_name(name) {
-            Err("At most 64 characters, on one line")
+            Err(tr!("At most 64 characters, on one line"))
         } else if self.taken(name, except) {
-            Err("Another scene has this name")
+            Err(tr!("Another scene has this name"))
         } else {
             Ok(name.to_owned())
         }
@@ -249,7 +249,7 @@ impl Scenes {
         if self.list.len() >= MAX_SCENES {
             return None;
         }
-        let name = self.free_name(&format!("Scene {}", self.list.len() + 1));
+        let name = self.free_name(&tr!("Scene {}", self.list.len() + 1));
         if self.list.is_empty() {
             self.active.clone_from(&name);
         }
@@ -266,7 +266,7 @@ impl Scenes {
             return None;
         }
         let mut copy = self.list.get(i)?.clone();
-        copy.name = self.free_name(&format!("{} copy", copy.name));
+        copy.name = self.free_name(&tr!("{} copy", copy.name));
         self.list.insert(i + 1, copy);
         Some(i + 1)
     }
@@ -274,7 +274,7 @@ impl Scenes {
     /// Renames scene `i`; the active scene stays active.
     pub fn rename(&mut self, i: usize, name: &str) -> Result<(), &'static str> {
         let name = self.check_name(name, Some(i))?;
-        let scene = self.list.get_mut(i).ok_or("That scene is gone")?;
+        let scene = self.list.get_mut(i).ok_or(tr!("That scene is gone"))?;
         if self.active == scene.name {
             self.active.clone_from(&name);
         }
@@ -1133,7 +1133,7 @@ mod tests {
         assert_eq!(names, ["Scene 1", "Scene 1 copy 2", "Scene 1 copy"]);
         assert_eq!(
             s.check_name(" scene 1 ", None),
-            Err("Another scene has this name")
+            Err(tr!("Another scene has this name"))
         );
         assert_eq!(s.check_name(" Scene 1 ", Some(0)), Ok("Scene 1".into()));
         assert_eq!(s.check_name("  ", None), Err("Type a name"));

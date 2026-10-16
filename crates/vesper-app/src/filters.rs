@@ -62,14 +62,14 @@ pub fn plugin_dir() -> Option<std::path::PathBuf> {
 /// Title shown for a filter.
 fn title(kind: &str) -> &'static str {
     match kind {
-        "noise_suppression" => "Noise suppression",
-        "expander" => "Expander",
-        "compressor" => "Compressor",
-        "de_esser" => "De-esser",
-        "limiter" => "Limiter",
-        "high_pass" => "High-pass",
-        "gain" => "Gain",
-        _ => "Filter",
+        "noise_suppression" => tr!("Noise suppression"),
+        "expander" => tr!("Expander"),
+        "compressor" => tr!("Compressor"),
+        "de_esser" => tr!("De-esser"),
+        "limiter" => tr!("Limiter"),
+        "high_pass" => tr!("High-pass"),
+        "gain" => tr!("Gain"),
+        _ => tr!("Filter"),
     }
 }
 
@@ -81,19 +81,19 @@ fn meters(kind: &str) -> bool {
 /// How a parameter is shown: label, unit, slider step, behind "More settings".
 fn param_meta(name: &str) -> (&'static str, &'static str, f32, bool) {
     match name {
-        "max_attenuation_db" => ("Suppression", "dB", 1.0, false),
-        "threshold_db" => ("Threshold", "dB", 0.5, false),
-        "ratio" => ("Ratio", "ratio", 0.1, false),
-        "attack_ms" => ("Attack", "ms", 0.1, true),
-        "release_ms" => ("Release", "ms", 1.0, true),
-        "range_db" => ("Range", "dB", 0.5, false),
-        "knee_db" => ("Knee", "dB", 0.5, true),
-        "makeup_db" => ("Makeup", "dB", 0.5, false),
-        "freq_hz" => ("Frequency", "Hz", 1.0, false),
-        "ceiling_db" => ("Ceiling", "dB", 0.1, false),
-        "lookahead_ms" => ("Lookahead", "ms", 0.1, true),
-        "db" => ("Gain", "dB", 0.5, false),
-        _ => ("Value", "", 0.1, false),
+        "max_attenuation_db" => (tr!("Suppression"), "dB", 1.0, false),
+        "threshold_db" => (tr!("Threshold"), "dB", 0.5, false),
+        "ratio" => (tr!("Ratio"), "ratio", 0.1, false),
+        "attack_ms" => (tr!("Attack"), "ms", 0.1, true),
+        "release_ms" => (tr!("Release"), "ms", 1.0, true),
+        "range_db" => (tr!("Range"), "dB", 0.5, false),
+        "knee_db" => (tr!("Knee"), "dB", 0.5, true),
+        "makeup_db" => (tr!("Makeup"), "dB", 0.5, false),
+        "freq_hz" => (tr!("Frequency"), "Hz", 1.0, false),
+        "ceiling_db" => (tr!("Ceiling"), "dB", 0.1, false),
+        "lookahead_ms" => (tr!("Lookahead"), "ms", 0.1, true),
+        "db" => (tr!("Gain"), "dB", 0.5, false),
+        _ => (tr!("Value"), "", 0.1, false),
     }
 }
 
@@ -122,13 +122,13 @@ fn plugin_row(enabled: bool, id: u32) -> FilterRow {
         Some(v) => {
             let title = match v.status {
                 Status::Running => v.name,
-                Status::Starting => format!("{} (starting)", v.name),
-                Status::Restarting(why) => format!("{} (bypassed: {why}; restarting)", v.name),
-                Status::Failed(why) => format!("{} (bypassed: {why})", v.name),
+                Status::Starting => tr!("{} (starting)", v.name),
+                Status::Restarting(why) => tr!("{} (bypassed: {}; restarting)", v.name, why),
+                Status::Failed(why) => tr!("{} (bypassed: {})", v.name, why),
             };
             (title, v.params)
         }
-        None => ("VST3 plugin (unavailable)".to_owned(), Vec::new()),
+        None => (tr!("VST3 plugin (unavailable)").to_owned(), Vec::new()),
     };
     let params: Vec<_> = params
         .iter()

@@ -148,7 +148,8 @@ impl StreamRequest {
     /// The ingest URL, key included: never log it (see `vesper_mux::redact`).
     pub fn url(&self) -> Result<String, String> {
         let key = self.key.as_ref().map(StreamKey::expose);
-        let need_key = || key.ok_or_else(|| "Set a stream key in the settings first".to_owned());
+        let need_key =
+            || key.ok_or_else(|| tr!("Set a stream key in the settings first").to_owned());
         match self.settings.service {
             Service::Twitch => Ok(format!("{TWITCH}/{}", need_key()?)),
             Service::YouTube => Ok(format!("{YOUTUBE}/{}", need_key()?)),
@@ -163,7 +164,7 @@ fn custom_url(url: &str, key: Option<&str>) -> Result<String, String> {
     let scheme = url.split_once("://").map(|(s, _)| s);
     let host = url.split_once("://").map_or("", |(_, rest)| rest);
     if host.is_empty() || url.chars().any(|c| c.is_whitespace() || c.is_control()) {
-        return Err("Enter the server URL in the settings first".into());
+        return Err(tr!("Enter the server URL in the settings first").into());
     }
     match (scheme, key) {
         (Some("rtmp" | "rtmps"), None) => Ok(url.to_owned()),
@@ -178,7 +179,7 @@ fn custom_url(url: &str, key: Option<&str>) -> Result<String, String> {
                 Ok(format!("{url}{sep}streamid={key}"))
             }
         }
-        _ => Err("The server URL must start with rtmp://, rtmps:// or srt://".into()),
+        _ => Err(tr!("The server URL must start with rtmp://, rtmps:// or srt://").into()),
     }
 }
 
@@ -234,9 +235,9 @@ pub fn split_secret(url: &str) -> (String, Option<String>) {
 /// Why a custom URL may send the key in clear, for the settings.
 pub fn cleartext_warning(url: &str) -> &'static str {
     if url.starts_with("rtmp://") {
-        "rtmp:// sends the key in clear: prefer rtmps:// if the server has it."
+        tr!("rtmp:// sends the key in clear: prefer rtmps:// if the server has it.")
     } else if url.starts_with("srt://") {
-        "srt:// is encrypted only with a passphrase: key streamid=...&passphrase=..."
+        tr!("srt:// is encrypted only with a passphrase: key streamid=...&passphrase=...")
     } else {
         ""
     }
@@ -274,27 +275,31 @@ pub enum StreamState {
 /// A short sentence for a connection error.
 fn describe(kind: LiveErrorKind, host: &str, live_before: bool) -> String {
     match kind {
-        LiveErrorKind::Unreachable => format!("Cannot reach {host}: check the network"),
+        LiveErrorKind::Unreachable => tr!("Cannot reach {}: check the network", host),
         LiveErrorKind::Unresolved => {
-            format!("Unknown server {host}: check the URL and the network")
+            tr!("Unknown server {}: check the URL and the network", host)
         }
-        LiveErrorKind::Refused if live_before => format!("{host} refused the connection"),
-        LiveErrorKind::Refused => format!("{host} refused the connection: check the server URL"),
+        LiveErrorKind::Refused if live_before => tr!("{} refused the connection", host),
+        LiveErrorKind::Refused => tr!("{} refused the connection: check the server URL", host),
         LiveErrorKind::Rejected if !live_before => {
-            "The server rejected the stream: check the stream key".into()
+            tr!("The server rejected the stream: check the stream key").into()
         }
-        LiveErrorKind::Rejected | LiveErrorKind::Other => "Connection lost".into(),
+        LiveErrorKind::Rejected | LiveErrorKind::Other => tr!("Connection lost").into(),
         LiveErrorKind::Insecure => {
-            format!("The secure connection to {host} failed: its certificate is not trusted")
+            tr!(
+                "The secure connection to {} failed: its certificate is not trusted",
+                host
+            )
         }
         LiveErrorKind::NotTls => {
             // Never suggest rtmp://: an interception can fake this answer.
-            format!(
-                "{host} does not answer in TLS: check the URL and port, \
-                 or the network may be intercepting the connection"
+            tr!(
+                "{} does not answer in TLS: check the URL and port, \
+                 or the network may be intercepting the connection",
+                host
             )
         }
-        LiveErrorKind::Aborted => "Stopped".into(),
+        LiveErrorKind::Aborted => tr!("Stopped").into(),
     }
 }
 
@@ -510,11 +515,11 @@ fn run(
                 } else {
                     (early_closes, failures) = (0, 0);
                 }
-                const CHECK_KEY: &str = "The server closed the stream: check the stream key";
+                let check_key = tr!("The server closed the stream: check the stream key");
                 match early_closes {
-                    0 => "Connection lost".to_owned(),
-                    MAX_EARLY_CLOSES.. => return Some(CHECK_KEY.into()),
-                    _ => CHECK_KEY.into(),
+                    0 => tr!("Connection lost").to_owned(),
+                    MAX_EARLY_CLOSES.. => return Some(check_key.into()),
+                    _ => check_key.into(),
                 }
             }
             Err(e) if e.kind() == LiveErrorKind::Aborted => return None,

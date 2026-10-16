@@ -50,9 +50,9 @@ impl SourceLabel {
     /// Kind of source, as a word.
     pub fn kind_word(&self) -> &'static str {
         match self.kind {
-            Kind::Monitor => "Screen",
-            Kind::Window => "Window",
-            Kind::Region => "Screen region",
+            Kind::Monitor => tr!("Screen"),
+            Kind::Window => tr!("Window"),
+            Kind::Region => tr!("Screen region"),
         }
     }
 

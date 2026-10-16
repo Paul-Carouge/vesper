@@ -64,7 +64,7 @@ component Clock inherits HorizontalLayout {
 
     alignment: center;
     accessible-role: text;
-    accessible-label: "Elapsed time";
+    accessible-label: @tr("Elapsed time");
     accessible-value: "\{h}:\{m < 10 ? "0" : ""}\{m}:\{s < 10 ? "0" : ""}\{s}";
     for d in root.digits: Text {
         width: d < 0 ? Theme.font-display * 0.32 : Theme.font-display * 0.6;
@@ -88,8 +88,8 @@ component RecordButton inherits FocusScope {
     focus-on-click: false;
     accessible-role: button;
     accessible-label: root.busy
-        ? (root.recording ? "Stopping recording" : "Starting recording")
-        : root.recording ? "Stop recording" : "Start recording";
+        ? (root.recording ? @tr("Stopping recording") : @tr("Starting recording"))
+        : root.recording ? @tr("Stop recording") : @tr("Start recording");
     accessible-description: root.shortcut;
     accessible-enabled: root.enabled && !root.busy;
     accessible-action-default => {
@@ -188,7 +188,7 @@ component Labeled inherits VerticalLayout {
 global TrackText {
     // "-3 dB", "+1.5 dB", "Silent" at the bottom of the range.
     public pure function volume(db: float) -> string {
-        db <= -60 ? "Silent" : (db > 0 ? "+" : "") + "\{Math.round(db * 2) / 2} dB"
+        db <= -60 ? @tr("Silent") : (db > 0 ? "+" : "") + "\{Math.round(db * 2) / 2} dB"
     }
 
     public pure function icon(kind: TrackKind, muted: bool) -> string {
@@ -198,10 +198,10 @@ global TrackText {
     }
 
     public pure function kind(kind: TrackKind) -> string {
-        kind == TrackKind.desktop ? "Desktop audio"
-            : kind == TrackKind.microphone ? "Microphone"
-            : kind == TrackKind.output ? "Output device"
-            : kind == TrackKind.input ? "Input device" : "Application"
+        kind == TrackKind.desktop ? @tr("Desktop audio")
+            : kind == TrackKind.microphone ? @tr("Microphone")
+            : kind == TrackKind.output ? @tr("Output device")
+            : kind == TrackKind.input ? @tr("Input device") : @tr("Application")
     }
 
     // The device it records ("Speakers (USB DAC)"), else its kind. The icon
@@ -212,7 +212,7 @@ global TrackText {
 
     // What a device selector shows.
     public pure function device(choice: DeviceChoice) -> string {
-        choice.name == "" ? "System default" : choice.connected ? choice.label : "\{choice.label} (disconnected)"
+        choice.name == "" ? @tr("System default") : choice.connected ? choice.label : @tr("{} (disconnected)", choice.label)
     }
 }
 
@@ -233,7 +233,7 @@ component AudioRow inherits HorizontalLayout {
 
     IconButton {
         icon: TrackText.icon(root.track.kind, root.track.muted);
-        label: root.track.muted ? "Unmute \{root.track.name}" : "Mute \{root.track.name}";
+        label: root.track.muted ? @tr("Unmute {}", root.track.name) : @tr("Mute {}", root.track.name);
         active: root.track.muted;
         active-tint: Theme.rec;
         enabled: root.interactive;
@@ -254,8 +254,8 @@ component AudioRow inherits HorizontalLayout {
             overflow: elide;
         }
         Text {
-            text: !root.track.enabled ? "Not recorded"
-                : root.track.muted ? "Muted"
+            text: !root.track.enabled ? @tr("Not recorded")
+                : root.track.muted ? @tr("Muted")
                 : root.track.volume-db != 0 ? TrackText.volume(root.track.volume-db) : TrackText.source(root.track);
             font-size: Theme.font-caption;
             font-weight: root.track.muted && root.track.enabled ? 600 : 400;
@@ -276,7 +276,7 @@ component AudioRow inherits HorizontalLayout {
 
     IconButton {
         icon: Icons.sliders;
-        label: "Settings of \{root.track.name}";
+        label: @tr("Settings of {}", root.track.name);
         active: root.open;
         enabled: root.interactive;
         clicked => {
@@ -312,7 +312,7 @@ component SourceRow inherits FocusScope {
     focus-on-click: false;
     height: root.below ? 44px : 36px;
     accessible-role: list-item;
-    accessible-label: root.taken ? "\{root.spoken} (already a track)" : root.choosing ? root.spoken : "Add \{root.spoken}";
+    accessible-label: root.taken ? @tr("{} (already a track)", root.spoken) : root.choosing ? root.spoken : @tr("Add {}", root.spoken);
     accessible-item-selectable: root.choosing;
     accessible-item-selected: root.selected;
     accessible-enabled: root.enabled && !root.taken;
@@ -380,11 +380,11 @@ component SourceRow inherits FocusScope {
             text: root.option.detail;
             vertical-alignment: center;
             font-size: Theme.font-caption;
-            color: root.option.detail == "Disconnected" ? Theme.warn : Theme.text-muted;
+            color: root.option.detail == @tr("Disconnected") ? Theme.warn : Theme.text-muted;
             overflow: elide;
         }
         if root.taken: Text {
-            text: "Added";
+            text: @tr("Added");
             vertical-alignment: center;
             font-size: Theme.font-caption;
             color: Theme.text-muted;
@@ -474,7 +474,7 @@ component DevicePicker inherits VerticalLayout {
         warn: !root.choice.connected;
         expanded: root.open;
         enabled: !root.locked;
-        description: root.locked ? "Locked while recording" : !root.choice.connected ? "Disconnected: recorded again once it is back" : "";
+        description: root.locked ? @tr("Locked while recording") : !root.choice.connected ? @tr("Disconnected: recorded again once it is back") : "";
         clicked => {
             root.opened(!root.open);
         }
@@ -606,7 +606,7 @@ component FilterCard inherits Rectangle {
                 width: 28px;
                 height: 36px;
                 icon: Icons.chevron-up;
-                label: "Move \{root.filter.title} up";
+                label: @tr("Move {} up", root.filter.title);
                 enabled: !root.first;
                 opacity: self.enabled ? 1 : 0.35;
                 clicked => {
@@ -617,7 +617,7 @@ component FilterCard inherits Rectangle {
                 width: 28px;
                 height: 36px;
                 icon: Icons.chevron-down;
-                label: "Move \{root.filter.title} down";
+                label: @tr("Move {} down", root.filter.title);
                 enabled: !root.last;
                 opacity: self.enabled ? 1 : 0.35;
                 clicked => {
@@ -628,7 +628,7 @@ component FilterCard inherits Rectangle {
                 width: 28px;
                 height: 36px;
                 icon: Icons.close;
-                label: "Remove \{root.filter.title}";
+                label: @tr("Remove {}", root.filter.title);
                 clicked => {
                     root.remove();
                 }
@@ -648,7 +648,7 @@ component FilterCard inherits Rectangle {
                 accessible-role: none;
                 Text {
                     width: 76px;
-                    text: "Reduction";
+                    text: @tr("Reduction");
                     vertical-alignment: center;
                     font-size: Theme.font-small;
                     color: Theme.text-muted;
@@ -699,10 +699,10 @@ component FilterCard inherits Rectangle {
             if root.filter.advanced.length > 0: HorizontalLayout {
                 alignment: start;
                 Button {
-                    text: root.show-advanced ? "Fewer settings" : "More settings";
+                    text: root.show-advanced ? @tr("Fewer settings") : @tr("More settings");
                     kind: "ghost";
                     small: true;
-                    accessible-label: (root.show-advanced ? "Hide" : "Show") + " the advanced settings of \{root.filter.title}";
+                    accessible-label: root.show-advanced ? @tr("Hide the advanced settings of {}", root.filter.title) : @tr("Show the advanced settings of {}", root.filter.title);
                     clicked => {
                         root.show-advanced = !root.show-advanced;
                     }
@@ -1043,6 +1043,9 @@ export component AppWindow inherits Window {
     in-out property <bool> autostart;
     in property <bool> tray-available;
     callback autostart-changed(bool);
+    // 0: the system's, 1: English, 2: French. Applies at once.
+    in-out property <int> language;
+    callback language-changed();
     callback quit();
     // Restarts the level meters, which stop while nothing moves them or the
     // window is hidden.
@@ -1063,7 +1066,7 @@ export component AppWindow inherits Window {
     // The stream settings are locked unless it is off.
     property <bool> live-off: root.live-state == LiveState.off;
     property <bool> on-air: root.live-state == LiveState.live;
-    property <string> live-service-name: root.live-service == LiveService.twitch ? "Twitch" : root.live-service == LiveService.youtube ? "YouTube" : "Custom server";
+    property <string> live-service-name: root.live-service == LiveService.twitch ? "Twitch" : root.live-service == LiveService.youtube ? "YouTube" : @tr("Custom server");
     property <int> live-m: Math.mod(Math.floor(root.live-seconds / 60), 60);
     property <int> live-s: Math.mod(root.live-seconds, 60);
     property <string> live-clock: "\{Math.floor(root.live-seconds / 3600)}:\{root.live-m < 10 ? "0" : ""}\{root.live-m}:\{root.live-s < 10 ? "0" : ""}\{root.live-s}";
@@ -1111,7 +1114,7 @@ export component AppWindow inherits Window {
     function set-profile-mode(mode: int) {
         root.profile-mode = mode;
         root.profile-error = "";
-        root.profile-draft = mode == 3 ? root.profile-name : mode == 2 ? root.profile-name + " copy" : "";
+        root.profile-draft = mode == 3 ? root.profile-name : mode == 2 ? @tr("{} copy", root.profile-name) : "";
     }
 
     function close-profile-menu() {
@@ -1374,11 +1377,11 @@ export component AppWindow inherits Window {
                         min-width: 96px;
                         max-width: 200px;
                         horizontal-stretch: 0;
-                        label: "Profile";
+                        label: @tr("Profile");
                         text: root.profile-name;
                         expanded: root.profile-menu;
                         enabled: !root.settings-open;
-                        description: root.profiles-locked ? "Switching is locked while recording or streaming" : "";
+                        description: root.profiles-locked ? @tr("Switching is locked while recording or streaming") : "";
                         clicked => {
                             if (root.profile-menu) {
                                 root.close-profile-menu();
@@ -1390,7 +1393,7 @@ export component AppWindow inherits Window {
                     scenes-button := IconButton {
                         enabled: !root.settings-open;
                         icon: Icons.layers;
-                        label: "Scenes";
+                        label: @tr("Scenes");
                         active: SceneStore.open;
                         clicked => {
                             root.open-scenes();
@@ -1399,7 +1402,7 @@ export component AppWindow inherits Window {
                     settings-button := IconButton {
                         enabled: !root.settings-open;
                         icon: Icons.sliders;
-                        label: "Output settings";
+                        label: @tr("Output settings");
                         active: root.settings-open;
                         clicked => {
                             root.open-settings();
@@ -1430,7 +1433,7 @@ export component AppWindow inherits Window {
                             VerticalLayout {
                                 spacing: 2px;
                                 accessible-role: list;
-                                accessible-label: "Profiles";
+                                accessible-label: @tr("Profiles");
                                 for p in root.profiles: ProfileRow {
                                     name: p.name;
                                     selected: p.slug == root.profile-slug;
@@ -1449,7 +1452,7 @@ export component AppWindow inherits Window {
                                 padding-left: Theme.space-sm;
                                 padding-right: Theme.space-sm;
                                 Text {
-                                    text: "Switching is locked while recording or streaming.";
+                                    text: @tr("Switching is locked while recording or streaming.");
                                     font-size: Theme.font-small;
                                     color: Theme.text-muted;
                                     wrap: word-wrap;
@@ -1463,42 +1466,42 @@ export component AppWindow inherits Window {
                                 spacing: Theme.space-xs;
                                 alignment: start;
                                 Button {
-                                    text: "New";
+                                    text: @tr("profile" => "New");
                                     small: true;
                                     kind: "ghost";
                                     enabled: !root.profiles-locked;
-                                    accessible-label: "New profile";
+                                    accessible-label: @tr("New profile");
                                     clicked => {
                                         root.set-profile-mode(1);
                                     }
                                 }
                                 Button {
-                                    text: "Duplicate";
+                                    text: @tr("Duplicate");
                                     small: true;
                                     kind: "ghost";
                                     enabled: !root.profiles-locked;
-                                    accessible-label: "Duplicate \{root.profile-name}";
+                                    accessible-label: @tr("Duplicate {}", root.profile-name);
                                     clicked => {
                                         root.set-profile-mode(2);
                                     }
                                 }
                                 Button {
-                                    text: "Rename";
+                                    text: @tr("Rename");
                                     small: true;
                                     kind: "ghost";
-                                    accessible-label: "Rename \{root.profile-name}";
+                                    accessible-label: @tr("Rename {}", root.profile-name);
                                     clicked => {
                                         root.set-profile-mode(3);
                                     }
                                 }
                                 Button {
-                                    text: "Delete";
+                                    text: @tr("Delete");
                                     small: true;
                                     kind: "ghost";
                                     // Never the last one.
                                     enabled: !root.profiles-locked && root.profiles.length > 1;
-                                    accessible-label: "Delete \{root.profile-name}";
-                                    accessible-description: root.profiles.length > 1 ? "" : "The last profile cannot be deleted";
+                                    accessible-label: @tr("Delete {}", root.profile-name);
+                                    accessible-description: root.profiles.length > 1 ? "" : @tr("The last profile cannot be deleted");
                                     clicked => {
                                         root.set-profile-mode(4);
                                     }
@@ -1508,7 +1511,7 @@ export component AppWindow inherits Window {
                                 padding: Theme.space-sm;
                                 spacing: Theme.space-sm;
                                 Text {
-                                    text: root.profile-mode == 1 ? "New profile, with the default settings" : root.profile-mode == 2 ? "Copy of “\{root.profile-name}”" : "Rename “\{root.profile-name}”";
+                                    text: root.profile-mode == 1 ? @tr("New profile, with the default settings") : root.profile-mode == 2 ? @tr("Copy of “{}”", root.profile-name) : @tr("Rename “{}”", root.profile-name);
                                     font-size: Theme.font-small;
                                     font-weight: 600;
                                     color: Theme.text;
@@ -1516,8 +1519,8 @@ export component AppWindow inherits Window {
                                 }
                                 TextField {
                                     text: root.profile-draft;
-                                    label: "Profile name";
-                                    placeholder: "Profile name";
+                                    label: @tr("Profile name");
+                                    placeholder: @tr("Profile name");
                                     enabled: root.profile-mode == 3 || !root.profiles-locked;
                                     init => {
                                         self.focus();
@@ -1544,7 +1547,7 @@ export component AppWindow inherits Window {
                                     alignment: end;
                                     spacing: Theme.space-sm;
                                     Button {
-                                        text: "Cancel";
+                                        text: @tr("Cancel");
                                         small: true;
                                         kind: "ghost";
                                         clicked => {
@@ -1552,7 +1555,7 @@ export component AppWindow inherits Window {
                                         }
                                     }
                                     Button {
-                                        text: root.profile-mode == 1 ? "Create" : root.profile-mode == 2 ? "Duplicate" : "Rename";
+                                        text: root.profile-mode == 1 ? @tr("Create") : root.profile-mode == 2 ? @tr("Duplicate") : @tr("Rename");
                                         small: true;
                                         kind: "primary";
                                         // A recording or stream that started meanwhile.
@@ -1567,7 +1570,7 @@ export component AppWindow inherits Window {
                                 padding: Theme.space-sm;
                                 spacing: Theme.space-sm;
                                 Text {
-                                    text: "Delete “\{root.profile-name}”? Its settings and plugin states are deleted.";
+                                    text: @tr("Delete “{}”? Its settings and plugin states are deleted.", root.profile-name);
                                     font-size: Theme.font-small;
                                     color: Theme.text;
                                     wrap: word-wrap;
@@ -1576,7 +1579,7 @@ export component AppWindow inherits Window {
                                     alignment: end;
                                     spacing: Theme.space-sm;
                                     Button {
-                                        text: "Cancel";
+                                        text: @tr("Cancel");
                                         small: true;
                                         kind: "ghost";
                                         init => {
@@ -1587,11 +1590,11 @@ export component AppWindow inherits Window {
                                         }
                                     }
                                     Button {
-                                        text: "Delete";
+                                        text: @tr("Delete");
                                         small: true;
                                         kind: "danger";
                                         enabled: !root.profiles-locked;
-                                        accessible-label: "Delete \{root.profile-name}";
+                                        accessible-label: @tr("Delete {}", root.profile-name);
                                         clicked => {
                                             root.profile-delete();
                                             root.close-profile-menu();
@@ -1607,19 +1610,19 @@ export component AppWindow inherits Window {
                 if root.pending-game != "": Card {
                     border-color: Theme.accent;
                     accessible-role: groupbox;
-                    accessible-label: "Allow Vesper to capture \{root.pending-game}?";
+                    accessible-label: @tr("Allow Vesper to capture {}?", root.pending-game);
                     VerticalLayout {
                         padding: Theme.card-padding;
                         spacing: Theme.space-sm;
                         Text {
-                            text: "Allow Vesper to capture \{root.pending-game}?";
+                            text: @tr("Allow Vesper to capture {}?", root.pending-game);
                             font-size: Theme.font-body;
                             font-weight: 600;
                             color: Theme.text;
                             wrap: word-wrap;
                         }
                         Text {
-                            text: "An app asks to be recorded. Allow only games you recognize.";
+                            text: @tr("An app asks to be recorded. Allow only games you recognize.");
                             font-size: Theme.font-small;
                             color: Theme.text-muted;
                             wrap: word-wrap;
@@ -1628,17 +1631,17 @@ export component AppWindow inherits Window {
                             alignment: end;
                             spacing: Theme.space-sm;
                             Button {
-                                text: "Ignore";
+                                text: @tr("Ignore");
                                 kind: "ghost";
-                                accessible-label: "Ignore \{root.pending-game}";
+                                accessible-label: @tr("Ignore {}", root.pending-game);
                                 clicked => {
                                     root.ignore-game();
                                 }
                             }
                             Button {
-                                text: "Allow";
+                                text: @tr("Allow");
                                 kind: "primary";
-                                accessible-label: "Allow capturing \{root.pending-game}";
+                                accessible-label: @tr("Allow capturing {}", root.pending-game);
                                 clicked => {
                                     root.allow-game();
                                 }
@@ -1667,32 +1670,32 @@ export component AppWindow inherits Window {
                             Labeled {
                                 horizontal-stretch: 1;
                                 title: root.game
-                                    ? (root.source-name != "" ? root.source-name : "Waiting for a game…")
-                                    : root.source-kind == SourceKind.none ? "No source selected" : root.source-name;
+                                    ? (root.source-name != "" ? root.source-name : @tr("Waiting for a game…"))
+                                    : root.source-kind == SourceKind.none ? @tr("No source selected") : root.source-name;
                                 subtitle: root.game
                                     ? (root.source-name != ""
-                                        ? (root.game-source == "window" ? "Game window" : root.game-source != "" ? "Game (" + root.game-source + ")" : "Game")
+                                        ? (root.game-source == "window" ? @tr("Game window") : root.game-source != "" ? @tr("Game ({})", root.game-source) : @tr("Game"))
                                             + (root.source-detail != "" ? " · " + root.source-detail : "")
-                                        : root.game-layer-installed || root.pending-game != "" ? "Start a game" : root.game-layer-available ? "Start a game: its window is captured" : "Game capture layer not built")
+                                        : root.game-layer-installed || root.pending-game != "" ? @tr("Start a game") : root.game-layer-available ? @tr("Start a game: its window is captured") : @tr("Game capture layer not built"))
                                     : root.source-kind == SourceKind.none
-                                        ? "Pick a screen or a window to record"
-                                        : root.source-detail != "" ? root.source-detail : root.source-kind == SourceKind.screen ? "Screen" : "Window";
+                                        ? @tr("Pick a screen or a window to record")
+                                        : root.source-detail != "" ? root.source-detail : root.source-kind == SourceKind.screen ? @tr("Screen") : @tr("Window");
                                 accessible-role: text;
                                 accessible-label: root.game
-                                    ? (root.source-name != "" ? "Game: " + root.source-name + ", " + self.subtitle : "Waiting for a game")
+                                    ? (root.source-name != "" ? @tr("Game: {}, {}", root.source-name, self.subtitle) : @tr("Waiting for a game"))
                                     : root.source-kind == SourceKind.none
-                                        ? "No source selected"
-                                        : "Source: " + self.title + ", " + self.subtitle;
+                                        ? @tr("No source selected")
+                                        : @tr("Source: {}, {}", self.title, self.subtitle);
                             }
                             // In game mode without the layer: the way to set it up,
                             // until a game (its window) is captured.
                             if !root.game || (!root.game-layer-installed && root.source-name == ""): VerticalLayout {
                                 alignment: center;
                                 Button {
-                                    text: root.game ? "Set up" : root.source-kind == SourceKind.none ? "Choose" : "Change";
+                                    text: root.game ? @tr("Set up") : root.source-kind == SourceKind.none ? @tr("Choose") : @tr("Change");
                                     kind: root.game || root.source-kind == SourceKind.none ? "primary" : "secondary";
                                     enabled: !root.active && !root.settings-open;
-                                    accessible-label: root.game ? "Open the game capture settings" : "Choose source";
+                                    accessible-label: root.game ? @tr("Open the game capture settings") : @tr("Choose source");
                                     clicked => {
                                         if (root.game) {
                                             root.open-game-settings();
@@ -1704,9 +1707,9 @@ export component AppWindow inherits Window {
                             }
                         }
                         Segmented {
-                            label: "Source type";
+                            label: @tr("Source type");
                             enabled: !root.active && !root.settings-open && root.live-off;
-                            options: ["Screen or window", "Game"];
+                            options: [@tr("Screen or window"), @tr("Game")];
                             selected: root.game ? 1 : 0;
                             changed(i) => {
                                 root.source-mode-changed(i == 1);
@@ -1715,7 +1718,7 @@ export component AppWindow inherits Window {
                         if root.game && root.other-games.length > 0: VerticalLayout {
                             spacing: Theme.space-xs;
                             Text {
-                                text: "Also running";
+                                text: @tr("Also running");
                                 font-size: Theme.font-caption;
                                 font-weight: 600;
                                 color: Theme.text-muted;
@@ -1731,10 +1734,10 @@ export component AppWindow inherits Window {
                                     overflow: elide;
                                 }
                                 Button {
-                                    text: "Capture";
+                                    text: @tr("verb" => "Capture");
                                     small: true;
                                     enabled: !root.settings-open;
-                                    accessible-label: "Capture \{g.name}";
+                                    accessible-label: @tr("Capture {}", g.name);
                                     clicked => {
                                         root.select-game(g.pid);
                                     }
@@ -1783,7 +1786,7 @@ export component AppWindow inherits Window {
                                     }
                                 }
                                 Text {
-                                    text: root.rec-state == RecState.starting ? "Starting" : root.rec-state == RecState.stopping ? "Saving" : root.recording ? "REC" : root.source-kind == SourceKind.none || (root.game && root.source-name == "") ? "No source" : "Ready";
+                                    text: root.rec-state == RecState.starting ? @tr("Starting") : root.rec-state == RecState.stopping ? @tr("Saving") : root.recording ? @tr("REC") : root.source-kind == SourceKind.none || (root.game && root.source-name == "") ? @tr("No source") : @tr("Ready");
                                     vertical-alignment: center;
                                     font-size: Theme.font-caption;
                                     font-weight: 700;
@@ -1798,7 +1801,7 @@ export component AppWindow inherits Window {
                         seconds: root.elapsed-seconds;
                         color: root.recording ? Theme.text : Theme.text-faint;
                         accessible-role: text;
-                        accessible-label: "Elapsed time";
+                        accessible-label: @tr("Elapsed time");
                     }
 
                     HorizontalLayout {
@@ -1817,7 +1820,7 @@ export component AppWindow inherits Window {
                     }
 
                     Text {
-                        text: root.rec-state == RecState.starting ? "Starting…" : root.rec-state == RecState.stopping ? "Finishing the file…" : root.recording ? "\{root.record-shortcut} to stop" : "\{root.record-shortcut} to start recording";
+                        text: root.rec-state == RecState.starting ? @tr("Starting…") : root.rec-state == RecState.stopping ? @tr("Finishing the file…") : root.recording ? @tr("{} to stop", root.record-shortcut) : @tr("{} to start recording", root.record-shortcut);
                         horizontal-alignment: center;
                         font-size: Theme.font-small;
                         color: Theme.text-faint;
@@ -1833,16 +1836,16 @@ export component AppWindow inherits Window {
                             spacing: Theme.space-md;
                             Labeled {
                                 horizontal-stretch: 1;
-                                title: "Replay buffer";
+                                title: @tr("Replay buffer");
                                 subtitle: root.replay-enabled
-                                    ? "Last \{root.replay-seconds < 60 ? root.replay-seconds + " s" : root.replay-seconds / 60 + " min"}, \{root.replay-memory}"
-                                    : "Off. Turn on to save past moments";
+                                    ? @tr("Last {}, {}", root.replay-seconds < 60 ? root.replay-seconds + " s" : root.replay-seconds / 60 + " min", root.replay-memory)
+                                    : @tr("Off. Turn on to save past moments");
                             }
                             VerticalLayout {
                                 alignment: center;
                                 Switch {
                                     enabled: !root.settings-open;
-                                    label: "Replay buffer";
+                                    label: @tr("Replay buffer");
                                     checked: root.replay-enabled;
                                     toggled(on) => {
                                         root.replay-enabled = on;
@@ -1856,7 +1859,7 @@ export component AppWindow inherits Window {
                             Segmented {
                                 enabled: !root.settings-open;
                                 horizontal-stretch: 1;
-                                label: "Replay length";
+                                label: @tr("Replay length");
                                 options: ["30 s", "1 min", "2 min"];
                                 selected: root.replay-seconds >= 120 ? 2 : root.replay-seconds >= 60 ? 1 : 0;
                                 changed(i) => {
@@ -1865,10 +1868,10 @@ export component AppWindow inherits Window {
                                 }
                             }
                             Button {
-                                text: "Save replay";
+                                text: @tr("button" => "Save replay");
                                 icon: Icons.save;
                                 enabled: root.replay-enabled && !root.settings-open;
-                                accessible-label: "Save replay";
+                                accessible-label: @tr("Save replay");
                                 shortcut-hint: root.replay-shortcut;
                                 clicked => {
                                     root.request-save-replay();
@@ -1881,7 +1884,7 @@ export component AppWindow inherits Window {
                 // ---- Live stream -------------------------------------------
                 Card {
                     accessible-role: groupbox;
-                    accessible-label: "Live stream";
+                    accessible-label: @tr("Live stream");
                     HorizontalLayout {
                         padding: Theme.space-lg;
                         spacing: Theme.space-md;
@@ -1905,10 +1908,10 @@ export component AppWindow inherits Window {
                                     }
                                 }
                                 live-title := Text {
-                                    text: root.live-state == LiveState.connecting ? "Connecting…"
-                                        : root.live-state == LiveState.reconnecting ? "Reconnecting…"
-                                        : root.live-state == LiveState.ending ? "Ending the stream…"
-                                        : root.on-air ? "LIVE" : "Live stream";
+                                    text: root.live-state == LiveState.connecting ? @tr("Connecting…")
+                                        : root.live-state == LiveState.reconnecting ? @tr("Reconnecting…")
+                                        : root.live-state == LiveState.ending ? @tr("Ending the stream…")
+                                        : root.on-air ? @tr("LIVE") : @tr("Live stream");
                                     font-size: Theme.font-body;
                                     font-weight: root.on-air ? 700 : 600;
                                     letter-spacing: root.on-air ? 1.2px : 0px;
@@ -1925,10 +1928,10 @@ export component AppWindow inherits Window {
                             }
                             live-subtitle := Text {
                                 text: root.live-off
-                                    ? root.live-service-name + " · " + (root.live-height == 0 ? "native size" : root.live-height + "p") + root.live-fps + " · " + root.live-bitrate + " Mbit/s"
+                                    ? root.live-service-name + " · " + (root.live-height == 0 ? @tr("native size") : root.live-height + "p") + root.live-fps + " · " + root.live-bitrate + " Mbit/s"
                                     : root.on-air
-                                        ? root.live-detail + " · " + (root.live-dropped == 1 ? "1 dropped" : "\{root.live-dropped} dropped")
-                                        : root.live-detail != "" ? root.live-detail : "to " + root.live-service-name;
+                                        ? root.live-detail + " · " + @tr("{n} dropped" | "{n} dropped" % root.live-dropped)
+                                        : root.live-detail != "" ? root.live-detail : @tr("to {}", root.live-service-name);
                                 font-size: Theme.font-small;
                                 color: root.on-air && root.live-dropped > 0 ? Theme.warn : Theme.text-muted;
                                 overflow: elide;
@@ -1937,11 +1940,11 @@ export component AppWindow inherits Window {
                         VerticalLayout {
                             alignment: center;
                             Button {
-                                text: root.live-off ? "Go live" : "End stream";
+                                text: root.live-off ? @tr("Go live") : @tr("End stream");
                                 icon: root.live-off ? Icons.broadcast : "";
                                 kind: "secondary";
                                 enabled: !root.settings-open && root.live-state != LiveState.ending;
-                                accessible-label: root.live-off ? "Go live on " + root.live-service-name : "End the live stream";
+                                accessible-label: root.live-off ? @tr("Go live on {}", root.live-service-name) : @tr("End the live stream");
                                 shortcut-hint: root.live-shortcut;
                                 clicked => {
                                     root.global-toggle-live();
@@ -1967,24 +1970,24 @@ export component AppWindow inherits Window {
                             SectionLabel {
                                 horizontal-stretch: 1;
                                 vertical-alignment: center;
-                                text: "AUDIO";
+                                text: @tr("AUDIO");
                             }
                             if !root.picking: Button {
-                                text: "Add track";
+                                text: @tr("Add track");
                                 icon: Icons.plus;
                                 kind: "ghost";
                                 small: true;
                                 enabled: !root.active && !root.settings-open && root.tracks.length < root.max-tracks;
-                                accessible-description: root.active ? "Locked while recording" : root.tracks.length >= root.max-tracks ? "At most \{root.max-tracks} tracks" : "";
+                                accessible-description: root.active ? @tr("Locked while recording") : root.tracks.length >= root.max-tracks ? @tr("At most {} tracks", root.max-tracks) : "";
                                 clicked => {
                                     root.set-picking(true);
                                 }
                             }
                             if root.picking: Button {
-                                text: "Cancel";
+                                text: @tr("Cancel");
                                 kind: "ghost";
                                 small: true;
-                                accessible-label: "Close the source list";
+                                accessible-label: @tr("Close the source list");
                                 clicked => {
                                     root.set-picking(false);
                                 }
@@ -1994,7 +1997,7 @@ export component AppWindow inherits Window {
                             padding-left: Theme.card-padding - Theme.space-xs;
                             Text {
                                 height: Theme.control-height;
-                                text: "No audio is recorded.";
+                                text: @tr("No audio is recorded.");
                                 vertical-alignment: center;
                                 font-size: Theme.font-small;
                                 color: Theme.text-muted;
@@ -2026,10 +2029,10 @@ export component AppWindow inherits Window {
                                 padding-bottom: Theme.space-sm;
                                 spacing: Theme.space-sm;
                                 accessible-role: groupbox;
-                                accessible-label: "Settings of \{track.name}";
+                                accessible-label: @tr("Settings of {}", track.name);
                                 TextField {
                                     text: track.name;
-                                    label: "Track name";
+                                    label: @tr("Track name");
                                     enabled: !root.active;
                                     accepted(name) => {
                                         root.name-draft-track = -1;
@@ -2045,19 +2048,19 @@ export component AppWindow inherits Window {
                                     spacing: Theme.space-md;
                                     Text {
                                         width: 52px;
-                                        text: "Source";
+                                        text: @tr("Source");
                                         vertical-alignment: center;
                                         font-size: Theme.font-small;
                                         color: Theme.text-muted;
                                     }
                                     source-field := SelectField {
                                         horizontal-stretch: 1;
-                                        label: "Source of \{track.name}";
+                                        label: @tr("Source of {}", track.name);
                                         text: track.source-label;
                                         icon: TrackText.icon(track.kind, false);
                                         expanded: root.choosing-source;
                                         enabled: !root.active;
-                                        description: root.active ? "Locked while recording" : "";
+                                        description: root.active ? @tr("Locked while recording") : "";
                                         clicked => {
                                             root.adding-filter = false;
                                             root.choosing-source = !root.choosing-source;
@@ -2065,7 +2068,7 @@ export component AppWindow inherits Window {
                                     }
                                 }
                                 if root.active: Text {
-                                    text: "Source, name and recording are locked while recording.";
+                                    text: @tr("Source, name and recording are locked while recording.");
                                     font-size: Theme.font-small;
                                     color: Theme.text-muted;
                                     wrap: word-wrap;
@@ -2075,7 +2078,7 @@ export component AppWindow inherits Window {
                                     focus-current: source-field.keyboard;
                                     choosing: true;
                                     current: track.source;
-                                    label: "Sources for \{track.name}";
+                                    label: @tr("Sources for {}", track.name);
                                     picked(option) => {
                                         root.choosing-source = false;
                                         source-field.focus();
@@ -2090,7 +2093,7 @@ export component AppWindow inherits Window {
                                     spacing: Theme.space-md;
                                     Slider {
                                         horizontal-stretch: 1;
-                                        label: "Volume of \{track.name}";
+                                        label: @tr("Volume of {}", track.name);
                                         minimum: -60;
                                         maximum: 12;
                                         step: 1;
@@ -2117,25 +2120,25 @@ export component AppWindow inherits Window {
                                     SectionLabel {
                                         horizontal-stretch: 1;
                                         vertical-alignment: center;
-                                        text: "FILTERS";
+                                        text: @tr("FILTERS");
                                     }
                                     if track.kind == TrackKind.microphone || track.kind == TrackKind.input: Button {
-                                        text: "Voice preset";
+                                        text: @tr("Voice preset");
                                         kind: "ghost";
                                         small: true;
-                                        accessible-description: "Replaces the filters with high-pass, noise suppression, expander, compressor, de-esser and limiter";
+                                        accessible-description: @tr("Replaces the filters with high-pass, noise suppression, expander, compressor, de-esser and limiter");
                                         clicked => {
                                             root.adding-filter = false;
                                             root.filter-voice-preset(i);
                                         }
                                     }
                                     Button {
-                                        text: root.adding-filter ? "Cancel" : "Add filter";
+                                        text: root.adding-filter ? @tr("Cancel") : @tr("Add filter");
                                         icon: root.adding-filter ? "" : Icons.plus;
                                         kind: "ghost";
                                         small: true;
                                         enabled: root.adding-filter || track.filters.length < root.max-filters;
-                                        accessible-label: root.adding-filter ? "Close the filter list" : "Add filter";
+                                        accessible-label: root.adding-filter ? @tr("Close the filter list") : @tr("Add filter");
                                         clicked => {
                                             root.adding-filter = !root.adding-filter;
                                             if (root.adding-filter) {
@@ -2147,10 +2150,10 @@ export component AppWindow inherits Window {
                                 if root.adding-filter: VerticalLayout {
                                     spacing: 2px;
                                     accessible-role: list;
-                                    accessible-label: "Filters";
+                                    accessible-label: @tr("Filters");
                                     for kind in root.filter-kinds: MenuRow {
                                         text: kind.title;
-                                        label: "Add \{kind.title}";
+                                        label: @tr("Add {}", kind.title);
                                         clicked => {
                                             root.adding-filter = false;
                                             root.filter-added(i, kind.kind);
@@ -2158,7 +2161,7 @@ export component AppWindow inherits Window {
                                     }
                                 }
                                 if track.filters.length == 0 && !root.adding-filter: Text {
-                                    text: "No filter: the track is recorded as is.";
+                                    text: @tr("No filter: the track is recorded as is.");
                                     font-size: Theme.font-small;
                                     color: Theme.text-muted;
                                     wrap: word-wrap;
@@ -2191,7 +2194,7 @@ export component AppWindow inherits Window {
                                     VerticalLayout {
                                         alignment: center;
                                         Switch {
-                                            label: "Record \{track.name}";
+                                            label: @tr("Record {}", track.name);
                                             enabled: !root.active;
                                             checked: track.enabled;
                                             toggled(on) => {
@@ -2201,17 +2204,17 @@ export component AppWindow inherits Window {
                                     }
                                     Text {
                                         horizontal-stretch: 1;
-                                        text: "Recorded";
+                                        text: @tr("Recorded");
                                         vertical-alignment: center;
                                         font-size: Theme.font-small;
                                         color: Theme.text-muted;
                                     }
                                     Button {
-                                        text: "Remove";
+                                        text: @tr("Remove");
                                         kind: "ghost";
                                         small: true;
                                         enabled: !root.active;
-                                        accessible-label: "Remove \{track.name}";
+                                        accessible-label: @tr("Remove {}", track.name);
                                         clicked => {
                                             // Its name no longer matters.
                                             root.name-draft-track = -1;
@@ -2229,7 +2232,7 @@ export component AppWindow inherits Window {
                             spacing: 2px;
                             SourceList {
                                 options: root.source-options;
-                                label: "Sources";
+                                label: @tr("Sources");
                                 picked(option) => {
                                     root.set-picking(false);
                                     root.track-added(option);
@@ -2242,7 +2245,7 @@ export component AppWindow inherits Window {
                                 padding-left: Theme.space-sm;
                                 padding-top: Theme.space-xs;
                                 Text {
-                                    text: "Applications show up here while they play audio.";
+                                    text: @tr("Applications show up here while they play audio.");
                                     font-size: Theme.font-small;
                                     color: Theme.text-muted;
                                     wrap: word-wrap;
@@ -2290,7 +2293,7 @@ export component AppWindow inherits Window {
                         }
                     }
                     if (root.notice == "" || root.active) && !root.notice-actions: Text {
-                        text: root.dropped-frames == 1 ? "1 dropped" : "\{root.dropped-frames} dropped";
+                        text: @tr("{n} dropped" | "{n} dropped" % root.dropped-frames);
                         vertical-alignment: center;
                         font-size: Theme.font-small;
                         font-weight: root.dropped-frames > 0 ? 600 : 400;
@@ -2321,19 +2324,19 @@ export component AppWindow inherits Window {
                         }
                     }
                     if root.notice-actions: Button {
-                        text: "Open";
+                        text: @tr("Open");
                         kind: "ghost";
                         small: true;
-                        accessible-label: "Show the file in its folder";
+                        accessible-label: @tr("Show the file in its folder");
                         clicked => {
                             root.open-notice-file();
                         }
                     }
                     if root.notice-actions: Button {
-                        text: "Play";
+                        text: @tr("Play");
                         kind: "ghost";
                         small: true;
-                        accessible-label: "Play the file";
+                        accessible-label: @tr("Play the file");
                         clicked => {
                             root.play-notice-file();
                         }
@@ -2375,7 +2378,7 @@ export component AppWindow inherits Window {
             drop-shadow-color: #00000055;
             animate x { duration: Theme.medium; easing: ease-out-quart; }
             accessible-role: groupbox;
-            accessible-label: "Output settings";
+            accessible-label: @tr("Output settings");
 
             // Swallow clicks so they do not reach the scrim.
             TouchArea { }
@@ -2395,7 +2398,7 @@ export component AppWindow inherits Window {
                     HorizontalLayout {
                         Text {
                             horizontal-stretch: 1;
-                            text: "Output";
+                            text: @tr("Output");
                             vertical-alignment: center;
                             font-size: Theme.font-title;
                             font-weight: 700;
@@ -2403,7 +2406,7 @@ export component AppWindow inherits Window {
                         }
                         close-button := IconButton {
                             icon: Icons.close;
-                            label: "Close settings";
+                            label: @tr("Close settings");
                             clicked => {
                                 root.close-settings();
                             }
@@ -2415,7 +2418,7 @@ export component AppWindow inherits Window {
                         background: Theme.rec-soft;
                         height: 36px;
                         Text {
-                            text: "Locked while recording";
+                            text: @tr("Locked while recording");
                             horizontal-alignment: center;
                             vertical-alignment: center;
                             font-size: Theme.font-small;
@@ -2425,12 +2428,12 @@ export component AppWindow inherits Window {
                     }
 
                     SettingGroup {
-                        label: "CODEC";
+                        label: @tr("CODEC");
                         hint: root.codec == VideoCodec.av1
-                            ? "Smallest files at a given quality. Needs a recent player."
-                            : root.codec == VideoCodec.hevc ? "Efficient and widely supported by hardware." : "Plays everywhere, larger files.";
+                            ? @tr("Smallest files at a given quality. Needs a recent player.")
+                            : root.codec == VideoCodec.hevc ? @tr("Efficient and widely supported by hardware.") : @tr("Plays everywhere, larger files.");
                         codec-picker := Segmented {
-                            label: "Codec";
+                            label: @tr("Codec");
                             enabled: !root.active;
                             options: ["AV1", "HEVC", "H.264"];
                             selected: root.codec == VideoCodec.av1 ? 0 : root.codec == VideoCodec.hevc ? 1 : 2;
@@ -2442,11 +2445,11 @@ export component AppWindow inherits Window {
                     }
 
                     SettingGroup {
-                        label: "QUALITY";
+                        label: @tr("QUALITY");
                         Segmented {
-                            label: "Quality preset";
+                            label: @tr("Quality preset");
                             enabled: !root.active;
-                            options: ["Performance", "Balanced", "Quality"];
+                            options: [@tr("Performance"), @tr("Balanced"), @tr("Quality")];
                             selected: root.quality == QualityPreset.performance ? 0 : root.quality == QualityPreset.balanced ? 1 : 2;
                             changed(i) => {
                                 root.quality = i == 0 ? QualityPreset.performance : i == 1 ? QualityPreset.balanced : QualityPreset.quality;
@@ -2456,9 +2459,9 @@ export component AppWindow inherits Window {
                     }
 
                     SettingGroup {
-                        label: "FRAME RATE";
+                        label: @tr("FRAME RATE");
                         Segmented {
-                            label: "Frame rate";
+                            label: @tr("Frame rate");
                             enabled: !root.active;
                             options: ["30", "60", "120", "144"];
                             selected: root.fps >= 144 ? 3 : root.fps >= 120 ? 2 : root.fps >= 60 ? 1 : 0;
@@ -2470,12 +2473,12 @@ export component AppWindow inherits Window {
                     }
 
                     SettingGroup {
-                        label: "AUDIO DEVICES";
-                        hint: "Recorded by the Desktop audio and Microphone tracks. An unplugged device is waited for, never replaced by another one.";
+                        label: @tr("AUDIO DEVICES");
+                        hint: @tr("Recorded by the Desktop audio and Microphone tracks. An unplugged device is waited for, never replaced by another one.");
                         VerticalLayout {
                             spacing: Theme.space-md;
                             DevicePicker {
-                                title: "Desktop audio";
+                                title: @tr("Desktop audio");
                                 choice: root.desktop-device;
                                 options: root.desktop-device-options;
                                 default-source: "desktop";
@@ -2489,7 +2492,7 @@ export component AppWindow inherits Window {
                                 }
                             }
                             DevicePicker {
-                                title: "Microphone";
+                                title: @tr("Microphone");
                                 choice: root.mic-device;
                                 options: root.mic-device-options;
                                 default-source: "microphone";
@@ -2506,19 +2509,19 @@ export component AppWindow inherits Window {
                     }
 
                     SettingGroup {
-                        label: "AUDIO";
-                        hint: "Each track is saved separately, for editing. The mix comes first, so players that play one track play everything.";
+                        label: @tr("AUDIO");
+                        hint: @tr("Each track is saved separately, for editing. The mix comes first, so players that play one track play everything.");
                         HorizontalLayout {
                             spacing: Theme.space-md;
                             Labeled {
                                 horizontal-stretch: 1;
-                                title: "Mix of all tracks";
-                                subtitle: "Added when two or more tracks record";
+                                title: @tr("Mix of all tracks");
+                                subtitle: @tr("Added when two or more tracks record");
                             }
                             VerticalLayout {
                                 alignment: center;
                                 Switch {
-                                    label: "Mix of all tracks";
+                                    label: @tr("Mix of all tracks");
                                     enabled: !root.active;
                                     checked: root.audio-mix;
                                     toggled(on) => {
@@ -2531,18 +2534,18 @@ export component AppWindow inherits Window {
                     }
 
                     SettingGroup {
-                        label: "LIVE STREAM";
+                        label: @tr("LIVE STREAM");
                         hint: root.live-service == LiveService.twitch
-                            ? "Sent to Twitch's automatic ingest over RTMPS, in H.264: the codec Twitch takes."
+                            ? @tr("Sent to Twitch's automatic ingest over RTMPS, in H.264: the codec Twitch takes.")
                             : root.live-service == LiveService.youtube
-                                ? "Sent to YouTube over RTMPS. HEVC and AV1 go through Enhanced RTMP."
-                                : "An rtmp://, rtmps:// or srt:// server. The key ends the RTMP path, or is the SRT streamid." + (root.live-url-warning != "" ? " " + root.live-url-warning : "");
+                                ? @tr("Sent to YouTube over RTMPS. HEVC and AV1 go through Enhanced RTMP.")
+                                : @tr("An rtmp://, rtmps:// or srt:// server. The key ends the RTMP path, or is the SRT streamid.") + (root.live-url-warning != "" ? " " + root.live-url-warning : "");
                         VerticalLayout {
                             spacing: Theme.space-md;
                             Segmented {
-                                label: "Streaming service";
+                                label: @tr("Streaming service");
                                 enabled: root.live-off;
-                                options: ["Twitch", "YouTube", "Custom"];
+                                options: ["Twitch", "YouTube", @tr("Custom")];
                                 selected: root.live-service == LiveService.twitch ? 0 : root.live-service == LiveService.youtube ? 1 : 2;
                                 changed(i) => {
                                     // A key being typed belongs to the service it was typed for.
@@ -2552,11 +2555,11 @@ export component AppWindow inherits Window {
                                 }
                             }
                             if root.live-service == LiveService.custom: Field {
-                                title: "Server URL";
+                                title: @tr("Server URL");
                                 TextField {
                                     text: root.live-url;
-                                    label: "Server URL";
-                                    placeholder: "rtmp://host/app or srt://host:port";
+                                    label: @tr("Server URL");
+                                    placeholder: @tr("rtmp://host/app or srt://host:port");
                                     enabled: root.live-off;
                                     accepted(url) => {
                                         root.live-url = url;
@@ -2568,17 +2571,17 @@ export component AppWindow inherits Window {
                                 spacing: Theme.space-md;
                                 Labeled {
                                     horizontal-stretch: 1;
-                                    title: "Stream key";
-                                    subtitle: root.live-key-state != "" ? root.live-key-state : "Not set";
+                                    title: @tr("Stream key");
+                                    subtitle: root.live-key-state != "" ? root.live-key-state : @tr("Not set");
                                 }
                                 if root.live-key-state != "": VerticalLayout {
                                     alignment: center;
                                     Button {
-                                        text: "Remove";
+                                        text: @tr("Remove");
                                         kind: "ghost";
                                         small: true;
                                         enabled: root.live-off;
-                                        accessible-label: "Remove the stream key";
+                                        accessible-label: @tr("Remove the stream key");
                                         clicked => {
                                             root.live-key-removed();
                                         }
@@ -2586,9 +2589,9 @@ export component AppWindow inherits Window {
                                 }
                             }
                             live-key-field := TextField {
-                                label: "New stream key";
+                                label: @tr("New stream key");
                                 password: true;
-                                placeholder: root.live-key-state != "" ? "Paste a new key to replace it" : "Paste the key";
+                                placeholder: root.live-key-state != "" ? @tr("Paste a new key to replace it") : @tr("Paste the key");
                                 enabled: root.live-off;
                                 accepted(key) => {
                                     root.live-key-entered(key);
@@ -2604,11 +2607,11 @@ export component AppWindow inherits Window {
                                 wrap: word-wrap;
                             }
                             Field {
-                                title: "Resolution";
+                                title: @tr("Resolution");
                                 Segmented {
-                                    label: "Stream resolution";
+                                    label: @tr("Stream resolution");
                                     enabled: root.live-off;
-                                    options: ["Native", "1080p", "720p"];
+                                    options: [@tr("Native"), "1080p", "720p"];
                                     selected: root.live-height == 0 ? 0 : root.live-height >= 1080 ? 1 : 2;
                                     changed(i) => {
                                         root.live-height = i == 0 ? 0 : i == 1 ? 1080 : 720;
@@ -2617,9 +2620,9 @@ export component AppWindow inherits Window {
                                 }
                             }
                             Field {
-                                title: "Frame rate";
+                                title: @tr("Frame rate");
                                 Segmented {
-                                    label: "Stream frame rate";
+                                    label: @tr("Stream frame rate");
                                     enabled: root.live-off;
                                     options: ["30", "60"];
                                     selected: root.live-fps >= 60 ? 1 : 0;
@@ -2630,12 +2633,12 @@ export component AppWindow inherits Window {
                                 }
                             }
                             Field {
-                                title: "Bitrate";
+                                title: @tr("Bitrate");
                                 HorizontalLayout {
                                     spacing: Theme.space-md;
                                     Slider {
                                         horizontal-stretch: 1;
-                                        label: "Stream bitrate";
+                                        label: @tr("Stream bitrate");
                                         enabled: root.live-off;
                                         minimum: 1;
                                         maximum: 20;
@@ -2660,9 +2663,9 @@ export component AppWindow inherits Window {
                                 }
                             }
                             Field {
-                                title: "Encoder";
+                                title: @tr("Encoder");
                                 Segmented {
-                                    label: "Stream codec";
+                                    label: @tr("Stream codec");
                                     enabled: root.live-off && root.live-service != LiveService.twitch;
                                     options: ["H.264", "HEVC", "AV1"];
                                     selected: root.live-service == LiveService.twitch || root.live-codec == VideoCodec.h264 ? 0 : root.live-codec == VideoCodec.hevc ? 1 : 2;
@@ -2676,23 +2679,23 @@ export component AppWindow inherits Window {
                     }
 
                     SettingGroup {
-                        label: "GAME CAPTURE";
-                        hint: "Records Vulkan games (Proton and 32-bit included) at their own frame rate, without the screen picker (off, Vesper captures the game window: the picker asks once per game). Installs a small layer that loads into your Vulkan apps and stays idle until Vesper captures a game you allowed. Some anti-cheats may reject it: launch those games with VESPER_CAPTURE_DISABLE=1.";
+                        label: @tr("GAME CAPTURE");
+                        hint: @tr("Records Vulkan games (Proton and 32-bit included) at their own frame rate, without the screen picker (off, Vesper captures the game window: the picker asks once per game). Installs a small layer that loads into your Vulkan apps and stays idle until Vesper captures a game you allowed. Some anti-cheats may reject it: launch those games with VESPER_CAPTURE_DISABLE=1.");
                         HorizontalLayout {
                             spacing: Theme.space-md;
                             Labeled {
                                 horizontal-stretch: 1;
-                                title: "Game capture (Vulkan layer)";
+                                title: @tr("Game capture (Vulkan layer)");
                                 wrap-subtitle: true;
                                 subtitle: root.game-layer-outdated
-                                    ? "Update available"
-                                    : root.game-layer-installed ? "Installed for this user" : root.game-layer-available ? "Not installed" : "Layer not built: install the Vesper package or build the workspace";
+                                    ? @tr("Update available")
+                                    : root.game-layer-installed ? @tr("Installed for this user") : root.game-layer-available ? @tr("Not installed") : @tr("Layer not built: install the Vesper package or build the workspace");
                             }
                             if root.game-layer-outdated: VerticalLayout {
                                 alignment: center;
                                 Button {
-                                    text: "Update";
-                                    accessible-label: "Update the game capture layer";
+                                    text: @tr("Update");
+                                    accessible-label: @tr("Update the game capture layer");
                                     clicked => {
                                         root.game-layer-changed(true);
                                     }
@@ -2701,7 +2704,7 @@ export component AppWindow inherits Window {
                             VerticalLayout {
                                 alignment: center;
                                 game-layer-switch := Switch {
-                                    label: "Game capture (Vulkan layer)";
+                                    label: @tr("Game capture (Vulkan layer)");
                                     enabled: root.game-layer-installed || root.game-layer-available;
                                     checked: root.game-layer-installed;
                                     toggled(on) => {
@@ -2713,17 +2716,17 @@ export component AppWindow inherits Window {
                     }
 
                     SettingGroup {
-                        label: "OPENGL GAMES";
-                        hint: "For the best performance in OpenGL games (Terraria, many indie games, emulators), add vesper-gl %command% to the game's launch options in Steam (Properties > General); otherwise Vesper captures the game window (the picker asks once per game). Only that game loads the capture library, with the same consent as Vulkan games. Don't use it on multiplayer games protected by VAC, EAC or BattlEye: risk of an account ban.";
+                        label: @tr("OPENGL GAMES");
+                        hint: @tr("For the best performance in OpenGL games (Terraria, many indie games, emulators), add vesper-gl %command% to the game's launch options in Steam (Properties > General); otherwise Vesper captures the game window (the picker asks once per game). Only that game loads the capture library, with the same consent as Vulkan games. Don't use it on multiplayer games protected by VAC, EAC or BattlEye: risk of an account ban.");
                         Labeled {
                             title: "vesper-gl %command%";
                             wrap-subtitle: true;
-                            subtitle: "Steam launch options";
+                            subtitle: @tr("Steam launch options");
                         }
                     }
 
                     SettingGroup {
-                        label: "OUTPUT FOLDER";
+                        label: @tr("OUTPUT FOLDER");
                         HorizontalLayout {
                             spacing: Theme.space-sm;
                             Rectangle {
@@ -2747,9 +2750,9 @@ export component AppWindow inherits Window {
                                         horizontal-stretch: 1;
                                         alignment: center;
                                         accessible-role: text;
-                                        accessible-label: "Output folder: " + (root.output-folder != "" ? root.output-folder : "none");
+                                        accessible-label: @tr("Output folder: {}", root.output-folder != "" ? root.output-folder : @tr("none"));
                                         Text {
-                                            text: root.output-folder != "" ? root.output-folder-name : "No folder chosen";
+                                            text: root.output-folder != "" ? root.output-folder-name : @tr("No folder chosen");
                                             font-size: Theme.font-small;
                                             font-weight: root.output-folder != "" ? 600 : 400;
                                             color: root.output-folder != "" ? Theme.text : Theme.text-muted;
@@ -2765,10 +2768,10 @@ export component AppWindow inherits Window {
                                 }
                             }
                             Button {
-                                text: root.output-folder != "" ? "Change" : "Choose";
+                                text: root.output-folder != "" ? @tr("Change") : @tr("Choose");
                                 kind: root.output-folder != "" ? "secondary" : "primary";
                                 enabled: !root.active;
-                                accessible-label: "Choose output folder";
+                                accessible-label: @tr("Choose output folder");
                                 clicked => {
                                     root.pick-output-folder();
                                 }
@@ -2777,21 +2780,36 @@ export component AppWindow inherits Window {
                     }
 
                     SettingGroup {
-                        label: "BACKGROUND";
+                        label: @tr("LANGUAGE");
+                        hint: @tr("System follows the language of the session.");
+                        Segmented {
+                            label: @tr("Language");
+                            // Each language in its own words.
+                            options: [@tr("System"), "English", "Français"];
+                            selected: root.language;
+                            changed(i) => {
+                                root.language = i;
+                                root.language-changed();
+                            }
+                        }
+                    }
+
+                    SettingGroup {
+                        label: @tr("BACKGROUND");
                         hint: root.tray-available
-                            ? "Closing the window keeps Vesper in the tray, with the replay buffer running. Quit from the tray menu or with Ctrl+Q."
-                            : "No system tray found: closing the window quits Vesper.";
+                            ? @tr("Closing the window keeps Vesper in the tray, with the replay buffer running. Quit from the tray menu or with Ctrl+Q.")
+                            : @tr("No system tray found: closing the window quits Vesper.");
                         HorizontalLayout {
                             spacing: Theme.space-md;
                             Labeled {
                                 horizontal-stretch: 1;
-                                title: "Start with the session";
-                                subtitle: "Starts hidden in the tray";
+                                title: @tr("Start with the session");
+                                subtitle: @tr("Starts hidden in the tray");
                             }
                             VerticalLayout {
                                 alignment: center;
                                 Switch {
-                                    label: "Start with the session";
+                                    label: @tr("Start with the session");
                                     checked: root.autostart;
                                     toggled(on) => {
                                         root.autostart-changed(on);
@@ -2808,7 +2826,7 @@ export component AppWindow inherits Window {
                     VerticalLayout {
                         spacing: Theme.space-sm;
                         Text {
-                            text: "Saved as MKV, which stays readable even if the app crashes.";
+                            text: @tr("Saved as MKV, which stays readable even if the app crashes.");
                             font-size: Theme.font-small;
                             color: Theme.text-faint;
                             wrap: word-wrap;
@@ -2819,7 +2837,7 @@ export component AppWindow inherits Window {
                             read-only: true;
                             font-size: Theme.font-caption;
                             color: Theme.text-faint;
-                            accessible-label: "Version";
+                            accessible-label: @tr("Version");
                         }
                     }
                 }

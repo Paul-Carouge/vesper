@@ -123,15 +123,15 @@ impl ksni::Tray for Item {
 
     fn tool_tip(&self) -> ToolTip {
         let description = if self.state.recording && self.state.live {
-            "Recording and live"
+            tr!("Recording and live")
         } else if self.state.recording {
-            "Recording"
+            tr!("Recording")
         } else if self.state.live {
-            "Live"
+            tr!("Live")
         } else if self.state.replay {
-            "Replay buffer on"
+            tr!("Replay buffer on")
         } else {
-            "Idle"
+            tr!("Idle")
         };
         ToolTip {
             title: "Vesper".into(),
@@ -158,7 +158,7 @@ impl ksni::Tray for Item {
         };
         let scenes = (!s.scenes.is_empty()).then(|| {
             SubMenu {
-                label: "Scene".into(),
+                label: tr!("Scene").into(),
                 submenu: vec![
                     RadioGroup {
                         selected: s.active_scene.unwrap_or(usize::MAX),
@@ -184,9 +184,9 @@ impl ksni::Tray for Item {
         let mut menu = vec![
             item(
                 if s.window_visible {
-                    "Hide window"
+                    tr!("Hide window")
                 } else {
-                    "Show window"
+                    tr!("Show window")
                 },
                 true,
                 Command::ToggleWindow,
@@ -194,21 +194,25 @@ impl ksni::Tray for Item {
             MenuItem::Separator,
             item(
                 if s.recording {
-                    "Stop recording"
+                    tr!("Stop recording")
                 } else {
-                    "Start recording"
+                    tr!("Start recording")
                 },
                 !s.busy,
                 Command::ToggleRecording,
             ),
-            item("Save replay", s.replay, Command::SaveReplay),
+            item(tr!("Save replay"), s.replay, Command::SaveReplay),
             item(
-                if s.live { "End stream" } else { "Go live" },
+                if s.live {
+                    tr!("End stream")
+                } else {
+                    tr!("Go live")
+                },
                 !s.live_busy,
                 Command::ToggleLive,
             ),
             CheckmarkItem {
-                label: "Replay buffer".into(),
+                label: tr!("Replay buffer").into(),
                 checked: s.replay,
                 activate: Box::new(|item: &mut Self| (item.on_command)(Command::ToggleReplay)),
                 ..Default::default()
@@ -219,7 +223,7 @@ impl ksni::Tray for Item {
         menu.extend([
             MenuItem::Separator,
             StandardItem {
-                label: "Quit".into(),
+                label: tr!("Quit").into(),
                 icon_name: "application-exit".into(),
                 activate: Box::new(|item: &mut Self| (item.on_command)(Command::Quit)),
                 ..Default::default()

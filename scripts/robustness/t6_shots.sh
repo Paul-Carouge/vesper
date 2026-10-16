@@ -36,3 +36,12 @@ SIZE=360x700 shot scenes-editor-narrow-dark dark scenes-look,scene-editor,scene-
 SIZE=1280x800 SCALE=1 shot scenes-editor-wide-dark dark scenes-look,scene-editor,scene-layer:2
 SIZE=1280x800 SCALE=1 shot scenes-editor-wide-light light scenes-look,scene-editor,scene-layer:1
 shot scenes-editor-typing-dark dark scenes-look,scene-editor,scene-layer:2,scroll:${SCROLL:-700},click:200:290,type:XYZ
+# French strings are longer: the narrowest window with the main card and the settings.
+SIZE=360x700 shot main-narrow-light light screen-look,replay-on,live-look,recording-look
+SIZE=360x700 shot settings-narrow-dark dark screen-look,settings
+SIZE=360x700 shot settings-narrow-end-light light screen-look,settings,scroll-end
+SIZE=360x700 shot profiles-narrow-dark dark screen-look,profiles
+SIZE=360x700 shot consent-narrow-light light game-look,consent-look
+SIZE=360x700 shot filters-narrow-dark dark screen-look,filters-look,scroll-end
+# Live language switch: picks English in the settings (at 360x700, after scroll-end).
+SIZE=360x700 shot language-switch-light light screen-look,settings,scroll-end,click:196:408

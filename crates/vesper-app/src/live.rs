@@ -34,8 +34,8 @@ pub fn settings(ui: &AppWindow) -> StreamSettings {
 fn show_store(ui: &AppWindow, store: Option<Store>) {
     ui.set_live_key_state(
         match store {
-            Some(Store::Keyring) => "Saved in the system keyring",
-            Some(Store::File) => "Saved in a private file (no keyring found)",
+            Some(Store::Keyring) => tr!("Saved in the system keyring"),
+            Some(Store::File) => tr!("Saved in a private file (no keyring found)"),
             None => "",
         }
         .into(),
@@ -64,12 +64,14 @@ pub fn show_key_state(ui: &AppWindow) {
     );
 }
 
-const NO_SERVER: &str = "Enter the server URL first: the key is saved for that server";
+fn no_server() -> &'static str {
+    tr!("Enter the server URL first: the key is saved for that server")
+}
 
 /// Saves `key` for the selected service, then says `done`.
 fn store_key(ui: &AppWindow, key: StreamKey, done: &'static str) {
     let Some(id) = secret::key_id(&settings(ui)) else {
-        flash_notice(ui, NO_SERVER);
+        flash_notice(ui, no_server());
         return;
     };
     save_key(ui, id, key, Some(done));
@@ -77,7 +79,7 @@ fn store_key(ui: &AppWindow, key: StreamKey, done: &'static str) {
 
 /// Saves `key` for `id`, shown next to the key field; `done`: said too.
 fn save_key(ui: &AppWindow, id: String, key: StreamKey, done: Option<&'static str>) {
-    show_save(ui, "Saving…", false);
+    show_save(ui, tr!("Saving…"), false);
     let draft = (id.clone(), key.clone());
     off_ui(
         ui,
@@ -89,7 +91,7 @@ fn save_key(ui: &AppWindow, id: String, key: StreamKey, done: Option<&'static st
                 Ok(_) => {
                     show_key_state(ui);
                     if shown {
-                        show_save(ui, "Saved", false);
+                        show_save(ui, tr!("Saved"), false);
                     }
                     if let Some(done) = done {
                         flash_notice(ui, done);
@@ -149,7 +151,7 @@ impl Draft {
 fn draft_edited(ui: &AppWindow, text: &str) -> bool {
     let id = secret::key_id(&settings(ui));
     if id.is_none() && StreamKey::new(text).is_some() {
-        show_save(ui, NO_SERVER, true);
+        show_save(ui, no_server(), true);
     }
     DRAFT.with(|d| {
         let mut d = d.borrow_mut();
@@ -262,10 +264,17 @@ fn no_key(request: &StreamRequest, other: Option<&str>) -> Option<String> {
         Service::YouTube => "YouTube",
         Service::Custom => return None,
     };
-    let other = other.map_or(String::new(), |o| format!(" (one is saved for {o})"));
-    Some(format!(
-        "No {name} stream key saved{other}: paste {name}'s key in the settings"
-    ))
+    Some(match other {
+        Some(o) => tr!(
+            "No {0} stream key saved (one is saved for {1}): paste {0}'s key in the settings",
+            name,
+            o
+        ),
+        None => tr!(
+            "No {0} stream key saved: paste {0}'s key in the settings",
+            name
+        ),
+    })
 }
 
 /// Says where the key of an older version went: it was saved for the
@@ -273,8 +282,9 @@ fn no_key(request: &StreamRequest, other: Option<&str>) -> Option<String> {
 fn say_moved(ui: &AppWindow, id: &str) {
     flash_notice(
         ui,
-        &format!(
-            "Your previous stream key is now saved for {id}: paste it again if it is another service's"
+        &tr!(
+            "Your previous stream key is now saved for {}: paste it again if it is another service's",
+            id
         ),
     );
 }
@@ -383,7 +393,11 @@ pub fn wire(ui: &AppWindow, recording: &Shared, games: &Games) {
         if let Some(key) = key.as_deref().and_then(StreamKey::new) {
             ui.set_live_url(url.as_str().into());
             // Saved for the server of the URL without the key.
-            store_key(&ui, key, "The key in the URL was moved to the stream key");
+            store_key(
+                &ui,
+                key,
+                tr!("The key in the URL was moved to the stream key"),
+            );
         }
         ui.set_live_url_warning(crate::stream::cleartext_warning(&url).into());
         log!("live-settings-changed: {:?}", settings(&ui));
@@ -433,7 +447,7 @@ pub fn wire(ui: &AppWindow, recording: &Shared, games: &Games) {
             move || secret::clear(&id),
             |ui, ()| {
                 show_key_state(ui);
-                flash_notice(ui, "Stream key removed");
+                flash_notice(ui, tr!("Stream key removed"));
             },
         );
     });
@@ -446,7 +460,6 @@ static GAME_CLOSED: AtomicU8 = AtomicU8::new(NOT_GAME);
 const NOT_GAME: u8 = 0;
 const GAME_SAID: u8 = 1;
 const GAME_QUIET: u8 = 2;
-const GAME_CLOSED_TEXT: &str = "Game closed: stream ended";
 
 /// Ends the stream because the captured game quit (a frozen picture would go
 /// out forever), the way End does: the stream is flushed and closed.
@@ -478,10 +491,11 @@ fn reset_after_game(ui: &AppWindow) -> bool {
 }
 
 fn announce_game_closed(ui: &AppWindow) {
+    let text = tr!("Game closed: stream ended");
     if !crate::window_focused(ui) {
-        crate::desktop::notify("Vesper".into(), GAME_CLOSED_TEXT.into(), None);
+        crate::desktop::notify("Vesper".into(), text.into(), None);
     }
-    crate::show_notice(ui, GAME_CLOSED_TEXT, None);
+    crate::show_notice(ui, text, None);
 }
 
 /// Shows a state change of the stream.
@@ -499,9 +513,9 @@ pub fn on_state(ui: &AppWindow, state: StreamState) {
                 LiveState::Connecting => {
                     ui.set_live_seconds(0);
                     ui.set_live_dropped(0);
-                    ui.set_live_detail("Starting…".into());
+                    ui.set_live_detail(tr!("Starting…").into());
                 }
-                LiveState::Reconnecting => ui.set_live_detail("Reconnected".into()),
+                LiveState::Reconnecting => ui.set_live_detail(tr!("Reconnected").into()),
                 // An end requested meanwhile stays shown.
                 LiveState::Ending => return,
                 _ => {}
@@ -513,7 +527,7 @@ pub fn on_state(ui: &AppWindow, state: StreamState) {
             if ui.get_live_state() != LiveState::Ending {
                 ui.set_live_state(LiveState::Reconnecting);
             }
-            ui.set_live_detail(format!("{error} · next try in {} s", retry_in.as_secs()).into());
+            ui.set_live_detail(tr!("{} · next try in {} s", error, retry_in.as_secs()).into());
         }
         StreamState::Ended(error) => {
             let was_on_air = ui.get_live_seconds() > 0;
@@ -524,8 +538,8 @@ pub fn on_state(ui: &AppWindow, state: StreamState) {
                 return;
             }
             match error {
-                Some(e) => crate::announce_failure(ui, "Stream ended", &e),
-                None if was_on_air => flash_notice(ui, "Stream ended"),
+                Some(e) => crate::announce_failure(ui, tr!("Stream ended"), &e),
+                None if was_on_air => flash_notice(ui, tr!("Stream ended")),
                 None => {}
             }
         }
@@ -535,7 +549,7 @@ pub fn on_state(ui: &AppWindow, state: StreamState) {
 /// Shows the stats of the last second.
 pub fn on_stats(ui: &AppWindow, elapsed: Duration, bitrate: u64, dropped: u64) {
     ui.set_live_seconds(elapsed.as_secs().min(i32::MAX as u64) as i32);
-    ui.set_live_detail(format!("{:.1} Mbit/s", bitrate as f64 / 1e6).into());
+    ui.set_live_detail(tr!("{} Mbit/s", crate::i18n::decimal(bitrate as f64 / 1e6, 1)).into());
     ui.set_live_dropped(dropped.min(i32::MAX as u64) as i32);
 }
 

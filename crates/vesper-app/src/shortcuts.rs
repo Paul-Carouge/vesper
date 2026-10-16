@@ -78,14 +78,14 @@ impl Action {
 
     fn description(self) -> &'static str {
         match self {
-            Self::ToggleRecording => "Start/stop recording",
-            Self::SaveReplay => "Save replay",
-            Self::ToggleLive => "Go live/end stream",
-            Self::NextScene => "Next scene",
-            Self::Scene(1) => "Scene 1",
-            Self::Scene(2) => "Scene 2",
-            Self::Scene(3) => "Scene 3",
-            Self::Scene(_) => "Scene 4",
+            Self::ToggleRecording => tr!("Start/stop recording"),
+            Self::SaveReplay => tr!("Save replay"),
+            Self::ToggleLive => tr!("Go live/end stream"),
+            Self::NextScene => tr!("Next scene"),
+            Self::Scene(1) => tr!("Scene 1"),
+            Self::Scene(2) => tr!("Scene 2"),
+            Self::Scene(3) => tr!("Scene 3"),
+            Self::Scene(_) => tr!("Scene 4"),
         }
     }
 }

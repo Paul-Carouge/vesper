@@ -249,9 +249,9 @@ pub fn apply(ui: &AppWindow) {
                 "allow" => ui.invoke_allow_game(),
                 "ignore" => ui.invoke_ignore_game(),
                 "browse" => ui.invoke_pick_output_folder(),
-                "saved" => crate::show_notice(&ui, "Replay saved", Some(demo_file())),
+                "saved" => crate::show_notice(&ui, tr!("Replay saved"), Some(demo_file())),
                 "notify" => crate::desktop::notify(
-                    "Replay saved".into(),
+                    tr!("Replay saved").into(),
                     demo_file().display().to_string(),
                     Some(demo_file()),
                 ),
@@ -470,9 +470,9 @@ fn look(ui: &AppWindow, step: &str) -> bool {
         }
         "live-reconnecting-look" => {
             ui.set_live_state(crate::LiveState::Reconnecting);
-            ui.set_live_detail("Connection lost · next try in 4 s".into());
+            ui.set_live_detail(tr!("{} · next try in {} s", tr!("Connection lost"), 4).into());
         }
-        "live-key-look" => ui.set_live_key_state("Saved in the system keyring".into()),
+        "live-key-look" => ui.set_live_key_state(tr!("Saved in the system keyring").into()),
         "camera-look" => ui.global::<crate::SceneStore>().set_camera_on(true),
         "replay-on" => ui.set_replay_enabled(true),
         "replay-off" => ui.set_replay_enabled(false),

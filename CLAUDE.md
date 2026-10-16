@@ -25,6 +25,7 @@ KDE Plasma on Wayland, PipeWire 1.6, AMD RX 9070 (RDNA4, Mesa radeonsi) on `/dev
 
 - Keep frames on the GPU. No CPU readback in the hot path.
 - No dependency for a few lines of code.
+- User-visible text is translated: `@tr(...)` in Slint, `tr!(...)` in Rust (see `i18n.rs`), with its French in `crates/vesper-app/lang/fr/LC_MESSAGES/vesper-app.po`. The `every_string_has_a_french_translation` test fails on a missing entry and prints it.
 - Before every commit: `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`.
 - Branches: `feat/<topic>`, `fix/<topic>`, `chore/<topic>`. One topic per branch, merged through a PR into `master`.
 - Commits: Conventional Commits, in English.

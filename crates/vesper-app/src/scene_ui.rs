@@ -88,7 +88,7 @@ fn rgba(c: Color) -> u32 {
 /// What the layer list calls a layer.
 fn label(source: &LayerSource) -> String {
     match source {
-        LayerSource::Main => "Capture".into(),
+        LayerSource::Main => tr!("Capture").into(),
         LayerSource::Camera { node } => CAMERAS.with_borrow(|c| {
             c.iter()
                 .find(|c| c.node == node.as_str())
@@ -100,7 +100,7 @@ fn label(source: &LayerSource) -> String {
         ),
         LayerSource::Text(style) => {
             let line = style.text.lines().map(str::trim).find(|l| !l.is_empty());
-            let line: String = line.unwrap_or("Text").chars().take(48).collect();
+            let line: String = line.unwrap_or(tr!("Text")).chars().take(48).collect();
             line
         }
     }
@@ -563,7 +563,7 @@ fn add_layer(ui: &AppWindow, rec: &Shared, scene: usize, source: LayerSource) {
         return;
     };
     if scene.layers.len() >= MAX_LAYERS {
-        flash_notice(ui, "A scene has at most 16 layers");
+        flash_notice(ui, tr!("A scene has at most 16 layers"));
         return;
     }
     let (rect, fit) = match &source {
@@ -586,7 +586,7 @@ fn add_layer(ui: &AppWindow, rec: &Shared, scene: usize, source: LayerSource) {
 /// The canvas of the next pipeline: the replay buffer restarts on it.
 fn set_canvas(ui: &AppWindow, rec: &Shared, games: &Games, canvas: Canvas) {
     if ui.get_rec_state() != RecState::Idle || ui.get_live_state() != LiveState::Off {
-        flash_notice(ui, "The canvas is locked while recording or streaming");
+        flash_notice(ui, tr!("The canvas is locked while recording or streaming"));
         return show(ui, &from_ui(ui));
     }
     let mut scenes = from_ui(ui);
@@ -718,7 +718,7 @@ pub fn wire(ui: &AppWindow, rec: &Shared, games: &Games) {
             LayerKind::Main => LayerSource::Main,
             LayerKind::Camera if !value.is_empty() => LayerSource::Camera { node: value.into() },
             LayerKind::Text => LayerSource::Text(TextStyle {
-                text: "Text".into(),
+                text: tr!("Text").into(),
                 size: 64.0,
                 outline: Some((0x0000_00c0, 3.0)),
                 ..TextStyle::default()
@@ -799,7 +799,7 @@ pub fn wire(ui: &AppWindow, rec: &Shared, games: &Games) {
                 Ok(None) => {}
                 Err(e) => {
                     log!("image picker: {e}");
-                    flash_notice(&ui, "Could not open the file picker");
+                    flash_notice(&ui, tr!("Could not open the file picker"));
                 }
             });
         });
@@ -951,7 +951,7 @@ pub fn wire(ui: &AppWindow, rec: &Shared, games: &Games) {
         let canvas = if fixed {
             let ok = |v: i32| (128..=8192).contains(&v);
             if !ok(w) || !ok(h) {
-                flash_notice(&ui, "Canvas sides are 128 to 8192 pixels");
+                flash_notice(&ui, tr!("Canvas sides are 128 to 8192 pixels"));
                 return show(&ui, &from_ui(&ui));
             }
             Canvas::Fixed(w as u32 & !1, h as u32 & !1)

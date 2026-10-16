@@ -1,0 +1,1394 @@
+# French translation of Vesper.
+# Generate the missing entries with:
+#   cargo test -p vesper-app every_string_has_a_french_translation
+# Typography: no-break space (U+00A0) before : ; ! ? » and after «.
+
+msgid ""
+msgstr ""
+"Project-Id-Version: Vesper\n"
+"Language: fr\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Plural-Forms: nplurals=2; plural=(n > 1);\n"
+
+msgid "A scene has at most 16 layers"
+msgstr "Une scène a 16 calques au plus"
+
+msgid "A webcam is hidden: the GPU could not use its picture"
+msgstr "Une webcam est masquée : le GPU n’a pas pu utiliser son image"
+
+msgid "APPLICATIONS"
+msgstr "APPLICATIONS"
+
+msgid "AUDIO"
+msgstr "AUDIO"
+
+msgid "AUDIO DEVICES"
+msgstr "PÉRIPHÉRIQUES AUDIO"
+
+msgid "Add"
+msgstr "Ajouter"
+
+msgid "Add a layer"
+msgstr "Ajouter un calque"
+
+msgid "Add filter"
+msgstr "Ajouter un filtre"
+
+msgid "Add track"
+msgstr "Ajouter une piste"
+
+msgid "Add {}"
+msgstr "Ajouter {}"
+
+msgid "Added"
+msgstr "Ajoutée"
+
+msgid "Added when two or more tracks record"
+msgstr "Ajouté dès deux pistes enregistrées"
+
+msgid "Alignment"
+msgstr "Alignement"
+
+msgid "Allow"
+msgstr "Autoriser"
+
+msgid "Allow Vesper to capture {}?"
+msgstr "Autoriser Vesper à capturer {} ?"
+
+msgid "Allow capturing {}"
+msgstr "Autoriser la capture de {}"
+
+msgid "Also running"
+msgstr "Également lancé"
+
+msgid "An app asks to be recorded. Allow only games you recognize."
+msgstr "Une application demande à être enregistrée. N’autorisez que les jeux que vous reconnaissez."
+
+msgid "An rtmp://, rtmps:// or srt:// server. The key ends the RTMP path, or is the SRT streamid."
+msgstr "Un serveur rtmp://, rtmps:// ou srt://. La clé termine le chemin RTMP, ou sert de streamid SRT."
+
+msgid "Another profile has this name"
+msgstr "Un autre profil porte ce nom"
+
+msgid "Another scene has this name"
+msgstr "Une autre scène porte ce nom"
+
+msgid "Application"
+msgstr "Application"
+
+msgid "Applications show up here while they play audio."
+msgstr "Les applications apparaissent ici pendant qu’elles jouent du son."
+
+msgid "At most 64 characters, on one line"
+msgstr "64 caractères au plus, sur une ligne"
+
+msgid "At most {} tracks"
+msgstr "{} pistes au plus"
+
+msgid "Attack"
+msgstr "Attaque"
+
+msgid "Auto"
+msgstr "Auto"
+
+msgid "BACKGROUND"
+msgstr "ARRIÈRE-PLAN"
+
+msgid "Balanced"
+msgstr "Équilibré"
+
+msgid "Bitrate"
+msgstr "Débit"
+
+msgid "Bottom"
+msgstr "Bas"
+
+msgid "CODEC"
+msgstr "CODEC"
+
+msgid "Camera"
+msgstr "Caméra"
+
+msgid "Camera on"
+msgstr "Caméra active"
+
+msgid "Cancel"
+msgstr "Annuler"
+
+msgid "Cannot reach {}: check the network"
+msgstr "Impossible de joindre {} : vérifiez le réseau"
+
+msgid "Canvas"
+msgstr "Canevas"
+
+msgid "Canvas height"
+msgstr "Hauteur du canevas"
+
+msgid "Canvas sides are 128 to 8192 pixels"
+msgstr "Les côtés du canevas font de 128 à 8192 pixels"
+
+msgid "Canvas size"
+msgstr "Taille du canevas"
+
+msgid "Canvas width"
+msgstr "Largeur du canevas"
+
+msgid "Capture"
+msgstr "Capture"
+
+msgid "Capture ended: {}"
+msgstr "Fin de la capture : {}"
+
+msgid "Capture {}"
+msgstr "Capturer {}"
+
+msgid "Ceiling"
+msgstr "Plafond"
+
+msgid "Center"
+msgstr "Centre"
+
+msgid "Change"
+msgstr "Changer"
+
+msgid "Change the image"
+msgstr "Changer l’image"
+
+msgid "Choose"
+msgstr "Choisir"
+
+msgid "Choose an image"
+msgstr "Choisir une image"
+
+msgid "Choose an output folder first"
+msgstr "Choisissez d’abord un dossier de sortie"
+
+msgid "Choose output folder"
+msgstr "Choisir le dossier de sortie"
+
+msgid "Choose source"
+msgstr "Choisir la source"
+
+msgid "Choose the output folder"
+msgstr "Choisir le dossier de sortie"
+
+msgid "Close"
+msgstr "Fermer"
+
+msgid "Close settings"
+msgstr "Fermer les paramètres"
+
+msgid "Close the filter list"
+msgstr "Fermer la liste des filtres"
+
+msgid "Close the menu"
+msgstr "Fermer le menu"
+
+msgid "Close the scene editor"
+msgstr "Fermer l’éditeur de scènes"
+
+msgid "Close the source list"
+msgstr "Fermer la liste des sources"
+
+msgid "Closing the window keeps Vesper in the tray, with the replay buffer running. Quit from the tray menu or with Ctrl+Q."
+msgstr "Fermer la fenêtre garde Vesper dans la zone de notification, avec le tampon de replay actif. Quittez depuis son menu ou avec Ctrl+Q."
+
+msgid "Codec"
+msgstr "Codec"
+
+msgid "Colour"
+msgstr "Couleur"
+
+msgid "Compressor"
+msgstr "Compresseur"
+
+msgid "Connecting…"
+msgstr "Connexion…"
+
+msgid "Connection lost"
+msgstr "Connexion perdue"
+
+msgid "Contain"
+msgstr "Contenir"
+
+msgid "Copy of “{}”"
+msgstr "Copie de « {} »"
+
+msgid "Could not change autostart: {}"
+msgstr "Impossible de modifier le lancement automatique : {}"
+
+msgid "Could not change game capture: {}"
+msgstr "Impossible de modifier la capture de jeu : {}"
+
+msgid "Could not delete {}"
+msgstr "Impossible de supprimer {}"
+
+msgid "Could not open the AAC encoder: {}"
+msgstr "Impossible d’ouvrir l’encodeur AAC : {}"
+
+msgid "Could not open the file picker"
+msgstr "Impossible d’ouvrir le sélecteur de fichiers"
+
+msgid "Could not open the folder picker"
+msgstr "Impossible d’ouvrir le sélecteur de dossiers"
+
+msgid "Could not open the stream encoder"
+msgstr "Impossible d’ouvrir l’encodeur du direct"
+
+msgid "Could not open the stream encoder: {}"
+msgstr "Impossible d’ouvrir l’encodeur du direct : {}"
+
+msgid "Could not read that profile"
+msgstr "Impossible de lire ce profil"
+
+msgid "Could not read the settings: changes are not saved"
+msgstr "Impossible de lire les paramètres : les changements ne sont pas sauvegardés"
+
+msgid "Could not save the replay: {}"
+msgstr "Impossible de sauvegarder le replay : {}"
+
+msgid "Could not save the stream key: {}"
+msgstr "Impossible de sauvegarder la clé de stream : {}"
+
+msgid "Could not start game capture: {}"
+msgstr "Impossible de lancer la capture de jeu : {}"
+
+msgid "Could not start the capture: {}"
+msgstr "Impossible de lancer la capture : {}"
+
+msgid "Could not start the stream: {}"
+msgstr "Impossible de lancer le direct : {}"
+
+msgid "Could not start: {}"
+msgstr "Démarrage impossible : {}"
+
+msgid "Cover"
+msgstr "Couvrir"
+
+msgid "Create"
+msgstr "Créer"
+
+msgid "Crop"
+msgstr "Recadrage"
+
+msgid "Custom"
+msgstr "Personnalisé"
+
+msgid "Custom server"
+msgstr "Serveur personnalisé"
+
+msgid "DESKTOP AND MICROPHONE"
+msgstr "BUREAU ET MICRO"
+
+msgid "De-esser"
+msgstr "De-esser"
+
+msgid "Default"
+msgstr "Par défaut"
+
+msgid "Default (sans-serif)"
+msgstr "Par défaut (sans empattement)"
+
+msgid "Delete"
+msgstr "Supprimer"
+
+msgid "Delete {}"
+msgstr "Supprimer {}"
+
+msgid "Delete “{}”?"
+msgstr "Supprimer « {} » ?"
+
+msgid "Delete “{}”? Its settings and plugin states are deleted."
+msgstr "Supprimer « {} » ? Ses paramètres et l’état de ses plugins sont supprimés."
+
+msgid "Delete “{}”? Without scenes, the capture is recorded alone."
+msgstr "Supprimer « {} » ? Sans scène, la capture est enregistrée seule."
+
+msgid "Deleted {}"
+msgstr "{} supprimé"
+
+msgid "Desktop"
+msgstr "Bureau"
+
+msgid "Desktop audio"
+msgstr "Son du bureau"
+
+msgid "Disconnected"
+msgstr "Déconnecté"
+
+msgid "Disconnected: recorded again once it is back"
+msgstr "Déconnecté : de nouveau enregistré dès son retour"
+
+msgid "Duplicate"
+msgstr "Copier"
+
+msgid "Duplicate {}"
+msgstr "Dupliquer {}"
+
+msgid "Each track is saved separately, for editing. The mix comes first, so players that play one track play everything."
+msgstr "Chaque piste est sauvegardée à part, pour le montage. Le mixage vient en premier : les lecteurs qui ne jouent qu’une piste jouent tout."
+
+msgid "Edit"
+msgstr "Modifier"
+
+msgid "Edit the scenes"
+msgstr "Modifier les scènes"
+
+msgid "Efficient and widely supported by hardware."
+msgstr "Efficace et largement pris en charge par le matériel."
+
+msgid "Elapsed time"
+msgstr "Temps écoulé"
+
+msgid "Empty: the scene records black."
+msgstr "Vide : la scène enregistre du noir."
+
+msgid "Encoder"
+msgstr "Encodeur"
+
+msgid "Encoding failed: {}"
+msgstr "Échec de l’encodage : {}"
+
+msgid "End stream"
+msgstr "Arrêter le direct"
+
+msgid "End the live stream"
+msgstr "Arrêter le direct"
+
+msgid "End the stream to change the source"
+msgstr "Arrêtez le direct pour changer de source"
+
+msgid "Ending the stream…"
+msgstr "Arrêt du direct…"
+
+msgid "Enter a name"
+msgstr "Saisissez un nom"
+
+msgid "Enter the server URL first: the key is saved for that server"
+msgstr "Saisissez d’abord l’URL du serveur : la clé est sauvegardée pour ce serveur"
+
+msgid "Enter the server URL in the settings first"
+msgstr "Saisissez d’abord l’URL du serveur dans les paramètres"
+
+msgid "Expander"
+msgstr "Expandeur"
+
+msgid "FILTERS"
+msgstr "FILTRES"
+
+msgid "FRAME RATE"
+msgstr "IMAGES PAR SECONDE"
+
+msgid "Fewer settings"
+msgstr "Moins de réglages"
+
+msgid "File"
+msgstr "Fichier"
+
+msgid "Filter"
+msgstr "Filtre"
+
+msgid "Filters"
+msgstr "Filtres"
+
+msgid "Finishing the file…"
+msgstr "Finalisation du fichier…"
+
+msgid "Fit"
+msgstr "Ajustement"
+
+msgid "Font"
+msgstr "Police"
+
+msgid "For the best performance in OpenGL games (Terraria, many indie games, emulators), add vesper-gl %command% to the game's launch options in Steam (Properties > General); otherwise Vesper captures the game window (the picker asks once per game). Only that game loads the capture library, with the same consent as Vulkan games. Don't use it on multiplayer games protected by VAC, EAC or BattlEye: risk of an account ban."
+msgstr "Pour les meilleures performances dans les jeux OpenGL (Terraria, beaucoup de jeux indépendants, émulateurs), ajoutez vesper-gl %command% aux options de lancement du jeu dans Steam (Propriétés > Général) ; sinon Vesper capture la fenêtre du jeu (le sélecteur demande une fois par jeu). Seul ce jeu charge la bibliothèque de capture, avec le même consentement que les jeux Vulkan. Ne l’utilisez pas sur les jeux multijoueurs protégés par VAC, EAC ou BattlEye : risque de bannissement du compte."
+
+msgid "Frame rate"
+msgstr "Images par seconde"
+
+msgid "Frequency"
+msgstr "Fréquence"
+
+msgid "GAME CAPTURE"
+msgstr "CAPTURE DE JEU"
+
+msgid "Gain"
+msgstr "Gain"
+
+msgid "Game"
+msgstr "Jeu"
+
+msgid "Game ({})"
+msgstr "Jeu ({})"
+
+msgid "Game capture (Vulkan layer)"
+msgstr "Capture de jeu (couche Vulkan)"
+
+msgid "Game capture failed: {}"
+msgstr "Échec de la capture de jeu : {}"
+
+msgid "Game capture installed"
+msgstr "Capture de jeu installée"
+
+msgid "Game capture is not running"
+msgstr "La capture de jeu n’est pas lancée"
+
+msgid "Game capture layer not built"
+msgstr "Couche de capture de jeu non compilée"
+
+msgid "Game capture removed"
+msgstr "Capture de jeu supprimée"
+
+msgid "Game capture stopped"
+msgstr "Capture de jeu arrêtée"
+
+msgid "Game closed, recording saved"
+msgstr "Jeu fermé, enregistrement sauvegardé"
+
+msgid "Game closed: recording saved, stream ended"
+msgstr "Jeu fermé : enregistrement sauvegardé, direct terminé"
+
+msgid "Game closed: stream ended"
+msgstr "Jeu fermé : direct terminé"
+
+msgid "Game window"
+msgstr "Fenêtre du jeu"
+
+msgid "Game: {}, {}"
+msgstr "Jeu : {}, {}"
+
+msgid "Go live"
+msgstr "Passer en direct"
+
+msgid "Go live on {}"
+msgstr "Passer en direct sur {}"
+
+msgid "Go live/end stream"
+msgstr "Lancer/arrêter le direct"
+
+msgid "Hide the advanced settings of {}"
+msgstr "Masquer les réglages avancés de {}"
+
+msgid "Hide window"
+msgstr "Masquer la fenêtre"
+
+msgid "Hide {}"
+msgstr "Masquer {}"
+
+msgid "High-pass"
+msgstr "Passe-haut"
+
+msgid "INPUT DEVICES"
+msgstr "PÉRIPHÉRIQUES D’ENTRÉE"
+
+msgid "Idle"
+msgstr "En veille"
+
+msgid "Ignore"
+msgstr "Ignorer"
+
+msgid "Ignore {}"
+msgstr "Ignorer {}"
+
+msgid "Image"
+msgstr "Image"
+
+msgid "Image…"
+msgstr "Image…"
+
+msgid "Input device"
+msgstr "Périphérique d’entrée"
+
+msgid "Installed for this user"
+msgstr "Installée pour cet utilisateur"
+
+msgid "Internal error: the recorder crashed"
+msgstr "Erreur interne : l’enregistreur a planté"
+
+msgid "It stays in the tray, with the replay buffer and global shortcuts. Quit from the tray icon's menu."
+msgstr "Il reste dans la zone de notification, avec le tampon de replay et les raccourcis globaux. Quittez depuis le menu de son icône."
+
+msgid "Knee"
+msgstr "Coude"
+
+msgid "LANGUAGE"
+msgstr "LANGUE"
+
+msgid "LAYERS"
+msgstr "CALQUES"
+
+msgid "LIVE"
+msgstr "EN DIRECT"
+
+msgid "LIVE STREAM"
+msgstr "DIRECT"
+
+msgid "Language"
+msgstr "Langue"
+
+msgid "Last {}, {}"
+msgstr "Garde {}, {}"
+
+msgid "Layer not built: install the Vesper package or build the workspace"
+msgstr "Couche non compilée : installez le paquet Vesper ou compilez l’espace de travail"
+
+msgid "Layers"
+msgstr "Calques"
+
+msgid "Layers, top first"
+msgstr "Calques, du haut vers le bas"
+
+msgid "Layout"
+msgstr "Disposition"
+
+msgid "Left"
+msgstr "Gauche"
+
+msgid "Limiter"
+msgstr "Limiteur"
+
+msgid "Live"
+msgstr "Direct"
+
+msgid "Live stream"
+msgstr "Direct"
+
+msgid "Loading the fonts…"
+msgstr "Chargement des polices…"
+
+msgid "Locked while recording"
+msgstr "Verrouillé pendant l’enregistrement"
+
+msgid "Locked while recording or streaming."
+msgstr "Verrouillé pendant l’enregistrement ou le direct."
+
+msgid "Lookahead"
+msgstr "Anticipation"
+
+msgid "Looking for cameras…"
+msgstr "Recherche des caméras…"
+
+msgid "Makeup"
+msgstr "Compensation"
+
+msgid "Microphone"
+msgstr "Micro"
+
+msgid "Mix of all tracks"
+msgstr "Mixage de toutes les pistes"
+
+msgid "More settings"
+msgstr "Plus de réglages"
+
+msgid "Move {} down"
+msgstr "Descendre {}"
+
+msgid "Move {} up"
+msgstr "Monter {}"
+
+msgid "Mute {}"
+msgstr "Couper le son de {}"
+
+msgid "Muted"
+msgstr "Coupé"
+
+msgid "Native"
+msgstr "Native"
+
+msgid "New profile"
+msgstr "Nouveau profil"
+
+msgid "New profile, with the default settings"
+msgstr "Nouveau profil, avec les paramètres par défaut"
+
+msgid "New scene"
+msgstr "Nouvelle scène"
+
+msgid "New stream key"
+msgstr "Nouvelle clé de stream"
+
+msgid "Next scene"
+msgstr "Scène suivante"
+
+msgid "No audio is recorded."
+msgstr "Aucun son n’est enregistré."
+
+msgid "No camera found"
+msgstr "Aucune caméra trouvée"
+
+msgid "No data folder (HOME is not set)"
+msgstr "Aucun dossier de données (HOME n’est pas défini)"
+
+msgid "No filter: the track is recorded as is."
+msgstr "Aucun filtre : la piste est enregistrée telle quelle."
+
+msgid "No folder chosen"
+msgstr "Aucun dossier choisi"
+
+msgid "No frame from the game"
+msgstr "Aucune image du jeu"
+
+msgid "No frame from the source"
+msgstr "Aucune image de la source"
+
+msgid "No frame was captured"
+msgstr "Aucune image n’a été capturée"
+
+msgid "No picture was recorded"
+msgstr "Aucune image n’a été enregistrée"
+
+msgid "No scenes yet: the capture is recorded alone. A scene adds images, text or a webcam over it."
+msgstr "Pas encore de scène : la capture est enregistrée seule. Une scène y superpose des images, du texte ou une webcam."
+
+msgid "No source"
+msgstr "Aucune source"
+
+msgid "No source selected"
+msgstr "Aucune source choisie"
+
+msgid "No source was picked"
+msgstr "Aucune source n’a été choisie"
+
+msgid "No system tray found: closing the window quits Vesper."
+msgstr "Aucune zone de notification trouvée : fermer la fenêtre quitte Vesper."
+
+msgid "No {0} stream key saved (one is saved for {1}): paste {0}'s key in the settings"
+msgstr "Aucune clé de stream {0} sauvegardée (il y en a une pour {1}) : collez la clé {0} dans les paramètres"
+
+msgid "No {0} stream key saved: paste {0}'s key in the settings"
+msgstr "Aucune clé de stream {0} sauvegardée : collez la clé {0} dans les paramètres"
+
+msgid "Noise suppression"
+msgstr "Réduction de bruit"
+
+msgid "Not installed"
+msgstr "Non installée"
+
+msgid "Not recorded"
+msgstr "Non enregistrée"
+
+msgid "Not recorded now."
+msgstr "Pas enregistrée en ce moment."
+
+msgid "Not set"
+msgstr "Non définie"
+
+msgid "OPENGL GAMES"
+msgstr "JEUX OPENGL"
+
+msgid "OUTPUT DEVICES"
+msgstr "PÉRIPHÉRIQUES DE SORTIE"
+
+msgid "OUTPUT FOLDER"
+msgstr "DOSSIER DE SORTIE"
+
+msgid "Off. Turn on to save past moments"
+msgstr "Désactivé. Activez-le pour sauvegarder les derniers instants"
+
+msgid "Opacity"
+msgstr "Opacité"
+
+msgid "Open"
+msgstr "Ouvrir"
+
+msgid "Open folder"
+msgstr "Ouvrir le dossier"
+
+msgid "Open the game capture settings"
+msgstr "Ouvrir les paramètres de capture de jeu"
+
+msgid "Outline"
+msgstr "Contour"
+
+msgid "Output"
+msgstr "Sortie"
+
+msgid "Output device"
+msgstr "Périphérique de sortie"
+
+msgid "Output folder: {}"
+msgstr "Dossier de sortie : {}"
+
+msgid "Output settings"
+msgstr "Paramètres de sortie"
+
+msgid "PNG or JPEG"
+msgstr "PNG ou JPEG"
+
+msgid "PNG or JPEG images"
+msgstr "Images PNG ou JPEG"
+
+msgid "PREVIEW"
+msgstr "APERÇU"
+
+msgid "Paste a new key to replace it"
+msgstr "Collez une nouvelle clé pour la remplacer"
+
+msgid "Paste the key"
+msgstr "Collez la clé"
+
+msgid "Performance"
+msgstr "Performance"
+
+msgid "Pick a screen or a window to record"
+msgstr "Choisissez un écran ou une fenêtre à enregistrer"
+
+msgid "Play"
+msgstr "Lire"
+
+msgid "Play the file"
+msgstr "Lire le fichier"
+
+msgid "Plays everywhere, larger files."
+msgstr "Se lit partout, fichiers plus gros."
+
+msgid "Profile"
+msgstr "Profil"
+
+msgid "Profile name"
+msgstr "Nom du profil"
+
+msgid "Profiles"
+msgstr "Profils"
+
+msgid "Profiles are locked while recording or streaming"
+msgstr "Les profils sont verrouillés pendant l’enregistrement ou le direct"
+
+msgid "QUALITY"
+msgstr "QUALITÉ"
+
+msgid "Quality"
+msgstr "Qualité"
+
+msgid "Quality preset"
+msgstr "Préréglage de qualité"
+
+msgid "Quit"
+msgstr "Quitter"
+
+msgid "REC"
+msgstr "REC"
+
+msgid "Range"
+msgstr "Plage"
+
+msgid "Ratio"
+msgstr "Ratio"
+
+msgid "Ready"
+msgstr "Prêt"
+
+msgid "Reconnected"
+msgstr "Reconnecté"
+
+msgid "Reconnecting…"
+msgstr "Reconnexion…"
+
+msgid "Record this scene"
+msgstr "Enregistrer cette scène"
+
+msgid "Record {}"
+msgstr "Enregistrer {}"
+
+msgid "Recorded"
+msgstr "Enregistrée"
+
+msgid "Recorded by the Desktop audio and Microphone tracks. An unplugged device is waited for, never replaced by another one."
+msgstr "Enregistrés par les pistes Son du bureau et Micro. Un périphérique débranché est attendu, jamais remplacé par un autre."
+
+msgid "Recording"
+msgstr "Enregistrement"
+
+msgid "Recording and live"
+msgstr "Enregistrement et direct"
+
+msgid "Recording failed"
+msgstr "Échec de l’enregistrement"
+
+msgid "Recording saved"
+msgstr "Enregistrement sauvegardé"
+
+msgid "Recording without the audio track {}"
+msgstr "Enregistrement sans la piste audio {}"
+
+msgid "Recording without the audio tracks {}"
+msgstr "Enregistrement sans les pistes audio {}"
+
+msgid "Recording without the mix track"
+msgstr "Enregistrement sans la piste de mixage"
+
+msgid "Records Vulkan games (Proton and 32-bit included) at their own frame rate, without the screen picker (off, Vesper captures the game window: the picker asks once per game). Installs a small layer that loads into your Vulkan apps and stays idle until Vesper captures a game you allowed. Some anti-cheats may reject it: launch those games with VESPER_CAPTURE_DISABLE=1."
+msgstr "Enregistre les jeux Vulkan (Proton et 32 bits compris) à leur propre fréquence d’images, sans le sélecteur d’écran (désactivée, Vesper capture la fenêtre du jeu : le sélecteur demande une fois par jeu). Installe une petite couche qui se charge dans vos applications Vulkan et reste inactive tant que Vesper ne capture pas un jeu que vous avez autorisé. Certains anti-triche peuvent la refuser : lancez ces jeux avec VESPER_CAPTURE_DISABLE=1."
+
+msgid "Reduction"
+msgstr "Réduction"
+
+msgid "Release"
+msgstr "Relâchement"
+
+msgid "Remove"
+msgstr "Retirer"
+
+msgid "Remove the stream key"
+msgstr "Retirer la clé de stream"
+
+msgid "Remove {}"
+msgstr "Retirer {}"
+
+msgid "Rename"
+msgstr "Renommer"
+
+msgid "Rename {}"
+msgstr "Renommer {}"
+
+msgid "Rename “{}”"
+msgstr "Renommer « {} »"
+
+msgid "Replaces the filters with high-pass, noise suppression, expander, compressor, de-esser and limiter"
+msgstr "Remplace les filtres par passe-haut, réduction de bruit, expandeur, compresseur, de-esser et limiteur"
+
+msgid "Replay buffer"
+msgstr "Tampon de replay"
+
+msgid "Replay buffer on"
+msgstr "Tampon de replay actif"
+
+msgid "Replay length"
+msgstr "Durée du replay"
+
+msgid "Replay not saved"
+msgstr "Replay non sauvegardé"
+
+msgid "Replay saved"
+msgstr "Replay sauvegardé"
+
+msgid "Replay starts once a source is picked"
+msgstr "Le replay démarre une fois une source choisie"
+
+msgid "Resolution"
+msgstr "Résolution"
+
+msgid "Right"
+msgstr "Droite"
+
+msgid "SCENE"
+msgstr "SCÈNE"
+
+msgid "SCENES"
+msgstr "SCÈNES"
+
+msgid "Save replay"
+msgstr "Sauvegarder le replay"
+
+msgid "Saved"
+msgstr "Sauvegardée"
+
+msgid "Saved as MKV, which stays readable even if the app crashes."
+msgstr "Sauvegardé en MKV, qui reste lisible même si l’application plante."
+
+msgid "Saved in a private file (no keyring found)"
+msgstr "Sauvegardée dans un fichier privé (aucun trousseau trouvé)"
+
+msgid "Saved in the system keyring"
+msgstr "Sauvegardée dans le trousseau du système"
+
+msgid "Saved source"
+msgstr "Source mémorisée"
+
+msgid "Saving"
+msgstr "Sauvegarde"
+
+msgid "Saving…"
+msgstr "Sauvegarde…"
+
+msgid "Scene"
+msgstr "Scène"
+
+msgid "Scene 1"
+msgstr "Scène 1"
+
+msgid "Scene 2"
+msgstr "Scène 2"
+
+msgid "Scene 3"
+msgstr "Scène 3"
+
+msgid "Scene 4"
+msgstr "Scène 4"
+
+msgid "Scene editor"
+msgstr "Éditeur de scènes"
+
+msgid "Scene name"
+msgstr "Nom de la scène"
+
+msgid "Scene overlays are off for now: the GPU compositor failed"
+msgstr "Superpositions de scène désactivées pour le moment : le compositeur GPU a échoué"
+
+msgid "Scene overlays may be unavailable: the GPU is busy"
+msgstr "Les superpositions de scène peuvent être indisponibles : le GPU est occupé"
+
+msgid "Scene preview"
+msgstr "Aperçu de la scène"
+
+msgid "Scene {}"
+msgstr "Scène {}"
+
+msgid "Scenes"
+msgstr "Scènes"
+
+msgid "Screen"
+msgstr "Écran"
+
+msgid "Screen or window"
+msgstr "Écran ou fenêtre"
+
+msgid "Screen region"
+msgstr "Zone de l’écran"
+
+msgid "Screen, window or game"
+msgstr "Écran, fenêtre ou jeu"
+
+msgid "Search fonts"
+msgstr "Rechercher une police"
+
+msgid "Select a layer in the list or on the preview to change it."
+msgstr "Sélectionnez un calque dans la liste ou sur l’aperçu pour le modifier."
+
+msgid "Sent to Twitch's automatic ingest over RTMPS, in H.264: the codec Twitch takes."
+msgstr "Envoyé à l’ingest automatique de Twitch en RTMPS, en H.264 : le codec que Twitch accepte."
+
+msgid "Sent to YouTube over RTMPS. HEVC and AV1 go through Enhanced RTMP."
+msgstr "Envoyé à YouTube en RTMPS. HEVC et AV1 passent par Enhanced RTMP."
+
+msgid "Server URL"
+msgstr "URL du serveur"
+
+msgid "Set a stream key in the settings first"
+msgstr "Définissez d’abord une clé de stream dans les paramètres"
+
+msgid "Set up"
+msgstr "Configurer"
+
+msgid "Settings could not be read: nothing is saved"
+msgstr "Impossible de lire les paramètres : rien n’est sauvegardé"
+
+msgid "Settings could not be read: profiles are unavailable"
+msgstr "Impossible de lire les paramètres : les profils sont indisponibles"
+
+msgid "Settings of {}"
+msgstr "Réglages de {}"
+
+msgid "Shadow"
+msgstr "Ombre"
+
+msgid "Show the advanced settings of {}"
+msgstr "Afficher les réglages avancés de {}"
+
+msgid "Show the file in its folder"
+msgstr "Afficher le fichier dans son dossier"
+
+msgid "Show window"
+msgstr "Afficher la fenêtre"
+
+msgid "Show {}"
+msgstr "Afficher {}"
+
+msgid "Silent"
+msgstr "Silence"
+
+msgid "Size"
+msgstr "Taille"
+
+msgid "Smallest files at a given quality. Needs a recent player."
+msgstr "Les plus petits fichiers à qualité égale. Demande un lecteur récent."
+
+msgid "Source"
+msgstr "Source"
+
+msgid "Source of {}"
+msgstr "Source de {}"
+
+msgid "Source type"
+msgstr "Type de source"
+
+msgid "Source, name and recording are locked while recording."
+msgstr "La source, le nom et l’enregistrement sont verrouillés pendant l’enregistrement."
+
+msgid "Source: {}, {}"
+msgstr "Source : {}, {}"
+
+msgid "Sources"
+msgstr "Sources"
+
+msgid "Sources for {}"
+msgstr "Sources pour {}"
+
+msgid "Start a game"
+msgstr "Lancez un jeu"
+
+msgid "Start a game: its window is captured"
+msgstr "Lancez un jeu : sa fenêtre est capturée"
+
+msgid "Start recording"
+msgstr "Démarrer l’enregistrement"
+
+msgid "Start with the session"
+msgstr "Lancer avec la session"
+
+msgid "Start/stop recording"
+msgstr "Démarrer/arrêter l’enregistrement"
+
+msgid "Starting"
+msgstr "Démarrage"
+
+msgid "Starting recording"
+msgstr "Démarrage de l’enregistrement"
+
+msgid "Starting…"
+msgstr "Démarrage…"
+
+msgid "Starts hidden in the tray"
+msgstr "Démarre en arrière-plan"
+
+msgid "Steam launch options"
+msgstr "Options de lancement Steam"
+
+msgid "Stop recording"
+msgstr "Arrêter l’enregistrement"
+
+msgid "Stopped"
+msgstr "Arrêté"
+
+msgid "Stopping recording"
+msgstr "Arrêt de l’enregistrement"
+
+msgid "Stream bitrate"
+msgstr "Débit du direct"
+
+msgid "Stream codec"
+msgstr "Codec du direct"
+
+msgid "Stream encoding failed: {}"
+msgstr "Échec de l’encodage du direct : {}"
+
+msgid "Stream ended"
+msgstr "Direct terminé"
+
+msgid "Stream frame rate"
+msgstr "Images par seconde du direct"
+
+msgid "Stream key"
+msgstr "Clé de stream"
+
+msgid "Stream key removed"
+msgstr "Clé de stream retirée"
+
+msgid "Stream key saved, but an older key could not be removed from the keyring"
+msgstr "Clé de stream sauvegardée, mais une ancienne clé n’a pas pu être retirée du trousseau"
+
+msgid "Stream resolution"
+msgstr "Résolution du direct"
+
+msgid "Streaming service"
+msgstr "Plateforme"
+
+msgid "Streaming without sound: no audio track runs"
+msgstr "Direct sans son : aucune piste audio ne tourne"
+
+msgid "Stretch"
+msgstr "Étirer"
+
+msgid "Suppression"
+msgstr "Atténuation"
+
+msgid "Switching is locked while recording or streaming"
+msgstr "Le changement est verrouillé pendant l’enregistrement ou le direct"
+
+msgid "Switching is locked while recording or streaming."
+msgstr "Le changement est verrouillé pendant l’enregistrement ou le direct."
+
+msgid "System"
+msgstr "Système"
+
+msgid "System default"
+msgstr "Défaut du système"
+
+msgid "System follows the language of the session."
+msgstr "Système suit la langue de la session."
+
+msgid "Text"
+msgstr "Texte"
+
+msgid "That profile is gone"
+msgstr "Ce profil n’existe plus"
+
+msgid "That scene is gone"
+msgstr "Cette scène n’existe plus"
+
+msgid "The canvas is locked while recording or streaming"
+msgstr "Le canevas est verrouillé pendant l’enregistrement ou le direct"
+
+msgid "The capture is fitted into it."
+msgstr "La capture y est ajustée."
+
+msgid "The disk is full"
+msgstr "Le disque est plein"
+
+msgid "The key in the URL was moved to the stream key"
+msgstr "La clé présente dans l’URL a été déplacée vers la clé de stream"
+
+msgid "The keyring did not answer: key not saved"
+msgstr "Le trousseau n’a pas répondu : clé non sauvegardée"
+
+msgid "The keyring did not keep the key: not saved"
+msgstr "Le trousseau n’a pas gardé la clé : non sauvegardée"
+
+msgid "The keyring stayed locked: key not saved"
+msgstr "Le trousseau est resté verrouillé : clé non sauvegardée"
+
+msgid "The last profile cannot be deleted"
+msgstr "Le dernier profil ne peut pas être supprimé"
+
+msgid "The layer was not built with Vesper"
+msgstr "La couche n’a pas été compilée avec Vesper"
+
+msgid "The output folder is missing"
+msgstr "Le dossier de sortie n’existe pas"
+
+msgid "The output folder is not a folder"
+msgstr "Le dossier de sortie n’est pas un dossier"
+
+msgid "The output folder is read-only"
+msgstr "Le dossier de sortie est en lecture seule"
+
+msgid "The picker opens when you record"
+msgstr "Le sélecteur s’ouvre quand vous enregistrez"
+
+msgid "The recording file was deleted while recording"
+msgstr "Le fichier a été supprimé pendant l’enregistrement"
+
+msgid "The replay buffer is empty"
+msgstr "Le tampon de replay est vide"
+
+msgid "The replay buffer is not running"
+msgstr "Le tampon de replay n’est pas actif"
+
+msgid "The secure connection to {} failed: its certificate is not trusted"
+msgstr "La connexion sécurisée à {} a échoué : son certificat n’est pas de confiance"
+
+msgid "The server URL must start with rtmp://, rtmps:// or srt://"
+msgstr "L’URL du serveur doit commencer par rtmp://, rtmps:// ou srt://"
+
+msgid "The server closed the stream: check the stream key"
+msgstr "Le serveur a fermé le direct : vérifiez la clé de stream"
+
+msgid "The server rejected the stream: check the stream key"
+msgstr "Le serveur a refusé le direct : vérifiez la clé de stream"
+
+msgid "The size of the captured source."
+msgstr "La taille de la source capturée."
+
+msgid "The video encoder (VAAPI) is unavailable"
+msgstr "L’encodeur vidéo (VAAPI) est indisponible"
+
+msgid "Threshold"
+msgstr "Seuil"
+
+msgid "Top"
+msgstr "Haut"
+
+msgid "Track"
+msgstr "Piste"
+
+msgid "Track name"
+msgstr "Nom de la piste"
+
+msgid "Type a name"
+msgstr "Saisissez un nom"
+
+msgid "Unknown server {}: check the URL and the network"
+msgstr "Serveur {} inconnu : vérifiez l’URL et le réseau"
+
+msgid "Unmute {}"
+msgstr "Rétablir le son de {}"
+
+msgid "Update"
+msgstr "Mettre à jour"
+
+msgid "Update available"
+msgstr "Mise à jour disponible"
+
+msgid "Update the game capture layer"
+msgstr "Mettre à jour la couche de capture de jeu"
+
+msgid "VST3 plugin (unavailable)"
+msgstr "Plugin VST3 (indisponible)"
+
+msgid "Value"
+msgstr "Valeur"
+
+msgid "Version"
+msgstr "Version"
+
+msgid "Vesper cannot write to the output folder"
+msgstr "Vesper ne peut pas écrire dans le dossier de sortie"
+
+msgid "Vesper is still running"
+msgstr "Vesper tourne toujours"
+
+msgid "Voice preset"
+msgstr "Préréglage voix"
+
+msgid "Volume of {}"
+msgstr "Volume de {}"
+
+msgid "Waiting for a game"
+msgstr "En attente d’un jeu"
+
+msgid "Waiting for a game…"
+msgstr "En attente d’un jeu…"
+
+msgid "Webcam decoded on the CPU: the GPU could not decode it"
+msgstr "Webcam décodée par le processeur : le GPU n’a pas pu la décoder"
+
+msgid "Webcam hidden: {}. Vesper keeps trying."
+msgstr "Webcam masquée : {}. Vesper continue d’essayer."
+
+msgid "Width"
+msgstr "Largeur"
+
+msgid "Window"
+msgstr "Fenêtre"
+
+msgid "Your previous stream key is now saved for {}: paste it again if it is another service's"
+msgstr "Votre ancienne clé de stream est maintenant sauvegardée pour {} : collez-la de nouveau si elle appartient à un autre service"
+
+msgid "amber"
+msgstr "ambre"
+
+msgid "black"
+msgstr "noir"
+
+msgid "blue"
+msgstr "bleu"
+
+msgid "green"
+msgstr "vert"
+
+msgid "grey"
+msgstr "gris"
+
+msgid "native size"
+msgstr "taille native"
+
+msgid "none"
+msgstr "aucun"
+
+msgid "red"
+msgstr "rouge"
+
+msgid "rtmp:// sends the key in clear: prefer rtmps:// if the server has it."
+msgstr "rtmp:// envoie la clé en clair : préférez rtmps:// si le serveur le propose."
+
+msgid "rtmp://host/app or srt://host:port"
+msgstr "rtmp://hôte/app ou srt://hôte:port"
+
+msgid "srt:// is encrypted only with a passphrase: key streamid=...&passphrase=..."
+msgstr "srt:// n’est chiffré qu’avec une phrase secrète : clé streamid=...&passphrase=..."
+
+msgid "to {}"
+msgstr "vers {}"
+
+msgid "violet"
+msgstr "violet"
+
+msgid "white"
+msgstr "blanc"
+
+msgid "{} (already a track)"
+msgstr "{} (déjà une piste)"
+
+msgid "{} (bypassed: {})"
+msgstr "{} (contourné : {})"
+
+msgid "{} (bypassed: {}; restarting)"
+msgstr "{} (contourné : {} ; redémarrage)"
+
+msgid "{} (disconnected)"
+msgstr "{} (déconnecté)"
+
+msgid "{} (hidden)"
+msgstr "{} (masqué)"
+
+msgid "{} (starting)"
+msgstr "{} (démarrage)"
+
+msgid "{} Mbit/s"
+msgstr "{} Mbit/s"
+
+msgid "{} colour {}"
+msgstr "{}, couleur {}"
+
+msgid "{} copy"
+msgstr "{} (copie)"
+
+msgid "{} does not answer in TLS: check the URL and port, or the network may be intercepting the connection"
+msgstr "{} ne répond pas en TLS : vérifiez l’URL et le port, ou le réseau intercepte peut-être la connexion"
+
+msgid "{} refused the connection"
+msgstr "{} a refusé la connexion"
+
+msgid "{} refused the connection: check the server URL"
+msgstr "{} a refusé la connexion : vérifiez l’URL du serveur"
+
+msgid "{} settings"
+msgstr "Réglages de {}"
+
+msgid "{} to start recording"
+msgstr "{} pour enregistrer"
+
+msgid "{} to stop"
+msgstr "{} pour arrêter"
+
+msgid "{} · next try in {} s"
+msgstr "{} · réessai dans {} s"
+
+msgid "{}: audio is back"
+msgstr "{} : le son est revenu"
+
+msgid "{}: reconnecting…"
+msgstr "{} : reconnexion…"
+
+msgid "{}: {} saved up to there"
+msgstr "{} : {} sauvegardé jusque-là"
+
+msgid "≈ {} MB at 4K{} {}"
+msgstr "≈ {} Mo en 4K{} {}"
+
+msgctxt "profile"
+msgid "New"
+msgstr "Nouveau"
+
+msgctxt "scene"
+msgid "New"
+msgstr "Nouvelle"
+
+msgctxt "verb"
+msgid "Capture"
+msgstr "Capturer"
+
+msgctxt "canvas size"
+msgid "Custom"
+msgstr "Autre"
+
+msgctxt "button"
+msgid "Save replay"
+msgstr "Sauvegarder"
+
+msgid "{n} dropped"
+msgid_plural "{n} dropped"
+msgstr[0] "{n} image perdue"
+msgstr[1] "{n} images perdues"
