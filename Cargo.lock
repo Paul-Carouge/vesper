@@ -5140,6 +5140,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "vesper-compose"
+version = "0.1.0"
+dependencies = [
+ "ash",
+ "ffmpeg-next",
+ "libc",
+ "tracing",
+ "tracing-subscriber",
+ "vesper-core",
+ "vesper-encode",
+]
+
+[[package]]
 name = "vesper-core"
 version = "0.1.0"
 

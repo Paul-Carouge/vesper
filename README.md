@@ -104,6 +104,8 @@ Settings are kept in `~/.config/vesper/settings`.
 
 The icons (`crates/vesper-app/data/icons/`) come from `scripts/icons.py`: edit it and run `python3 scripts/icons.py` (needs `rsvg-convert`) to regenerate the SVGs and PNGs. Preview: `docs/screenshots/icons.png`.
 
+The scene compositor's compute shader (`crates/vesper-compose/shaders/compose.comp`) is committed with its SPIR-V (`compose.spv`), so building needs no shader compiler. After editing it, run `scripts/shaders.sh` (needs `glslc` from shaderc or `glslangValidator` from glslang; checks the result with `spirv-val` when installed) and commit both files.
+
 Failure-injection lab (disk full, game crash, portal or PipeWire gone...): `scripts/robustness/go <name> <scenario>.sh` runs a scenario against a debug build in a private user/mount/pid namespace with its own D-Bus, PipeWire (no real device) and headless gamescope; see `scripts/robustness/run.sh`. The real session's sockets (`/run/user`) are hidden and the bus starts with the lab's `HOME` and XDG directories, so the services it activates (portal, kwalletd, permission store) never reach the real compositor, wallet or files. `w1_window_fallback.sh`: a Steam game without the layer and a recording ask the (absent) portal for its window once, never in a loop.
 
 ## VST3 plugins
