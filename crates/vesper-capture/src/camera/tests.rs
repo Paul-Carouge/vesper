@@ -6,6 +6,7 @@ use std::process::Command;
 use std::ptr;
 
 use ffmpeg_next::ffi as ff;
+use pw::main_loop::MainLoopRc;
 
 use super::*;
 
@@ -356,4 +357,94 @@ fn gpu_surfaces_keep_their_buffer_id_and_return_on_release() {
         .collect();
     let distinct: std::collections::BTreeSet<_> = held.iter().map(|f| f.buffer_id).collect();
     assert_eq!(distinct.len(), held.len());
+}
+
+#[test]
+fn cpu_decoder_rejects_444_jpegs_as_unsupported() {
+    let Some(jpeg) = jpeg(RGB, 64, 64, "yuvj444p") else {
+        eprintln!("no ffmpeg CLI, skipping");
+        return;
+    };
+    let err = decode::Decoder::cpu()
+        .unwrap()
+        .decode(&jpeg, Duration::ZERO)
+        .unwrap_err();
+    assert!(err.is::<decode::Unsupported>(), "{err}");
+}
+
+/// A `Shared` whose PipeWire side is a bare loop (no server).
+fn lifecycle() -> (Arc<Shared>, pw::channel::Receiver<()>) {
+    pw::init();
+    let (wake, rx) = pw::channel::channel();
+    (Arc::new(Shared::new(wake)), rx)
+}
+
+/// Whether the PipeWire side gets woken within 5 s.
+fn woken(rx: pw::channel::Receiver<()>) -> bool {
+    let mainloop = MainLoopRc::new(None).unwrap();
+    let woken = Rc::new(Cell::new(false));
+    let _attached = rx.attach(mainloop.loop_(), {
+        let (woken, mainloop) = (woken.clone(), mainloop.clone());
+        move |()| {
+            woken.set(true);
+            mainloop.quit();
+        }
+    });
+    crate::pw::run_until(&mainloop, || woken.get(), Duration::from_secs(5)).unwrap()
+}
+
+/// Runs `decode_loop` on its own thread; the receiver gets `()` when it returns.
+fn spawn_decoder(shared: &Arc<Shared>) -> std::sync::mpsc::Receiver<()> {
+    let (done, exited) = std::sync::mpsc::channel();
+    let shared = shared.clone();
+    std::thread::spawn(move || {
+        decode_loop(&shared);
+        let _ = done.send(());
+    });
+    exited
+}
+
+#[test]
+fn a_decode_side_end_stops_the_pipewire_side_and_drops_frames() {
+    let (shared, rx) = lifecycle();
+    let exited = spawn_decoder(&shared);
+    let s = shared.clone();
+    // As the decode thread does when the camera sends nothing decodable.
+    std::thread::spawn(move || s.end("broken pictures".into()));
+    assert!(woken(rx), "the PipeWire side must stop too");
+    exited
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the decode loop exits");
+    let slot = shared.lock();
+    assert!(slot.stop);
+    assert_eq!(slot.ended.as_deref(), Some("broken pictures"));
+    drop(slot);
+    // Nothing goes out once ended.
+    shared.publish(CameraFrame::Cpu(CpuFrame {
+        width: 2,
+        height: 2,
+        layout: CpuLayout::Yuy2,
+        planes: vec![CpuPlane {
+            offset: 0,
+            stride: 4,
+        }],
+        data: vec![0; 8],
+        matrix: Matrix::Bt601,
+        range: Range::Limited,
+        pts: Duration::ZERO,
+    }));
+    assert!(shared.lock().frame.is_none());
+}
+
+#[test]
+fn closing_stops_both_sides_without_an_error() {
+    let (shared, rx) = lifecycle();
+    let exited = spawn_decoder(&shared);
+    // What `Camera`'s drop does.
+    assert!(shared.stop().is_none());
+    assert!(woken(rx));
+    exited
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the decode loop exits");
+    assert!(shared.lock().ended.is_none());
 }

@@ -189,14 +189,37 @@ struct Slot {
     stop: bool,
 }
 
-#[derive(Default)]
 struct Shared {
     slot: Mutex<Slot>,
     /// Wakes the decode thread.
     jpeg_ready: Condvar,
+    /// Wakes the PipeWire loop, which then checks `stop`.
+    wake: pw::channel::Sender<()>,
 }
 
 impl Shared {
+    fn new(wake: pw::channel::Sender<()>) -> Self {
+        Self {
+            slot: Mutex::default(),
+            jpeg_ready: Condvar::new(),
+            wake,
+        }
+    }
+
+    /// Stops both threads; `stop` is set before they wake to check it.
+    fn stop(&self) -> Option<CameraFrame> {
+        let old = {
+            let mut slot = self.lock();
+            slot.stop = true;
+            slot.jpeg = None;
+            slot.frame.take()
+        };
+        self.jpeg_ready.notify_all();
+        // Fails only once the PipeWire thread is gone.
+        let _ = self.wake.send(());
+        old
+    }
+
     fn lock(&self) -> MutexGuard<'_, Slot> {
         self.slot.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -204,7 +227,7 @@ impl Shared {
     fn publish(&self, frame: CameraFrame) {
         let old = {
             let mut slot = self.lock();
-            if slot.ended.is_some() {
+            if slot.ended.is_some() || slot.stop {
                 return;
             }
             slot.frame.replace(frame)
@@ -213,27 +236,23 @@ impl Shared {
         drop(old);
     }
 
-    /// Ends the stream once with `reason`, and stops the decode thread.
+    /// Ends the stream once with `reason`, and stops both threads: the
+    /// camera is released at once, not when the caller drops the [`Camera`].
     fn end(&self, reason: String) {
-        let old = {
+        {
             let mut slot = self.lock();
             if slot.ended.is_none() {
                 warn!("camera stream ended: {reason}");
                 slot.ended = Some(reason);
             }
-            slot.stop = true;
-            slot.jpeg = None;
-            slot.frame.take()
-        };
-        self.jpeg_ready.notify_all();
-        drop(old);
+        }
+        drop(self.stop());
     }
 }
 
 /// A streaming camera. Dropping it stops the stream without waiting.
 pub struct Camera {
     shared: Arc<Shared>,
-    stop: pw::channel::Sender<()>,
 }
 
 impl Camera {
@@ -242,8 +261,8 @@ impl Camera {
     /// that thread; a failure shows in [`Camera::take`]. Errs only if the
     /// thread cannot start.
     pub fn open(node_name: &str) -> Result<Self> {
-        let shared = Arc::new(Shared::default());
-        let (stop, stop_rx) = pw::channel::channel();
+        let (wake, stop_rx) = pw::channel::channel();
+        let shared = Arc::new(Shared::new(wake));
         let name = node_name.to_owned();
         let s = shared.clone();
         std::thread::Builder::new()
@@ -256,7 +275,7 @@ impl Camera {
                     Err(_) => s.end("the camera thread crashed".into()),
                 }
             })?;
-        Ok(Self { shared, stop })
+        Ok(Self { shared })
     }
 
     /// The newest picture since the last call, if any. Errs once the stream
@@ -284,16 +303,8 @@ impl Camera {
 
 impl Drop for Camera {
     fn drop(&mut self) {
-        // The threads exit on their own: never wait on PipeWire or the GPU
-        // here. `stop` first: the PipeWire loop checks it once woken.
-        let old = {
-            let mut slot = self.shared.lock();
-            slot.stop = true;
-            slot.frame.take()
-        };
-        self.shared.jpeg_ready.notify_all();
-        let _ = self.stop.send(());
-        drop(old);
+        // The threads exit on their own: never wait on PipeWire or the GPU here.
+        drop(self.shared.stop());
     }
 }
 
@@ -342,6 +353,9 @@ fn decode_loop(shared: &Shared) {
                 failures += 1;
                 // Webcams send a torn picture now and then: skip it.
                 warn!("camera picture dropped: {e}");
+                if e.is::<decode::Unsupported>() {
+                    return shared.end(e.to_string());
+                }
                 if d.is_gpu() && !gpu_worked && failures >= GPU_TRIES {
                     warn!("the GPU cannot decode this camera's MJPEG: decoding on the CPU");
                     shared.lock().software = true;
@@ -413,6 +427,9 @@ impl State {
         let Some((mode, matrix, range)) = self.format else {
             return;
         };
+        if self.shared.lock().stop {
+            return;
+        }
         // SAFETY: per the contract.
         let Some((datas, pts)) = (unsafe { buffer_data(buffer) }) else {
             return;
@@ -422,6 +439,10 @@ impl State {
                 return;
             };
             let mut slot = self.shared.lock();
+            // Ended or closing: nothing to copy (the stream stops right after).
+            if slot.stop {
+                return;
+            }
             // The decoder had no time for the previous one: it is dropped.
             slot.jpeg = Some((jpeg.to_vec(), pts));
             drop(slot);

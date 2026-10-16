@@ -5,7 +5,7 @@
 //! decoder, the planes repacked (not converted) into a [`CpuFrame`].
 
 use std::collections::HashMap;
-use std::ffi::{CStr, c_int, c_void};
+use std::ffi::{CStr, c_int};
 use std::os::fd::BorrowedFd;
 use std::ptr;
 use std::time::Duration;
@@ -20,10 +20,18 @@ use crate::Error;
 /// The discrete GPU (`renderD129` is the iGPU on the target machine).
 const RENDER_NODE: &CStr = c"/dev/dri/renderD128";
 
-#[link(name = "va")]
-unsafe extern "C" {
-    fn vaSyncSurface(dpy: *mut c_void, surface: u32) -> c_int;
+/// A JPEG the CPU decoder cannot repack (4:4:4, grey...): every picture of
+/// the camera will be the same, so the stream ends at once.
+#[derive(Debug)]
+pub struct Unsupported(String);
+
+impl std::fmt::Display for Unsupported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
 }
+
+impl std::error::Error for Unsupported {}
 
 fn check(ret: c_int, what: &str) -> Result<c_int, Error> {
     if ret < 0 {
@@ -75,7 +83,6 @@ pub struct Decoder {
     ctx: *mut ff::AVCodecContext,
     /// VAAPI device; null on the CPU.
     device: *mut ff::AVBufferRef,
-    display: *mut c_void,
     packet: *mut ff::AVPacket,
     decoded: Frame,
     graph: Option<Graph>,
@@ -123,7 +130,6 @@ impl Decoder {
         let mut d = Self {
             ctx: ptr::null_mut(),
             device: ptr::null_mut(),
-            display: ptr::null_mut(),
             packet: ptr::null_mut(),
             decoded: Frame::new()?,
             graph: None,
@@ -154,9 +160,10 @@ impl Decoder {
                     ),
                     "open VAAPI device",
                 )?;
-                let dev = (*d.device).data as *mut ff::AVHWDeviceContext;
-                d.display = (*((*dev).hwctx as *mut ff::AVVAAPIDeviceContext)).display;
                 (*d.ctx).hw_device_ctx = ff::av_buffer_ref(d.device);
+                if (*d.ctx).hw_device_ctx.is_null() {
+                    return Err("referencing the VAAPI device failed".into());
+                }
                 (*d.ctx).get_format = Some(vaapi_format);
             }
             check(
@@ -224,11 +231,8 @@ impl Decoder {
             let rgb = Frame::new()?;
             check(ff::av_buffersink_get_frame(graph.sink, rgb.0), "run VPP")?;
             let surface = (*rgb.0).data[3] as usize as u32;
-            // The consumer gets a finished picture, read on another queue or GPU.
-            let status = vaSyncSurface(self.display, surface);
-            if status != 0 {
-                return Err(format!("vaSyncSurface failed: VA status {status}").into());
-            }
+            // A read map syncs the surface before exporting it (FFmpeg 9,
+            // vaExportSurfaceHandle path): the consumer gets a finished picture.
             let drm = Frame::new()?;
             (*drm.0).format = ff::AVPixelFormat::AV_PIX_FMT_DRM_PRIME as c_int;
             check(
@@ -236,17 +240,23 @@ impl Decoder {
                 "export the RGB surface",
             )?;
             let desc = &*((*drm.0).data[0] as *const ff::AVDRMFrameDescriptor);
-            if desc.nb_layers != 1 || desc.nb_objects < 1 {
+            // One RGB layer in one buffer object; more than one plane only
+            // for the modifier's metadata (DCC), in that same object.
+            let layer = &desc.layers[0];
+            let planes_ok = (1..=4).contains(&layer.nb_planes)
+                && layer.planes[..layer.nb_planes as usize]
+                    .iter()
+                    .all(|p| p.object_index == 0);
+            if desc.nb_layers != 1 || desc.nb_objects != 1 || !planes_ok {
                 return Err(format!(
-                    "unexpected RGB export: {} layers, {} objects",
-                    desc.nb_layers, desc.nb_objects
+                    "unexpected RGB export: {} layers, {} objects, {} planes",
+                    desc.nb_layers, desc.nb_objects, layer.nb_planes
                 )
                 .into());
             }
-            let layer = &desc.layers[0];
             let mut planes = Vec::with_capacity(layer.nb_planes as usize);
             for p in &layer.planes[..layer.nb_planes as usize] {
-                let object = &desc.objects[p.object_index as usize];
+                let object = &desc.objects[0];
                 // The mapping closes its fds when `drm` drops: keep our own.
                 let fd = BorrowedFd::borrow_raw(object.fd)
                     .try_clone_to_owned()
@@ -415,7 +425,9 @@ unsafe fn repack(f: &ff::AVFrame, pts: Duration) -> Result<CpuFrame, Error> {
         }
         (CpuLayout::Yuy2, data, vec![CpuPlane { offset: 0, stride }])
     } else {
-        return Err(format!("unsupported JPEG sampling (pixel format {format})").into());
+        return Err(Box::new(Unsupported(format!(
+            "the camera's JPEG sampling (FFmpeg pixel format {format}) needs GPU decoding"
+        ))));
     };
     Ok(CpuFrame {
         width: w as u32,
