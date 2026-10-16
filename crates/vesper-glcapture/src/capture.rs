@@ -345,7 +345,6 @@ fn parse_version(v: &str) -> Option<(u32, bool)> {
 
 fns!(GbmLib {
     create_device: fn(c_int) -> *mut c_void = c"gbm_create_device";
-    device_destroy: fn(*mut c_void) = c"gbm_device_destroy";
     bo_create: fn(*mut c_void, u32, u32, u32, u32) -> *mut c_void = c"gbm_bo_create";
     bo_get_fd: fn(*mut c_void) -> c_int = c"gbm_bo_get_fd";
     bo_get_stride: fn(*mut c_void) -> u32 = c"gbm_bo_get_stride";
@@ -360,37 +359,46 @@ unsafe impl Sync for GbmLib {}
 const GBM_BO_USE_RENDERING: u32 = 1 << 2;
 const GBM_BO_USE_LINEAR: u32 = 1 << 4;
 
-static GBM: OnceLock<Option<GbmLib>> = OnceLock::new();
+/// The process's GBM device, kept for its lifetime. Opened before `STATE`
+/// is taken, never under it: loading libgbm and `gbm_create_device` (which
+/// loads Mesa's backend) take the loader lock, which a thread in a library
+/// destructor may hold while it destroys a context (and waits on `STATE`).
+///
+/// shortcut: one device per process, on the GPU of the first context
+/// captured; a context on another GPU still works (linear buffers import
+/// anywhere), only with a cross-GPU copy.
+static DEVICE: OnceLock<Result<GbmDevice, String>> = OnceLock::new();
 
-/// Loads libgbm once. Never under `STATE`: dlopen takes the loader lock,
-/// which a thread in a destructor may hold while destroying a context.
-fn load_gbm() {
-    GBM.get_or_init(|| {
-        // Loaded only when a ring is first made, and kept (never dlclosed).
-        let h = unsafe { libc::dlopen(c"libgbm.so.1".as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
-        if h.is_null() {
-            warn("cannot load libgbm.so.1: capture off");
-            return None;
-        }
-        GbmLib::load(&|name| crate::real_dlsym(h, name))
-    });
+fn open_device(f: &Funcs, dpy: *mut c_void) {
+    DEVICE.get_or_init(|| GbmDevice::open(&f.render_node(dpy)));
 }
 
-/// A GBM device on a render node. Dropped after its buffers.
+/// A GBM device on a render node.
 struct GbmDevice {
     lib: &'static GbmLib,
     dev: *mut c_void,
     /// The render node: also the DRM device of the syncobjs.
     node: File,
+    path: PathBuf,
 }
 
 impl GbmDevice {
-    /// `Ok(None)`: libgbm not loaded yet (`load_gbm` runs on a later swap).
-    fn open(node: &Path) -> Result<Option<GbmDevice>, String> {
-        let lib = match GBM.get() {
-            None => return Ok(None),
-            Some(lib) => lib.as_ref().ok_or("no libgbm")?,
-        };
+    fn open(node: &Path) -> Result<GbmDevice, String> {
+        static LIB: OnceLock<Option<GbmLib>> = OnceLock::new();
+        let lib = LIB
+            .get_or_init(|| {
+                // Kept loaded (never dlclosed).
+                let h = unsafe {
+                    libc::dlopen(c"libgbm.so.1".as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL)
+                };
+                if h.is_null() {
+                    warn("cannot load libgbm.so.1: capture off");
+                    return None;
+                }
+                GbmLib::load(&|name| crate::real_dlsym(h, name))
+            })
+            .as_ref()
+            .ok_or("no libgbm")?;
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -400,17 +408,12 @@ impl GbmDevice {
         if dev.is_null() {
             return Err(format!("no GBM device on {}", node.display()));
         }
-        Ok(Some(GbmDevice {
+        Ok(GbmDevice {
             lib,
             dev,
             node: file,
-        }))
-    }
-}
-
-impl Drop for GbmDevice {
-    fn drop(&mut self) {
-        unsafe { (self.lib.device_destroy)(self.dev) };
+            path: node.to_owned(),
+        })
     }
 }
 
@@ -428,6 +431,8 @@ struct Slot {
     sem: u32,
     /// Not held by Vesper.
     free: bool,
+    /// Its copy was never submitted: never used again in this ring.
+    retired: bool,
 }
 
 struct Ring {
@@ -441,7 +446,7 @@ struct Ring {
     /// context on an sRGB EGL surface (ES blits decode an sRGB source; an
     /// sRGB target encodes back, so the bytes are copied unchanged).
     format: u32,
-    gbm: GbmDevice,
+    gbm: &'static GbmDevice,
     slots: Vec<Slot>,
     pacer: protocol::Pacer,
     /// Oldest copy not yet seen done: (its sync_file, swap time), for the pacer.
@@ -579,7 +584,7 @@ pub fn before_swap(api: Api, dpy: *mut c_void, drawable: usize) {
         return;
     }
     if IPC.capturing.load(Ordering::Relaxed) {
-        load_gbm();
+        open_device(f, dpy);
     }
     let mut st = STATE.locked();
     if st.disabled.contains(&(api, ctx)) {
@@ -740,8 +745,15 @@ fn capture(f: &Funcs, owner: &mut Owner, dpy: *mut c_void, drawable: usize) -> R
             return Err("the driver never signaled the copy's semaphore".into());
         }
         // Its syncobj may still get this copy's fence: not reused in this ring.
-        ring.slots[p.index].free = false;
+        let slot = &mut ring.slots[p.index];
+        (slot.free, slot.retired) = (false, true);
         debug("copy never submitted: frame dropped, ring image retired");
+        if ring.slots.iter().all(|s| s.retired) {
+            // Nothing left to copy into: a new ring after RING_RETRY.
+            let ring = owner.ring.take().expect("checked above");
+            ring.destroy(Some(&f.gl));
+            return Ok(());
+        }
     }
     if let Some((sync, at)) = &ring.timing
         && signaled(sync.as_fd())
@@ -878,17 +890,19 @@ fn create_ring(
     } else {
         GL_RGBA8
     };
-    let node = f.render_node(dpy);
+    let gbm = match DEVICE.get() {
+        // Opened on a later swap, before `STATE`.
+        None => return Ok(None),
+        Some(Err(e)) => return Err(e.clone()),
+        Some(Ok(d)) => d,
+    };
     let mut ring = Ring {
         start_id: start,
         generation: GENERATION.fetch_add(1, Ordering::SeqCst).wrapping_add(1),
         size,
         es,
         format,
-        gbm: match GbmDevice::open(&node)? {
-            Some(g) => g,
-            None => return Ok(None),
-        },
+        gbm,
         slots: Vec::new(),
         pacer: protocol::Pacer::new(ipc::fps()),
         timing: None,
@@ -913,7 +927,7 @@ fn create_ring(
         "ring of {RING} {}x{} linear images on {}",
         size.0,
         size.1,
-        node.display()
+        gbm.path.display()
     ));
     Ok(Some(ring))
 }
@@ -952,6 +966,7 @@ fn create_slot(gl: &Gl, ring: &mut Ring, index: u32) -> Result<Msg, String> {
         syncobj: 0,
         sem: 0,
         free: true,
+        retired: false,
     });
     let slot = ring.slots.last_mut().expect("pushed above");
     let (stride, offset) = unsafe { ((lib.bo_get_stride)(bo), (lib.bo_get_offset)(bo, 0)) };
@@ -1154,6 +1169,8 @@ fn signaled(sync: BorrowedFd) -> bool {
 // SAFETY: GBM buffer pointers, only used under `STATE`'s lock.
 unsafe impl Send for Slot {}
 unsafe impl Send for GbmDevice {}
+// SAFETY: only used under `STATE`'s lock.
+unsafe impl Sync for GbmDevice {}
 
 #[cfg(test)]
 mod tests {

@@ -30,6 +30,7 @@ depends=(
 optdepends=(
   'vulkan-icd-loader: game capture (the opt-in Vulkan layer)'
   'lib32-vulkan-icd-loader: game capture of 32-bit Vulkan games'
+  'lib32-mesa: game capture of 32-bit OpenGL games'
   'xdg-desktop-portal-kde: screen capture and global shortcuts on KDE'
 )
 makedepends=('cargo' 'clang' 'git')
