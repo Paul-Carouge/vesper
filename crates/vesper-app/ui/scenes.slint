@@ -1167,7 +1167,7 @@ component PreviewCard inherits Card {
             Segmented {
                 label: @tr("Canvas size");
                 enabled: !root.locked;
-                options: [@tr("Auto"), "1080p", "1440p", "2160p", @tr("Custom")];
+                options: [@tr("Auto"), "1080p", "1440p", "2160p", @tr("canvas size" => "Custom")];
                 selected: root.custom ? 4 : root.preset;
                 changed(i) => {
                     root.custom-open = i == 4;
@@ -1769,7 +1769,8 @@ export component SceneEditor inherits Rectangle {
                 padding-top: Theme.space-sm;
                 spacing: Theme.section-gap;
                 VerticalLayout {
-                    width: 300px;
+                    // Room for the scene actions in French.
+                    width: 320px;
                     spacing: Theme.section-gap;
                     alignment: start;
                     ScenesCard { }
