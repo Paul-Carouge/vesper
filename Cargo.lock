@@ -5131,6 +5131,7 @@ version = "0.1.0"
 dependencies = [
  "ashpd",
  "async-io",
+ "ffmpeg-next",
  "futures-lite",
  "libc",
  "pipewire",

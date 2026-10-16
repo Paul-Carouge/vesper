@@ -41,7 +41,7 @@ pub struct FormatInfo {
     pub size: Option<Rectangle>,
 }
 
-fn choice_values<T: Copy + pipewire::spa::pod::CanonicalFixedSizedPod>(
+pub(crate) fn choice_values<T: Copy + pipewire::spa::pod::CanonicalFixedSizedPod>(
     choice: &ChoiceEnum<T>,
 ) -> Vec<T> {
     match choice {
@@ -58,7 +58,7 @@ fn choice_values<T: Copy + pipewire::spa::pod::CanonicalFixedSizedPod>(
     }
 }
 
-fn dedup<T: PartialEq>(values: Vec<T>) -> Vec<T> {
+pub(crate) fn dedup<T: PartialEq>(values: Vec<T>) -> Vec<T> {
     let mut out = Vec::with_capacity(values.len());
     for v in values {
         if !out.contains(&v) {
@@ -111,7 +111,7 @@ pub fn parse_format(bytes: &[u8]) -> Option<FormatInfo> {
     Some(info)
 }
 
-fn serialize(obj: Object) -> Vec<u8> {
+pub(crate) fn serialize(obj: Object) -> Vec<u8> {
     PodSerializer::serialize(std::io::Cursor::new(Vec::new()), &Value::Object(obj))
         .expect("pod serialization into a Vec cannot fail")
         .0
