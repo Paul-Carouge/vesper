@@ -35,5 +35,11 @@ mkdir -m 0700 /tmp/vesper-0
 for p in "$DATA" "$(readlink -f "$HERE/../..")"; do
   case $p in /tmp/*) mkdir -p "$p"; mount --bind "/mnt${p#/tmp}" "$p" ;; esac
 done
+# The real session'"'"'s sockets (Wayland, PipeWire, D-Bus, kwallet) are out of
+# reach, and the bus gets the lab'"'"'s HOME, XDG directories and no display
+# before it starts: services it activates (portal, kwalletd, permission
+# store) would otherwise use the real compositor, wallet and files.
+mount -t tmpfs tmpfs /run/user
+. "$HERE/env.sh"
 set +e
 dbus-run-session -- bash "$HERE/session.sh" "$@"' x "$@"
