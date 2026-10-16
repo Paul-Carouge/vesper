@@ -1,7 +1,7 @@
 # T7: CPU of the audio threads with 2 tracks, no mix track, no stream: the
 # mix must stay idle. BEFORE and AFTER: two optimized builds with the dev
 # flags (see t5_cost.sh) to compare.
-. $LABROOT/lib.sh
+. "${LABROOT:?not in the lab, use go or r2}/lib.sh" || exit 1
 . $LABROOT/audio_up.sh
 audio_up
 start_game t7

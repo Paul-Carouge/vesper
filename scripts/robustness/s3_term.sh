@@ -1,5 +1,5 @@
 # S3/S7: UI recording a game; send $SIG ($1, default TERM) to vesper after ~8 s of recording.
-. $LABROOT/lib.sh
+. "${LABROOT:?not in the lab, use go or r2}/lib.sh" || exit 1
 . $LABROOT/audio_up.sh
 SIG=${1:-TERM}
 audio_up
@@ -8,7 +8,7 @@ printf 'game_source=true\nreplay=false\n' > $L/cfg/vesper/settings
 gamescope --backend headless -W 1280 -H 800 -- bash $LABROOT/ui_child.sh > $L/log/gs.log 2>&1 &
 GS=$!
 sleep 14
-V=$(pgrep -x vesper | head -1)
+V=$(pid_of vesper)
 echo "vesper pid $V"; grep -E "start-recording|Started|recording" $L/log/ui.log | cut -c1-200 | tail -3
 sleep 8
 echo "sending SIG$SIG"

@@ -2,7 +2,7 @@
 # recording; checks the received stream and the recording.
 # Env: PROTO (rtmp, or srt), SECS (20), CODEC (h264), H (1080; the game is
 # 1280x720), FPS (60), KBPS (6000).
-. $LABROOT/lib.sh
+. "${LABROOT:?not in the lab, use go or r2}/lib.sh" || exit 1
 . $LABROOT/audio_up.sh
 audio_up
 start_game t1

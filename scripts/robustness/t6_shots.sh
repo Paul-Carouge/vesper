@@ -1,6 +1,6 @@
 # T6: window snapshots of the live stream UI with demo data (no capture, no
 # key), in $L/shots as PNG. Env: SIZE (440x780 logical), SCALE (2).
-. $LABROOT/lib.sh
+. "${LABROOT:?not in the lab, use go or r2}/lib.sh" || exit 1
 mkdir -p $L/cfg/vesper $L/shots
 # No replay buffer: it would open the (missing) portal picker.
 printf 'replay=false\n' > $L/cfg/vesper/settings

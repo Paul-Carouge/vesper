@@ -1,5 +1,5 @@
 # S-long: 31 min game recording with a tone on the desktop track; samples RSS/fds/threads.
-. $LABROOT/lib.sh
+. "${LABROOT:?not in the lab, use go or r2}/lib.sh" || exit 1
 . $LABROOT/audio_up.sh
 SECS=${LONG_SECS:-1900}
 audio_up

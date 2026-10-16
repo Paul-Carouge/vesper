@@ -1,5 +1,5 @@
 # P1: two instances, with and without the session bus (single-instance guard)
-. $LABROOT/lib.sh
+. "${LABROOT:?not in the lab, use go or r2}/lib.sh" || exit 1
 mkdir -p $L/cfg/vesper
 printf 'game_source=true\nreplay=true\n' > $L/cfg/vesper/settings
 cat > $L/two.sh <<'EOF'

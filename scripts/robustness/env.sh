@@ -29,13 +29,17 @@ cat > $L/cfg/pipewire/pipewire.conf.d/10-lab.conf <<J
 context.objects = [
   { factory = adapter args = { factory.name = support.null-audio-sink node.name = labsink node.description = labsink media.class = Audio/Sink object.linked = true audio.position = [ FL FR ] } }
   { factory = adapter args = { factory.name = support.null-audio-sink node.name = labsink2 node.description = labsink2 media.class = Audio/Sink object.linked = true audio.position = [ FL FR ] } }
+  { factory = adapter args = { factory.name = support.null-audio-sink node.name = labmic node.description = labmic media.class = Audio/Sink object.linked = true audio.position = [ FL FR ] } }
 ]
 J
 # Never the session's display, nor its X cookie.
 unset WAYLAND_DISPLAY DISPLAY XAUTHORITY XDG_STATE_HOME XDG_CONFIG_DIRS PIPEWIRE_REMOTE PULSE_SERVER
-export VESPER=$R/target/debug/vesper
+# BUILD: the cargo output dir to test (default: the debug build; the r2_*
+# scenarios use an optimized build with debug assertions, see r2_build.sh).
+BUILD=${BUILD:-$R/target/debug}
+export VESPER=$BUILD/vesper BUILD
 cat > $L/layers/vesper_capture.json <<J
-{"file_format_version":"1.2.1","layer":{"name":"VK_LAYER_VESPER_capture","type":"GLOBAL","library_path":"$R/target/debug/libvesper_vklayer.so","library_arch":"64","api_version":"1.4.0","implementation_version":"1","description":"lab","disable_environment":{"VESPER_CAPTURE_DISABLE":"1"}}}
+{"file_format_version":"1.2.1","layer":{"name":"VK_LAYER_VESPER_capture","type":"GLOBAL","library_path":"$BUILD/libvesper_vklayer.so","library_arch":"64","api_version":"1.4.0","implementation_version":"1","description":"lab","disable_environment":{"VESPER_CAPTURE_DISABLE":"1"}}}
 J
 # 32-bit games: the i686 debug build, if built
 # (cargo build -p vesper-vklayer -p vesper-glcapture --target i686-unknown-linux-gnu).
@@ -45,9 +49,9 @@ cat > $L/layers/vesper_capture_32.json <<J
 J
 export VK_ADD_IMPLICIT_LAYER_PATH=$L/layers
 # OpenGL games: "$VESPER_GL game", the real wrapper in a <prefix>/bin,
-# lib/vesper, lib32/vesper layout of the debug builds.
+# lib/vesper, lib32/vesper layout of $BUILD and the i686 debug build.
 mkdir -p $L/glprefix/bin $L/glprefix/lib/vesper $L/glprefix/lib32/vesper
 cp $R/crates/vesper-glcapture/vesper-gl $L/glprefix/bin/
-ln -sf $R/target/debug/libvesper_glcapture.so $L/glprefix/lib/vesper/
+ln -sf $BUILD/libvesper_glcapture.so $L/glprefix/lib/vesper/
 ln -sf $I686/libvesper_glcapture.so $L/glprefix/lib32/vesper/
 export VESPER_GL=$L/glprefix/bin/vesper-gl

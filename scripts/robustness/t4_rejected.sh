@@ -2,7 +2,7 @@
 # up after the handshake (a refused key), nothing listening (a wrong URL),
 # and an unknown host (retried: it may be the network). The recording goes
 # on in every case.
-. $LABROOT/lib.sh
+. "${LABROOT:?not in the lab, use go or r2}/lib.sh" || exit 1
 start_game t4
 python3 -I $LABROOT/rtmp_reject.py 1935 1 > $L/log/reject.log 2>&1 &
 S=$!

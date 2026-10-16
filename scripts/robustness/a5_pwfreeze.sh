@@ -1,5 +1,5 @@
 # A5: PipeWire daemon frozen (SIGSTOP) when a recording starts and while it runs
-. $LABROOT/lib.sh
+. "${LABROOT:?not in the lab, use go or r2}/lib.sh" || exit 1
 mkdir -p $L/cfg/vesper
 printf 'game_source=true\nreplay=false\n' > $L/cfg/vesper/settings
 gamescope --backend headless -W 1280 -H 800 -- bash $LABROOT/ui_child.sh > $L/log/gs.log 2>&1 &
@@ -8,7 +8,7 @@ sleep 5
 kill -STOP $PW
 echo "pipewire frozen at t=5 (the demo presses record at t~8)"
 sleep 12
-V=$(pgrep -x vesper | head -1)
+V=$(pid_of vesper)
 echo "vesper alive: $(kill -0 $V 2>/dev/null && echo yes || echo no); $(grep -c 'recording to' $L/log/ui.log) recording started"
 grep -E "recording to|track|Could not" $L/log/ui.log | cut -c1-200 | tail -5
 sleep 6

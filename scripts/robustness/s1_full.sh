@@ -1,5 +1,5 @@
 # S1: disk full mid-recording (4 MiB tmpfs as the output folder)
-. $LABROOT/lib.sh
+. "${LABROOT:?not in the lab, use go or r2}/lib.sh" || exit 1
 mkdir -p $L/small
 mount -t tmpfs -o size=4m tmpfs $L/small
 echo "XDG_VIDEOS_DIR=\"$L/small\"" > $L/cfg/user-dirs.dirs

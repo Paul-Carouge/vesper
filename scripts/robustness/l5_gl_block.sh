@@ -1,7 +1,7 @@
 # L5: does the OpenGL interposer ever block the game? L1 for vesper-gl: an
 # uncapped GLX app runs SECS seconds (frames counted) alone, with Vesper
 # recording, with Vesper SIGSTOPped mid-recording, with Vesper SIGKILLed.
-. $LABROOT/lib.sh
+. "${LABROOT:?not in the lab, use go or r2}/lib.sh" || exit 1
 SECS=${SECS:-20}
 mkdir -p $L/apps
 gcc -O2 -o $L/apps/gltest64 $LABROOT/apps/gltest.c -lX11 -lGL -lEGL -lm || exit 1

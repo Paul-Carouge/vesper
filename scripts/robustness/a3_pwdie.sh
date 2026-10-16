@@ -1,5 +1,5 @@
 # A3: the PipeWire daemon restarts mid-recording (a user restarting the audio stack)
-. $LABROOT/lib.sh
+. "${LABROOT:?not in the lab, use go or r2}/lib.sh" || exit 1
 . $LABROOT/audio_up.sh
 mkdir -p $L/cfg/vesper
 cat > $L/cfg/vesper/settings <<'EOF'

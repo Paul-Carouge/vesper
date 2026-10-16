@@ -1,5 +1,5 @@
 # S1b: the output folder is deleted mid-recording; then: unwritable folder, folder replaced by a file
-. $LABROOT/lib.sh
+. "${LABROOT:?not in the lab, use go or r2}/lib.sh" || exit 1
 start_game s1b
 echo "=== folder removed mid-recording"
 $VESPER --record-game 14 > $L/log/vesper-a.log 2>&1 &

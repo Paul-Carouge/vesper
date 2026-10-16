@@ -1,5 +1,5 @@
 # S7: SIGTERM at launch, and SIGTERM right after a replay save was requested
-. $LABROOT/lib.sh
+. "${LABROOT:?not in the lab, use go or r2}/lib.sh" || exit 1
 . $LABROOT/audio_up.sh
 audio_up
 mkdir -p $L/cfg/vesper
@@ -19,7 +19,7 @@ rm -f $L/vid/Vesper/*
 gamescope --backend headless -W 1280 -H 800 -- env DEMO=ctrl+s DELAY=22000 bash $LABROOT/ui_child.sh > $L/log/gs.log 2>&1 &
 GS=$!
 sleep ${KILLAT:-24.3}
-V=$(pgrep -x vesper | head -1)
+V=$(pid_of vesper)
 kill -TERM $V
 t0=$(date +%s%N)
 for i in $(seq 1 100); do kill -0 $V 2>/dev/null || break; sleep 0.1; done

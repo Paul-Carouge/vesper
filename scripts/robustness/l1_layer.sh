@@ -1,6 +1,6 @@
 # L1: does the layer ever block the game? vkcube renders N frames (vsync 60): time it
 #  - alone, with Vesper recording, with Vesper SIGSTOPped mid-recording, with Vesper SIGKILLed.
-. $LABROOT/lib.sh
+. "${LABROOT:?not in the lab, use go or r2}/lib.sh" || exit 1
 N=${N:-1200}
 run_game() { # run_game <tag>; runs vkcube --c N inside gamescope, echoes elapsed ms
   local t0=$(date +%s%N)
