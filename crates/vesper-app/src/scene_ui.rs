@@ -348,29 +348,22 @@ fn spawn_rasterizer(weak: slint::Weak<AppWindow>) -> Sender<Key> {
         while let Ok(first) = rx.recv() {
             let keys: Vec<Key> = std::iter::once(first).chain(rx.try_iter()).collect();
             for key in keys {
-                let wanted = crate::recorder::lock(&WANTED).contains(&key);
-                let raster = if wanted {
+                // Not wanted any more: skipped (`None`).
+                let raster = crate::recorder::lock(&WANTED).contains(&key).then(|| {
                     match &key {
                         Key::Image(path) => overlay::image(path),
                         Key::Text(style) => overlay::text(style),
                     }
                     .map(|r| shrink(r, PREVIEW_SIDE))
-                } else {
-                    Err(String::new())
-                };
-                let pixels = raster
-                    .map_err(|e| {
-                        if !e.is_empty() {
-                            log!("scene preview: {e}");
-                        }
-                    })
+                    .map_err(|e| log!("scene preview: {e}"))
                     .ok()
                     .map(|r| {
                         let mut buffer = SharedPixelBuffer::<Rgba8Pixel>::new(r.width, r.height);
                         buffer.make_mut_bytes().copy_from_slice(&r.rgba);
                         buffer
-                    });
-                let _ = weak.upgrade_in_event_loop(move |ui| rastered(&ui, key, pixels));
+                    })
+                });
+                let _ = weak.upgrade_in_event_loop(move |ui| rastered(&ui, key, raster));
             }
         }
     };
@@ -408,19 +401,30 @@ fn shrink(r: overlay::Raster, side: u32) -> overlay::Raster {
     }
 }
 
-fn rastered(ui: &AppWindow, key: Key, pixels: Option<SharedPixelBuffer<Rgba8Pixel>>) {
+/// `raster`: `None` if skipped, `Some(None)` if it failed.
+fn rastered(ui: &AppWindow, key: Key, raster: Option<Option<SharedPixelBuffer<Rgba8Pixel>>>) {
     PENDING.with_borrow_mut(|p| p.retain(|k| *k != key));
-    // A failed raster leaves the stand-in.
-    let Some(pixels) = pixels.filter(|p| p.width() > 0) else {
+    let Some(pixels) = raster else {
+        // Wanted again since it was skipped: asked for again.
+        if crate::recorder::lock(&WANTED).contains(&key) {
+            request_rasters(ui);
+        }
         return;
     };
-    let image = Image::from_rgba8_premultiplied(pixels);
-    RASTERS.with_borrow_mut(|r| {
-        r.retain(|(k, _)| *k != key);
-        r.push((key.clone(), image.clone()));
-        let over = r.len().saturating_sub(RASTER_CACHE);
-        r.drain(..over);
-    });
+    // A failed raster shows the stand-in, as the recording hides the layer.
+    let image = match pixels.filter(|p| p.width() > 0) {
+        Some(pixels) => {
+            let image = Image::from_rgba8_premultiplied(pixels);
+            RASTERS.with_borrow_mut(|r| {
+                r.retain(|(k, _)| *k != key);
+                r.push((key.clone(), image.clone()));
+                let over = r.len().saturating_sub(RASTER_CACHE);
+                r.drain(..over);
+            });
+            image
+        }
+        None => Image::default(),
+    };
     let scenes = ui.global::<SceneStore>().get_scenes();
     for s in scenes.iter() {
         for (i, mut r) in s.layers.iter().enumerate() {
@@ -599,6 +603,14 @@ fn set_canvas(ui: &AppWindow, rec: &Shared, games: &Games, canvas: Canvas) {
     crate::start_replay(ui, rec, games);
 }
 
+/// The window shown again (tray, second launch): the preview resumes.
+pub fn window_shown(ui: &AppWindow) {
+    OCCLUDED.set(false);
+    if ui.global::<SceneStore>().get_open() && !TICK.with(slint::Timer::running) {
+        shown(ui);
+    }
+}
+
 pub fn wire(ui: &AppWindow, rec: &Shared, games: &Games) {
     let store = ui.global::<SceneStore>();
 
@@ -612,7 +624,13 @@ pub fn wire(ui: &AppWindow, rec: &Shared, games: &Games) {
                 OCCLUDED.set(hidden);
                 !hidden
             }
-            WindowEvent::Focused(true) | WindowEvent::Resized(_) => true,
+            // Seen, whatever an old surface said (winit may make a new one
+            // after the tray, which never says `Occluded(false)`).
+            WindowEvent::Focused(true) => {
+                OCCLUDED.set(false);
+                true
+            }
+            WindowEvent::Resized(_) => true,
             _ => false,
         };
         if let Some(ui) = weak.upgrade() {

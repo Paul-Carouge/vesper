@@ -1934,8 +1934,10 @@ struct Stage {
     game: Option<GameFrames>,
     draws: Vec<Draw>,
     want: Vec<(u32, Key)>,
-    /// Texture id of each overlay source seen, stable across scenes.
-    ids: Vec<Key>,
+    /// Texture id of each overlay source wanted (pruned with `want`), never
+    /// reused: the overlay thread may still hold an old id's texture.
+    ids: Vec<(u32, Key)>,
+    next_id: u32,
     overlays: Option<Overlays>,
     /// Camera id of each webcam seen (its node name), stable across scenes.
     camera_ids: Vec<String>,
@@ -1978,6 +1980,25 @@ struct Stage {
     probe: Option<Arc<Probe>>,
 }
 
+/// The overlay texture a layer source shows.
+fn texture_key(source: &LayerSource) -> Option<Key> {
+    match source {
+        LayerSource::Image { path } => Some(Key::Image(path.clone())),
+        LayerSource::Text(style) => Some(Key::Text(style.clone())),
+        LayerSource::Main | LayerSource::Camera { .. } => None,
+    }
+}
+
+/// Whether the layer that showed `old` became `new`: same kind, and `old`
+/// shown by no layer of the new scene (`keys`), so not moved elsewhere.
+fn edited(old: &Key, new: &LayerSource, keys: &[Key]) -> bool {
+    let kind = matches!(
+        (old, new),
+        (Key::Image(_), LayerSource::Image { .. }) | (Key::Text(_), LayerSource::Text(_))
+    );
+    kind && !keys.contains(old)
+}
+
 impl Stage {
     fn new(settings: &Settings, on_event: &OnEvent) -> Self {
         let mut stage = Self {
@@ -1989,6 +2010,7 @@ impl Stage {
             draws: Vec::new(),
             want: Vec::new(),
             ids: Vec::new(),
+            next_id: 0,
             overlays: None,
             camera_ids: Vec::new(),
             cameras: None,
@@ -2036,6 +2058,13 @@ impl Stage {
             .as_ref()
             .map(|o| lock(&o.shared.done).clone())
             .unwrap_or_default();
+        // An edit keeps the layers' count; a layer added, removed or shown
+        // is no edit.
+        let same_shape = scene.drawn().count() == old.len();
+        let keys: Vec<Key> = scene
+            .drawn()
+            .filter_map(|l| texture_key(&l.source))
+            .collect();
         for l in scene.drawn() {
             let source = match &l.source {
                 LayerSource::Main => DrawSource::Main,
@@ -2062,12 +2091,21 @@ impl Stage {
             // An edited image or text keeps its old texture until the new
             // one is uploaded: an edit never blanks it in the recording.
             let n = self.draws.len();
-            let source = match (source, old.get(n).map(|d| (d.source, d.rect))) {
-                (DrawSource::Texture(new), Some((DrawSource::Texture(prev), rect)))
-                    if !renamed && prev != new && rect == l.rect && !done.contains(&new) =>
+            let prev = match (source, old.get(n)) {
+                (DrawSource::Texture(new), Some(d))
+                    if !renamed && same_shape && d.rect == l.rect && !done.contains(&new) =>
                 {
+                    match d.source {
+                        DrawSource::Texture(prev) if prev != new => self.key_of(prev),
+                        _ => None,
+                    }
+                    .filter(|(_, k)| edited(k, &l.source, &keys))
+                }
+                _ => None,
+            };
+            let source = match (source, prev) {
+                (DrawSource::Texture(new), Some((prev, key))) => {
                     self.swaps.push((n, new));
-                    let key = self.ids[prev as usize].clone();
                     self.want.push((prev, key));
                     DrawSource::Texture(prev)
                 }
@@ -2081,6 +2119,7 @@ impl Stage {
                 opacity: l.opacity,
             });
         }
+        self.prune_ids();
         self.scene_name.clone_from(&scene.name);
         if !cameras.is_empty() && self.cameras.is_none() {
             match Cameras::start(self.on_event.clone()) {
@@ -2110,17 +2149,30 @@ impl Stage {
 
     /// The texture id of `key`, added to this scene's wanted textures.
     fn texture(&mut self, key: Key) -> DrawSource {
-        let id = match self.ids.iter().position(|k| *k == key) {
-            Some(i) => i,
+        let id = match self.ids.iter().find(|(_, k)| *k == key) {
+            Some(&(id, _)) => id,
             None => {
-                self.ids.push(key.clone());
-                self.ids.len() - 1
+                let id = self.next_id;
+                self.next_id = self.next_id.wrapping_add(1);
+                self.ids.push((id, key.clone()));
+                id
             }
-        } as u32;
+        };
         if !self.want.iter().any(|(i, _)| *i == id) {
             self.want.push((id, key));
         }
         DrawSource::Texture(id)
+    }
+
+    fn key_of(&self, id: u32) -> Option<(u32, Key)> {
+        self.ids.iter().find(|(i, _)| *i == id).cloned()
+    }
+
+    /// Forgets the ids of textures no longer wanted (each edit of a text
+    /// makes one).
+    fn prune_ids(&mut self) {
+        let want = &self.want;
+        self.ids.retain(|(id, _)| want.iter().any(|(w, _)| w == id));
     }
 
     /// The encoder (re)opened at this size: it has no picture yet.
@@ -2221,6 +2273,7 @@ impl Stage {
                     draws.iter().any(|d| d.source == DrawSource::Texture(*id))
                         || swaps.iter().any(|s| s.1 == *id)
                 });
+                self.prune_ids();
                 self.dirty = true;
                 self.request();
             }
@@ -3166,5 +3219,87 @@ mod tests {
         let left: Vec<_> = std::fs::read_dir(&folder).unwrap().collect();
         assert!(left.is_empty(), "left behind: {left:?}");
         std::fs::remove_dir_all(base).unwrap();
+    }
+
+    // --- texture swaps on a scene edit, without an overlay thread ---
+
+    fn stage_with(scene: Scene) -> Stage {
+        let settings = Settings {
+            game: None,
+            scene,
+            ..settings()
+        };
+        let on_event: OnEvent = Arc::new(|_| {});
+        Stage::new(&settings, &on_event)
+    }
+
+    fn image_layer(path: &str) -> crate::scenes::Layer {
+        crate::scenes::Layer {
+            source: LayerSource::Image { path: path.into() },
+            rect: [0.5, 0.5, 0.25, 0.25],
+            ..crate::scenes::Layer::main()
+        }
+    }
+
+    fn texture_of(stage: &Stage, path: &str) -> DrawSource {
+        let id = stage
+            .ids
+            .iter()
+            .find(|(_, k)| *k == Key::Image(path.into()));
+        DrawSource::Texture(id.expect("an id for the image").0)
+    }
+
+    fn scene_of(layers: Vec<crate::scenes::Layer>) -> Scene {
+        Scene {
+            name: "S".into(),
+            layers,
+        }
+    }
+
+    #[test]
+    fn an_edit_keeps_the_old_texture_and_ids_stay_few() {
+        let main = crate::scenes::Layer::main();
+        let mut stage = stage_with(scene_of(vec![main.clone(), image_layer("/a.png")]));
+        let a = texture_of(&stage, "/a.png");
+        for i in 0..100 {
+            let path = format!("/edit{i}.png");
+            stage.set_scene(scene_of(vec![main.clone(), image_layer(&path)]));
+            assert_eq!(stage.draws[1].source, a, "edit {i} shows the old texture");
+        }
+        // The old texture and the newest edit's.
+        assert_eq!(stage.ids.len(), 2, "{:?}", stage.ids);
+        assert_eq!(stage.want.len(), 2);
+    }
+
+    #[test]
+    fn a_new_or_moved_layer_never_shows_another_layers_texture() {
+        let main = crate::scenes::Layer::main();
+        let (a, b, c) = (
+            image_layer("/a.png"),
+            image_layer("/b.png"),
+            image_layer("/c.png"),
+        );
+        let mut stage = stage_with(scene_of(vec![main.clone(), a.clone(), b.clone()]));
+        // Added under the others, at the same rect.
+        stage.set_scene(scene_of(vec![
+            main.clone(),
+            c.clone(),
+            a.clone(),
+            b.clone(),
+        ]));
+        assert!(stage.swaps.is_empty());
+        assert_eq!(stage.draws[1].source, texture_of(&stage, "/c.png"));
+        // Moved: each keeps its own texture.
+        stage.set_scene(scene_of(vec![main.clone(), b, c, a]));
+        assert!(stage.swaps.is_empty());
+        assert_eq!(stage.draws[1].source, texture_of(&stage, "/b.png"));
+        assert_eq!(stage.draws[3].source, texture_of(&stage, "/a.png"));
+        // A text never takes an image's place.
+        let text = crate::scenes::Layer {
+            source: LayerSource::Text(crate::scenes::TextStyle::default()),
+            ..image_layer("")
+        };
+        stage.set_scene(scene_of(vec![main, text.clone(), text.clone(), text]));
+        assert!(stage.swaps.is_empty());
     }
 }

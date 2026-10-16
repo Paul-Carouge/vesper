@@ -689,6 +689,87 @@ fn a_compositor_failure_falls_back_without_losing_the_recording() {
     std::fs::remove_dir_all(out).unwrap();
 }
 
+/// A 32x32 opaque PNG of `rgb` in `dir`.
+fn png(dir: &Path, name: &str, rgb: [u8; 3]) -> PathBuf {
+    let path = dir.join(format!("{name}.png"));
+    image::RgbaImage::from_pixel(32, 32, image::Rgba([rgb[0], rgb[1], rgb[2], 255]))
+        .save(&path)
+        .unwrap();
+    path
+}
+
+/// Which of `colours` fills the logo rect of `f` (see [`logo_scene`]).
+fn logo_colour(f: &Yuv, colours: &[(char, [u8; 3])]) -> Option<char> {
+    let (w, h) = (W as usize, H as usize);
+    let (x0, y0, x1, y1) = (w / 2, h / 2, w * 3 / 4, h * 3 / 4);
+    let points = [
+        (x0 + 16, y0 + 16),
+        (x1 - 16, y0 + 16),
+        ((x0 + x1) / 2, (y0 + y1) / 2),
+        (x0 + 16, y1 - 16),
+        (x1 - 16, y1 - 16),
+    ];
+    colours.iter().find_map(|&(name, rgb)| {
+        let want = yuv709(rgb.map(f64::from));
+        points
+            .iter()
+            .all(|&(x, y)| (0..3).all(|k| (f64::from(f.at(x, y)[k]) - want[k]).abs() <= 16.0))
+            .then_some(name)
+    })
+}
+
+/// An image edited while recording keeps its old picture until the new one
+/// is uploaded, a second edit replacing a pending one included; one that
+/// fails to load hides the layer. Never a gap, never the skipped picture.
+#[test]
+fn an_edited_image_keeps_its_old_texture_until_the_new_one_is_ready() {
+    let Some(rig) = Rig::new() else { return };
+    let out = dir("swap");
+    let red = red_png(&out);
+    let green = png(&out, "green", [0, 255, 0]);
+    let blue = png(&out, "blue", [0, 0, 255]);
+    let settings = Settings {
+        scene: logo_scene(&red),
+        ..settings(&rig.route)
+    };
+    let Some((p, rx)) = record_with(settings, &out) else {
+        return;
+    };
+    std::thread::sleep(Duration::from_millis(1000));
+    // Slow loads: both edits land before any upload.
+    lock(&fake::HELD).extend([blue.clone(), green.clone()]);
+    assert!(p.set_scene(logo_scene(&blue)));
+    std::thread::sleep(Duration::from_millis(400));
+    assert!(p.set_scene(logo_scene(&green)));
+    std::thread::sleep(Duration::from_millis(600));
+    lock(&fake::HELD).retain(|h| *h != blue && *h != green);
+    std::thread::sleep(Duration::from_millis(800));
+    assert!(p.set_scene(logo_scene(&out.join("missing.png"))));
+    std::thread::sleep(Duration::from_millis(800));
+    let path = finish(&p, &rx);
+    p.join();
+    let colours = [('r', [255, 0, 0]), ('g', [0, 255, 0]), ('b', [0, 0, 255])];
+    let mut runs: Vec<(Option<char>, usize)> = Vec::new();
+    for f in decode_all(&path) {
+        let c = logo_colour(&f, &colours);
+        match runs.last_mut() {
+            Some((last, n)) if *last == c => *n += 1,
+            _ => runs.push((c, 1)),
+        }
+    }
+    let order: Vec<Option<char>> = runs
+        .iter()
+        .map(|r| r.0)
+        .skip_while(Option::is_none)
+        .collect();
+    assert_eq!(order, [Some('r'), Some('g'), None], "runs {runs:?}");
+    // Red through the held second too (30 fps).
+    let red_frames = runs.iter().find(|r| r.0 == Some('r')).unwrap().1;
+    assert!(red_frames > 45, "runs {runs:?}");
+    assert!(rig.route.0.probe.compositors.load(Ordering::Relaxed) >= 1);
+    std::fs::remove_dir_all(out).unwrap();
+}
+
 /// CPU time (user + system) of this process's threads named `name`.
 fn thread_cpu(name: &str) -> Duration {
     // SAFETY: plain sysconf query.

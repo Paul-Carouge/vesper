@@ -674,6 +674,9 @@ pub mod fake {
 
     static CAMERAS: Mutex<Vec<(String, Arc<FakeCamera>)>> = Mutex::new(Vec::new());
 
+    /// Images the overlay thread waits on before loading, as a slow disk.
+    pub static HELD: Mutex<Vec<std::path::PathBuf>> = Mutex::new(Vec::new());
+
     /// A fake camera named `fake:<name>`.
     pub fn add(name: &str) -> Arc<FakeCamera> {
         let cam = Arc::new(FakeCamera::default());
@@ -714,6 +717,10 @@ pub mod fake {
 }
 
 fn load(key: &Key) -> Result<Raster, String> {
+    #[cfg(test)]
+    while matches!(key, Key::Image(p) if lock(&fake::HELD).contains(p)) {
+        std::thread::sleep(Duration::from_millis(5));
+    }
     match key {
         Key::Image(path) => image(path),
         Key::Text(style) => text(style),
