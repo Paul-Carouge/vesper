@@ -170,6 +170,9 @@ fn main() -> Result<(), slint::PlatformError> {
     wire_game_callbacks(&ui, &games);
     live::wire(&ui, &recording, &games);
     profiles::wire(&ui, &recording, &games, defaults);
+    if prefs::SAVING_OFF.load(Ordering::Relaxed) {
+        flash_notice(&ui, "Could not read the settings: changes are not saved");
+    }
     wire_global_shortcuts(&ui);
     let tray = spawn_tray(&ui);
     wire_background(&ui, tray.as_ref());

@@ -47,6 +47,18 @@ class Item(dbus.service.Object):
         self.attributes = attributes
         self.secret = secret
 
+    @dbus.service.method(dbus.PROPERTIES_IFACE, in_signature="ss", out_signature="v")
+    def Get(self, interface, name):
+        if interface == ITEM and name == "Attributes":
+            return dbus.Dictionary(self.attributes, signature="ss")
+        raise dbus.exceptions.DBusException(name, name="org.freedesktop.DBus.Error.UnknownProperty")
+
+    @dbus.service.method(dbus.PROPERTIES_IFACE, in_signature="s", out_signature="a{sv}")
+    def GetAll(self, interface):
+        if interface != ITEM:
+            return dbus.Dictionary({}, signature="sv")
+        return dbus.Dictionary({"Attributes": dbus.Dictionary(self.attributes, signature="ss")}, signature="sv")
+
     @dbus.service.method(ITEM, out_signature="o")
     def Delete(self):
         del self.service.items[self.path]

@@ -315,39 +315,59 @@ impl Prefs {
 
     /// `defaults` with the saved settings applied: the app's own from
     /// `settings`, the recording ones from the current profile (see
-    /// [`crate::profiles::open`]). Missing or unreadable files keep the defaults.
+    /// [`crate::profiles::open`]). Missing files keep the defaults. A file
+    /// that cannot be read keeps them too, and turns saving off (see
+    /// [`SAVING_OFF`]): the user's settings are never overwritten with them.
     pub fn load(defaults: Self) -> Self {
-        match (path(), crate::profiles::dir()) {
-            (Some(path), Some(dir)) => crate::profiles::open(&path, &dir, defaults),
-            _ => defaults,
-        }
-    }
-
-    /// `self` with the settings of file `path` applied. A missing or
-    /// unreadable file changes nothing.
-    pub fn read(self, path: &Path) -> Self {
-        match read_capped(path) {
-            Ok(bytes) => self.parse(&String::from_utf8_lossy(&bytes)),
+        let (Some(path), Some(dir)) = (path(), crate::profiles::dir()) else {
+            return defaults;
+        };
+        match crate::profiles::open(&path, &dir, defaults.clone()) {
+            Ok(prefs) => prefs,
             Err(e) => {
-                if e.kind() != std::io::ErrorKind::NotFound {
-                    log!("could not read {}: {e}", path.display());
-                }
-                self
+                log!("{e}: settings are not saved until Vesper restarts");
+                SAVING_OFF.store(true, Ordering::Relaxed);
+                defaults
             }
         }
     }
 
+    /// `self` with the settings of file `path` applied; unchanged when the
+    /// file does not exist. An error for a file that cannot be read.
+    pub fn try_read(self, path: &Path) -> std::io::Result<Self> {
+        match read_capped(path) {
+            Ok(bytes) => Ok(self.parse(&String::from_utf8_lossy(&bytes))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(self),
+            Err(e) => Err(std::io::Error::new(
+                e.kind(),
+                format!("could not read {}: {e}", path.display()),
+            )),
+        }
+    }
+
     pub fn save(&self) {
+        if SAVING_OFF.load(Ordering::Relaxed) {
+            return;
+        }
         let (Some(path), Some(dir)) = (path(), crate::profiles::dir()) else {
             return;
         };
         let default_folder = crate::default_output_folder().unwrap_or_default();
-        self.save_to(&path, &dir, &default_folder.to_string_lossy());
+        if let Err(e) = self.save_to(&path, &dir, &default_folder.to_string_lossy(), false) {
+            log!("{e}");
+        }
     }
 
     /// Writes the current profile's file into `profiles`, then `settings`:
-    /// the settings never name a profile that was not written.
-    pub fn save_to(&self, settings: &Path, profiles: &Path, default_folder: &str) {
+    /// the settings never name a profile that was not written. `durable`:
+    /// each file and its folder reach the disk before the next is written.
+    pub fn save_to(
+        &self,
+        settings: &Path,
+        profiles: &Path,
+        default_folder: &str,
+        durable: bool,
+    ) -> std::io::Result<()> {
         let mut files = Vec::with_capacity(2);
         if crate::profiles::valid_slug(&self.profile) {
             let file = crate::profiles::file(profiles, &self.profile);
@@ -355,13 +375,17 @@ impl Prefs {
         }
         files.push((settings.to_owned(), self.serialize_settings()));
         for (path, text) in files {
-            if let Err(e) = write_atomically(&path, text.as_bytes()) {
-                log!("could not save {}: {e}", path.display());
-                return;
-            }
+            write_file(&path, text.as_bytes(), durable).map_err(|e| {
+                std::io::Error::new(e.kind(), format!("could not save {}: {e}", path.display()))
+            })?;
         }
+        Ok(())
     }
 }
+
+/// The settings could not be read at startup: nothing is saved, so the
+/// defaults shown never replace them.
+pub static SAVING_OFF: AtomicBool = AtomicBool::new(false);
 
 fn set<T>(field: &mut T, value: Option<T>) {
     if let Some(value) = value {
@@ -644,6 +668,12 @@ fn read_capped(path: &Path) -> std::io::Result<Vec<u8>> {
 /// process crash leaves either the old or the new file, never half of one.
 /// No fsync: it would block the UI thread, and settings are cheap to lose.
 pub fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    write_file(path, bytes, false)
+}
+
+/// [`write_atomically`]; `durable`: the file, then its folder (the rename),
+/// reach the disk before it returns. For one-time changes not to be lost.
+pub fn write_file(path: &Path, bytes: &[u8], durable: bool) -> std::io::Result<()> {
     static WRITES: AtomicU64 = AtomicU64::new(0);
     let dir = path.parent().ok_or(std::io::ErrorKind::NotFound)?;
     std::fs::create_dir_all(dir)?;
@@ -662,12 +692,27 @@ pub fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         .create_new(true)
         .mode(0o600)
         .open(&tmp)
-        .and_then(|mut file| file.write_all(bytes))
+        .and_then(|mut file| {
+            file.write_all(bytes)?;
+            if durable {
+                file.sync_all()?;
+            }
+            Ok(())
+        })
         .and_then(|()| std::fs::rename(&tmp, path));
     if written.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
-    written
+    written?;
+    if durable {
+        sync_dir(dir)?;
+    }
+    Ok(())
+}
+
+/// Makes the files created or renamed in `dir` durable.
+pub fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::File::open(dir)?.sync_all()
 }
 
 #[cfg(test)]

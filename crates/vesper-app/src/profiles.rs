@@ -90,11 +90,16 @@ fn free_slug(dir: &Path, name: &str) -> String {
         .expect("a free name")
 }
 
-/// The profiles in `dir`, by name. A file without a valid name is named
-/// after its file.
-pub fn list(dir: &Path) -> Vec<Entry> {
-    let Ok(read) = std::fs::read_dir(dir) else {
-        return Vec::new();
+/// The profiles in `dir`, by name; none if `dir` does not exist. A file
+/// without a valid name (or unreadable) is named after its file.
+pub fn try_list(dir: &Path) -> std::io::Result<Vec<Entry>> {
+    let read = match std::fs::read_dir(dir) {
+        Ok(read) => read,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => {
+            let what = format!("could not list {}: {e}", dir.display());
+            return Err(std::io::Error::new(e.kind(), what));
+        }
     };
     let mut list: Vec<Entry> = read
         .flatten()
@@ -104,7 +109,10 @@ pub fn list(dir: &Path) -> Vec<Entry> {
             valid_slug(slug).then(|| slug.to_owned())
         })
         .map(|slug| {
-            let name = Prefs::default().read(&file(dir, &slug)).profile_name;
+            let name = Prefs::default()
+                .try_read(&file(dir, &slug))
+                .map(|p| p.profile_name)
+                .unwrap_or_default();
             Entry {
                 name: if name.is_empty() { slug.clone() } else { name },
                 slug,
@@ -112,7 +120,14 @@ pub fn list(dir: &Path) -> Vec<Entry> {
         })
         .collect();
     list.sort_by_cached_key(|e| (e.name.to_lowercase(), e.slug.clone()));
-    list
+    Ok(list)
+}
+
+/// [`try_list`], empty (and logged) on an error: for the menu.
+pub fn list(dir: &Path) -> Vec<Entry> {
+    try_list(dir)
+        .inspect_err(|e| log!("{e}"))
+        .unwrap_or_default()
 }
 
 /// `name` as typed, cleaned to one line of at most 64 characters, if no
@@ -134,38 +149,82 @@ pub fn check_name(
 }
 
 /// Profile `entry` of `dir`: `defaults` with its settings applied.
-pub fn load(dir: &Path, entry: &Entry, defaults: &Prefs) -> Prefs {
-    Prefs {
+pub fn load(dir: &Path, entry: &Entry, defaults: &Prefs) -> std::io::Result<Prefs> {
+    Ok(Prefs {
         profile: entry.slug.clone(),
         profile_name: entry.name.clone(),
-        ..defaults.clone().read(&file(dir, &entry.slug))
-    }
+        ..defaults.clone().try_read(&file(dir, &entry.slug))?
+    })
+}
+
+/// Where the settings of a version without profiles are kept, as they were.
+pub fn backup_path(settings: &Path) -> PathBuf {
+    settings.with_file_name("settings.pre-profiles")
 }
 
 /// The settings at startup: the app's own from `settings`, the recording
-/// ones from the profile it names (else the first one), on `defaults`.
+/// ones from the profile it names (else "default", else the first one),
+/// on `defaults`.
 ///
-/// Without any profile, `settings` is from a version without profiles and
-/// holds the recording settings too: they become the "Default" profile,
-/// and `settings` keeps only the app's own.
-pub fn open(settings: &Path, dir: &Path, defaults: Prefs) -> Prefs {
-    let app = defaults.clone().read(settings);
-    let profiles = list(dir);
+/// When `settings` names no profile and there is none, it is from a
+/// version without profiles and holds the recording settings too: it is
+/// copied to [`backup_path`], its settings become the "Default" profile,
+/// and it keeps only the app's own (each step synced to the disk before
+/// the next). An error, and nothing written, when a file cannot be read.
+pub fn open(settings: &Path, dir: &Path, defaults: Prefs) -> std::io::Result<Prefs> {
+    let app = defaults.clone().try_read(settings)?;
+    let profiles = try_list(dir)?;
     let current = profiles
         .iter()
         .find(|e| e.slug == app.profile)
+        .or_else(|| profiles.iter().find(|e| e.slug == DEFAULT_SLUG))
         .or(profiles.first());
     if let Some(entry) = current {
-        return load(dir, entry, &defaults).with_app_settings(&app);
+        return Ok(load(dir, entry, &defaults)?.with_app_settings(&app));
     }
+    let legacy = app.profile.is_empty();
+    let base = if legacy {
+        backup(settings)?;
+        log!("settings moved into the {DEFAULT_NAME:?} profile");
+        app
+    } else {
+        // Profiles were there and are gone: `settings` has no recording
+        // settings left (and its backup is not replaced).
+        log!("no profile left: a new {DEFAULT_NAME:?} one");
+        defaults.clone().with_app_settings(&app)
+    };
     let prefs = Prefs {
         profile: DEFAULT_SLUG.into(),
         profile_name: DEFAULT_NAME.into(),
-        ..app
+        ..base
     };
-    log!("settings moved into the {DEFAULT_NAME:?} profile");
-    prefs.save_to(settings, dir, &defaults.output_folder);
-    prefs
+    prefs.save_to(settings, dir, &defaults.output_folder, true)?;
+    Ok(prefs)
+}
+
+/// Copies `settings` to [`backup_path`] (0600, synced) unless a backup is
+/// there already. Nothing to copy is fine.
+fn backup(settings: &Path) -> std::io::Result<()> {
+    let to = backup_path(settings);
+    let copy = || -> std::io::Result<()> {
+        let bytes = match std::fs::read(settings) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        if to.is_file() {
+            return Ok(());
+        }
+        crate::prefs::write_file(&to, &bytes, true)
+    };
+    copy().map_err(|e| {
+        let what = format!(
+            "could not back up {} to {}: {e}",
+            settings.display(),
+            to.display()
+        );
+        std::io::Error::new(e.kind(), what)
+    })
 }
 
 /// The VST3 plugin instances of `tracks`.
@@ -235,7 +294,12 @@ fn plan(old: &Prefs, new: &Prefs) -> Plan {
 
 /// Switching is refused while a recording or a stream runs: their settings
 /// cannot change under them.
+/// Nor while saving is off (the settings could not be read).
 fn locked(ui: &AppWindow) -> bool {
+    if crate::prefs::SAVING_OFF.load(std::sync::atomic::Ordering::Relaxed) {
+        flash_notice(ui, "Settings could not be read: profiles are unavailable");
+        return true;
+    }
     let locked = ui.get_rec_state() != RecState::Idle || ui.get_live_state() != LiveState::Off;
     if locked {
         flash_notice(ui, "Profiles are locked while recording or streaming");
@@ -269,6 +333,8 @@ fn activate(ui: &AppWindow, rec: &Shared, games: &Games, dir: &Path, new: Prefs)
     crate::audio::show_known_sources(ui);
     new.save();
     show_list(ui, dir);
+    // The key shown is the new service's.
+    crate::live::show_key_state(ui);
     match plan(&old, &new) {
         Plan::Restart { source_mode } => {
             if let Some(p) = rec.borrow_mut().take() {
@@ -317,7 +383,10 @@ pub fn wire(ui: &AppWindow, rec: &Shared, games: &Games, defaults: Prefs) {
             return;
         }
         match list(&d).into_iter().find(|e| e.slug == slug.as_str()) {
-            Some(entry) => activate(&ui, &r, &g, &d, load(&d, &entry, &fresh)),
+            Some(entry) => match load(&d, &entry, &fresh) {
+                Ok(new) => activate(&ui, &r, &g, &d, new),
+                Err(e) => refused(&ui, &e),
+            },
             None => {
                 flash_notice(&ui, "That profile is gone");
                 show_list(&ui, &d);
@@ -370,6 +439,9 @@ pub fn wire(ui: &AppWindow, rec: &Shared, games: &Games, defaults: Prefs) {
         let Some(ui) = weak.upgrade() else {
             return false;
         };
+        if crate::prefs::SAVING_OFF.load(std::sync::atomic::Ordering::Relaxed) {
+            return report(&ui, Some("Settings could not be read: nothing is saved"));
+        }
         let slug = ui.get_profile_slug();
         match check_name(&list(&d), &name, Some(&slug)) {
             Ok(name) => {
@@ -395,18 +467,52 @@ pub fn wire(ui: &AppWindow, rec: &Shared, games: &Games, defaults: Prefs) {
             flash_notice(&ui, "The last profile cannot be deleted");
             return;
         };
+        let next = match load(&d, &next, &defaults) {
+            Ok(next) => next,
+            Err(e) => return refused(&ui, &e),
+        };
         log!("delete profile {:?} ({})", gone.profile_name, gone.profile);
-        activate(&ui, &r, &g, &d, load(&d, &next, &defaults));
-        if let Err(e) = std::fs::remove_file(file(&d, &gone.profile)) {
-            log!("could not delete profile {}: {e}", gone.profile);
-        }
-        // Its plugin instances were its own.
-        if let Some(registry) = vesper_vst::global() {
-            plugin_ids(&gone.tracks).for_each(|id| registry.remove(id));
+        activate(&ui, &r, &g, &d, next);
+        match delete(&d, &gone, &defaults) {
+            Ok(unused) => {
+                if let Some(registry) = vesper_vst::global() {
+                    unused.into_iter().for_each(|id| registry.remove(id));
+                }
+                flash_notice(&ui, &format!("Deleted {}", gone.profile_name));
+            }
+            Err(e) => {
+                log!("could not delete profile {}: {e}", gone.profile);
+                flash_notice(&ui, &format!("Could not delete {}", gone.profile_name));
+            }
         }
         show_list(&ui, &d);
-        flash_notice(&ui, &format!("Deleted {}", gone.profile_name));
     });
+}
+
+/// A profile that cannot be read is not switched to.
+fn refused(ui: &AppWindow, e: &std::io::Error) {
+    log!("{e}");
+    flash_notice(ui, "Could not read that profile");
+}
+
+/// Deletes `gone`'s file from `dir`. Then its plugin instances whose
+/// settings no other profile refers to (a hand-copied file may) are the
+/// ones to forget; none when another profile cannot be read.
+fn delete(dir: &Path, gone: &Prefs, defaults: &Prefs) -> std::io::Result<Vec<u32>> {
+    std::fs::remove_file(file(dir, &gone.profile))?;
+    let mut used = std::collections::HashSet::new();
+    for entry in try_list(dir)? {
+        match load(dir, &entry, defaults) {
+            Ok(other) => used.extend(plugin_ids(&other.tracks)),
+            Err(e) => {
+                log!("{e}: plugin settings of {} kept", gone.profile);
+                return Ok(Vec::new());
+            }
+        }
+    }
+    Ok(plugin_ids(&gone.tracks)
+        .filter(|id| !used.contains(id))
+        .collect())
 }
 
 #[cfg(test)]
@@ -473,15 +579,17 @@ mod tests {
             allowed_games: vec!["game.exe".into()],
             ..game()
         };
-        prefs.save_to(&settings, &dir, &defaults().output_folder);
+        prefs
+            .save_to(&settings, &dir, &defaults().output_folder, false)
+            .unwrap();
         let entry = Entry {
             slug: "game".into(),
             name: "Game — 1440p144 AV1".into(),
         };
         assert_eq!(list(&dir), std::slice::from_ref(&entry));
         // The app's own settings are not in the profile.
-        assert_eq!(load(&dir, &entry, &defaults()), game());
-        assert_eq!(open(&settings, &dir, defaults()), prefs);
+        assert_eq!(load(&dir, &entry, &defaults()).unwrap(), game());
+        assert_eq!(open(&settings, &dir, defaults()).unwrap(), prefs);
         // Private files.
         use std::os::unix::fs::PermissionsExt;
         let mode = std::fs::metadata(file(&dir, "game"))
@@ -496,15 +604,18 @@ mod tests {
     fn old_settings_become_the_default_profile() {
         let root = temp("migrate");
         let (settings, dir) = (root.join("settings"), root.join("profiles"));
-        std::fs::write(
-            &settings,
-            "codec=hevc\nfps=30\nreplay_seconds=120\ntracks=\n\
+        let old = "codec=hevc\nfps=30\nreplay_seconds=120\ntracks=\n\
              track=true|true|-3|desktop|Desktop\nfilter=true|gain:db=2\n\
              output_folder=/mnt/clips\ngame_source=false\ntray_notice_shown=true\n\
-             allow_game=game.exe\nlive_service=youtube\n",
-        )
-        .unwrap();
-        let prefs = open(&settings, &dir, defaults());
+             allow_game=game.exe\nlive_service=youtube\n";
+        std::fs::write(&settings, old).unwrap();
+        let prefs = open(&settings, &dir, defaults()).unwrap();
+        // Kept as they were, for an older Vesper.
+        let backup = backup_path(&settings);
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), old);
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&backup).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
         assert_eq!(
             (prefs.codec, prefs.fps, prefs.replay_seconds),
             (VideoCodec::Hevc, 30, 120)
@@ -528,20 +639,104 @@ mod tests {
                 name: "Default".into()
             }]
         );
-        assert_eq!(open(&settings, &dir, defaults()), prefs);
+        assert_eq!(open(&settings, &dir, defaults()).unwrap(), prefs);
+
+        // Every profile deleted by hand: a new Default from the defaults,
+        // the backup of the old settings kept.
+        std::fs::remove_file(file(&dir, "default")).unwrap();
+        let fresh = open(&settings, &dir, defaults()).unwrap();
+        assert_eq!(fresh.codec, defaults().codec);
+        assert!(fresh.allowed_games == ["game.exe"]);
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), old);
         std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn a_missing_current_profile_falls_back_to_the_first() {
+    fn unreadable_settings_are_never_migrated() {
+        let root = temp("unreadable");
+        let (settings, dir) = (root.join("settings"), root.join("profiles"));
+        // A folder where the file should be: EISDIR, whoever runs the test.
+        std::fs::create_dir(&settings).unwrap();
+        assert!(open(&settings, &dir, defaults()).is_err());
+        assert!(!dir.exists() && !backup_path(&settings).exists());
+        assert!(settings.is_dir());
+        // An unreadable profiles folder does not migrate either.
+        std::fs::remove_dir(&settings).unwrap();
+        std::fs::write(&settings, "codec=hevc\n").unwrap();
+        std::fs::write(&dir, "not a folder").unwrap();
+        assert!(open(&settings, &dir, defaults()).is_err());
+        assert_eq!(std::fs::read_to_string(&settings).unwrap(), "codec=hevc\n");
+        assert!(!backup_path(&settings).exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_failed_backup_stops_the_migration() {
+        let root = temp("backup");
+        let (settings, dir) = (root.join("settings"), root.join("profiles"));
+        std::fs::write(&settings, "codec=hevc\n").unwrap();
+        // The backup cannot be written: a folder is in the way.
+        std::fs::create_dir_all(backup_path(&settings).join("x")).unwrap();
+        assert!(open(&settings, &dir, defaults()).is_err());
+        assert_eq!(std::fs::read_to_string(&settings).unwrap(), "codec=hevc\n");
+        assert_eq!(try_list(&dir).unwrap(), []);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_missing_current_profile_falls_back_to_default_then_the_first() {
         let root = temp("fallback");
         let (settings, dir) = (root.join("settings"), root.join("profiles"));
-        game().save_to(&settings, &dir, "/x");
+        game().save_to(&settings, &dir, "/x", false).unwrap();
         std::fs::write(&settings, "profile=gone\ncodec=h264\n").unwrap();
-        let prefs = open(&settings, &dir, defaults());
+        let prefs = open(&settings, &dir, defaults()).unwrap();
         assert_eq!(prefs.profile, "game");
         // Stale recording settings in `settings` do not leak in.
         assert_eq!(prefs.codec, VideoCodec::Av1);
+        // Back from an older Vesper (no `profile=`): "default" first.
+        let zz = Prefs {
+            profile: "default".into(),
+            profile_name: "Zz".into(),
+            ..defaults()
+        };
+        zz.save_to(&settings, &dir, "/x", false).unwrap();
+        std::fs::write(&settings, "codec=h264\n").unwrap();
+        assert_eq!(
+            open(&settings, &dir, defaults()).unwrap().profile,
+            "default"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn deleting_keeps_plugin_settings_another_profile_uses() {
+        let root = temp("delete");
+        let (settings, dir) = (root.join("settings"), root.join("profiles"));
+        let with = |slug: &str, ids: &[u32]| Prefs {
+            profile: slug.into(),
+            profile_name: slug.into(),
+            tracks: vec![Track {
+                filters: ids
+                    .iter()
+                    .map(|&id| TrackFilter {
+                        enabled: true,
+                        spec: FilterSpec::Vst3 { id },
+                    })
+                    .collect(),
+                ..Track::new("Mic", Source::Microphone)
+            }],
+            ..defaults()
+        };
+        // "copy" is a hand copy of "game": plugin 3 is shared.
+        let gone = with("game", &[3, 4]);
+        gone.save_to(&settings, &dir, "/x", false).unwrap();
+        with("copy", &[3])
+            .save_to(&settings, &dir, "/x", false)
+            .unwrap();
+        assert_eq!(delete(&dir, &gone, &defaults()).unwrap(), [4]);
+        assert!(!file(&dir, "game").exists());
+        // A file that cannot be deleted: nothing to forget.
+        assert!(delete(&dir, &gone, &defaults()).is_err());
         std::fs::remove_dir_all(root).unwrap();
     }
 

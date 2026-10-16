@@ -1,30 +1,36 @@
-//! The stream key, kept out of the settings file.
+//! The stream keys, kept out of the settings file: one per service (Twitch,
+//! YouTube, and each custom server host, see [`key_id`]), so a key is only
+//! ever sent to the service it was saved for, whichever profile is on.
 //!
 //! First choice: the Secret Service (`org.freedesktop.secrets` on the session
 //! bus: KWallet's ksecretd on Plasma, GNOME Keyring, KeePassXC), which keeps
-//! it encrypted at rest and unlocked with the session. The Secret portal is
-//! for sandboxed apps only and would still leave the encryption to us, so it
-//! is not used. Only when the session has no Secret Service at all does the
-//! key go to `$XDG_CONFIG_HOME/vesper/stream-key` (mode 0600, written
-//! atomically), like the portal restore token: readable by this user's
-//! processes only, but in clear on disk. A keyring that is there but stays
-//! locked (the user dismissed the prompt) never sends the key to the file.
-//! The key is never logged.
+//! them encrypted at rest and unlocked with the session, one item per
+//! service (attribute `service`). The Secret portal is for sandboxed apps
+//! only and would still leave the encryption to us, so it is not used. Only
+//! when the session has no Secret Service at all do they go to
+//! `$XDG_CONFIG_HOME/vesper/stream-keys` (`<service>\t<key>` lines, mode
+//! 0600, written atomically), like the portal restore token: readable by
+//! this user's processes only, but in clear on disk. A keyring that is there
+//! but stays locked (the user dismissed the prompt) never sends a key to the
+//! file. Keys are never logged.
+//!
+//! Versions before per-service keys kept one key (an item without the
+//! `service` attribute, or the `stream-key` file): [`migrate`] gives it to
+//! the service selected at startup.
 //!
 //! Every call may block (D-Bus, an unlock prompt): never on the UI thread.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use futures_lite::StreamExt;
 use futures_lite::future::block_on;
 use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue, Value};
 
-use crate::stream::StreamKey;
+use crate::stream::{Service, StreamKey, StreamSettings};
 
 const DEST: &str = "org.freedesktop.secrets";
 const SERVICE: &str = "/org/freedesktop/secrets";
-const LABEL: &str = "Vesper stream key";
 
 /// Where the key is kept, as the settings show it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,16 +42,60 @@ pub enum Store {
 /// `(session, parameters, value, content type)`, the Secret Service's `Secret`.
 type Secret = (OwnedObjectPath, Vec<u8>, Vec<u8>, String);
 
-fn attributes() -> HashMap<&'static str, &'static str> {
+/// Which key a stream with `settings` uses: `twitch`, `youtube`, or
+/// `custom:<host>` (lowercase, no port or user); `None` for a custom URL
+/// without a host.
+pub fn key_id(settings: &StreamSettings) -> Option<String> {
+    match settings.service {
+        Service::Twitch => Some("twitch".into()),
+        Service::YouTube => Some("youtube".into()),
+        Service::Custom => custom_host(&settings.custom_url).map(|h| format!("custom:{h}")),
+    }
+}
+
+/// The host of a server URL: between `://` (and a `user@`) and the port,
+/// path or query.
+fn custom_host(url: &str) -> Option<String> {
+    let (_, rest) = url.trim().split_once("://")?;
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let host_port = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let host = match host_port.strip_prefix('[') {
+        // [IPv6]:port
+        Some(v6) => &host_port[..v6.find(']')? + 2],
+        None => host_port.split(':').next()?,
+    };
+    let valid = !host.is_empty() && !host.chars().any(|c| c.is_whitespace() || c.is_control());
+    valid.then(|| host.to_lowercase())
+}
+
+/// The items of every key.
+fn base_attributes() -> HashMap<&'static str, &'static str> {
     HashMap::from([
         ("application", crate::shortcuts::APP_ID),
         ("type", "stream-key"),
     ])
 }
 
-/// `$XDG_CONFIG_HOME/vesper/stream-key`.
+/// The item of `id`'s key.
+fn attributes(id: &str) -> HashMap<&str, &str> {
+    let mut a = base_attributes();
+    a.insert("service", id);
+    a
+}
+
+/// `$XDG_CONFIG_HOME/vesper/<name>`.
+fn config_file(name: &str) -> Option<PathBuf> {
+    dirs::config_dir().map(|d| d.join("vesper").join(name))
+}
+
+/// The fallback file of the keys.
 fn file_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join("vesper").join("stream-key"))
+    config_file("stream-keys")
+}
+
+/// The one key of versions before per-service keys.
+fn legacy_file_path() -> Option<PathBuf> {
+    config_file("stream-key")
 }
 
 type Result<T> = std::result::Result<T, String>;
@@ -128,19 +178,27 @@ async fn unlock(
     prompt(conn, &p).await
 }
 
-async fn items(service: &zbus::Proxy<'_>) -> Result<(Vec<OwnedObjectPath>, Vec<OwnedObjectPath>)> {
+/// The items with `attributes`: unlocked, locked.
+async fn items(
+    service: &zbus::Proxy<'_>,
+    attributes: HashMap<&str, &str>,
+) -> Result<(Vec<OwnedObjectPath>, Vec<OwnedObjectPath>)> {
     service
-        .call("SearchItems", &(attributes(),))
+        .call("SearchItems", &(attributes,))
         .await
         .map_err(|e| e.to_string())
 }
 
-async fn keyring_load() -> Result<Option<StreamKey>> {
-    let (conn, session) = open().await?;
-    let service = proxy(&conn, SERVICE, "org.freedesktop.Secret.Service").await?;
-    let (unlocked, locked) = items(&service).await?;
+/// The secret of the first of `found` (unlocked, locked), unlocking them
+/// if needed.
+async fn first_secret(
+    conn: &zbus::Connection,
+    service: &zbus::Proxy<'_>,
+    session: &OwnedObjectPath,
+    (unlocked, locked): (Vec<OwnedObjectPath>, Vec<OwnedObjectPath>),
+) -> Result<Option<StreamKey>> {
     let found = if unlocked.is_empty() {
-        if locked.is_empty() || !unlock(&conn, &service, &locked).await? {
+        if locked.is_empty() || !unlock(conn, service, &locked).await? {
             return Ok(None);
         }
         locked
@@ -148,7 +206,7 @@ async fn keyring_load() -> Result<Option<StreamKey>> {
         unlocked
     };
     let secrets: HashMap<OwnedObjectPath, Secret> = service
-        .call("GetSecrets", &(&found, &session))
+        .call("GetSecrets", &(&found, session))
         .await
         .map_err(|e| e.to_string())?;
     Ok(found
@@ -157,7 +215,14 @@ async fn keyring_load() -> Result<Option<StreamKey>> {
         .and_then(|(_, _, value, _)| StreamKey::new(&String::from_utf8_lossy(value))))
 }
 
-async fn keyring_store(key: &StreamKey) -> Result<()> {
+async fn keyring_load(id: &str) -> Result<Option<StreamKey>> {
+    let (conn, session) = open().await?;
+    let service = proxy(&conn, SERVICE, "org.freedesktop.Secret.Service").await?;
+    let found = items(&service, attributes(id)).await?;
+    first_secret(&conn, &service, &session, found).await
+}
+
+async fn keyring_store(id: &str, key: &StreamKey) -> Result<()> {
     let (conn, session) = open().await?;
     let service = proxy(&conn, SERVICE, "org.freedesktop.Secret.Service").await?;
     let collection: OwnedObjectPath = service
@@ -172,11 +237,12 @@ async fn keyring_store(key: &StreamKey) -> Result<()> {
         return Err("the keyring stayed locked".into());
     }
     let c = proxy(&conn, collection, "org.freedesktop.Secret.Collection").await?;
+    let label = format!("Vesper stream key ({id})");
     let properties = HashMap::from([
-        ("org.freedesktop.Secret.Item.Label", Value::from(LABEL)),
+        ("org.freedesktop.Secret.Item.Label", Value::from(label)),
         (
             "org.freedesktop.Secret.Item.Attributes",
-            Value::from(attributes()),
+            Value::from(attributes(id)),
         ),
     ]);
     let secret: Secret = (
@@ -195,69 +261,201 @@ async fn keyring_store(key: &StreamKey) -> Result<()> {
     Ok(())
 }
 
-async fn keyring_clear() -> Result<()> {
-    let (conn, _) = open().await?;
-    let service = proxy(&conn, SERVICE, "org.freedesktop.Secret.Service").await?;
-    let (unlocked, locked) = items(&service).await?;
-    for item in unlocked.iter().chain(&locked) {
-        let i = proxy(&conn, item.clone(), "org.freedesktop.Secret.Item").await?;
+async fn delete_items(conn: &zbus::Connection, paths: &[OwnedObjectPath]) -> Result<()> {
+    for item in paths {
+        let i = proxy(conn, item.clone(), "org.freedesktop.Secret.Item").await?;
         let p: OwnedObjectPath = i.call("Delete", &()).await.map_err(|e| e.to_string())?;
-        prompt(&conn, &p).await?;
+        prompt(conn, &p).await?;
     }
     Ok(())
 }
 
-async fn keyring_has() -> Result<bool> {
+async fn keyring_clear(id: &str) -> Result<()> {
     let (conn, _) = open().await?;
     let service = proxy(&conn, SERVICE, "org.freedesktop.Secret.Service").await?;
-    let (unlocked, locked) = items(&service).await?;
+    let (unlocked, locked) = items(&service, attributes(id)).await?;
+    delete_items(&conn, &[unlocked, locked].concat()).await
+}
+
+async fn keyring_has(id: &str) -> Result<bool> {
+    let (conn, _) = open().await?;
+    let service = proxy(&conn, SERVICE, "org.freedesktop.Secret.Service").await?;
+    let (unlocked, locked) = items(&service, attributes(id)).await?;
     Ok(!(unlocked.is_empty() && locked.is_empty()))
 }
 
-fn file_load() -> Option<StreamKey> {
-    StreamKey::new(&std::fs::read_to_string(file_path()?).ok()?)
+/// The items of the one key of older versions: no `service` attribute.
+async fn legacy_items(
+    conn: &zbus::Connection,
+    service: &zbus::Proxy<'_>,
+) -> Result<(Vec<OwnedObjectPath>, Vec<OwnedObjectPath>)> {
+    let (unlocked, locked) = items(service, base_attributes()).await?;
+    let mut legacy = (Vec::new(), Vec::new());
+    for (list, out) in [(unlocked, &mut legacy.0), (locked, &mut legacy.1)] {
+        for item in list {
+            let p = proxy(conn, item.clone(), "org.freedesktop.DBus.Properties").await?;
+            let value: OwnedValue = p
+                .call("Get", &("org.freedesktop.Secret.Item", "Attributes"))
+                .await
+                .map_err(|e| e.to_string())?;
+            let attributes =
+                HashMap::<String, String>::try_from(value).map_err(|e| e.to_string())?;
+            if !attributes.contains_key("service") {
+                out.push(item);
+            }
+        }
+    }
+    Ok(legacy)
 }
 
-fn file_store(key: &StreamKey) -> std::io::Result<()> {
-    write_private(&file_path().ok_or(std::io::ErrorKind::NotFound)?, key)
+/// Gives the key of an older version to `id` (unless `id` has one), then
+/// deletes it. Ok(false) when there is none.
+async fn keyring_migrate(id: &str) -> Result<bool> {
+    let (conn, session) = open().await?;
+    let service = proxy(&conn, SERVICE, "org.freedesktop.Secret.Service").await?;
+    let legacy = legacy_items(&conn, &service).await?;
+    if legacy.0.is_empty() && legacy.1.is_empty() {
+        return Ok(false);
+    }
+    let all = [legacy.0.clone(), legacy.1.clone()].concat();
+    if !keyring_has(id).await? {
+        let Some(key) = first_secret(&conn, &service, &session, legacy).await? else {
+            // Locked and not unlocked: kept for the next launch.
+            return Ok(false);
+        };
+        keyring_store(id, &key).await?;
+    }
+    delete_items(&conn, &all).await?;
+    Ok(true)
 }
 
-/// A new 0600 file renamed over `path`: never readable by others, even
-/// for a moment, and never half written.
-fn write_private(path: &std::path::Path, key: &StreamKey) -> std::io::Result<()> {
-    crate::prefs::write_atomically(path, key.expose().as_bytes())
+/// `<service>\t<key>` lines; a line that is not one is left out.
+fn parse_keys(text: &str) -> Vec<(String, StreamKey)> {
+    text.lines()
+        .filter_map(|line| {
+            let (id, key) = line.split_once('\t')?;
+            Some((id.to_owned(), StreamKey::new(key)?))
+        })
+        .collect()
 }
 
-fn file_clear() {
+fn serialize_keys(keys: &[(String, StreamKey)]) -> String {
+    keys.iter()
+        .map(|(id, key)| format!("{id}\t{}\n", key.expose()))
+        .collect()
+}
+
+fn read_keys(path: &Path) -> Vec<(String, StreamKey)> {
+    std::fs::read_to_string(path)
+        .map(|t| parse_keys(&t))
+        .unwrap_or_default()
+}
+
+/// Sets (`Some`) or removes `id`'s key in the file at `path`; the file goes
+/// with its last key.
+fn write_key(path: &Path, id: &str, key: Option<&StreamKey>) -> std::io::Result<()> {
+    let mut keys = read_keys(path);
+    keys.retain(|(i, _)| i != id);
+    if let Some(key) = key {
+        // One line each: a key never spans lines (`StreamKey::new` trims).
+        if key.expose().contains(['\n', '\r', '\t']) {
+            return Err(std::io::ErrorKind::InvalidInput.into());
+        }
+        keys.push((id.to_owned(), key.clone()));
+    }
+    if keys.is_empty() {
+        return match std::fs::remove_file(path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        };
+    }
+    crate::prefs::write_atomically(path, serialize_keys(&keys).as_bytes())
+}
+
+fn file_load_from(path: &Path, id: &str) -> Option<StreamKey> {
+    read_keys(path)
+        .into_iter()
+        .find_map(|(i, key)| (i == id).then_some(key))
+}
+
+fn file_load(id: &str) -> Option<StreamKey> {
+    file_load_from(&file_path()?, id)
+}
+
+fn file_store(id: &str, key: &StreamKey) -> std::io::Result<()> {
+    write_key(
+        &file_path().ok_or(std::io::ErrorKind::NotFound)?,
+        id,
+        Some(key),
+    )
+}
+
+fn file_clear(id: &str) {
     if let Some(path) = file_path()
-        && let Err(e) = std::fs::remove_file(&path)
-        && e.kind() != std::io::ErrorKind::NotFound
+        && let Err(e) = write_key(&path, id, None)
     {
-        log!("could not remove {}: {e}", path.display());
+        log!("could not remove a key from {}: {e}", path.display());
     }
 }
 
-/// The saved key: from the keyring (may ask to unlock it), else the file.
-pub fn load() -> Option<StreamKey> {
-    match block_on(keyring_load()) {
+/// Moves the key of an older version's file at `legacy` to `id` in `path`
+/// (unless `id` has one). True if there was one.
+fn file_migrate(legacy: &Path, path: &Path, id: &str) -> std::io::Result<bool> {
+    let key = match std::fs::read_to_string(legacy) {
+        Ok(text) => StreamKey::new(&text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    if let Some(key) = key
+        && file_load_from(path, id).is_none()
+    {
+        write_key(path, id, Some(&key))?;
+    }
+    std::fs::remove_file(legacy)?;
+    Ok(true)
+}
+
+/// Gives the one key of an older version (keyring item or file) to `id`,
+/// the service selected at startup. Never to another one later: a key is
+/// only read for the service it is saved for.
+pub fn migrate(id: &str) {
+    match block_on(keyring_migrate(id)) {
+        Ok(true) => log!("the stream key now belongs to {id}"),
+        Ok(false) => {}
+        Err(e) if e == ABSENT => {}
+        Err(e) => log!("secret service: {e}"),
+    }
+    if let (Some(legacy), Some(path)) = (legacy_file_path(), file_path()) {
+        match file_migrate(&legacy, &path, id) {
+            Ok(true) => log!("the stream key file now belongs to {id}"),
+            Ok(false) => {}
+            Err(e) => log!("could not move {}: {e}", legacy.display()),
+        }
+    }
+}
+
+/// `id`'s key: from the keyring (may ask to unlock it), else the file.
+pub fn load(id: &str) -> Option<StreamKey> {
+    match block_on(keyring_load(id)) {
         Ok(Some(key)) => return Some(key),
         Ok(None) => {}
         Err(e) => log!("secret service: {e}"),
     }
-    file_load()
+    file_load(id)
 }
 
-/// Saves `key`: in the keyring, or in the private file if that fails.
-pub fn store(key: &StreamKey) -> std::result::Result<Store, String> {
-    match block_on(keyring_store(key)) {
+/// Saves `key` for `id`: in the keyring, or in the private file if there
+/// is no keyring.
+pub fn store(id: &str, key: &StreamKey) -> std::result::Result<Store, String> {
+    match block_on(keyring_store(id, key)) {
         Ok(()) => {
             // A key saved before the keyring was there must not stay behind.
-            file_clear();
+            file_clear(id);
             Ok(Store::Keyring)
         }
         Err(e) if e == ABSENT => {
             log!("secret service: {e}; keeping the stream key in a private file");
-            file_store(key)
+            file_store(id, key)
                 .map(|()| Store::File)
                 .map_err(|e| format!("Could not save the stream key: {e}"))
         }
@@ -270,19 +468,19 @@ pub fn store(key: &StreamKey) -> std::result::Result<Store, String> {
     }
 }
 
-/// Forgets the key, wherever it is.
-pub fn clear() {
-    if let Err(e) = block_on(keyring_clear()) {
+/// Forgets `id`'s key, wherever it is.
+pub fn clear(id: &str) {
+    if let Err(e) = block_on(keyring_clear(id)) {
         log!("secret service: {e}");
     }
-    file_clear();
+    file_clear(id);
 }
 
-/// Where a key is saved, if any; does not unlock anything.
-pub fn saved() -> Option<Store> {
-    if block_on(keyring_has()).unwrap_or(false) {
+/// Where `id`'s key is saved, if anywhere; does not unlock anything.
+pub fn saved(id: &str) -> Option<Store> {
+    if block_on(keyring_has(id)).unwrap_or(false) {
         Some(Store::Keyring)
-    } else if file_path().is_some_and(|p| p.exists()) {
+    } else if file_load(id).is_some() {
         Some(Store::File)
     } else {
         None
@@ -294,23 +492,160 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
+    fn custom(url: &str) -> StreamSettings {
+        StreamSettings {
+            service: Service::Custom,
+            custom_url: url.into(),
+            ..StreamSettings::default()
+        }
+    }
+
+    fn key(k: &str) -> StreamKey {
+        StreamKey::new(k).unwrap()
+    }
+
+    #[test]
+    fn each_service_and_custom_host_has_its_own_key() {
+        let twitch = StreamSettings::default();
+        assert_eq!(key_id(&twitch).as_deref(), Some("twitch"));
+        let youtube = StreamSettings {
+            service: Service::YouTube,
+            ..twitch.clone()
+        };
+        assert_eq!(key_id(&youtube).as_deref(), Some("youtube"));
+        for (url, id) in [
+            ("rtmp://Live.Example.com/app", "custom:live.example.com"),
+            (
+                "rtmps://live.example.com:443/app/",
+                "custom:live.example.com",
+            ),
+            ("srt://u:p@10.0.0.2:9000?latency=1", "custom:10.0.0.2"),
+            ("srt://[fd00::1]:9000", "custom:[fd00::1]"),
+        ] {
+            assert_eq!(key_id(&custom(url)).as_deref(), Some(id), "{url}");
+        }
+        for url in [
+            "",
+            "rtmp://",
+            "rtmp:///app",
+            "live.example.com/app",
+            "rtmp://a b/x",
+        ] {
+            assert_eq!(key_id(&custom(url)), None, "{url}");
+        }
+    }
+
+    #[test]
+    fn the_file_keeps_one_key_per_service() {
+        let dir = std::env::temp_dir().join(format!("vesper-keys-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("stream-keys");
+        write_key(&path, "twitch", Some(&key("tw"))).unwrap();
+        write_key(&path, "custom:a.example", Some(&key("ca"))).unwrap();
+        write_key(&path, "twitch", Some(&key("tw2"))).unwrap();
+        assert_eq!(file_load_from(&path, "twitch"), Some(key("tw2")));
+        assert_eq!(file_load_from(&path, "custom:a.example"), Some(key("ca")));
+        // Never another service's key.
+        assert_eq!(file_load_from(&path, "youtube"), None);
+        assert_eq!(file_load_from(&path, "custom:b.example"), None);
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        write_key(&path, "twitch", None).unwrap();
+        assert_eq!(file_load_from(&path, "twitch"), None);
+        write_key(&path, "custom:a.example", None).unwrap();
+        assert!(!path.exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_old_key_file_goes_to_the_selected_service() {
+        let dir = std::env::temp_dir().join(format!("vesper-keys-old-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (legacy, path) = (dir.join("stream-key"), dir.join("stream-keys"));
+        assert!(!file_migrate(&legacy, &path, "youtube").unwrap());
+        std::fs::write(&legacy, "old_key\n").unwrap();
+        assert!(file_migrate(&legacy, &path, "youtube").unwrap());
+        assert!(!legacy.exists());
+        assert_eq!(file_load_from(&path, "youtube"), Some(key("old_key")));
+        assert_eq!(file_load_from(&path, "twitch"), None);
+        // A key already saved for that service wins.
+        std::fs::write(&legacy, "older").unwrap();
+        file_migrate(&legacy, &path, "youtube").unwrap();
+        assert_eq!(file_load_from(&path, "youtube"), Some(key("old_key")));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// Against whatever Secret Service the session bus has: never run it on
     /// a user session, only in a private `dbus-run-session` with a
-    /// throwaway service.
+    /// throwaway service (`scripts/fake_secret_service.py`).
     #[test]
     #[ignore = "needs a throwaway Secret Service on a private session bus"]
     fn keyring_round_trip() {
-        let key = StreamKey::new("live_test_key_123").unwrap();
-        assert_eq!(block_on(keyring_store(&key)), Ok(()));
-        assert!(block_on(keyring_has()).unwrap());
-        assert_eq!(block_on(keyring_load()).unwrap(), Some(key));
+        let k = key("live_test_key_123");
+        assert_eq!(block_on(keyring_store("twitch", &k)), Ok(()));
+        assert!(block_on(keyring_has("twitch")).unwrap());
+        assert!(!block_on(keyring_has("youtube")).unwrap());
+        assert_eq!(block_on(keyring_load("twitch")).unwrap(), Some(k.clone()));
+        // Never another service's key.
+        assert_eq!(block_on(keyring_load("youtube")).unwrap(), None);
         // Replaces, does not add.
-        let other = StreamKey::new("other").unwrap();
-        block_on(keyring_store(&other)).unwrap();
-        assert_eq!(block_on(keyring_load()).unwrap(), Some(other));
-        block_on(keyring_clear()).unwrap();
-        assert!(!block_on(keyring_has()).unwrap());
-        assert_eq!(block_on(keyring_load()).unwrap(), None);
+        let other = key("other");
+        block_on(keyring_store("twitch", &other)).unwrap();
+        assert_eq!(block_on(keyring_load("twitch")).unwrap(), Some(other));
+        block_on(keyring_store("youtube", &k)).unwrap();
+        block_on(keyring_clear("twitch")).unwrap();
+        assert!(!block_on(keyring_has("twitch")).unwrap());
+        assert_eq!(block_on(keyring_load("twitch")).unwrap(), None);
+        assert_eq!(block_on(keyring_load("youtube")).unwrap(), Some(k));
+        block_on(keyring_clear("youtube")).unwrap();
+    }
+
+    /// An item of an older version (no `service` attribute) goes to the
+    /// service given, once. Same private bus as `keyring_round_trip`.
+    #[test]
+    #[ignore = "needs a throwaway Secret Service on a private session bus"]
+    fn keyring_old_key_goes_to_the_selected_service() {
+        block_on(async {
+            let (conn, session) = open().await.unwrap();
+            let service = proxy(&conn, SERVICE, "org.freedesktop.Secret.Service")
+                .await
+                .unwrap();
+            let collection: OwnedObjectPath =
+                service.call("ReadAlias", &("default",)).await.unwrap();
+            assert!(
+                unlock(&conn, &service, std::slice::from_ref(&collection))
+                    .await
+                    .unwrap()
+            );
+            let c = proxy(&conn, collection, "org.freedesktop.Secret.Collection")
+                .await
+                .unwrap();
+            let properties = HashMap::from([(
+                "org.freedesktop.Secret.Item.Attributes",
+                Value::from(base_attributes()),
+            )]);
+            let secret: Secret = (
+                session,
+                Vec::new(),
+                b"old_key".to_vec(),
+                "text/plain".into(),
+            );
+            let _: (OwnedObjectPath, OwnedObjectPath) = c
+                .call("CreateItem", &(properties, secret, true))
+                .await
+                .unwrap();
+        });
+        assert_eq!(block_on(keyring_load("youtube")).unwrap(), None);
+        assert_eq!(block_on(keyring_migrate("youtube")), Ok(true));
+        assert_eq!(
+            block_on(keyring_load("youtube")).unwrap(),
+            Some(key("old_key"))
+        );
+        assert_eq!(block_on(keyring_load("twitch")).unwrap(), None);
+        // Done once: the old item is gone.
+        assert_eq!(block_on(keyring_migrate("twitch")), Ok(false));
+        block_on(keyring_clear("youtube")).unwrap();
     }
 
     /// `EXPECT=absent` on a private bus without a Secret Service, or
@@ -318,27 +653,11 @@ mod tests {
     #[test]
     #[ignore = "needs a private session bus prepared as EXPECT says"]
     fn a_refusing_keyring_is_not_an_absent_one() {
-        let key = StreamKey::new("live_test_key_123").unwrap();
-        let result = block_on(keyring_store(&key));
+        let result = block_on(keyring_store("twitch", &key("live_test_key_123")));
         match std::env::var("EXPECT").as_deref() {
             Ok("absent") => assert_eq!(result, Err(ABSENT.into())),
             Ok("refused") => assert!(result.is_err_and(|e| e != ABSENT)),
             other => panic!("EXPECT={other:?}"),
         }
-    }
-
-    #[test]
-    fn the_fallback_file_is_private() {
-        let dir = std::env::temp_dir().join(format!("vesper-secret-{}", std::process::id()));
-        let path = dir.join("stream-key");
-        std::fs::create_dir_all(&dir).unwrap();
-        // An older, world-readable file is tightened.
-        std::fs::write(&path, "an older, longer key").unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-        write_private(&path, &StreamKey::new("k").unwrap()).unwrap();
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600);
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "k");
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

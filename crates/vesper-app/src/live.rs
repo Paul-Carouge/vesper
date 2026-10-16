@@ -41,6 +41,48 @@ fn show_store(ui: &AppWindow, store: Option<Store>) {
     );
 }
 
+/// Shows whether the selected service has a key saved (each has its own);
+/// nothing is unlocked for that. A late answer for another service is
+/// dropped.
+pub fn show_key_state(ui: &AppWindow) {
+    let Some(id) = secret::key_id(&settings(ui)) else {
+        show_store(ui, None);
+        return;
+    };
+    let asked = id.clone();
+    off_ui(
+        ui,
+        move || secret::saved(&asked),
+        move |ui, store| {
+            if secret::key_id(&settings(ui)).as_deref() == Some(id.as_str()) {
+                show_store(ui, store);
+            }
+        },
+    );
+}
+
+/// Saves `key` for the selected service, then says `done`.
+fn store_key(ui: &AppWindow, key: StreamKey, done: &'static str) {
+    let Some(id) = secret::key_id(&settings(ui)) else {
+        flash_notice(
+            ui,
+            "Enter the server URL first: the key is saved for that server",
+        );
+        return;
+    };
+    off_ui(
+        ui,
+        move || secret::store(&id, &key),
+        move |ui, result| match result {
+            Ok(_) => {
+                show_key_state(ui);
+                flash_notice(ui, done);
+            }
+            Err(e) => flash_notice(ui, &e),
+        },
+    );
+}
+
 /// Runs `work` on a new thread, then `done` with its result on the UI thread.
 fn off_ui<T: Send + 'static>(
     ui: &AppWindow,
@@ -66,8 +108,16 @@ thread_local! {
 
 pub fn wire(ui: &AppWindow, recording: &Shared, games: &Games) {
     CONTEXT.with(|c| *c.borrow_mut() = Some((recording.clone(), games.clone())));
-    // Whether a key is saved; nothing is unlocked for that.
-    off_ui(ui, secret::saved, show_store);
+    // An older version's single key goes to the service selected now, then
+    // whether that one has a key is shown.
+    match secret::key_id(&settings(ui)) {
+        Some(id) => off_ui(
+            ui,
+            move || secret::migrate(&id),
+            |ui, ()| show_key_state(ui),
+        ),
+        None => show_key_state(ui),
+    }
 
     let weak = ui.as_weak();
     let rec = recording.clone();
@@ -106,7 +156,10 @@ pub fn wire(ui: &AppWindow, recording: &Shared, games: &Games) {
         log!("go-live: {settings:?}");
         ui.set_live_state(LiveState::Connecting);
         ui.set_live_detail("".into());
-        off_ui(&ui, secret::load, move |ui, key| {
+        // Only the key saved for this service (or server): never another's.
+        let id = secret::key_id(&settings);
+        let load = move || id.and_then(|id| secret::load(&id));
+        off_ui(&ui, load, move |ui, key| {
             // Ended meanwhile (e.g. the pipeline stopped).
             let Some((rec, g)) = CONTEXT.with(|c| c.borrow().clone()) else {
                 return;
@@ -141,21 +194,13 @@ pub fn wire(ui: &AppWindow, recording: &Shared, games: &Games) {
         let (url, key) = crate::stream::split_secret(ui.get_live_url().trim());
         if let Some(key) = key.as_deref().and_then(StreamKey::new) {
             ui.set_live_url(url.as_str().into());
-            off_ui(
-                &ui,
-                move || secret::store(&key),
-                |ui, result| match result {
-                    Ok(store) => {
-                        show_store(ui, Some(store));
-                        flash_notice(ui, "The key in the URL was moved to the stream key");
-                    }
-                    Err(e) => flash_notice(ui, &e),
-                },
-            );
+            // Saved for the server of the URL without the key.
+            store_key(&ui, key, "The key in the URL was moved to the stream key");
         }
         ui.set_live_url_warning(crate::stream::cleartext_warning(&url).into());
         log!("live-settings-changed: {:?}", settings(&ui));
         Prefs::from_ui(&ui).save();
+        show_key_state(&ui);
     });
 
     let weak = ui.as_weak();
@@ -165,27 +210,24 @@ pub fn wire(ui: &AppWindow, recording: &Shared, games: &Games) {
             return;
         };
         log!("live-key-entered");
-        off_ui(
-            &ui,
-            move || secret::store(&key),
-            |ui, result| match result {
-                Ok(store) => {
-                    show_store(ui, Some(store));
-                    flash_notice(ui, "Stream key saved");
-                }
-                Err(e) => flash_notice(ui, &e),
-            },
-        );
+        store_key(&ui, key, "Stream key saved");
     });
 
     let weak = ui.as_weak();
     ui.on_live_key_removed(move || {
         let Some(ui) = weak.upgrade() else { return };
+        let Some(id) = secret::key_id(&settings(&ui)) else {
+            return;
+        };
         log!("live-key-removed");
-        off_ui(&ui, secret::clear, |ui, ()| {
-            show_store(ui, None);
-            flash_notice(ui, "Stream key removed");
-        });
+        off_ui(
+            &ui,
+            move || secret::clear(&id),
+            |ui, ()| {
+                show_key_state(ui);
+                flash_notice(ui, "Stream key removed");
+            },
+        );
     });
 }
 

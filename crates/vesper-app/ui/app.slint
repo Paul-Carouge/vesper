@@ -1110,6 +1110,10 @@ export component AppWindow inherits Window {
     }
 
     function submit-profile-name() {
+        // New and Duplicate switch profiles: not while recording or streaming.
+        if (root.profile-mode != 3 && root.profiles-locked) {
+            return;
+        }
         if (root.profile-mode == 1 ? root.profile-create(root.profile-draft) : root.profile-mode == 2 ? root.profile-duplicate(root.profile-draft) : root.profile-rename(root.profile-draft)) {
             root.close-profile-menu();
         }
@@ -1465,6 +1469,7 @@ export component AppWindow inherits Window {
                                     text: root.profile-draft;
                                     label: "Profile name";
                                     placeholder: "Profile name";
+                                    enabled: root.profile-mode == 3 || !root.profiles-locked;
                                     init => {
                                         self.focus();
                                     }
@@ -1476,12 +1481,15 @@ export component AppWindow inherits Window {
                                         root.submit-profile-name();
                                     }
                                 }
-                                if root.profile-error != "": Text {
+                                // Always there, so a new error is announced.
+                                Text {
+                                    max-height: root.profile-error == "" ? 0px : 1000px;
                                     text: root.profile-error;
                                     font-size: Theme.font-small;
                                     color: Theme.warn;
                                     wrap: word-wrap;
                                     accessible-role: text;
+                                    accessible-live-region: AccessibleLiveness.assertive;
                                 }
                                 HorizontalLayout {
                                     alignment: end;
@@ -1498,6 +1506,8 @@ export component AppWindow inherits Window {
                                         text: root.profile-mode == 1 ? "Create" : root.profile-mode == 2 ? "Duplicate" : "Rename";
                                         small: true;
                                         kind: "primary";
+                                        // A recording or stream that started meanwhile.
+                                        enabled: root.profile-mode == 3 || !root.profiles-locked;
                                         clicked => {
                                             root.submit-profile-name();
                                         }
@@ -1530,7 +1540,8 @@ export component AppWindow inherits Window {
                                     Button {
                                         text: "Delete";
                                         small: true;
-                                        kind: "primary";
+                                        kind: "danger";
+                                        enabled: !root.profiles-locked;
                                         accessible-label: "Delete \{root.profile-name}";
                                         clicked => {
                                             root.profile-delete();
