@@ -20,6 +20,10 @@
 //!   mutex. The mix is encoded on whichever track thread completes a block.
 //! - Replay threads: each saved replay is muxed on its own thread from a
 //!   snapshot of the ring (shared packet data, no copy).
+//! - Overlay thread (`overlay`), while the active scene is more than the
+//!   capture alone: creates the scene compositor and uploads its images and
+//!   text. The pipeline thread composes each tick under `try_lock`, only
+//!   when the capture or an overlay changed (else the picture repeats).
 //! - Live thread (`stream`): sends a live stream's packets. Its video comes
 //!   from the pipeline thread (the recording's packets, or a second encode of
 //!   the same pictures scaled on the GPU), its AAC audio from the mix's tap.
@@ -37,12 +41,15 @@ use std::time::Duration;
 
 use vesper_audio::{Aac, AudioCapture, CHANNELS, Mix, Options, SAMPLE_RATE, Source, TrackState};
 use vesper_capture::Capture;
-use vesper_core::{Codec, EncodedPacket, VideoFrame};
+use vesper_compose::{Draw, Source as DrawSource};
+use vesper_core::{Codec, DmaBufPlane, EncodedPacket, ReleaseGuard, VideoFrame};
 use vesper_dsp::{FilterSpec, LiveControl};
 use vesper_encode::{Encoder, RateControl};
 use vesper_gamecapture::{GameCapture, protocol};
 use vesper_mux::{AudioTrack, Muxer, VideoTrack};
 
+use crate::overlay::{Key, Overlays};
+use crate::scenes::{Canvas, LayerSource, Scene};
 use crate::stream::{AudioTap, LiveSink, StreamRequest, StreamState, live_audio, stream_size};
 
 /// How often `Event::Stats` is sent.
@@ -68,6 +75,15 @@ const FIRST_FRAME_TIMEOUT: Duration = if cfg!(test) {
 /// nothing records (a launcher, then the game in fullscreen).
 const RESIZE_AFTER: Duration = Duration::from_secs(1);
 
+/// First wait before the scene compositor is tried again after a failure;
+/// doubled on each failure in a row, up to [`RETRY_MAX`].
+const RETRY_FIRST: Duration = if cfg!(test) {
+    Duration::from_millis(300)
+} else {
+    Duration::from_secs(2)
+};
+const RETRY_MAX: Duration = Duration::from_secs(60);
+
 /// Encoder settings, fixed for the life of a pipeline.
 #[derive(Debug, Clone)]
 pub struct Settings {
@@ -83,6 +99,10 @@ pub struct Settings {
     pub mix: bool,
     /// Record the game these frames come from instead of a portal source.
     pub game: Option<GameFrames>,
+    /// The scene shown first; [`Pipeline::set_scene`] changes it.
+    pub scene: Scene,
+    /// The recorded size.
+    pub canvas: Canvas,
 }
 
 /// Routes game capture frames to the running pipeline. The game capture
@@ -104,6 +124,22 @@ struct GameRoute {
     /// Tests: the game is gone, without a capture server.
     #[cfg(test)]
     gone: AtomicBool,
+    /// Tests: watches and breaks the scene compositor.
+    #[cfg(test)]
+    probe: Arc<Probe>,
+}
+
+/// Tests: the scene compositor of the pipeline a route feeds.
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct Probe {
+    /// Compositors created.
+    compositors: AtomicUsize,
+    /// The next composition fails.
+    fail: AtomicBool,
+    /// Compositions, and their GPU time (when measured), ns.
+    composed: std::sync::atomic::AtomicU64,
+    gpu_ns: std::sync::atomic::AtomicU64,
 }
 
 impl GameFrames {
@@ -216,6 +252,8 @@ pub enum Event {
     /// Some audio tracks or the mix could not start: what is left out, for
     /// a notice.
     AudioMissing(String),
+    /// Something to tell the user that changes nothing for the recording.
+    Notice(String),
     /// The live stream's state changed.
     Stream(StreamState),
     /// Sent every second while the stream is on air.
@@ -369,6 +407,8 @@ struct Control {
     /// A live stream to start.
     stream: Option<StreamRequest>,
     stop_stream: bool,
+    /// The scene to show from the next tick.
+    scene: Option<Scene>,
     quit: bool,
     /// Set once the pipeline thread takes no more requests.
     ended: bool,
@@ -491,6 +531,12 @@ impl Pipeline {
             c.stream = None;
             c.stop_stream = true;
         })
+    }
+
+    /// Shows `scene` from the next tick, recording or not. The canvas
+    /// stays: the encoder is not reopened.
+    pub fn set_scene(&self, scene: Scene) -> bool {
+        self.request(|c| c.scene = Some(scene))
     }
 
     /// Mutes track `index` (it records silence), live.
@@ -1017,8 +1063,8 @@ struct Video {
 }
 
 impl Video {
-    fn open(settings: &Settings, first: &VideoFrame) -> Result<Self, String> {
-        let (width, height, fps) = (first.width, first.height, settings.fps);
+    fn open(settings: &Settings, width: u32, height: u32) -> Result<Self, String> {
+        let fps = settings.fps;
         let bitrate =
             (f64::from(width) * f64::from(height) * f64::from(fps) * settings.max_bits_per_pixel)
                 as u64;
@@ -1193,7 +1239,7 @@ impl Streaming {
     }
 
     /// Sends this tick's picture. `packets`: what the recording encoder
-    /// made of it; `new_picture`: it encoded a new capture (not a repeat).
+    /// made of it; `new_picture`: it encoded a new picture (not a repeat).
     fn tick(
         &mut self,
         v: &mut Video,
@@ -1412,6 +1458,7 @@ fn pump(
     let mut was_gone = false;
     let mut streaming: Option<Streaming> = None;
     let mut stopping: Option<Streaming> = None;
+    let mut stage = Stage::new(settings, on_event);
 
     loop {
         match &video {
@@ -1426,22 +1473,33 @@ fn pump(
             error = Some(format!("Capture ended: {e}"));
             break;
         }
-        let mut first = video.is_none() && frame.is_some();
-        if let (None, Some(f)) = (&video, &frame) {
+        // The canvas: a fixed one, else the first frame's size. A fixed
+        // canvas with a scene that does not show the capture (e.g. "Be
+        // right back") needs no frame at all.
+        let size = match settings.canvas {
+            Canvas::Fixed(w, h) => Some((w, h)),
+            Canvas::Auto => frame.as_ref().map(|f| (f.width, f.height)),
+        };
+        let mut first = video.is_none() && (frame.is_some() || !stage.shows_main);
+        if let (true, Some((width, height))) = (first, size) {
             // Audio starts with the first frame: before it, the ring and a
             // recording would drop its packets anyway. Before the encoder
             // opens, so the tracks cover the first video tick.
             start_audio(sources, sinks, on_event);
             reset_ring_audio(sources, sinks);
             on_event(Event::AudioStarted);
-            match Video::open(settings, f) {
-                Ok(v) => video = Some(v),
+            match Video::open(settings, width, height) {
+                Ok(v) => {
+                    stage.set_canvas(width, height);
+                    video = Some(v);
+                }
                 Err(e) => {
                     error = Some(e);
                     break;
                 }
             }
         }
+        first &= video.is_some();
         // Requests are read under the control lock, so none lands on an
         // ended pipeline unseen.
         // The live thread ended on its own (the server refused the stream).
@@ -1449,7 +1507,7 @@ fn pump(
             let handle = streaming.take().and_then(|s| s.stop(sources, None, false));
             lock(control).saves.extend(handle);
         }
-        let (record, stop, replay, save, go_live) = {
+        let (record, stop, replay, save, go_live, scene) = {
             // Only this thread sets `rec`; never take `sinks` under
             // `control`: the UI would wait on muxer writes.
             let recording = lock(sinks).rec.is_some();
@@ -1515,8 +1573,22 @@ fn pump(
                 // once instead of waiting for a frame.
                 slot.poke();
             }
-            (record, stop, c.replay, c.save.take(), go_live)
+            (
+                record,
+                stop,
+                c.replay,
+                c.save.take(),
+                go_live,
+                c.scene.take(),
+            )
         };
+        if let Some(scene) = scene {
+            stage.set_scene(scene);
+            // Without a frame yet, a scene without the capture may start now.
+            if video.is_none() {
+                slot.poke();
+            }
+        }
         if let Some(s) = stopping.take() {
             let handle = s.stop(sources, None, false);
             lock(control).saves.extend(handle);
@@ -1546,7 +1618,10 @@ fn pump(
         }
         // While nothing records, follow a lasting size change with a new
         // encoder (and an empty replay buffer: its packets need the old one).
-        if let (Some(v), Some(f)) = (&video, &frame) {
+        // A fixed canvas never changes: the compositor or the encoder
+        // scales the capture into it.
+        let auto = settings.canvas == Canvas::Auto;
+        if let (Some(v), Some(f), true) = (&video, &frame, auto) {
             let size = (f.width, f.height);
             if size == (v.track.width, v.track.height) {
                 new_size = None;
@@ -1560,8 +1635,11 @@ fn pump(
             && streaming.is_none()
         {
             new_size = None;
-            match Video::open(settings, f) {
-                Ok(v) => video = Some(v),
+            match Video::open(settings, f.width, f.height) {
+                Ok(v) => {
+                    stage.set_canvas(f.width, f.height);
+                    video = Some(v);
+                }
                 Err(e) => {
                     error = Some(e);
                     break;
@@ -1612,6 +1690,16 @@ fn pump(
         if stop && let Some(r) = lock(sinks).rec.as_mut() {
             r.stop_at.get_or_insert(pts);
         }
+        // Only a video packet ends a recording: with no picture yet (a fixed
+        // canvas waiting for a compositor that never came), end it here.
+        if stop && !stage.pictured {
+            let rec = lock(sinks).rec.take();
+            if let Some(r) = rec {
+                on_event(Event::Finished(
+                    r.finish(Some("No picture was recorded".into())),
+                ));
+            }
+        }
         if let Some(request) = go_live {
             match Streaming::start(&request, v, settings, sources, on_event) {
                 Ok(s) => streaming = Some(s),
@@ -1643,20 +1731,14 @@ fn pump(
         let recording = lock(sinks).rec.is_some() || streaming.is_some();
         let gone =
             frame.is_none() && !recording && settings.game.as_ref().is_some_and(GameFrames::gone);
-        let new_picture = frame.is_some();
-        let packets = match frame {
-            Some(mut frame) => {
-                if std::mem::take(&mut was_gone) {
-                    v.enc.force_keyframe();
-                }
-                frame.pts = pts;
-                v.enc.encode(frame)
+        let packets = if gone {
+            was_gone = true;
+            Ok(Vec::new())
+        } else {
+            if frame.is_some() && std::mem::take(&mut was_gone) {
+                v.enc.force_keyframe();
             }
-            None if gone => {
-                was_gone = true;
-                Ok(Vec::new())
-            }
-            None => v.enc.repeat(pts),
+            stage.picture(&mut v.enc, frame, pts)
         };
         let packets = match packets {
             Ok(p) => p,
@@ -1665,8 +1747,11 @@ fn pump(
                 break;
             }
         };
+        let new_picture = stage.fresh();
         // Before the sinks take the packets. A failing stream ends alone.
+        // A stream with its own encoder needs a picture to scale.
         if !gone
+            && stage.pictured
             && let Some(s) = &mut streaming
             && let Err(e) = s.tick(v, k, fps, &packets, new_picture, sources)
         {
@@ -1747,6 +1832,369 @@ fn pump(
         }
         None => Ok(()),
     }
+}
+
+/// What a composition attempt gave.
+enum Composed {
+    Frame(VideoFrame),
+    /// The overlay thread holds the compositor (an upload): try next tick.
+    Busy,
+    /// No compositor (being created, or failed): show the capture alone.
+    Unavailable,
+}
+
+/// Turns the tick's capture into the encoder's picture. A scene that shows
+/// the capture alone is a passthrough: frames go to the encoder as without
+/// scenes, and no compositor (no Vulkan device) exists. Otherwise the
+/// compositor draws the scene, only when the capture or an overlay changed;
+/// it holds the latest capture frame (one producer buffer) to redraw an
+/// overlay change without waiting for a new one. Any compositor failure
+/// shows the capture alone (with a notice) and retries later: a recording
+/// never fails because of an overlay.
+struct Stage {
+    scene_name: String,
+    passthrough: bool,
+    shows_main: bool,
+    draws: Vec<Draw>,
+    want: Vec<(u32, Key)>,
+    /// Texture id of each overlay source seen, stable across scenes.
+    ids: Vec<Key>,
+    overlays: Option<Overlays>,
+    /// The encoder's size, once open.
+    canvas: Option<(u32, u32)>,
+    held: Option<VideoFrame>,
+    /// The picture must be drawn again.
+    dirty: bool,
+    /// The encoder has a picture to repeat.
+    pictured: bool,
+    /// A new picture went to the encoder since [`Stage::fresh`].
+    encoded: bool,
+    /// When to try the compositor again after a failure.
+    retry: Option<Duration>,
+    backoff: Duration,
+    /// The user was told overlays are off; reset by a composition.
+    told: bool,
+    on_event: OnEvent,
+    #[cfg(test)]
+    probe: Option<Arc<Probe>>,
+}
+
+impl Stage {
+    fn new(settings: &Settings, on_event: &OnEvent) -> Self {
+        let mut stage = Self {
+            scene_name: String::new(),
+            passthrough: true,
+            shows_main: true,
+            draws: Vec::new(),
+            want: Vec::new(),
+            ids: Vec::new(),
+            overlays: None,
+            canvas: None,
+            held: None,
+            dirty: true,
+            pictured: false,
+            encoded: false,
+            retry: None,
+            backoff: RETRY_FIRST,
+            told: false,
+            on_event: on_event.clone(),
+            #[cfg(test)]
+            probe: settings.game.as_ref().map(|g| g.0.probe.clone()),
+        };
+        stage.set_scene(settings.scene.clone());
+        stage
+    }
+
+    fn set_scene(&mut self, scene: Scene) {
+        if !self.scene_name.is_empty() || !scene.is_passthrough() {
+            log!("scene: {:?}", scene.name);
+        }
+        if scene
+            .layers
+            .iter()
+            .any(|l| l.visible && matches!(l.source, LayerSource::Camera { .. }))
+        {
+            log!("scene {:?}: webcam layers are not drawn yet", scene.name);
+        }
+        self.passthrough = scene.is_passthrough();
+        self.shows_main = scene.shows_main();
+        self.draws.clear();
+        self.want.clear();
+        for l in scene.drawn() {
+            let source = match &l.source {
+                LayerSource::Main => DrawSource::Main,
+                LayerSource::Image { path } => self.texture(Key::Image(path.clone())),
+                LayerSource::Text(style) => self.texture(Key::Text(style.clone())),
+                LayerSource::Camera { .. } => continue,
+            };
+            self.draws.push(Draw {
+                source,
+                rect: l.rect,
+                crop: l.crop,
+                fit: l.fit,
+                opacity: l.opacity,
+            });
+        }
+        self.scene_name = scene.name;
+        if !self.shows_main {
+            self.held = None;
+        }
+        if self.passthrough {
+            // Frees the compositor and its textures.
+            self.overlays = None;
+        } else {
+            self.request();
+        }
+        self.dirty = true;
+    }
+
+    /// The texture id of `key`, added to this scene's wanted textures.
+    fn texture(&mut self, key: Key) -> DrawSource {
+        let id = match self.ids.iter().position(|k| *k == key) {
+            Some(i) => i,
+            None => {
+                self.ids.push(key.clone());
+                self.ids.len() - 1
+            }
+        } as u32;
+        if !self.want.iter().any(|(i, _)| *i == id) {
+            self.want.push((id, key));
+        }
+        DrawSource::Texture(id)
+    }
+
+    /// The encoder (re)opened at this size: it has no picture yet.
+    fn set_canvas(&mut self, width: u32, height: u32) {
+        self.canvas = Some((width, height));
+        self.pictured = false;
+        self.dirty = true;
+        self.request();
+    }
+
+    /// Asks the overlay thread for this scene's compositor and textures.
+    fn request(&mut self) {
+        let Some(canvas) = self.canvas else { return };
+        if self.passthrough || self.retry.is_some() {
+            return;
+        }
+        if self.overlays.is_none() {
+            match Overlays::start() {
+                Ok(o) => self.overlays = Some(o),
+                Err(e) => return self.fail(format!("no overlay thread: {e}")),
+            }
+        }
+        if let Some(o) = &self.overlays {
+            o.request(canvas, self.want.clone());
+        }
+    }
+
+    /// Shows the capture alone until a retry after the backoff.
+    fn fail(&mut self, why: String) {
+        log!("scene compositor: {why}; retrying in {:?}", self.backoff);
+        if !std::mem::replace(&mut self.told, true) {
+            (self.on_event)(Event::Notice(
+                "Scene overlays are off for now: the GPU compositor failed".into(),
+            ));
+        }
+        self.retry = Some(monotonic_now() + self.backoff);
+        self.backoff = (self.backoff * 2).min(RETRY_MAX);
+        self.dirty = true;
+    }
+
+    /// News from the overlay thread, and a retry when due.
+    fn poll(&mut self) {
+        if let Some(o) = &self.overlays {
+            #[cfg(test)]
+            if let Some(p) = &self.probe {
+                let n = o.shared.created.load(Ordering::Relaxed);
+                p.compositors.fetch_max(n, Ordering::Relaxed);
+            }
+            if o.changed() {
+                self.dirty = true;
+            }
+            if let Some(e) = o.error() {
+                self.fail(format!("could not start: {e}"));
+            }
+        }
+        if self.retry.is_some_and(|t| monotonic_now() >= t) {
+            self.retry = None;
+            self.request();
+        }
+    }
+
+    /// The tick's packets: `frame` (the new capture, if any) drawn into the
+    /// scene, or the last picture again.
+    fn picture(
+        &mut self,
+        enc: &mut Encoder,
+        frame: Option<VideoFrame>,
+        pts: Duration,
+    ) -> Result<Vec<EncodedPacket>, vesper_encode::Error> {
+        if self.passthrough {
+            // A held frame: the scene just became a passthrough. Released
+            // at once when a new frame came.
+            let held = self.held.take();
+            return match frame.or(held) {
+                Some(mut frame) => {
+                    frame.pts = pts;
+                    self.encode(enc, frame)
+                }
+                None => self.repeat(enc, pts),
+            };
+        }
+        self.poll();
+        if let Some(f) = frame
+            && self.shows_main
+        {
+            // The previous one goes back to its producer now.
+            self.held = Some(f);
+            self.dirty = true;
+        }
+        if !self.dirty {
+            return self.repeat(enc, pts);
+        }
+        match self.compose(pts) {
+            Composed::Frame(f) => {
+                self.dirty = false;
+                self.encode(enc, f)
+            }
+            Composed::Busy if self.pictured => self.repeat(enc, pts),
+            Composed::Busy | Composed::Unavailable => {
+                // The capture alone. A compositor or texture made ready
+                // later sets `changed`: the scene is drawn then.
+                self.dirty = false;
+                match self.held.as_ref().and_then(borrow) {
+                    Some(mut f) => {
+                        f.pts = pts;
+                        self.encode(enc, f)
+                    }
+                    None => self.repeat(enc, pts),
+                }
+            }
+        }
+    }
+
+    fn encode(
+        &mut self,
+        enc: &mut Encoder,
+        frame: VideoFrame,
+    ) -> Result<Vec<EncodedPacket>, vesper_encode::Error> {
+        (self.pictured, self.encoded) = (true, true);
+        enc.encode(frame)
+    }
+
+    /// The last tick encoded a new picture (not a repeat): a stream with
+    /// its own encoder scales it.
+    fn fresh(&mut self) -> bool {
+        std::mem::take(&mut self.encoded)
+    }
+
+    fn repeat(
+        &self,
+        enc: &mut Encoder,
+        pts: Duration,
+    ) -> Result<Vec<EncodedPacket>, vesper_encode::Error> {
+        // Nothing to show yet (a fixed canvas waiting for its compositor).
+        if !self.pictured {
+            return Ok(Vec::new());
+        }
+        enc.repeat(pts)
+    }
+
+    fn compose(&mut self, pts: Duration) -> Composed {
+        let Some(shared) = self.overlays.as_ref().map(|o| o.shared.clone()) else {
+            return Composed::Unavailable;
+        };
+        let mut slot = match shared.comp.try_lock() {
+            Ok(slot) => slot,
+            Err(std::sync::TryLockError::WouldBlock) => return Composed::Busy,
+            Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+        };
+        // Another size: the overlay thread is replacing it (canvas resize).
+        let Some(comp) = slot
+            .as_mut()
+            .filter(|c| Some((c.width(), c.height())) == self.canvas)
+        else {
+            return Composed::Unavailable;
+        };
+        let main = self.held.as_ref().and_then(borrow);
+        #[cfg(test)]
+        if self
+            .probe
+            .as_ref()
+            .is_some_and(|p| p.fail.swap(false, Ordering::Relaxed))
+        {
+            drop(main);
+            let old = slot.take();
+            drop(slot);
+            drop(old);
+            self.fail("injected failure".into());
+            return Composed::Unavailable;
+        }
+        match comp.compose(main, &self.draws) {
+            Ok(mut f) => {
+                f.pts = pts;
+                #[cfg(test)]
+                if let Some(p) = &self.probe {
+                    p.composed.fetch_add(1, Ordering::Relaxed);
+                    let ns = comp.gpu_time().map_or(0, |t| t.as_nanos() as u64);
+                    p.gpu_ns.fetch_add(ns, Ordering::Relaxed);
+                }
+                if std::mem::take(&mut self.told) {
+                    log!("scene compositor: back");
+                }
+                self.backoff = RETRY_FIRST;
+                Composed::Frame(f)
+            }
+            Err(e) => {
+                let lost = comp.is_lost();
+                // Its teardown waits for the GPU: never on the tick.
+                let old = slot.take();
+                drop(slot);
+                let _ = std::thread::Builder::new()
+                    .name("vesper-compose-drop".into())
+                    .spawn(move || drop(old));
+                let why = if lost {
+                    format!("the GPU stopped answering ({e})")
+                } else {
+                    e.to_string()
+                };
+                self.fail(why);
+                Composed::Unavailable
+            }
+        }
+    }
+}
+
+/// A second handle on `f`'s buffer, released with `f` (not with it): the
+/// held frame is drawn again while the producer keeps it ours.
+fn borrow(f: &VideoFrame) -> Option<VideoFrame> {
+    let planes = f
+        .planes
+        .iter()
+        .map(|p| {
+            Some(DmaBufPlane {
+                fd: p
+                    .fd
+                    .try_clone()
+                    .inspect_err(|e| log!("dup frame fd: {e}"))
+                    .ok()?,
+                offset: p.offset,
+                stride: p.stride,
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(VideoFrame {
+        width: f.width,
+        height: f.height,
+        fourcc: f.fourcc,
+        modifier: f.modifier,
+        planes,
+        buffer_id: f.buffer_id,
+        pool_generation: f.pool_generation,
+        pts: f.pts,
+        release: ReleaseGuard::new(|| {}),
+    })
 }
 
 /// Creates `<folder>/<stem>.mkv`, or `<stem> (2).mkv`, `(3)`... if taken, so
@@ -1976,6 +2424,8 @@ mod tests {
             tracks: Vec::new(),
             mix: false,
             game: None,
+            scene: Scene::main(),
+            canvas: Canvas::Auto,
         };
         let control = Mutex::new(Control {
             record: Some(std::env::temp_dir()),
@@ -2140,6 +2590,8 @@ mod tests {
             tracks: Vec::new(),
             mix: false,
             game: Some(GameFrames::default()),
+            scene: Scene::main(),
+            canvas: Canvas::Auto,
         }
     }
 

@@ -276,7 +276,8 @@ enum Plan {
 
 fn plan(old: &Prefs, new: &Prefs) -> Plan {
     let source_mode = old.game_source != new.game_source;
-    if source_mode || (old.codec, old.quality, old.fps) != (new.codec, new.quality, new.fps) {
+    let video = |p: &Prefs| (p.codec, p.quality, p.fps, p.scenes.canvas);
+    if source_mode || video(old) != video(new) {
         return Plan::Restart { source_mode };
     }
     let audio = |p: &Prefs| {
@@ -346,6 +347,9 @@ fn activate(ui: &AppWindow, rec: &Shared, games: &Games, dir: &Path, new: Prefs)
             crate::start_replay(ui, rec, games);
         }
         Plan::Update { tracks } => {
+            if let Some(p) = rec.borrow().as_ref() {
+                p.set_scene(new.scenes.active_scene());
+            }
             crate::apply_replay(ui, rec, games);
             if tracks {
                 crate::audio::apply_tracks(ui, rec);

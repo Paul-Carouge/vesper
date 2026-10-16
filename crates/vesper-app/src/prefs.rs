@@ -14,7 +14,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use vesper_audio::{MAX_DB, MIN_DB, Source};
 
 use crate::outputs::{Kind, SourceLabel};
-use crate::recorder::{MAX_FILTERS, MAX_TRACKS, Track, TrackFilter};
+use crate::recorder::{MAX_FILTERS, MAX_TRACKS, Track, TrackFilter, lock};
+use crate::scenes::{self, SCENES, Scenes};
 use crate::stream::{Service, StreamSettings};
 use crate::{AppWindow, LiveService, QualityPreset, SourceKind, VideoCodec};
 
@@ -58,6 +59,8 @@ pub struct Prefs {
     pub profile: String,
     /// The current profile's name; in its file.
     pub profile_name: String,
+    /// Canvas and scenes; in the profile's file.
+    pub scenes: Scenes,
 }
 
 impl Prefs {
@@ -79,6 +82,7 @@ impl Prefs {
             live: crate::live::settings(ui),
             profile: ui.get_profile_slug().into(),
             profile_name: ui.get_profile_name().into(),
+            scenes: lock(&SCENES).clone(),
         }
     }
 
@@ -120,6 +124,7 @@ impl Prefs {
         });
         ui.set_profile_slug(self.profile.as_str().into());
         ui.set_profile_name(self.profile_name.as_str().into());
+        lock(&SCENES).clone_from(&self.scenes);
     }
 
     /// `self` with the app's own settings of `app`: the ones no profile has.
@@ -143,11 +148,15 @@ impl Prefs {
         let (mut desktop_muted, mut mic_muted) = (None, None);
         // Duplicate check in O(1): a huge allow list must not stall startup.
         let mut allowed: HashSet<String> = self.allowed_games.iter().cloned().collect();
+        let mut scenes = scenes::Parser::default();
         for line in text.lines() {
             let Some((key, value)) = line.split_once('=') else {
                 continue;
             };
             let value = value.trim_end_matches('\r');
+            if scenes.line(key.trim(), value) {
+                continue;
+            }
             match key.trim() {
                 "codec" => set(&mut self.codec, codec(value)),
                 "quality" => set(&mut self.quality, quality(value)),
@@ -215,6 +224,7 @@ impl Prefs {
                 _ => {}
             }
         }
+        self.scenes = scenes.finish(std::mem::take(&mut self.scenes));
         match tracks {
             Some(tracks) => self.tracks = tracks,
             None => {
@@ -310,6 +320,7 @@ impl Prefs {
         if one_line(&url) {
             text += &format!("live_url={url}\n");
         }
+        text += &self.scenes.serialize();
         text
     }
 
@@ -751,6 +762,7 @@ mod tests {
             live: StreamSettings::default(),
             profile: String::new(),
             profile_name: String::new(),
+            scenes: Scenes::default(),
         }
     }
 
@@ -812,6 +824,23 @@ mod tests {
             },
             profile: "game-1440p".into(),
             profile_name: "Game — 1440p / AV1".into(),
+            scenes: Scenes {
+                canvas: crate::scenes::Canvas::Fixed(1920, 1080),
+                active: "Logo".into(),
+                list: vec![crate::scenes::Scene {
+                    name: "Logo".into(),
+                    layers: vec![
+                        crate::scenes::Layer::main(),
+                        crate::scenes::Layer {
+                            source: crate::scenes::LayerSource::Image {
+                                path: "/home/u/logo.png".into(),
+                            },
+                            rect: [0.8, 0.0, 0.2, 0.2],
+                            ..crate::scenes::Layer::main()
+                        },
+                    ],
+                }],
+            },
         }
     }
 
@@ -837,6 +866,11 @@ mod tests {
                 // Unnamed: the current profile stays.
                 profile: changed().profile,
                 profile_name: changed().profile_name,
+                // No scene lines: the scenes stay, `canvas` is always written.
+                scenes: Scenes {
+                    canvas: crate::scenes::Canvas::Auto,
+                    ..changed().scenes
+                },
                 ..defaults()
             }
         );

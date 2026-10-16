@@ -22,9 +22,11 @@ mod layer;
 mod live;
 mod meter;
 mod outputs;
+mod overlay;
 mod prefs;
 mod profiles;
 mod recorder;
+mod scenes;
 mod secret;
 mod shortcuts;
 mod stream;
@@ -838,6 +840,8 @@ fn settings(ui: &AppWindow, games: &Games) -> Settings {
         max_bits_per_pixel: max_bits_per_pixel(ui.get_codec(), ui.get_quality()),
         tracks: audio::recorded_tracks(ui),
         mix: ui.get_audio_mix(),
+        scene: recorder::lock(&scenes::SCENES).active_scene(),
+        canvas: recorder::lock(&scenes::SCENES).canvas,
     }
 }
 
@@ -945,7 +949,7 @@ fn on_recorder_event(ui: &AppWindow, generation: u64, event: Event) {
             log!("audio track {name:?}: {reason}");
             flash_notice(ui, &format!("{name}: reconnecting…"));
         }
-        Event::AudioMissing(text) => flash_notice(ui, &text),
+        Event::AudioMissing(text) | Event::Notice(text) => flash_notice(ui, &text),
         Event::AudioTrack(name, TrackState::Running) => {
             flash_notice(ui, &format!("{name}: audio is back"));
         }
@@ -1047,6 +1051,8 @@ fn default_settings() -> Settings {
         ),
         mix: saved.audio_mix,
         game: None,
+        scene: saved.scenes.active_scene(),
+        canvas: saved.scenes.canvas,
     }
 }
 
