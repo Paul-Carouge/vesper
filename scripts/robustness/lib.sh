@@ -1,9 +1,21 @@
 # Helpers for scenarios (sourced). Runs inside run.sh's namespaces.
+#
+# Guard: scenarios run built binaries ($VESPER, test binaries), so only inside
+# run.sh's lab (private user namespace, /run/user hidden, no display, the lab's
+# HOME). Never run a scenario directly: go through `go`, `r2` or `run.sh`.
+lab_abort() { echo "lib.sh: not in the lab ($1), refusing to run" >&2; exit 1; }
+[ -z "${WAYLAND_DISPLAY:-}${DISPLAY:-}" ] || lab_abort "WAYLAND_DISPLAY/DISPLAY set"
+[ -z "$(ls -A /run/user 2>/dev/null)" ] || lab_abort "/run/user visible"
+read -r _ns_in _ns_out _ < /proc/self/uid_map
+[ "$_ns_in $_ns_out" != "0 0" ] || lab_abort "no user namespace"
+[ "$HOME" != "$(getent passwd "$_ns_out" | cut -d: -f6)" ] || lab_abort "HOME is the real home"
+[ -n "${L:-}" ] && [ "$HOME" = "$L/home" ] || lab_abort "HOME is not the lab's"
+#
 # start_game <name> : gamescope headless + vkcube; sets GS (gamescope pid).
 # $L/run/display-<name> gets gamescope's Xwayland DISPLAY (see game_display).
 start_game() {
   local size=${2:-1280x720}
-  gamescope --backend headless -W ${size%x*} -H ${size#*x} -- bash -c 'echo "$DISPLAY" > "$0"; exec env SteamAppId=1 vkcube --width "$1" --height "$2"' $L/run/display-$1 ${size%x*} ${size#*x} > $L/log/game-$1.log 2>&1 &
+  gamescope --backend headless -W ${size%x*} -H ${size#*x} ${GS_ARGS:-} -- bash -c 'echo "$DISPLAY" > "$0"; exec env SteamAppId=1 vkcube --width "$1" --height "$2"' $L/run/display-$1 ${size%x*} ${size#*x} > $L/log/game-$1.log 2>&1 &
   GS=$!
   sleep 5
 }

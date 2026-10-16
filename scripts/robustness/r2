@@ -1,0 +1,16 @@
+#!/bin/bash
+# r2 <lab> <scenario.sh> [VAR=value ...]  -- `go` with the optimized, debug-assertions build
+# (target-da/release, see r2_build.sh) and the malloc counting shim, built on first use.
+R=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+D=$R/scripts/robustness
+lab=$1 scn=$2
+shift 2
+for kv in "$@"; do export "$kv"; done
+export BUILD=${BUILD:-$R/target-da/release}
+# cargo and rustup inside the lab (r2_flakes.sh), whose HOME is the lab's.
+export CARGO_HOME=${CARGO_HOME:-$HOME/.cargo} RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}
+export VESPER_LAB_DATA=${VESPER_LAB_DATA:-/tmp/vesper-lab-$(id -u)}
+mkdir -p "$VESPER_LAB_DATA"
+export SHIM=${SHIM:-$VESPER_LAB_DATA/r2_allocshim.so}
+[ -f "$SHIM" ] || gcc -O2 -shared -fPIC -o "$SHIM" "$D/r2_allocshim.c"
+exec "$D/go" "$lab" "$scn"
