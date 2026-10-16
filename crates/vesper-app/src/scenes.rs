@@ -22,7 +22,6 @@
 //! ignored, numbers are clamped.
 
 use std::path::PathBuf;
-use std::sync::Mutex;
 
 pub use vesper_compose::Fit;
 
@@ -34,10 +33,6 @@ pub const MAX_LAYERS: usize = vesper_compose::MAX_LAYERS;
 const MAX_TEXT: usize = 1024;
 /// Smallest and largest fixed canvas side, pixels.
 const CANVAS_SIDES: (u32, u32) = (128, 8192);
-
-/// The scenes of the current profile. Not UI state (yet), so kept here for
-/// `Prefs::from_ui`, like the allowed games.
-pub static SCENES: Mutex<Scenes> = Mutex::new(Scenes::new());
 
 /// Size of the recorded picture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -196,6 +191,123 @@ impl Scenes {
             .or(self.list.first())
             .cloned()
             .unwrap_or_else(Scene::main)
+    }
+
+    /// Index of the scene recorded: the active one, else the first.
+    pub fn active_index(&self) -> Option<usize> {
+        let found = self.list.iter().position(|s| s.name == self.active);
+        found.or((!self.list.is_empty()).then_some(0))
+    }
+
+    /// Another scene than `except` has this name (case aside, as the parser).
+    fn taken(&self, name: &str, except: Option<usize>) -> bool {
+        self.list
+            .iter()
+            .enumerate()
+            .any(|(i, s)| Some(i) != except && s.name.eq_ignore_ascii_case(name))
+    }
+
+    /// `base` if free, else `base 2`, `base 3`... (shortened to stay valid).
+    pub fn free_name(&self, base: &str) -> String {
+        let base = if base.trim().is_empty() {
+            "Scene"
+        } else {
+            base
+        };
+        (1..)
+            .map(|n| {
+                let suffix = if n == 1 {
+                    String::new()
+                } else {
+                    format!(" {n}")
+                };
+                let room = 64 - suffix.chars().count();
+                let head: String = base.trim().chars().take(room).collect();
+                format!("{}{suffix}", head.trim_end())
+            })
+            .find(|name| valid_name(name) && !self.taken(name, None))
+            .expect("at most MAX_SCENES names are taken")
+    }
+
+    /// The name typed for scene `except` (`None`: a new one), trimmed.
+    pub fn check_name(&self, name: &str, except: Option<usize>) -> Result<String, &'static str> {
+        let name = name.trim();
+        if name.is_empty() {
+            Err("Type a name")
+        } else if !valid_name(name) {
+            Err("At most 64 characters, on one line")
+        } else if self.taken(name, except) {
+            Err("Another scene has this name")
+        } else {
+            Ok(name.to_owned())
+        }
+    }
+
+    /// Adds a scene showing the capture; the first one becomes active (it
+    /// records what the implicit scene did). Its index, `None` when full.
+    pub fn add(&mut self) -> Option<usize> {
+        if self.list.len() >= MAX_SCENES {
+            return None;
+        }
+        let name = self.free_name(&format!("Scene {}", self.list.len() + 1));
+        if self.list.is_empty() {
+            self.active.clone_from(&name);
+        }
+        self.list.push(Scene {
+            name,
+            ..Scene::main()
+        });
+        Some(self.list.len() - 1)
+    }
+
+    /// A copy of scene `i` right after it; its index.
+    pub fn duplicate(&mut self, i: usize) -> Option<usize> {
+        if self.list.len() >= MAX_SCENES {
+            return None;
+        }
+        let mut copy = self.list.get(i)?.clone();
+        copy.name = self.free_name(&format!("{} copy", copy.name));
+        self.list.insert(i + 1, copy);
+        Some(i + 1)
+    }
+
+    /// Renames scene `i`; the active scene stays active.
+    pub fn rename(&mut self, i: usize, name: &str) -> Result<(), &'static str> {
+        let name = self.check_name(name, Some(i))?;
+        let scene = self.list.get_mut(i).ok_or("That scene is gone")?;
+        if self.active == scene.name {
+            self.active.clone_from(&name);
+        }
+        scene.name = name;
+        Ok(())
+    }
+
+    /// Removes scene `i`. Without the active one, the first is recorded;
+    /// without any, the capture alone.
+    pub fn remove(&mut self, i: usize) {
+        if i >= self.list.len() {
+            return;
+        }
+        let gone = self.list.remove(i);
+        if gone.name == self.active {
+            self.active = self
+                .list
+                .first()
+                .map(|s| s.name.clone())
+                .unwrap_or_default();
+        }
+    }
+
+    /// Moves layer `layer` of scene `scene` one step up (towards the top of
+    /// the stack) or down; its new index.
+    pub fn move_layer(&mut self, scene: usize, layer: usize, up: bool) -> Option<usize> {
+        let layers = &mut self.list.get_mut(scene)?.layers;
+        let to = if up { layer + 1 } else { layer.checked_sub(1)? };
+        if to >= layers.len() {
+            return None;
+        }
+        layers.swap(layer, to);
+        Some(to)
     }
 
     /// The profile lines; only `canvas` for the implicit scene.
@@ -546,6 +658,163 @@ fn serialize_layer(l: &Layer) -> Option<String> {
     })
 }
 
+/// Smallest layer side while resizing, canvas fraction.
+const MIN_SIDE: f32 = 0.02;
+
+/// What a pointer drag on the editor's preview changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Handle {
+    Move,
+    N,
+    S,
+    E,
+    W,
+    NE,
+    NW,
+    SE,
+    SW,
+}
+
+impl Handle {
+    /// The UI's numbering: 0 the layer's body, then N, S, E, W, NE, NW, SE, SW.
+    pub fn from_index(i: i32) -> Option<Self> {
+        use Handle::*;
+        [Move, N, S, E, W, NE, NW, SE, SW]
+            .get(usize::try_from(i).ok()?)
+            .copied()
+    }
+
+    /// Whether it moves the left, right, top and bottom edges.
+    fn edges(self) -> [bool; 4] {
+        use Handle::*;
+        [
+            matches!(self, W | NW | SW),
+            matches!(self, E | NE | SE),
+            matches!(self, N | NW | NE),
+            matches!(self, S | SW | SE),
+        ]
+    }
+}
+
+/// A layer being moved or resized on the preview, in canvas fractions.
+/// Edges snap to the canvas edges and centre and to the other layers'
+/// edges and centres, within `tolerance`.
+#[derive(Debug, Clone)]
+pub struct Drag {
+    pub handle: Handle,
+    /// The layer's rect when the drag started.
+    pub start: [f32; 4],
+    /// Snap distance per axis.
+    tolerance: (f32, f32),
+    /// Vertical lines (x) and horizontal lines (y) to snap to.
+    lines: (Vec<f32>, Vec<f32>),
+}
+
+/// A drag's result: the rect, and the lines it lies on (to draw).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Snapped {
+    pub rect: [f32; 4],
+    pub guide_x: Option<f32>,
+    pub guide_y: Option<f32>,
+}
+
+/// The line nearest to one of `values`, within `tolerance`: (shift, line).
+fn nearest(values: &[f32], lines: &[f32], tolerance: f32) -> Option<(f32, f32)> {
+    let mut best: Option<(f32, f32)> = None;
+    for &v in values {
+        for &l in lines {
+            let d = l - v;
+            if d.abs() <= tolerance && best.is_none_or(|(b, _)| d.abs() < b.abs()) {
+                best = Some((d, l));
+            }
+        }
+    }
+    best
+}
+
+impl Drag {
+    pub fn new(
+        handle: Handle,
+        start: [f32; 4],
+        tolerance: (f32, f32),
+        others: impl IntoIterator<Item = [f32; 4]>,
+    ) -> Self {
+        let (mut xs, mut ys) = (vec![0.0, 0.5, 1.0], vec![0.0, 0.5, 1.0]);
+        for [x, y, w, h] in others {
+            xs.extend([x, x + w / 2.0, x + w]);
+            ys.extend([y, y + h / 2.0, y + h]);
+        }
+        Self {
+            handle,
+            start,
+            tolerance,
+            lines: (xs, ys),
+        }
+    }
+
+    /// The rect once the pointer moved `(dx, dy)` from where the drag
+    /// started. `keep_ratio` (Shift) keeps the start's proportions on a
+    /// corner; without `snap` it goes exactly where the pointer says.
+    pub fn to(&self, dx: f32, dy: f32, keep_ratio: bool, snap: bool) -> Snapped {
+        let [x0, y0, w0, h0] = self.start;
+        let (tx, ty) = if snap { self.tolerance } else { (-1.0, -1.0) };
+        let (xs, ys) = (&self.lines.0, &self.lines.1);
+        let rect = if self.handle == Handle::Move {
+            let (x, y) = (x0 + dx, y0 + dy);
+            let sx = nearest(&[x, x + w0 / 2.0, x + w0], xs, tx).map_or(0.0, |s| s.0);
+            let sy = nearest(&[y, y + h0 / 2.0, y + h0], ys, ty).map_or(0.0, |s| s.0);
+            [x + sx, y + sy, w0, h0]
+        } else {
+            let [left, right, top, bottom] = self.handle.edges();
+            let snapped = |v: f32, lines: &[f32], t| nearest(&[v], lines, t).map_or(v, |s| s.1);
+            let (mut l, mut r, mut t, mut b) = (x0, x0 + w0, y0, y0 + h0);
+            if left {
+                l = snapped(l + dx, xs, tx).min(r - MIN_SIDE);
+            }
+            if right {
+                r = snapped(r + dx, xs, tx).max(l + MIN_SIDE);
+            }
+            if top {
+                t = snapped(t + dy, ys, ty).min(b - MIN_SIDE);
+            }
+            if bottom {
+                b = snapped(b + dy, ys, ty).max(t + MIN_SIDE);
+            }
+            if keep_ratio && (left || right) && (top || bottom) {
+                // The larger change leads; the opposite corner stays.
+                let s = ((r - l) / w0).max((b - t) / h0);
+                let (w, h) = (w0 * s, h0 * s);
+                if left {
+                    l = r - w;
+                } else {
+                    r = l + w;
+                }
+                if top {
+                    t = b - h;
+                } else {
+                    b = t + h;
+                }
+            }
+            [l, t, r - l, b - t]
+        };
+        let [x, y, w, h] = [
+            rect[0].clamp(-1.0, 1.0),
+            rect[1].clamp(-1.0, 1.0),
+            rect[2].clamp(MIN_SIDE, 2.0),
+            rect[3].clamp(MIN_SIDE, 2.0),
+        ];
+        let on = |values: [f32; 3], lines: &[f32]| {
+            snap.then(|| nearest(&values, lines, 1e-4).map(|s| s.1))
+                .flatten()
+        };
+        Snapped {
+            rect: [x, y, w, h],
+            guide_x: on([x, x + w / 2.0, x + w], xs),
+            guide_y: on([y, y + h / 2.0, y + h], ys),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -843,5 +1112,125 @@ mod tests {
             assert_eq!(back.serialize(), again, "{text:?}");
             let _ = s.active_scene();
         }
+    }
+
+    #[test]
+    fn names_stay_unique_and_valid() {
+        let mut s = Scenes::default();
+        assert_eq!(s.add(), Some(0));
+        // The first scene is recorded: it shows what the implicit one did.
+        assert_eq!(s.active, "Scene 1");
+        assert_eq!(s.active_scene().layers, Scene::main().layers);
+        assert_eq!(s.duplicate(0), Some(1));
+        assert_eq!(s.duplicate(0), Some(1));
+        let names: Vec<_> = s.list.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["Scene 1", "Scene 1 copy 2", "Scene 1 copy"]);
+        assert_eq!(
+            s.check_name(" scene 1 ", None),
+            Err("Another scene has this name")
+        );
+        assert_eq!(s.check_name(" Scene 1 ", Some(0)), Ok("Scene 1".into()));
+        assert_eq!(s.check_name("  ", None), Err("Type a name"));
+        let long = "y".repeat(64);
+        assert!(s.check_name(&format!("{long}y"), None).is_err());
+        assert!(s.check_name("a\u{7}b", None).is_err());
+        // Renaming the active scene keeps it active.
+        s.rename(0, "Gameplay").unwrap();
+        assert_eq!(s.active, "Gameplay");
+        assert_eq!(s.rename(1, "gameplay"), Err("Another scene has this name"));
+        // A long name's copy is shortened, never invalid.
+        s.rename(2, &long).unwrap();
+        let i = s.duplicate(2).unwrap();
+        assert!(valid_name(&s.list[i].name) && s.list[i].name != long);
+        while s.add().is_some() {}
+        assert_eq!(s.list.len(), MAX_SCENES);
+        assert_eq!(s.duplicate(0), None);
+        assert_eq!(parse(&s.serialize()), s);
+    }
+
+    #[test]
+    fn removing_the_active_scene_records_the_first() {
+        let mut s = sample();
+        s.remove(1);
+        assert_eq!(s.active, "Gameplay");
+        s.remove(7);
+        s.remove(0);
+        assert_eq!(s.active, "Empty");
+        s.remove(0);
+        assert!(s.list.is_empty() && s.active.is_empty());
+        assert_eq!(s.active_scene(), Scene::main());
+        assert_eq!(s.active_index(), None);
+    }
+
+    #[test]
+    fn layers_reorder_within_bounds() {
+        let mut s = sample();
+        let kinds = |s: &Scenes| {
+            s.list[0]
+                .layers
+                .iter()
+                .map(|l| std::mem::discriminant(&l.source))
+                .collect::<Vec<_>>()
+        };
+        let before = kinds(&s);
+        assert_eq!(s.move_layer(0, 0, false), None);
+        assert_eq!(s.move_layer(0, 2, true), None);
+        assert_eq!(s.move_layer(0, 0, true), Some(1));
+        assert_eq!(kinds(&s), [before[1], before[0], before[2]]);
+        assert_eq!(s.move_layer(0, 1, false), Some(0));
+        assert_eq!(kinds(&s), before);
+        assert_eq!(s.move_layer(9, 0, true), None);
+    }
+
+    fn close(a: [f32; 4], b: [f32; 4]) -> bool {
+        a.iter().zip(b).all(|(a, b)| (a - b).abs() < 1e-5)
+    }
+
+    #[test]
+    fn moves_snap_to_the_canvas_and_other_layers() {
+        let other = [0.6, 0.1, 0.2, 0.2];
+        let d = Drag::new(Handle::Move, [0.1, 0.1, 0.25, 0.1], (0.01, 0.01), [other]);
+        // Nothing near: where the pointer says.
+        let r = d.to(0.13, 0.27, false, true);
+        assert!(close(r.rect, [0.23, 0.37, 0.25, 0.1]), "{r:?}");
+        assert_eq!((r.guide_x, r.guide_y), (None, None));
+        // The right edge onto the other layer's left edge.
+        let r = d.to(0.252, 0.0, false, true);
+        assert!(close(r.rect, [0.35, 0.1, 0.25, 0.1]), "{r:?}");
+        assert_eq!((r.guide_x, r.guide_y), (Some(0.6), Some(0.1)));
+        // The centre onto the canvas centre.
+        let r = d.to(0.27, 0.352, false, true);
+        assert!(close(r.rect, [0.375, 0.45, 0.25, 0.1]), "{r:?}");
+        assert_eq!((r.guide_x, r.guide_y), (Some(0.5), Some(0.5)));
+        // The left edge onto the canvas edge; past it without snapping.
+        let r = d.to(-0.105, 0.03, false, true);
+        assert!(close(r.rect, [0.0, 0.13, 0.25, 0.1]), "{r:?}");
+        assert_eq!(r.guide_x, Some(0.0));
+        let r = d.to(-0.105, 0.0, false, false);
+        assert!(close(r.rect, [-0.005, 0.1, 0.25, 0.1]), "{r:?}");
+        assert_eq!((r.guide_x, r.guide_y), (None, None));
+    }
+
+    #[test]
+    fn resizes_snap_and_keep_the_ratio() {
+        let start = [0.2, 0.2, 0.4, 0.2];
+        let r = Drag::new(Handle::SE, start, (0.01, 0.01), []).to(-0.095, 0.0, false, true);
+        assert!(close(r.rect, [0.2, 0.2, 0.3, 0.2]), "{r:?}");
+        assert_eq!((r.guide_x, r.guide_y), (Some(0.5), None));
+        // Shift: 2:1 kept, the larger change leads, the opposite corner stays.
+        let r = Drag::new(Handle::SE, start, (0.01, 0.01), []).to(0.2, 0.01, true, false);
+        assert!(close(r.rect, [0.2, 0.2, 0.6, 0.3]), "{r:?}");
+        let r = Drag::new(Handle::NW, start, (0.01, 0.01), []).to(0.0, -0.1, true, false);
+        assert!(close(r.rect, [0.0, 0.1, 0.6, 0.3]), "{r:?}");
+        // Edge handles ignore the other axis; edges never cross.
+        let r = Drag::new(Handle::W, start, (0.01, 0.01), []).to(0.9, 0.3, false, true);
+        assert!(close(r.rect, [0.6 - MIN_SIDE, 0.2, MIN_SIDE, 0.2]), "{r:?}");
+        let r = Drag::new(Handle::N, start, (0.01, 0.01), []).to(0.3, -0.195, false, true);
+        assert!(close(r.rect, [0.2, 0.0, 0.4, 0.4]), "{r:?}");
+        assert_eq!((r.guide_x, r.guide_y), (None, Some(0.0)));
+        assert_eq!(Handle::from_index(0), Some(Handle::Move));
+        assert_eq!(Handle::from_index(8), Some(Handle::SW));
+        assert_eq!(Handle::from_index(9), None);
+        assert_eq!(Handle::from_index(-1), None);
     }
 }

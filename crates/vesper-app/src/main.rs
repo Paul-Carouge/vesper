@@ -26,6 +26,7 @@ mod overlay;
 mod prefs;
 mod profiles;
 mod recorder;
+mod scene_ui;
 mod scenes;
 mod secret;
 mod shortcuts;
@@ -39,8 +40,8 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use slint::ComponentHandle;
 use slint::winit_030::WinitWindowAccessor;
+use slint::{ComponentHandle, Model};
 
 use game::GameSource;
 use outputs::SourceLabel;
@@ -193,6 +194,7 @@ fn main() -> Result<(), slint::PlatformError> {
     wire_callbacks(&ui, &recording, &games);
     wire_game_callbacks(&ui, &games);
     live::wire(&ui, &recording, &games);
+    scene_ui::wire(&ui, &recording, &games);
     profiles::wire(&ui, &recording, &games, defaults);
     if prefs::SAVING_OFF.load(Ordering::Relaxed) {
         flash_notice(&ui, "Could not read the settings: changes are not saved");
@@ -599,6 +601,7 @@ fn spawn_tray(ui: &AppWindow) -> Option<Tray> {
             tray::Command::SaveReplay => ui.invoke_global_save_replay(),
             tray::Command::ToggleReplay => ui.invoke_toggle_replay(),
             tray::Command::ToggleLive => ui.invoke_global_toggle_live(),
+            tray::Command::Scene(i) => ui.global::<SceneStore>().invoke_switch(i as i32),
             tray::Command::Quit => ui.invoke_quit(),
         });
     });
@@ -620,6 +623,13 @@ fn tray_state(ui: &AppWindow) -> tray::State {
         replay: ui.get_replay_enabled(),
         live: ui.get_live_state() != LiveState::Off,
         live_busy: ui.get_live_state() == LiveState::Ending,
+        scenes: ui
+            .global::<SceneStore>()
+            .get_scenes()
+            .iter()
+            .map(|s| s.name.to_string())
+            .collect(),
+        active_scene: usize::try_from(ui.global::<SceneStore>().get_active()).ok(),
     }
 }
 
@@ -808,6 +818,8 @@ fn wire_global_shortcuts(ui: &AppWindow) {
                         Action::ToggleRecording => "Ctrl+R".to_owned(),
                         Action::SaveReplay => "Ctrl+S".to_owned(),
                         Action::ToggleLive => "Ctrl+L".to_owned(),
+                        // No in-window key, no hint.
+                        Action::NextScene | Action::Scene(_) => return,
                     }
                 } else {
                     trigger
@@ -816,6 +828,7 @@ fn wire_global_shortcuts(ui: &AppWindow) {
                     Action::ToggleRecording => ui.set_record_shortcut(key.into()),
                     Action::SaveReplay => ui.set_replay_shortcut(key.into()),
                     Action::ToggleLive => ui.set_live_shortcut(key.into()),
+                    Action::NextScene | Action::Scene(_) => {}
                 }
             });
         },
@@ -825,6 +838,12 @@ fn wire_global_shortcuts(ui: &AppWindow) {
                 Action::ToggleRecording => ui.invoke_global_toggle_recording(),
                 Action::SaveReplay => ui.invoke_global_save_replay(),
                 Action::ToggleLive => ui.invoke_global_toggle_live(),
+                Action::NextScene => {
+                    if let Some(i) = scene_ui::next(&ui) {
+                        ui.global::<SceneStore>().invoke_switch(i as i32);
+                    }
+                }
+                Action::Scene(n) => ui.global::<SceneStore>().invoke_switch(i32::from(n) - 1),
             });
         },
     );
@@ -832,6 +851,7 @@ fn wire_global_shortcuts(ui: &AppWindow) {
 
 /// Encoder settings from the UI.
 fn settings(ui: &AppWindow, games: &Games) -> Settings {
+    let scenes = scene_ui::from_ui(ui);
     Settings {
         game: games.borrow().as_ref().map(|g| g.frames.clone()),
         codec: ui.get_codec().into(),
@@ -840,8 +860,8 @@ fn settings(ui: &AppWindow, games: &Games) -> Settings {
         max_bits_per_pixel: max_bits_per_pixel(ui.get_codec(), ui.get_quality()),
         tracks: audio::recorded_tracks(ui),
         mix: ui.get_audio_mix(),
-        scene: recorder::lock(&scenes::SCENES).active_scene(),
-        canvas: recorder::lock(&scenes::SCENES).canvas,
+        scene: scenes.active_scene(),
+        canvas: scenes.canvas,
     }
 }
 
@@ -966,6 +986,7 @@ fn on_recorder_event(ui: &AppWindow, generation: u64, event: Event) {
         } => live::on_stats(ui, elapsed, bitrate, dropped),
         // A clean stop always follows `Finished`: nothing to reset (a new
         // pipeline may already be starting).
+        Event::Preview(pixels) => scene_ui::on_preview(ui, pixels),
         Event::Stopped(None) => log!("pipeline stopped"),
         Event::Stopped(Some(e)) if generation != GENERATION.load(Ordering::Relaxed) => {
             log!("earlier pipeline stopped: {e}");

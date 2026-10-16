@@ -1,14 +1,20 @@
-# T6: window snapshots of the live stream UI with demo data (no capture, no
-# key), in $L/shots as PNG. Env: SIZE (440x780 logical), SCALE (2).
+# T6: window snapshots of the live stream and scene UI with demo data (no
+# capture, no key, no webcam), in $L/shots as PNG. Env: SIZE (440x780
+# logical), SCALE (2), ONLY (a pattern: only the shots it matches).
 . "${LABROOT:?not in the lab, use go or r2}/lib.sh" || exit 1
 mkdir -p $L/cfg/vesper $L/shots
+# The scenes' demo logo.
+cp $R/crates/vesper-app/data/icons/hicolor/256x256/apps/io.github.PaulCarouge.Vesper.png $L/logo.png
 # No replay buffer: it would open the (missing) portal picker.
 printf 'replay=false\n' > $L/cfg/vesper/settings
 shot() {
   local name=$1 theme=$2 demo=$3
-  gamescope --backend headless -W 1200 -H 2000 -- env VESPER_THEME=$theme SLINT_SCALE_FACTOR=${SCALE:-2} \
-    VESPER_WINDOW_SIZE=${SIZE:-440x780} VESPER_DEMO="$demo" VESPER_DEMO_DELAY=1500 \
-    VESPER_SNAPSHOT=$L/shots/$name.ppm $VESPER > $L/log/shot-$name.log 2>&1
+  case $name in ${ONLY:-*}) ;; *) return ;; esac
+  local size=${SIZE:-440x780} scale=${SCALE:-2}
+  # Room for the whole window.
+  gamescope --backend headless -W $(( ${size%x*} * scale + 200 )) -H $(( ${size#*x} * scale + 200 )) -- env VESPER_THEME=$theme SLINT_SCALE_FACTOR=$scale \
+    VESPER_WINDOW_SIZE=$size VESPER_DEMO="$demo" VESPER_DEMO_DELAY=1500 \
+    VESPER_DEMO_IMAGE=$L/logo.png VESPER_SNAPSHOT=$L/shots/$name.ppm $VESPER > $L/log/shot-$name.log 2>&1
   ffmpeg -y -loglevel error -i $L/shots/$name.ppm $L/shots/$name.png && rm $L/shots/$name.ppm && echo "$name: $(file -b $L/shots/$name.png | cut -d, -f2)"
 }
 shot live-idle-dark dark screen-look,replay-on
@@ -20,3 +26,12 @@ shot live-settings-dark dark screen-look,settings,live-key-look,scroll:${SCROLL:
 shot live-settings-light light screen-look,settings,scroll:${SCROLL:-560}
 shot settings-end-dark dark screen-look,settings,scroll-end
 shot settings-end-light light screen-look,settings,scroll-end
+shot scenes-main-dark dark screen-look,replay-on,scenes-look
+shot scenes-main-light light screen-look,replay-on,scenes-look,recording-look
+shot scenes-editor-dark dark scenes-look,scene-editor,scene-layer:2
+shot scenes-editor-light light scenes-look,scene-editor,scene-layer:1
+shot scenes-editor-props-dark dark scenes-look,scene-editor,scene-layer:2,scroll:${SCROLL:-700}
+shot scenes-editor-empty-light light scene-editor
+SIZE=360x700 shot scenes-editor-narrow-dark dark scenes-look,scene-editor,scene-layer:1
+SIZE=1280x800 SCALE=1 shot scenes-editor-wide-dark dark scenes-look,scene-editor,scene-layer:2
+SIZE=1280x800 SCALE=1 shot scenes-editor-wide-light light scenes-look,scene-editor,scene-layer:1

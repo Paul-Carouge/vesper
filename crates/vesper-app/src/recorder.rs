@@ -285,7 +285,15 @@ pub enum Event {
     /// The pipeline ended, with the error that ended it if any. A recording
     /// still running then is lost only if the pipeline crashed.
     Stopped(Option<String>),
+    /// A small copy of the composed picture, while [`PREVIEW`] is set.
+    Preview(slint::SharedPixelBuffer<slint::Rgba8Pixel>),
 }
+
+/// The scene editor shows the recorded scene: composed pictures come as
+/// [`Event::Preview`], [`PREVIEW_PERIOD`] apart. Off the hot path: a
+/// 480 x 270 downscale read back only while this is set.
+pub static PREVIEW: AtomicBool = AtomicBool::new(false);
+const PREVIEW_PERIOD: Duration = Duration::from_millis(100);
 
 /// Most audio tracks a recording has, the mix aside.
 pub const MAX_TRACKS: usize = 8;
@@ -1958,6 +1966,8 @@ struct Stage {
     told: bool,
     /// The user was told a previous compositor is stuck.
     stuck_told: bool,
+    /// When the next preview is due.
+    preview_at: Duration,
     on_event: OnEvent,
     #[cfg(test)]
     probe: Option<Arc<Probe>>,
@@ -1989,6 +1999,7 @@ impl Stage {
             backoff: RETRY_FIRST,
             told: false,
             stuck_told: false,
+            preview_at: Duration::ZERO,
             on_event: on_event.clone(),
             #[cfg(test)]
             probe: settings.game.as_ref().map(|g| g.0.probe.clone()),
@@ -2293,6 +2304,20 @@ impl Stage {
             drop(slot);
             return direct(self, frame);
         };
+        if PREVIEW.load(Ordering::Relaxed) && monotonic_now() >= self.preview_at {
+            self.preview_at = monotonic_now() + PREVIEW_PERIOD;
+            if let Some(px) = comp.preview() {
+                let (w, h) = (
+                    vesper_compose::PREVIEW_WIDTH,
+                    vesper_compose::PREVIEW_HEIGHT,
+                );
+                let buffer = slint::SharedPixelBuffer::clone_from_slice(px, w, h);
+                (self.on_event)(Event::Preview(buffer));
+            }
+            // The next composition carries the preview pass, even of a
+            // picture that would otherwise repeat.
+            self.dirty = true;
+        }
         let mut out = None;
         if comp.in_flight() {
             match comp.poll(Duration::ZERO) {

@@ -4,7 +4,9 @@
 import { Theme, Icons } from "theme.slint";
 import { Icon, Logo, Card, Button, IconButton, Switch, Segmented, Meter, SectionLabel, FocusRing, Slider, TextField, SelectField } from "components.slint";
 
-export { Theme }
+import { SceneBar, SceneEditor, SceneStore, LayerKind, LayerRow, SceneRow, CameraChoice } from "scenes.slint";
+
+export { Theme, SceneStore, LayerKind, LayerRow, SceneRow, CameraChoice }
 
 export enum TrackKind { desktop, microphone, output, input, app }
 /// A filter parameter. `index` is its place in the filter's parameters.
@@ -1244,6 +1246,19 @@ export component AppWindow inherits Window {
         game-layer-switch.focus();
     }
 
+    public function open-scenes() {
+        root.settings-open = false;
+        root.profile-menu = false;
+        SceneStore.open = true;
+        SceneStore.shown();
+    }
+
+    function close-scenes() {
+        SceneStore.open = false;
+        SceneStore.shown();
+        scenes-button.focus();
+    }
+
     function close-settings() {
         root.settings-open = false;
         root.device-list = 0;
@@ -1300,6 +1315,10 @@ export component AppWindow inherits Window {
                 root.close-settings();
                 return accept;
             }
+            if (event.text == Key.Escape && SceneStore.open) {
+                root.close-scenes();
+                return accept;
+            }
             reject
         }
 
@@ -1350,6 +1369,15 @@ export component AppWindow inherits Window {
                             } else {
                                 root.open-profile-menu(0);
                             }
+                        }
+                    }
+                    scenes-button := IconButton {
+                        enabled: !root.settings-open;
+                        icon: Icons.layers;
+                        label: "Scenes";
+                        active: SceneStore.open;
+                        clicked => {
+                            root.open-scenes();
                         }
                     }
                     settings-button := IconButton {
@@ -1697,6 +1725,13 @@ export component AppWindow inherits Window {
                                 }
                             }
                         }
+                    }
+                }
+
+                // ---- Scenes ------------------------------------------------
+                if SceneStore.scenes.length > 0: SceneBar {
+                    edit => {
+                        root.open-scenes();
                     }
                 }
 
@@ -2761,6 +2796,19 @@ export component AppWindow inherits Window {
                         }
                     }
                 }
+            }
+        }
+
+        // ---- Scene editor -----------------------------------------------
+        SceneEditor {
+            x: SceneStore.open ? 0 : parent.width + 24px;
+            width: parent.width;
+            height: parent.height;
+            visible: SceneStore.open || self.x < parent.width;
+            animate x { duration: Theme.medium; easing: ease-out-quart; }
+            locked: root.active || !root.live-off;
+            close => {
+                root.close-scenes();
             }
         }
     }
