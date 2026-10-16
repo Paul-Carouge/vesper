@@ -308,74 +308,129 @@ async fn legacy_items(
     Ok(legacy)
 }
 
-/// Gives the key of an older version to `id` (unless `id` has one), then
-/// deletes it. Ok(false) when there is none.
-async fn keyring_migrate(id: &str) -> Result<bool> {
+/// What a migration of the old key did.
+#[derive(Debug, PartialEq)]
+enum Migrated {
+    /// No old key.
+    Nothing,
+    /// Moved to its service, read back equal, the old copy deleted.
+    Moved,
+    /// Left as it was: its service has a key already (never overwritten),
+    /// or the keyring stayed locked. Tried again at the next launch.
+    Kept,
+}
+
+/// Serializes saving, removing and migrating keys: a migration checks the
+/// target has no key, then writes it.
+static WRITING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn writing() -> std::sync::MutexGuard<'static, ()> {
+    WRITING.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Gives the old keyring item's key to `id`, the service it was saved for,
+/// unless `id` has a key. The old item is deleted only once the new one
+/// reads back equal.
+async fn keyring_migrate(id: &str) -> Result<Migrated> {
     let (conn, session) = open().await?;
     let service = proxy(&conn, SERVICE, "org.freedesktop.Secret.Service").await?;
     let legacy = legacy_items(&conn, &service).await?;
     if legacy.0.is_empty() && legacy.1.is_empty() {
-        return Ok(false);
+        return Ok(Migrated::Nothing);
     }
     let all = [legacy.0.clone(), legacy.1.clone()].concat();
-    if !keyring_has(id).await? {
-        let Some(key) = first_secret(&conn, &service, &session, legacy).await? else {
-            // Locked and not unlocked: kept for the next launch.
-            return Ok(false);
-        };
-        keyring_store(id, &key).await?;
+    if keyring_has(id).await? {
+        return Ok(Migrated::Kept);
+    }
+    let Some(key) = first_secret(&conn, &service, &session, legacy).await? else {
+        // Locked and not unlocked.
+        return Ok(Migrated::Kept);
+    };
+    // Again, right before writing: the unlock prompt may have taken long.
+    if keyring_has(id).await? {
+        return Ok(Migrated::Kept);
+    }
+    keyring_store(id, &key).await?;
+    if keyring_load(id).await? != Some(key) {
+        return Err(format!("the key saved for {id} does not read back"));
     }
     delete_items(&conn, &all).await?;
-    Ok(true)
+    Ok(Migrated::Moved)
 }
 
-/// `<service>\t<key>` lines; a line that is not one is left out.
-fn parse_keys(text: &str) -> Vec<(String, StreamKey)> {
+/// A line of the keys file: a key, or a line kept as it is.
+#[derive(Clone, Debug, PartialEq)]
+enum Line {
+    Key(String, StreamKey),
+    Other(String),
+}
+
+/// `<service>\t<key>` lines; others are kept verbatim when rewriting.
+fn parse_keys(text: &str) -> Vec<Line> {
     text.lines()
-        .filter_map(|line| {
-            let (id, key) = line.split_once('\t')?;
-            Some((id.to_owned(), StreamKey::new(key)?))
+        .map(|line| {
+            let key = line
+                .split_once('\t')
+                .and_then(|(id, key)| Some((id.to_owned(), StreamKey::new(key)?)));
+            match key {
+                Some((id, key)) => Line::Key(id, key),
+                None => Line::Other(line.to_owned()),
+            }
         })
         .collect()
 }
 
-fn serialize_keys(keys: &[(String, StreamKey)]) -> String {
-    keys.iter()
-        .map(|(id, key)| format!("{id}\t{}\n", key.expose()))
+fn serialize_keys(lines: &[Line]) -> String {
+    lines
+        .iter()
+        .map(|line| match line {
+            Line::Key(id, key) => format!("{id}\t{}\n", key.expose()),
+            Line::Other(text) => format!("{text}\n"),
+        })
         .collect()
 }
 
-fn read_keys(path: &Path) -> Vec<(String, StreamKey)> {
-    std::fs::read_to_string(path)
-        .map(|t| parse_keys(&t))
-        .unwrap_or_default()
+/// The file's lines; none if it does not exist, an error if it cannot be
+/// read (then nothing may rewrite it).
+fn read_keys(path: &Path) -> std::io::Result<Vec<Line>> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(parse_keys(&text)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(e),
+    }
 }
 
-/// Sets (`Some`) or removes `id`'s key in the file at `path`; the file goes
-/// with its last key.
-fn write_key(path: &Path, id: &str, key: Option<&StreamKey>) -> std::io::Result<()> {
-    let mut keys = read_keys(path);
-    keys.retain(|(i, _)| i != id);
+/// Sets (`Some`) or removes `id`'s key in the file at `path`, the other
+/// lines as they are; the file goes with its last line. `durable`: synced
+/// to the disk before it returns.
+fn write_key(path: &Path, id: &str, key: Option<&StreamKey>, durable: bool) -> std::io::Result<()> {
+    let mut lines = read_keys(path)?;
+    lines.retain(|line| !matches!(line, Line::Key(i, _) if i == id));
     if let Some(key) = key {
         // One line each: a key never spans lines (`StreamKey::new` trims).
-        if key.expose().contains(['\n', '\r', '\t']) {
+        if key.expose().contains(['\n', '\r', '\t']) || id.contains(['\n', '\r', '\t']) {
             return Err(std::io::ErrorKind::InvalidInput.into());
         }
-        keys.push((id.to_owned(), key.clone()));
+        lines.push(Line::Key(id.to_owned(), key.clone()));
     }
-    if keys.is_empty() {
+    if lines.is_empty() {
         return match std::fs::remove_file(path) {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
             _ => Ok(()),
         };
     }
-    crate::prefs::write_atomically(path, serialize_keys(&keys).as_bytes())
+    crate::prefs::write_file(path, serialize_keys(&lines).as_bytes(), durable)
 }
 
 fn file_load_from(path: &Path, id: &str) -> Option<StreamKey> {
     read_keys(path)
+        .inspect_err(|e| log!("could not read {}: {e}", path.display()))
+        .ok()?
         .into_iter()
-        .find_map(|(i, key)| (i == id).then_some(key))
+        .find_map(|line| match line {
+            Line::Key(i, key) if i == id => Some(key),
+            _ => None,
+        })
 }
 
 fn file_load(id: &str) -> Option<StreamKey> {
@@ -387,50 +442,100 @@ fn file_store(id: &str, key: &StreamKey) -> std::io::Result<()> {
         &file_path().ok_or(std::io::ErrorKind::NotFound)?,
         id,
         Some(key),
+        false,
     )
 }
 
 fn file_clear(id: &str) {
     if let Some(path) = file_path()
-        && let Err(e) = write_key(&path, id, None)
+        && let Err(e) = write_key(&path, id, None, false)
     {
         log!("could not remove a key from {}: {e}", path.display());
     }
 }
 
-/// Moves the key of an older version's file at `legacy` to `id` in `path`
-/// (unless `id` has one). True if there was one.
-fn file_migrate(legacy: &Path, path: &Path, id: &str) -> std::io::Result<bool> {
+/// Where the old file's key goes.
+enum Target<'a> {
+    /// The keyring (there is one): never the file in clear.
+    Keyring,
+    /// The keys file at this path (no keyring).
+    File(&'a Path),
+}
+
+/// Gives the old file's key at `legacy` to `id`, the service it was saved
+/// for, in `target`, unless `id` has a key there. The old file is removed
+/// only once the new copy is durable and reads back equal.
+fn file_migrate(legacy: &Path, id: &str, target: Target) -> Result<Migrated> {
     let key = match std::fs::read_to_string(legacy) {
         Ok(text) => StreamKey::new(&text),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(e) => return Err(e),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Migrated::Nothing),
+        Err(e) => return Err(format!("could not read {}: {e}", legacy.display())),
     };
-    if let Some(key) = key
-        && file_load_from(path, id).is_none()
-    {
-        write_key(path, id, Some(&key))?;
+    if let Some(key) = &key {
+        match target {
+            Target::Keyring => {
+                if block_on(keyring_has(id))? {
+                    return Ok(Migrated::Kept);
+                }
+                block_on(keyring_store(id, key))?;
+                if block_on(keyring_load(id))?.as_ref() != Some(key) {
+                    return Err(format!("the key saved for {id} does not read back"));
+                }
+            }
+            Target::File(path) => {
+                let lines = read_keys(path)
+                    .map_err(|e| format!("could not read {}: {e}", path.display()))?;
+                if lines
+                    .iter()
+                    .any(|l| matches!(l, Line::Key(i, _) if i == id))
+                {
+                    return Ok(Migrated::Kept);
+                }
+                write_key(path, id, Some(key), true)
+                    .map_err(|e| format!("could not save {}: {e}", path.display()))?;
+                if file_load_from(path, id).as_ref() != Some(key) {
+                    return Err(format!("the key saved for {id} does not read back"));
+                }
+            }
+        }
     }
-    std::fs::remove_file(legacy)?;
-    Ok(true)
+    std::fs::remove_file(legacy)
+        .map_err(|e| format!("could not remove {}: {e}", legacy.display()))?;
+    Ok(Migrated::Moved)
 }
 
 /// Gives the one key of an older version (keyring item or file) to `id`,
-/// the service selected at startup. Never to another one later: a key is
-/// only read for the service it is saved for.
+/// the service it was saved for (the caller reads it from the settings of
+/// that version). Never to another one: a key is only read for the service
+/// it is saved for, and a newer key of `id` is never overwritten.
 pub fn migrate(id: &str) {
-    match block_on(keyring_migrate(id)) {
-        Ok(true) => log!("the stream key now belongs to {id}"),
-        Ok(false) => {}
-        Err(e) if e == ABSENT => {}
-        Err(e) => log!("secret service: {e}"),
-    }
-    if let (Some(legacy), Some(path)) = (legacy_file_path(), file_path()) {
-        match file_migrate(&legacy, &path, id) {
-            Ok(true) => log!("the stream key file now belongs to {id}"),
-            Ok(false) => {}
-            Err(e) => log!("could not move {}: {e}", legacy.display()),
+    let _writing = writing();
+    let keyring = match block_on(keyring_migrate(id)) {
+        Ok(done) => {
+            if done != Migrated::Nothing {
+                log!("old stream key for {id}: {done:?}");
+            }
+            true
         }
+        Err(e) if e == ABSENT => false,
+        Err(e) => {
+            log!("secret service: {e}; the old stream key is kept");
+            return;
+        }
+    };
+    let Some(legacy) = legacy_file_path() else {
+        return;
+    };
+    let path = file_path();
+    let target = match (keyring, &path) {
+        (true, _) => Target::Keyring,
+        (false, Some(path)) => Target::File(path),
+        (false, None) => return,
+    };
+    match file_migrate(&legacy, id, target) {
+        Ok(Migrated::Nothing) => {}
+        Ok(done) => log!("old stream key file for {id}: {done:?}"),
+        Err(e) => log!("{e}; {} is kept", legacy.display()),
     }
 }
 
@@ -447,6 +552,7 @@ pub fn load(id: &str) -> Option<StreamKey> {
 /// Saves `key` for `id`: in the keyring, or in the private file if there
 /// is no keyring.
 pub fn store(id: &str, key: &StreamKey) -> std::result::Result<Store, String> {
+    let _writing = writing();
     match block_on(keyring_store(id, key)) {
         Ok(()) => {
             // A key saved before the keyring was there must not stay behind.
@@ -470,6 +576,7 @@ pub fn store(id: &str, key: &StreamKey) -> std::result::Result<Store, String> {
 
 /// Forgets `id`'s key, wherever it is.
 pub fn clear(id: &str) {
+    let _writing = writing();
     if let Err(e) = block_on(keyring_clear(id)) {
         log!("secret service: {e}");
     }
@@ -535,14 +642,21 @@ mod tests {
         }
     }
 
+    /// A fresh folder for one test.
+    fn temp(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("vesper-keys-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
     #[test]
     fn the_file_keeps_one_key_per_service() {
-        let dir = std::env::temp_dir().join(format!("vesper-keys-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = temp("file");
         let path = dir.join("stream-keys");
-        write_key(&path, "twitch", Some(&key("tw"))).unwrap();
-        write_key(&path, "custom:a.example", Some(&key("ca"))).unwrap();
-        write_key(&path, "twitch", Some(&key("tw2"))).unwrap();
+        write_key(&path, "twitch", Some(&key("tw")), false).unwrap();
+        write_key(&path, "custom:a.example", Some(&key("ca")), false).unwrap();
+        write_key(&path, "twitch", Some(&key("tw2")), true).unwrap();
         assert_eq!(file_load_from(&path, "twitch"), Some(key("tw2")));
         assert_eq!(file_load_from(&path, "custom:a.example"), Some(key("ca")));
         // Never another service's key.
@@ -550,102 +664,163 @@ mod tests {
         assert_eq!(file_load_from(&path, "custom:b.example"), None);
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
-        write_key(&path, "twitch", None).unwrap();
+        write_key(&path, "twitch", None, false).unwrap();
         assert_eq!(file_load_from(&path, "twitch"), None);
-        write_key(&path, "custom:a.example", None).unwrap();
+        write_key(&path, "custom:a.example", None, false).unwrap();
         assert!(!path.exists());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
-    fn the_old_key_file_goes_to_the_selected_service() {
-        let dir = std::env::temp_dir().join(format!("vesper-keys-old-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+    fn lines_it_does_not_know_survive_and_an_unreadable_file_is_not_rewritten() {
+        let dir = temp("lines");
+        let path = dir.join("stream-keys");
+        std::fs::write(&path, "# note\nyoutube\tyt\nno tab here\nfuture\t\n").unwrap();
+        write_key(&path, "twitch", Some(&key("tw")), false).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "# note\nyoutube\tyt\nno tab here\nfuture\t\ntwitch\ttw\n"
+        );
+        // A folder in the way: EISDIR, nothing clobbered, no key read.
+        let blocked = dir.join("blocked");
+        std::fs::create_dir(&blocked).unwrap();
+        assert!(read_keys(&blocked).is_err());
+        assert!(write_key(&blocked, "twitch", Some(&key("x")), false).is_err());
+        assert!(blocked.is_dir());
+        assert_eq!(file_load_from(&blocked, "twitch"), None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_old_key_file_goes_to_its_service_and_never_overwrites() {
+        let dir = temp("old");
         let (legacy, path) = (dir.join("stream-key"), dir.join("stream-keys"));
-        assert!(!file_migrate(&legacy, &path, "youtube").unwrap());
+        let to_file = || Target::File(&path);
+        assert_eq!(
+            file_migrate(&legacy, "youtube", to_file()),
+            Ok(Migrated::Nothing)
+        );
         std::fs::write(&legacy, "old_key\n").unwrap();
-        assert!(file_migrate(&legacy, &path, "youtube").unwrap());
+        assert_eq!(
+            file_migrate(&legacy, "youtube", to_file()),
+            Ok(Migrated::Moved)
+        );
         assert!(!legacy.exists());
         assert_eq!(file_load_from(&path, "youtube"), Some(key("old_key")));
         assert_eq!(file_load_from(&path, "twitch"), None);
-        // A key already saved for that service wins.
+        // The service has a key: both are kept, the newer one untouched.
         std::fs::write(&legacy, "older").unwrap();
-        file_migrate(&legacy, &path, "youtube").unwrap();
+        assert_eq!(
+            file_migrate(&legacy, "youtube", to_file()),
+            Ok(Migrated::Kept)
+        );
         assert_eq!(file_load_from(&path, "youtube"), Some(key("old_key")));
+        assert_eq!(std::fs::read_to_string(&legacy).unwrap(), "older");
+        // An unreadable keys file: the old file stays.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(file_migrate(&legacy, "twitch", to_file()).is_err());
+        assert!(legacy.exists());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// Against whatever Secret Service the session bus has: never run it on
     /// a user session, only in a private `dbus-run-session` with a
-    /// throwaway service (`scripts/fake_secret_service.py`).
+    /// throwaway service (`scripts/fake_secret_service.py`). Each keyring
+    /// test uses ids of its own.
     #[test]
     #[ignore = "needs a throwaway Secret Service on a private session bus"]
     fn keyring_round_trip() {
+        let (a, b) = ("test-round-a", "test-round-b");
         let k = key("live_test_key_123");
-        assert_eq!(block_on(keyring_store("twitch", &k)), Ok(()));
-        assert!(block_on(keyring_has("twitch")).unwrap());
-        assert!(!block_on(keyring_has("youtube")).unwrap());
-        assert_eq!(block_on(keyring_load("twitch")).unwrap(), Some(k.clone()));
+        assert_eq!(block_on(keyring_store(a, &k)), Ok(()));
+        assert!(block_on(keyring_has(a)).unwrap());
+        assert!(!block_on(keyring_has(b)).unwrap());
+        assert_eq!(block_on(keyring_load(a)).unwrap(), Some(k.clone()));
         // Never another service's key.
-        assert_eq!(block_on(keyring_load("youtube")).unwrap(), None);
+        assert_eq!(block_on(keyring_load(b)).unwrap(), None);
         // Replaces, does not add.
         let other = key("other");
-        block_on(keyring_store("twitch", &other)).unwrap();
-        assert_eq!(block_on(keyring_load("twitch")).unwrap(), Some(other));
-        block_on(keyring_store("youtube", &k)).unwrap();
-        block_on(keyring_clear("twitch")).unwrap();
-        assert!(!block_on(keyring_has("twitch")).unwrap());
-        assert_eq!(block_on(keyring_load("twitch")).unwrap(), None);
-        assert_eq!(block_on(keyring_load("youtube")).unwrap(), Some(k));
-        block_on(keyring_clear("youtube")).unwrap();
+        block_on(keyring_store(a, &other)).unwrap();
+        assert_eq!(block_on(keyring_load(a)).unwrap(), Some(other));
+        block_on(keyring_store(b, &k)).unwrap();
+        block_on(keyring_clear(a)).unwrap();
+        assert!(!block_on(keyring_has(a)).unwrap());
+        assert_eq!(block_on(keyring_load(a)).unwrap(), None);
+        assert_eq!(block_on(keyring_load(b)).unwrap(), Some(k));
+        block_on(keyring_clear(b)).unwrap();
     }
 
-    /// An item of an older version (no `service` attribute) goes to the
-    /// service given, once. Same private bus as `keyring_round_trip`.
+    /// Adds an item as versions before per-service keys saved it.
+    async fn seed_old_item(secret: &[u8]) {
+        let (conn, session) = open().await.unwrap();
+        let service = proxy(&conn, SERVICE, "org.freedesktop.Secret.Service")
+            .await
+            .unwrap();
+        let collection: OwnedObjectPath = service.call("ReadAlias", &("default",)).await.unwrap();
+        assert!(
+            unlock(&conn, &service, std::slice::from_ref(&collection))
+                .await
+                .unwrap()
+        );
+        let c = proxy(&conn, collection, "org.freedesktop.Secret.Collection")
+            .await
+            .unwrap();
+        let properties = HashMap::from([(
+            "org.freedesktop.Secret.Item.Attributes",
+            Value::from(base_attributes()),
+        )]);
+        let secret: Secret = (session, Vec::new(), secret.to_vec(), "text/plain".into());
+        let _: (OwnedObjectPath, OwnedObjectPath) = c
+            .call("CreateItem", &(properties, secret, true))
+            .await
+            .unwrap();
+    }
+
+    async fn old_items() -> usize {
+        let (conn, _) = open().await.unwrap();
+        let service = proxy(&conn, SERVICE, "org.freedesktop.Secret.Service")
+            .await
+            .unwrap();
+        let (a, b) = legacy_items(&conn, &service).await.unwrap();
+        a.len() + b.len()
+    }
+
+    /// The old item goes to its service only when that one has no key, and
+    /// is deleted once moved. Same private bus as `keyring_round_trip`; the
+    /// only test that makes old items.
     #[test]
     #[ignore = "needs a throwaway Secret Service on a private session bus"]
-    fn keyring_old_key_goes_to_the_selected_service() {
-        block_on(async {
-            let (conn, session) = open().await.unwrap();
-            let service = proxy(&conn, SERVICE, "org.freedesktop.Secret.Service")
-                .await
-                .unwrap();
-            let collection: OwnedObjectPath =
-                service.call("ReadAlias", &("default",)).await.unwrap();
-            assert!(
-                unlock(&conn, &service, std::slice::from_ref(&collection))
-                    .await
-                    .unwrap()
-            );
-            let c = proxy(&conn, collection, "org.freedesktop.Secret.Collection")
-                .await
-                .unwrap();
-            let properties = HashMap::from([(
-                "org.freedesktop.Secret.Item.Attributes",
-                Value::from(base_attributes()),
-            )]);
-            let secret: Secret = (
-                session,
-                Vec::new(),
-                b"old_key".to_vec(),
-                "text/plain".into(),
-            );
-            let _: (OwnedObjectPath, OwnedObjectPath) = c
-                .call("CreateItem", &(properties, secret, true))
-                .await
-                .unwrap();
-        });
-        assert_eq!(block_on(keyring_load("youtube")).unwrap(), None);
-        assert_eq!(block_on(keyring_migrate("youtube")), Ok(true));
+    fn keyring_old_key_goes_to_its_service_and_never_overwrites() {
+        let (target, other) = ("test-old-target", "test-old-other");
+        block_on(seed_old_item(b"old_key"));
+        // The target has a newer key: both kept.
+        block_on(keyring_store(target, &key("newer"))).unwrap();
+        assert_eq!(block_on(keyring_migrate(target)), Ok(Migrated::Kept));
+        assert_eq!(block_on(keyring_load(target)).unwrap(), Some(key("newer")));
+        assert_eq!(block_on(old_items()), 1);
+        // Without one: moved, read back, the old item deleted.
+        block_on(keyring_clear(target)).unwrap();
+        assert_eq!(block_on(keyring_migrate(target)), Ok(Migrated::Moved));
         assert_eq!(
-            block_on(keyring_load("youtube")).unwrap(),
+            block_on(keyring_load(target)).unwrap(),
             Some(key("old_key"))
         );
-        assert_eq!(block_on(keyring_load("twitch")).unwrap(), None);
-        // Done once: the old item is gone.
-        assert_eq!(block_on(keyring_migrate("twitch")), Ok(false));
-        block_on(keyring_clear("youtube")).unwrap();
+        assert_eq!(block_on(keyring_load(other)).unwrap(), None);
+        assert_eq!(block_on(old_items()), 0);
+        assert_eq!(block_on(keyring_migrate(other)), Ok(Migrated::Nothing));
+        block_on(keyring_clear(target)).unwrap();
+    }
+
+    /// With the fake started as `DISMISS=1 SEED_OLD=old_key`: the keyring
+    /// stays locked, so the old item is kept and nothing is written.
+    #[test]
+    #[ignore = "needs the fake Secret Service with DISMISS=1 SEED_OLD=old_key"]
+    fn keyring_locked_keeps_the_old_key() {
+        assert_eq!(block_on(old_items()), 1);
+        assert_eq!(block_on(keyring_migrate("test-locked")), Ok(Migrated::Kept));
+        assert_eq!(block_on(old_items()), 1);
+        assert!(!block_on(keyring_has("test-locked")).unwrap());
     }
 
     /// `EXPECT=absent` on a private bus without a Secret Service, or
@@ -653,7 +828,7 @@ mod tests {
     #[test]
     #[ignore = "needs a private session bus prepared as EXPECT says"]
     fn a_refusing_keyring_is_not_an_absent_one() {
-        let result = block_on(keyring_store("twitch", &key("live_test_key_123")));
+        let result = block_on(keyring_store("test-refused", &key("live_test_key_123")));
         match std::env::var("EXPECT").as_deref() {
             Ok("absent") => assert_eq!(result, Err(ABSENT.into())),
             Ok("refused") => assert!(result.is_err_and(|e| e != ABSENT)),

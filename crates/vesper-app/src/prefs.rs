@@ -383,6 +383,17 @@ impl Prefs {
     }
 }
 
+/// The settings of the version before profiles, as they were (see
+/// `profiles::backup_path`); `None` without a readable copy.
+pub fn legacy_settings() -> Option<Prefs> {
+    let backup = crate::profiles::backup_path(&path()?);
+    backup.is_file().then_some(())?;
+    Prefs::default()
+        .try_read(&backup)
+        .inspect_err(|e| log!("{e}"))
+        .ok()
+}
+
 /// The settings could not be read at startup: nothing is saved, so the
 /// defaults shown never replace them.
 pub static SAVING_OFF: AtomicBool = AtomicBool::new(false);

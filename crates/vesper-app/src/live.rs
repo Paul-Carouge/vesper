@@ -106,11 +106,24 @@ thread_local! {
     static CONTEXT: RefCell<Option<(Shared, Games)>> = const { RefCell::new(None) };
 }
 
+/// The service the single key of a version before per-service keys was
+/// saved for: the one selected in that version's settings (`legacy`, the
+/// copy kept by the profile migration). `None` when unknown, or when the
+/// settings could not be read (nothing is written then): the old key stays
+/// as it is, never given to another service.
+fn old_key_service(saving_off: bool, legacy: Option<Prefs>) -> Option<String> {
+    if saving_off {
+        return None;
+    }
+    secret::key_id(&legacy?.live)
+}
+
 pub fn wire(ui: &AppWindow, recording: &Shared, games: &Games) {
     CONTEXT.with(|c| *c.borrow_mut() = Some((recording.clone(), games.clone())));
-    // An older version's single key goes to the service selected now, then
-    // whether that one has a key is shown.
-    match secret::key_id(&settings(ui)) {
+    // An older version's single key goes to the service it was saved for,
+    // then whether the selected service has a key is shown.
+    let saving_off = crate::prefs::SAVING_OFF.load(std::sync::atomic::Ordering::Relaxed);
+    match old_key_service(saving_off, crate::prefs::legacy_settings()) {
         Some(id) => off_ui(
             ui,
             move || secret::migrate(&id),
@@ -287,4 +300,28 @@ pub fn reset(ui: &AppWindow) {
     ui.set_live_seconds(0);
     ui.set_live_detail("".into());
     ui.set_live_dropped(0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_old_key_goes_only_to_the_service_it_was_saved_for() {
+        let old = |text: &str| Some(Prefs::default().parse(text));
+        assert_eq!(
+            old_key_service(false, old("live_service=youtube\n")).as_deref(),
+            Some("youtube")
+        );
+        let custom = old("live_service=custom\nlive_url=rtmp://h.example/app\n");
+        assert_eq!(
+            old_key_service(false, custom).as_deref(),
+            Some("custom:h.example")
+        );
+        // Unknown: no copy of the old settings, a custom service without a
+        // server, or settings that could not be read.
+        assert_eq!(old_key_service(false, None), None);
+        assert_eq!(old_key_service(false, old("live_service=custom\n")), None);
+        assert_eq!(old_key_service(true, old("live_service=youtube\n")), None);
+    }
 }
