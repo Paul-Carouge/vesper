@@ -17,7 +17,8 @@
 //!   switches to that profile.
 //!   `scenes-look` shows three demo scenes (an image from
 //!   `VESPER_DEMO_IMAGE`, text, a webcam), `scene-editor` opens the editor,
-//!   `scene-layer:<i>` selects layer `i` of the edited scene;
+//!   `scene-layer:<i>` selects layer `i` of the edited scene, `camera-look`
+//!   shows the webcam mark;
 //!   `click:<x>:<y>` clicks there, `type:<text>` types it then.
 //! - `VESPER_SNAPSHOT=<file.ppm>` saves the window as a PPM image once the
 //!   demo settled, then quits. Nothing outside the window is captured.
@@ -472,6 +473,7 @@ fn look(ui: &AppWindow, step: &str) -> bool {
             ui.set_live_detail("Connection lost · next try in 4 s".into());
         }
         "live-key-look" => ui.set_live_key_state("Saved in the system keyring".into()),
+        "camera-look" => ui.global::<crate::SceneStore>().set_camera_on(true),
         "replay-on" => ui.set_replay_enabled(true),
         "replay-off" => ui.set_replay_enabled(false),
         _ => return false,

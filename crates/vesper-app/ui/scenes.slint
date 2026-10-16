@@ -207,6 +207,7 @@ export component SceneBar inherits Card {
                 vertical-alignment: center;
             }
             if SceneStore.camera-on: HorizontalLayout {
+                horizontal-stretch: 0;
                 spacing: 6px;
                 accessible-role: text;
                 accessible-label: "Camera on";
@@ -220,6 +221,7 @@ export component SceneBar inherits Card {
                     }
                 }
                 Text {
+                    horizontal-stretch: 0;
                     text: "Camera on";
                     vertical-alignment: center;
                     font-size: Theme.font-caption;

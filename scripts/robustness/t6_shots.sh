@@ -26,7 +26,7 @@ shot live-settings-dark dark screen-look,settings,live-key-look,scroll:${SCROLL:
 shot live-settings-light light screen-look,settings,scroll:${SCROLL:-560}
 shot settings-end-dark dark screen-look,settings,scroll-end
 shot settings-end-light light screen-look,settings,scroll-end
-shot scenes-main-dark dark screen-look,replay-on,scenes-look
+shot scenes-main-dark dark screen-look,replay-on,scenes-look,camera-look
 shot scenes-main-light light screen-look,replay-on,scenes-look,recording-look
 shot scenes-editor-dark dark scenes-look,scene-editor,scene-layer:2
 shot scenes-editor-light light scenes-look,scene-editor,scene-layer:1
