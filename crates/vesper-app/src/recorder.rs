@@ -45,8 +45,8 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use vesper_audio::{
-    Aac, AudioCapture, CHANNELS, DuckSettings, Mix, Options, Peaks, SAMPLE_RATE, Source,
-    TrackState, VoiceKey,
+    Aac, AudioCapture, CHANNELS, DuckSettings, Exclusions, Mix, Options, Peaks, SAMPLE_RATE,
+    Source, TrackState, VoiceKey,
 };
 use vesper_capture::Capture;
 use vesper_compose::{Compositor, Draw, Source as DrawSource};
@@ -250,6 +250,9 @@ pub enum Event {
     /// The audio tracks started (on the first frame) or restarted: their
     /// peaks move from now on.
     AudioStarted,
+    /// The desktop and output tracks now leave out these apps (their app
+    /// tracks started, lost their source or got it back).
+    DesktopExcept(Vec<String>),
     /// A track got louder than the meters' floor after they went to rest
     /// (see [`Pipeline::wake_meters_on_signal`]).
     AudioSignal,
@@ -451,6 +454,8 @@ struct Audio {
     mix_in_files: bool,
     /// The running live stream's audio, fed by the mix.
     stream_tap: Option<Arc<AudioTap>>,
+    /// The apps the running desktop and output tracks leave out.
+    exclusions: Option<Arc<Exclusions>>,
 }
 
 impl Audio {
@@ -1044,9 +1049,17 @@ fn start_audio(sources: &AudioSources, sinks: &SharedSinks, on_event: &OnEvent) 
     let mut controls = Vec::new();
     // The microphones speak into it, the other tracks duck under it.
     let voice = Arc::new(VoiceKey::default());
-    // shortcut: an app track that fails to start still leaves its app out of
-    // the desktop; start app tracks first if that ever happens in practice.
-    let except = desktop_except(&tracks);
+    // An app track holds its app out of the desktop while it captures;
+    // held from now, so the desktop starts without it. One that fails to
+    // start, or loses its source later, gives it back to the desktop.
+    let exclusions = Exclusions::new(Some(Box::new({
+        let on_event = on_event.clone();
+        move |apps| on_event(Event::DesktopExcept(apps))
+    })));
+    let holds: Vec<_> = desktop_except(&tracks)
+        .iter()
+        .map(|app| exclusions.hold(app))
+        .collect();
     let mut failed = Vec::new();
     for (input, &i) in inputs.iter_mut().zip(&enabled) {
         let track = &tracks[i];
@@ -1074,7 +1087,10 @@ fn start_audio(sources: &AudioSources, sinks: &SharedSinks, on_event: &OnEvent) 
             voice: Some(voice.clone()),
             ducking: track.ducking.settings(),
             speaks: track.ducking.voice,
-            desktop_except: except.clone(),
+            exclusions: match &track.source {
+                Source::App(_) if !track.leave_desktop => None,
+                _ => Some(exclusions.clone()),
+            },
         };
         match AudioCapture::start(track.source.clone(), options, move |packet| {
             write_audio(&sinks, index.get(), packet)
@@ -1089,6 +1105,7 @@ fn start_audio(sources: &AudioSources, sinks: &SharedSinks, on_event: &OnEvent) 
             }
         }
     }
+    drop(holds);
     // A mix of one track would be a copy of it.
     let dropped = in_files && running.len() < 2;
     if dropped {
@@ -1115,6 +1132,7 @@ fn start_audio(sources: &AudioSources, sinks: &SharedSinks, on_event: &OnEvent) 
         }
     }
     (audio.running, audio.mixer, audio.filters) = (running, mixer, controls);
+    audio.exclusions = Some(exclusions);
     audio.mix_in_files = in_files;
     // A stream running across the restart goes on with the new mix.
     let tap = audio.stream_tap.clone();
@@ -1147,6 +1165,10 @@ fn reset_ring_audio(sources: &AudioSources, sinks: &SharedSinks) {
 fn stop_audio(sources: &AudioSources) {
     let (running, mixer) = {
         let mut audio = lock(sources);
+        // Its tracks leave one by one: not worth telling.
+        if let Some(ex) = audio.exclusions.take() {
+            ex.quiet();
+        }
         audio.filters.clear();
         audio.mix_in_files = false;
         (std::mem::take(&mut audio.running), audio.mixer.take())

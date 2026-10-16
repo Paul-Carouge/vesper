@@ -117,7 +117,12 @@ impl Drop for Rig {
 fn event(rx: &Receiver<Event>) -> Option<Event> {
     loop {
         match rx.recv_timeout(Duration::from_secs(20)) {
-            Ok(Event::Stats { .. } | Event::Source(_) | Event::AudioStarted) => {}
+            Ok(
+                Event::Stats { .. }
+                | Event::Source(_)
+                | Event::AudioStarted
+                | Event::DesktopExcept(_),
+            ) => {}
             Ok(Event::Stopped(Some(e))) if e.contains("Could not open the encoder") => {
                 eprintln!("no VAAPI encoder ({e}), skipping");
                 return None;

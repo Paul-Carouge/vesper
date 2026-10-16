@@ -3,7 +3,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 use pipewire as pw;
@@ -14,7 +14,7 @@ use pw::spa::pod::Pod;
 use pw::types::ObjectType;
 use tracing::{debug, error, info, warn};
 
-use crate::{CHANNELS, Error, OnState, SAMPLE_RATE, Source, TrackState};
+use crate::{CHANNELS, Error, Exclusions, OnState, SAMPLE_RATE, Source, TrackState};
 
 /// Interleaved F32 samples whose first frame was captured at `start`
 /// (`CLOCK_MONOTONIC`).
@@ -23,16 +23,36 @@ pub struct Chunk {
     pub samples: Vec<f32>,
 }
 
-/// Our only `EnumFormat`: F32 interleaved, 48 kHz, stereo. The stream's
-/// adapter converts whatever the device has (mono mics get upmixed).
-fn format_pod() -> Vec<u8> {
+/// Stereo: what we record.
+const STEREO: [u32; 2] = [
+    spa::sys::SPA_AUDIO_CHANNEL_FL,
+    spa::sys::SPA_AUDIO_CHANNEL_FR,
+];
+
+/// The ports of a stream we link playback streams to ourselves (`AppLinks`),
+/// 7.1 as `LINKED_NAMES`: a stream on a surround sink has surround ports,
+/// and `downmix` folds them to stereo with the usual gains. Links cannot
+/// scale, so folding several channels onto one port would sum them at unity.
+const LINKED: [u32; 8] = [
+    spa::sys::SPA_AUDIO_CHANNEL_FL,
+    spa::sys::SPA_AUDIO_CHANNEL_FR,
+    spa::sys::SPA_AUDIO_CHANNEL_FC,
+    spa::sys::SPA_AUDIO_CHANNEL_LFE,
+    spa::sys::SPA_AUDIO_CHANNEL_RL,
+    spa::sys::SPA_AUDIO_CHANNEL_RR,
+    spa::sys::SPA_AUDIO_CHANNEL_SL,
+    spa::sys::SPA_AUDIO_CHANNEL_SR,
+];
+
+/// Our only `EnumFormat`: F32 interleaved, 48 kHz, these channels. The
+/// stream's adapter converts whatever the device has (mono mics get upmixed).
+fn format_pod(channels: &[u32]) -> Vec<u8> {
     let mut info = spa::param::audio::AudioInfoRaw::new();
     info.set_format(spa::param::audio::AudioFormat::F32LE);
     info.set_rate(SAMPLE_RATE);
-    info.set_channels(u32::from(CHANNELS));
+    info.set_channels(channels.len() as u32);
     let mut position = [0; spa::sys::SPA_AUDIO_MAX_CHANNELS as usize];
-    position[0] = spa::sys::SPA_AUDIO_CHANNEL_FL;
-    position[1] = spa::sys::SPA_AUDIO_CHANNEL_FR;
+    position[..channels.len()].copy_from_slice(channels);
     info.set_position(position);
     let obj = spa::pod::Object {
         type_: spa::utils::SpaTypes::ObjectParamFormat.as_raw(),
@@ -198,9 +218,14 @@ impl Health {
 /// When the stream or PipeWire itself goes away (daemon restart, device
 /// removed), it reconnects with a backoff and reports the track's state on
 /// `on_state`; the encode thread fills the gap with silence meanwhile.
+///
+/// With `exclusions`, an app track holds its app there while connected,
+/// and a desktop or output track reopens at once (no backoff, no state
+/// change) when the apps held change, or when it cannot follow the default
+/// sink (it then reads the monitor for good).
 pub fn run(
     source: Source,
-    except: Vec<String>,
+    exclusions: Option<Arc<Exclusions>>,
     tx: mpsc::SyncSender<Chunk>,
     stop: pw::channel::Receiver<()>,
     ready: mpsc::Sender<Result<(), Error>>,
@@ -227,6 +252,29 @@ pub fn run(
     };
     let mut ready = Some(ready);
     let mut reconnect = Reconnect::default();
+    // The desktop or output track's apps left out, and its reopening.
+    let sink_track = matches!(source, Source::Desktop | Source::Output(_));
+    let reopen = Rc::new(Reopen::default());
+    let (except_tx, except_rx) = pw::channel::channel();
+    let excluded = exclusions.as_ref().filter(|_| sink_track);
+    if let Some(ex) = excluded {
+        ex.watch(except_tx);
+    }
+    let _except = excluded.map(|ex| {
+        let (ex, reopen, quit) = (ex.clone(), reopen.clone(), mainloop.clone());
+        except_rx.attach(mainloop.loop_(), move |()| {
+            // Only a running session: a reconnection keeps its backoff.
+            if reopen.open.get() && *reopen.apps.borrow() != ex.apps() {
+                reopen.wanted.set(true);
+                quit.quit();
+            }
+        })
+    });
+    // The app an app track holds while connected.
+    let holds = match (&source, &exclusions) {
+        (Source::App(app), Some(ex)) => Some((ex.clone(), app.clone())),
+        _ => None,
+    };
     loop {
         let health = Rc::new(Health::default());
         let running = {
@@ -239,16 +287,44 @@ pub fn run(
                 }
             }
         };
-        match Session::open(&mainloop, &source, &except, tx.clone(), &health, running) {
+        let except = match excluded {
+            Some(ex) => ex.apps(),
+            None => Vec::new(),
+        };
+        *reopen.apps.borrow_mut() = except.clone();
+        let except = if reopen.monitor.get() {
+            Vec::new()
+        } else {
+            except
+        };
+        let opened = Session::open(
+            &mainloop,
+            &source,
+            &except,
+            tx.clone(),
+            &health,
+            running,
+            &reopen,
+        );
+        match opened {
             Ok(session) => {
+                // Before `ready`: the caller's hold is dropped after it.
+                if let Some((ex, app)) = &holds {
+                    ex.add(app);
+                }
                 if let Some(ready) = ready.take() {
                     let _ = ready.send(Ok(()));
                 }
                 // `run` would forget a loss reported before it.
-                if health.lost.borrow().is_none() {
+                if health.lost.borrow().is_none() && !reopen.wanted.get() {
+                    reopen.open.set(true);
                     mainloop.run();
+                    reopen.open.set(false);
                 }
                 drop(session);
+                if let Some((ex, app)) = &holds {
+                    ex.remove(app);
+                }
             }
             // The first attempt fails the start: the app leaves the track out.
             Err(e) => match ready.take() {
@@ -258,6 +334,10 @@ pub fn run(
         }
         if stopped.get() {
             return;
+        }
+        if reopen.wanted.replace(false) && health.lost.borrow().is_none() {
+            debug!("{source:?}: reopening for the apps left out");
+            continue;
         }
         let reason = health.lost.take().unwrap_or_else(|| "stream ended".into());
         let up = health.streaming_since.get().map(|t| t.elapsed());
@@ -304,6 +384,19 @@ pub fn run(
             return;
         }
     }
+}
+
+/// A desktop or output track's reopening, see `run`.
+#[derive(Default)]
+struct Reopen {
+    /// The apps held when the session opened.
+    apps: RefCell<Vec<String>>,
+    /// A session runs the loop.
+    open: Cell<bool>,
+    /// The session is to be reopened.
+    wanted: Cell<bool>,
+    /// The default sink cannot be followed: the monitor, for good.
+    monitor: Cell<bool>,
 }
 
 /// Leaves the loop when a node named `target` (`node.name`) is added to the
@@ -398,6 +491,7 @@ impl Session {
         tx: mpsc::SyncSender<Chunk>,
         health: &Rc<Health>,
         running: impl Fn() + 'static,
+        reopen: &Rc<Reopen>,
     ) -> Result<Self, Error> {
         let context = pw::context::ContextRc::new(mainloop, None)?;
         let core = context.connect_rc(None)?;
@@ -424,6 +518,10 @@ impl Session {
         // the default changes. A device is targeted by name, never replaced
         // by the default while it is missing. An app's streams are linked by
         // us (`AppLinks`), and so are the desktop's when it leaves apps out.
+        // shortcut: what plays to the sink is left out by its own node only:
+        // an app sent to a virtual sink whose loopback plays to the default
+        // sink stays in the desktop (the loopback is not the app). Follow
+        // links upstream if that setup shows up.
         let (name, target) = match &source {
             Source::Desktop => ("vesper-desktop-audio", None),
             Source::Microphone => ("vesper-microphone", None),
@@ -449,7 +547,22 @@ impl Session {
         let input = source.is_input();
         // How the sink an app plays to stamps its monitor; unused otherwise.
         let timing = Rc::new(AppTiming::default());
-        let app = wanted.map(|w| AppLinks::new(w, timing.clone()));
+        // Leaving apps out needs the default sink: without it, the monitor.
+        let fallback: Rc<dyn Fn(&str)> = {
+            let (reopen, mainloop) = (reopen.clone(), mainloop.clone());
+            Rc::new(move |why| {
+                warn!("{name}: {why}; recording the sink's monitor with every app");
+                reopen.monitor.set(true);
+                reopen.wanted.set(true);
+                mainloop.quit();
+            })
+        };
+        let app = wanted.map(|w| AppLinks::new(w, timing.clone(), fallback));
+        let channels = if app.is_some() {
+            LINKED.len()
+        } else {
+            STEREO.len()
+        };
         let stream = pw::stream::StreamRc::new(core.clone(), name, props)?;
         let listener = stream
             .add_local_listener_with_user_data(tx)
@@ -498,12 +611,7 @@ impl Session {
                 let Some(bytes) = data.data().and_then(|d| d.get(offset..offset + size)) else {
                     return;
                 };
-                let samples: Vec<f32> = bytes
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .map(|&b| f32::from_le_bytes(b))
-                    .collect();
+                let samples = to_stereo(bytes, channels);
                 let frames = samples.len() / usize::from(CHANNELS);
                 let start = match time {
                     Some(t) if t.now() > 0 => buffer_start(
@@ -523,7 +631,7 @@ impl Session {
                 }
             })
             .register()?;
-        let pod = format_pod();
+        let pod = format_pod(if app.is_some() { &LINKED } else { &STEREO });
         let mut params = [Pod::from_bytes(&pod).ok_or("invalid audio format pod")?];
         let mut flags = pw::stream::StreamFlags::MAP_BUFFERS;
         if app.is_none() {
@@ -545,16 +653,47 @@ impl Session {
     }
 }
 
-/// Our input channels an application's output channel is linked to: left
-/// and right to their side, center, mono and the rest to both. LFE is left
-/// out, as in a usual stereo downmix.
+/// Our input channels (`LINKED`) a playback stream's output channel is
+/// linked to: its own, else the nearest; mono and the rest to front left
+/// and right. LFE is left out, as in a usual stereo downmix.
 fn link_targets(channel: &str) -> &'static [&'static str] {
     match channel {
         "LFE" | "LFE2" => &[],
-        "FL" | "SL" | "RL" | "FLC" | "RLC" | "TFL" | "TRL" | "FLW" => &["FL"],
-        "FR" | "SR" | "RR" | "FRC" | "RRC" | "TFR" | "TRR" | "FRW" => &["FR"],
+        "FL" | "FLC" | "TFL" | "FLW" => &["FL"],
+        "FR" | "FRC" | "TFR" | "FRW" => &["FR"],
+        "FC" | "TFC" | "TC" => &["FC"],
+        "RL" | "RLC" | "TRL" => &["RL"],
+        "RR" | "RRC" | "TRR" => &["RR"],
+        "SL" => &["SL"],
+        "SR" => &["SR"],
+        "RC" | "TRC" => &["RL", "RR"],
         _ => &["FL", "FR"],
     }
+}
+
+/// -3 dB: center and surround channels in a stereo downmix.
+const FOLD: f32 = std::f32::consts::FRAC_1_SQRT_2;
+
+/// Interleaved F32 samples of `channels` channels as stereo: as is, or
+/// `LINKED` folded down (center and surrounds at -3 dB, LFE left out), as
+/// PipeWire's channel mixer does for the monitor.
+fn to_stereo(bytes: &[u8], channels: usize) -> Vec<f32> {
+    let floats = bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|&b| f32::from_le_bytes(b));
+    if channels == STEREO.len() {
+        return floats.collect();
+    }
+    let floats: Vec<f32> = floats.collect();
+    let mut out = Vec::with_capacity(floats.len() / channels * 2);
+    for f in floats.chunks_exact(channels) {
+        // FL FR FC LFE RL RR SL SR
+        out.push(f[0] + FOLD * (f[2] + f[4] + f[6]));
+        out.push(f[1] + FOLD * (f[2] + f[5] + f[7]));
+    }
+    out
 }
 
 /// A port seen in the registry.
@@ -678,10 +817,11 @@ impl Wanted {
     fn matches(&self, props: &spa::utils::dict::DictRef, own_pid: &str) -> bool {
         match self {
             Self::App(app) => crate::nodes::is_app_stream(app, props),
-            // Any node: the monitor had whatever plays to the sink, not
-            // only streams (a loopback, a node linked by hand).
+            // Playback streams, a loopback's included; a node linked to
+            // the sink by hand (rare) is left out.
             Self::SinkExcept { apps, .. } => {
-                props.get(*pw::keys::APP_PROCESS_ID) != Some(own_pid)
+                props.get(*pw::keys::MEDIA_CLASS) == Some("Stream/Output/Audio")
+                    && props.get(*pw::keys::APP_PROCESS_ID) != Some(own_pid)
                     && !apps
                         .iter()
                         .any(|app| crate::nodes::is_app_stream(app, props))
@@ -754,6 +894,11 @@ pub(crate) struct AppLinks {
     default_sink: Option<String>,
     /// The "default" metadata, followed for `default_sink`.
     metadata: Option<(pw::metadata::MetadataListener, pw::metadata::Metadata)>,
+    /// Told why the default sink cannot be followed: the track then reads
+    /// the monitor instead (see `run`).
+    fallback: Rc<dyn Fn(&str)>,
+    /// Checks, once the registry is listed, that the default metadata is.
+    synced: Option<pw::core::Listener>,
     registry: Option<pw::registry::RegistryRc>,
     core: Option<pw::core::CoreRc>,
 }
@@ -779,7 +924,11 @@ impl Drop for SinkWatch {
 }
 
 impl AppLinks {
-    pub(crate) fn new(wanted: Wanted, timing: Rc<AppTiming>) -> Rc<RefCell<Self>> {
+    pub(crate) fn new(
+        wanted: Wanted,
+        timing: Rc<AppTiming>,
+        fallback: Rc<dyn Fn(&str)>,
+    ) -> Rc<RefCell<Self>> {
         Rc::new(RefCell::new(Self {
             wanted,
             own_pid: std::process::id().to_string(),
@@ -794,6 +943,8 @@ impl AppLinks {
             timing,
             default_sink: None,
             metadata: None,
+            fallback,
+            synced: None,
             registry: None,
             core: None,
         }))
@@ -824,7 +975,7 @@ impl AppLinks {
                             match s.watch_default_sink(global, &state, &core, &stream) {
                                 Ok(m) => s.metadata = Some(m),
                                 Err(e) => {
-                                    warn!("{}: cannot follow the default sink: {e}", s.wanted)
+                                    (s.fallback)(&format!("cannot follow the default sink: {e}"))
                                 }
                             }
                             return;
@@ -842,7 +993,14 @@ impl AppLinks {
                         }
                         // After the sinks: a sink is never one of the streams.
                         ObjectType::Node if s.wanted.matches(props, &s.own_pid) => {
-                            info!("{}: following stream node {}", s.wanted, global.id);
+                            match s.wanted {
+                                Wanted::App(_) => {
+                                    info!("{}: following stream node {}", s.wanted, global.id)
+                                }
+                                Wanted::SinkExcept { .. } => {
+                                    debug!("{}: following stream node {}", s.wanted, global.id)
+                                }
+                            }
                             s.nodes.insert(global.id);
                         }
                         ObjectType::Port => {
@@ -892,6 +1050,27 @@ impl AppLinks {
                 }
             })
             .register();
+        // The globals come before the reply to this sync: no "default"
+        // metadata by then (no session manager), no default sink to follow.
+        if matches!(state.borrow().wanted, Wanted::SinkExcept { sink: None, .. }) {
+            let pending = core.sync(0)?;
+            let weak = Rc::downgrade(state);
+            let synced = core
+                .add_listener_local()
+                .done(move |id, seq| {
+                    if id == pw::core::PW_ID_CORE
+                        && seq == pending
+                        && let Some(state) = weak.upgrade()
+                    {
+                        let s = state.borrow();
+                        if s.metadata.is_none() {
+                            (s.fallback)("no default metadata");
+                        }
+                    }
+                })
+                .register();
+            state.borrow_mut().synced = Some(synced);
+        }
         Ok(listener)
     }
 
@@ -1077,7 +1256,7 @@ impl AppLinks {
                 drop(stream.dequeue_buffer());
             })
             .register()?;
-        let pod = format_pod();
+        let pod = format_pod(&STEREO);
         let mut params = [Pod::from_bytes(&pod).ok_or("invalid audio format pod")?];
         reference.connect(
             spa::utils::Direction::Input,
@@ -1262,9 +1441,8 @@ mod tests {
         // Never our own nodes (no feedback loop).
         assert!(!desktop.matches(ours.as_ref(), "7"));
         assert!(desktop.matches(ours.as_ref(), "8"));
-        // Followed, but only linked if it plays to the sink, which a
-        // capture stream never does.
-        assert!(desktop.matches(capture.as_ref(), "7"));
+        // Only playback streams.
+        assert!(!desktop.matches(capture.as_ref(), "7"));
         assert!(!app.matches(capture.as_ref(), "7"));
         assert_eq!(desktop.to_string(), "desktop except Firefox");
     }
@@ -1293,11 +1471,27 @@ mod tests {
     #[test]
     fn app_channels_downmix_to_stereo() {
         assert_eq!(link_targets("FL"), ["FL"]);
-        assert_eq!(link_targets("RR"), ["FR"]);
+        assert_eq!(link_targets("RR"), ["RR"]);
+        assert_eq!(link_targets("TFL"), ["FL"]);
         assert_eq!(link_targets("MONO"), ["FL", "FR"]);
-        assert_eq!(link_targets("FC"), ["FL", "FR"]);
+        assert_eq!(link_targets("FC"), ["FC"]);
         assert_eq!(link_targets("AUX0"), ["FL", "FR"]);
         assert!(link_targets("LFE").is_empty());
+        // Every target is one of our ports.
+        let names = ["FL", "FR", "FC", "LFE", "RL", "RR", "SL", "SR"];
+        for c in ["FL", "FRC", "TC", "RLC", "TRR", "SL", "SR", "RC", "MONO"] {
+            assert!(link_targets(c).iter().all(|t| names.contains(t)), "{c}");
+        }
+        let bytes = |v: &[f32]| v.iter().flat_map(|f| f.to_le_bytes()).collect::<Vec<_>>();
+        // Stereo stays as is.
+        assert_eq!(to_stereo(&bytes(&[0.1, -0.2]), 2), [0.1, -0.2]);
+        // 7.1: center and surrounds at -3 dB, LFE dropped.
+        let s = to_stereo(&bytes(&[0.5, 0.25, 0.2, 1.0, 0.1, 0.3, 0.4, 0.0]), 8);
+        let close = |a: f32, b: f32| (a - b).abs() < 1e-6;
+        assert!(
+            close(s[0], 0.5 + FOLD * 0.7) && close(s[1], 0.25 + FOLD * 0.5),
+            "{s:?}"
+        );
     }
 
     #[test]
@@ -1324,7 +1518,7 @@ mod tests {
 
     #[test]
     fn format_pod_parses_back() {
-        let bytes = format_pod();
+        let bytes = format_pod(&STEREO);
         let pod = Pod::from_bytes(&bytes).unwrap();
         let mut info = spa::param::audio::AudioInfoRaw::new();
         info.parse(pod).unwrap();

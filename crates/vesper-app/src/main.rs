@@ -958,7 +958,13 @@ fn on_recorder_event(ui: &AppWindow, generation: u64, event: Event) {
             prefs::save_source(&label);
         }
         Event::Source(_) => {}
-        Event::AudioStarted | Event::AudioSignal => ui.invoke_meters_wake(),
+        Event::AudioStarted => {
+            // Track changes made while recording apply now.
+            audio::show_without(ui);
+            ui.invoke_meters_wake();
+        }
+        Event::AudioSignal => ui.invoke_meters_wake(),
+        Event::DesktopExcept(apps) => audio::show_running_except(ui, apps),
         Event::Started => {
             ui.set_rec_state(RecState::Recording);
             ui.set_elapsed_seconds(0);

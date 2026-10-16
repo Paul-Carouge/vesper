@@ -1,8 +1,14 @@
 # A6: Desktop audio leaves out the apps that have their own track.
 # A fake "firefox" plays a 440 Hz tone and another app white noise, both on
 # the default sink; a third app plays 1000 Hz on labsink2 (not the default).
-#   except: Desktop + firefox tracks, firefox left out of Desktop; firefox
-#           restarts mid-run (its new stream must be linked again).
+#   except: Desktop + firefox tracks, firefox left out of Desktop. Mid-run
+#           (seconds of the recording): firefox stops at 3 and is back at 4
+#           (its new stream must be linked again); the noise moves to
+#           labsink2 at 6 and back at 8; the default sink is labsink2 from
+#           10 to 13. Desktop: no 440 Hz ever, noise but not from 6 to 8 nor
+#           from 10 to 13, 1000 Hz from 10 to 13.
+#           WirePlumber then moves the 1000 Hz stream to the default sink:
+#           from 13 on, 1000 Hz is in Desktop (and in plain), as in the monitor.
 #   plain:  same tracks, nothing left out (the sink's monitor, as on master).
 #   cost:   CPU of the audio threads, 1 left-out app + 5 other streams, both
 #           modes (PROBE: an optimized audio_probe for real numbers).
@@ -10,6 +16,12 @@
 . "${LABROOT:?not in the lab, use go or r2}/lib.sh" || exit 1
 PROBE=${PROBE:-$R/target/debug/examples/audio_probe}
 SECS=${SECS:-12}
+# node_id <node.name>: the node's id in the lab's graph
+node_id() {
+  pw-dump | python3 -I -c 'import json,sys; print(next(o["id"] for o in json.load(sys.stdin) if o.get("info",{}).get("props",{}).get("node.name")==sys.argv[1]))' "$1"
+}
+move_to() { pw-metadata $(node_id $1) target.object $2 Spa:Id > /dev/null; }
+default_sink() { pw-metadata 0 default.configured.audio.sink "{\"name\":\"$1\"}" Spa:String:JSON > /dev/null; }
 echo "default sink: $(pw-metadata 0 default.audio.sink 2>/dev/null | grep -o "value:'[^']*'")"
 # play <pidfile> <lavfi source> <app name> <binary> [pw-cat args...]
 play() {
@@ -35,12 +47,21 @@ finish() { # finish <name>
   cp /tmp/vesper-audio-probe.mka $L/log/a6-$1.mka
   python3 -I $LABROOT/a6_bands.py $L/log/a6-$1.mka
 }
-echo "== except (firefox restarts at 4 s, back at 6 s)"
-probe except Firefox
-sleep 4
+echo "== except (see the header for the timeline)"
+SECS=16 probe except Firefox
+sleep 3
 stop_play firefox
-sleep 2
+sleep 1
 play firefox "sine=frequency=440:sample_rate=48000" Firefox firefox
+sleep 2
+move_to Noiser labsink2
+sleep 2
+move_to Noiser labsink
+sleep 2
+default_sink labsink2
+sleep 3
+default_sink labsink
+echo "default sink after: $(pw-metadata 0 default.audio.sink 2>/dev/null | grep -o "value:'[^']*'")"
 finish except
 echo "== plain"
 probe plain ""
