@@ -272,9 +272,10 @@ impl GameSource {
 
     /// Runs the window fallback: takes the portal's answer, notices a closed
     /// window, and opens or closes the window as [`Switch`] decides. `layer`:
-    /// a layer game is captured, waits for consent, or was just lost and
-    /// still runs; `quit`: the lost one exited before its window was taken.
-    fn drive_window(&mut self, ui: &AppWindow, layer: bool, quit: bool) {
+    /// a layer game is captured, or was just lost and still runs; `hold`: a
+    /// game waits for consent; `quit`: the lost one exited before its window
+    /// was taken.
+    fn drive_window(&mut self, ui: &AppWindow, layer: bool, hold: bool, quit: bool) {
         let now = Instant::now();
         let demand = match self.frames.fps() {
             None => Demand::None,
@@ -309,18 +310,20 @@ impl GameSource {
                     self.window = None;
                     stop_window(capture);
                 }
+                // Dropped by Vesper (`discard`): asked again when needed.
+                // Cancelled by the user or failed: not asked again until
+                // another game or request.
                 Ok(Err((cancelled, e))) => {
                     let key = self.window.take().map(|w| w.key).unwrap_or_default();
-                    if !cancelled {
+                    if !cancelled && !discard {
                         log!("could not capture the game window: {e}");
                     }
-                    // Not asked again until another game or request.
-                    self.switch.block(&key);
+                    self.switch.failed(&key, discard);
                 }
                 // Its thread could not start: not retried every tick.
                 Err(TryRecvError::Disconnected) => {
                     let key = self.window.take().map(|w| w.key).unwrap_or_default();
-                    self.switch.block(&key);
+                    self.switch.failed(&key, discard);
                 }
             }
         }
@@ -353,6 +356,7 @@ impl GameSource {
         let input = fallback::Input {
             demand,
             layer,
+            hold,
             quit,
             game: self
                 .steam
@@ -449,7 +453,7 @@ impl GameSource {
             .lost
             .is_some_and(|(_, t)| t.elapsed() < fallback::GRACE);
         let pending = waits_for_consent(&games, &IGNORED.lock().unwrap());
-        self.drive_window(ui, self.captured.is_some() || lost || pending, quit);
+        self.drive_window(ui, self.captured.is_some() || lost, pending, quit);
         let shown_game = candidate(&games, self.selected).cloned();
         let window = match &self.window {
             Some(GameWindow {

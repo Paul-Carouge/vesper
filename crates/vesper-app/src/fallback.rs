@@ -58,9 +58,12 @@ pub enum Window {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Input {
     pub demand: Demand,
-    /// A layer or interposer game is captured, waits for consent, or was
-    /// just lost and still runs.
+    /// A layer or interposer game is captured, or was just lost and still
+    /// runs.
     pub layer: bool,
+    /// A layer game waits for the user's Allow: no picker over its prompt
+    /// (an opening one is dropped), but an open window keeps recording.
+    pub hold: bool,
     /// The layer game lost earlier exited (before its window was captured):
     /// its window is not asked for, an opening one is dropped.
     pub quit: bool,
@@ -116,6 +119,12 @@ impl Switch {
             };
         }
         let since = *self.no_layer_since.get_or_insert(now);
+        if input.hold {
+            return match input.window {
+                Window::Opening => Action::Close,
+                _ => Action::None,
+            };
+        }
         if input.window != Window::Closed || self.blocked.as_deref() == Some(want) {
             return Action::None;
         }
@@ -138,6 +147,16 @@ impl Switch {
     /// Not opened again for `key` until another game or a new request.
     pub fn block(&mut self, key: &str) {
         self.blocked = Some(key.to_owned());
+    }
+
+    /// The portal request for `key` ended without a window. `dropped`: Vesper
+    /// itself cancelled it ([`Action::Close`]): nothing to remember, it is
+    /// asked again whenever needed. Otherwise (the user cancelled, the
+    /// portal failed) it is blocked.
+    pub fn failed(&mut self, key: &str, dropped: bool) {
+        if !dropped {
+            self.block(key);
+        }
     }
 }
 
@@ -315,10 +334,53 @@ mod tests {
         Input {
             demand,
             layer,
+            hold: false,
             quit: false,
             game: game.map(str::to_owned),
             window,
         }
+    }
+
+    #[test]
+    fn a_request_vesper_drops_is_asked_again_later() {
+        let (mut sw, t) = (Switch::default(), Instant::now());
+        let rec = input(Demand::Explicit, false, Some("steam:1"), Window::Closed);
+        sw.tick(t, &rec);
+        assert_eq!(sw.tick(t + GRACE, &rec), Action::Open("steam:1".into()));
+        // A layer game connects while the picker is open: dropped.
+        let layer = input(Demand::Explicit, true, Some("steam:1"), Window::Opening);
+        assert_eq!(sw.tick(t + 3 * S, &layer), Action::Close);
+        sw.failed("steam:1", true);
+        let layer = input(Demand::Explicit, true, Some("steam:1"), Window::Closed);
+        assert_eq!(sw.tick(t + 4 * S, &layer), Action::None);
+        // It disconnects, still running: its window is asked for again.
+        sw.tick(t + 5 * S, &rec);
+        assert_eq!(
+            sw.tick(t + 5 * S + GRACE, &rec),
+            Action::Open("steam:1".into())
+        );
+        // The user cancelling blocks it.
+        sw.failed("steam:1", false);
+        assert_eq!(sw.tick(t + 20 * S, &rec), Action::None);
+    }
+
+    #[test]
+    fn a_consent_prompt_holds_a_new_picker_but_not_an_open_window() {
+        let (mut sw, t) = (Switch::default(), Instant::now());
+        let hold = |window| Input {
+            hold: true,
+            ..input(Demand::Explicit, false, None, window)
+        };
+        // Recording a window: another app asking for consent keeps it.
+        assert_eq!(sw.tick(t, &hold(Window::Open)), Action::None);
+        assert_eq!(sw.tick(t + 10 * S, &hold(Window::Open)), Action::None);
+        // No picker over the prompt; an opening one is dropped.
+        assert_eq!(sw.tick(t + 11 * S, &hold(Window::Closed)), Action::None);
+        assert_eq!(sw.tick(t + 12 * S, &hold(Window::Opening)), Action::Close);
+        sw.failed(OTHER_GAME, true);
+        // Denied: the window is asked for at once (the grace is long over).
+        let rec = input(Demand::Explicit, false, None, Window::Closed);
+        assert_eq!(sw.tick(t + 13 * S, &rec), Action::Open(OTHER_GAME.into()));
     }
 
     #[test]

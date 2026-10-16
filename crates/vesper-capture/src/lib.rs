@@ -14,9 +14,13 @@ use std::task::{Poll, Waker};
 use std::thread::JoinHandle;
 
 pub use ashpd::desktop::screencast::SourceType;
-use ashpd::desktop::screencast::{CursorMode, Screencast, SelectSourcesOptions};
+use std::collections::HashMap;
+
+use ashpd::desktop::screencast::{CursorMode, Screencast, SelectSourcesOptions, StartCastOptions};
 use ashpd::desktop::{PersistMode, Session};
 use ashpd::enumflags2::BitFlags;
+use ashpd::zbus::export::serde;
+use ashpd::zvariant;
 use futures_lite::future::block_on;
 use tracing::warn;
 use vesper_core::VideoFrame;
@@ -225,6 +229,24 @@ impl Cancel {
     }
 }
 
+/// The `handle_token` a request's options carry (ashpd draws it at random
+/// and keeps it private).
+fn handle_token(options: &(impl serde::Serialize + zvariant::Type)) -> Option<String> {
+    use zvariant::serialized::Context;
+    let data = zvariant::to_bytes(Context::new_dbus(zvariant::LE, 0), options).ok()?;
+    let (map, _): (HashMap<String, zvariant::OwnedValue>, _) = data.deserialize().ok()?;
+    String::try_from(map.get("handle_token")?.try_clone().ok()?).ok()
+}
+
+/// `/org/freedesktop/portal/desktop/request/SENDER/TOKEN`, SENDER being the
+/// caller's unique bus name without its `:` and with `_` for `.`.
+fn request_path(sender: &str, token: &str) -> Option<String> {
+    let sender = sender.strip_prefix(':')?.replace('.', "_");
+    Some(format!(
+        "/org/freedesktop/portal/desktop/request/{sender}/{token}"
+    ))
+}
+
 async fn open_portal(
     sources: BitFlags<SourceType>,
     restore_token: Option<&str>,
@@ -241,24 +263,27 @@ async fn open_portal(
         warn!("portal cannot embed the cursor: recording without it");
         CursorMode::Hidden
     };
+    // Cancelled while the portal was reached: no session, no picker.
+    if cancel.0.done.load(Ordering::SeqCst) {
+        return Err(CANCELLED.into());
+    }
     let session = proxy.create_session(Default::default()).await?;
+    let select = SelectSourcesOptions::default()
+        .set_cursor_mode(cursor)
+        .set_sources(sources)
+        .set_multiple(false)
+        .set_persist_mode(PersistMode::ExplicitlyRevoked)
+        .set_restore_token(restore_token);
+    let start = StartCastOptions::default();
+    // The requests' paths, to close the one a cancel leaves open.
+    let requests: Vec<String> = [handle_token(&select), handle_token(&start)]
+        .into_iter()
+        .flatten()
+        .filter_map(|token| request_path(proxy.connection().unique_name()?.as_str(), &token))
+        .collect();
     let result = async {
-        proxy
-            .select_sources(
-                &session,
-                SelectSourcesOptions::default()
-                    .set_cursor_mode(cursor)
-                    .set_sources(sources)
-                    .set_multiple(false)
-                    .set_persist_mode(PersistMode::ExplicitlyRevoked)
-                    .set_restore_token(restore_token),
-            )
-            .await?
-            .response()?;
-        let streams = proxy
-            .start(&session, None, Default::default())
-            .await?
-            .response()?;
+        proxy.select_sources(&session, select).await?.response()?;
+        let streams = proxy.start(&session, None, start).await?.response()?;
         let stream = streams
             .streams()
             .first()
@@ -283,6 +308,22 @@ async fn open_portal(
     match futures_lite::future::or(result, cancelled).await {
         Ok((node_id, fd, token, source)) => Ok((session, node_id, fd, token, source)),
         Err(e) => {
+            if cancel.0.done.load(Ordering::SeqCst) {
+                // Ends the picker of the request in flight (the session's
+                // close below should too); a finished request just errors.
+                for path in &requests {
+                    let _ = proxy
+                        .connection()
+                        .call_method(
+                            Some("org.freedesktop.portal.Desktop"),
+                            path.as_str(),
+                            Some("org.freedesktop.portal.Request"),
+                            "Close",
+                            &(),
+                        )
+                        .await;
+                }
+            }
             let _ = session.close().await;
             Err(e)
         }
@@ -292,6 +333,19 @@ async fn open_portal(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn request_paths_come_from_the_options_token() {
+        let token = handle_token(&SelectSourcesOptions::default()).expect("a handle token");
+        assert!(!token.is_empty() && token.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'));
+        let other = handle_token(&StartCastOptions::default()).unwrap();
+        assert_ne!(token, other, "each request draws its own");
+        assert_eq!(
+            request_path(":1.42", "ashpd_x").as_deref(),
+            Some("/org/freedesktop/portal/desktop/request/1_42/ashpd_x")
+        );
+        assert_eq!(request_path("org.x", "t"), None);
+    }
 
     #[test]
     fn cancel_wakes_a_waiting_portal_request() {
