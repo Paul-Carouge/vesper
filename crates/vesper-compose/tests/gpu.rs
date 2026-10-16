@@ -541,12 +541,11 @@ fn textures_removed_while_their_copy_runs_are_freed_after_it() {
         let s = c.uploader().prepare(2048, 2048, &big).unwrap();
         c.set_staged(1, s).unwrap();
         c.remove_texture(1);
-        // Kept while its copy may still write it.
-        let kept = c.garbage() > 0;
-        assert!(
-            kept || c.copies_done(),
-            "round {round}: freed during its copy"
-        );
+        // Kept while its copy may still write it (checked in this order:
+        // nothing frees it between the two calls).
+        if !c.copies_done() {
+            assert!(c.garbage() > 0, "round {round}: freed during its copy");
+        }
         // B: a composition in flight, a copy queued behind it, removed,
         // then the composition polled out (which collects garbage).
         c.submit(None, &draws, false).unwrap();
@@ -558,11 +557,9 @@ fn textures_removed_while_their_copy_runs_are_freed_after_it() {
                 break f;
             }
         };
-        let kept = c.garbage() > 0;
-        assert!(
-            kept || c.copies_done(),
-            "round {round}: freed during its copy"
-        );
+        if !c.copies_done() {
+            assert!(c.garbage() > 0, "round {round}: freed during its copy");
+        }
         drop(f);
         assert!(!c.is_lost(), "round {round}");
     }

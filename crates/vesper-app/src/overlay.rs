@@ -49,6 +49,8 @@ pub struct Shared {
     error: Mutex<Option<String>>,
     /// No compositor is created before then (backoff after a failure).
     suspended: Mutex<Option<Instant>>,
+    /// Retired: queued jobs are skipped.
+    quit: AtomicBool,
     /// Compositors created.
     pub created: AtomicUsize,
 }
@@ -85,6 +87,7 @@ impl Overlays {
     /// handle (or wait for it to finish) before creating another, so two
     /// devices never coexist.
     pub fn retire(self) -> JoinHandle<()> {
+        self.shared.quit.store(true, Ordering::Release);
         drop(self.jobs);
         self.thread
     }
@@ -118,9 +121,13 @@ fn run(rx: &Receiver<Job>, shared: &Shared) {
     let mut failed: Vec<Key> = Vec::new();
     let mut uploaded: Vec<u32> = Vec::new();
     let mut canvas = None;
+    let quit = || shared.quit.load(Ordering::Acquire);
     while let Ok(mut job) = rx.recv() {
         while let Ok(newer) = rx.try_recv() {
             job = newer;
+        }
+        if quit() {
+            break;
         }
         if canvas != Some(job.canvas) {
             failed.clear();
@@ -141,6 +148,16 @@ fn run(rx: &Receiver<Job>, shared: &Shared) {
             drop(old);
             uploaded.clear();
             failed.clear();
+            // A compositor still being freed elsewhere goes first (unless
+            // stuck in the driver): one device at a time.
+            while crate::recorder::retiring()
+                .is_some_and(|age| age < crate::recorder::RETIRING_STUCK)
+            {
+                if quit() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
             match Compositor::new(w, h) {
                 Ok(c) => {
                     log!("scene compositor: {w}x{h}");
@@ -158,6 +175,9 @@ fn run(rx: &Receiver<Job>, shared: &Shared) {
             continue;
         };
         for (id, key) in &job.want {
+            if quit() {
+                break;
+            }
             if uploaded.contains(id) || failed.contains(key) {
                 continue;
             }

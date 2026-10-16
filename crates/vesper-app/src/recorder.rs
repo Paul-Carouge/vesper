@@ -1849,22 +1849,31 @@ fn pump(
 /// composed scene: switching back soon reuses them.
 const OVERLAYS_WARM: Duration = Duration::from_secs(10);
 
-/// Overlay threads retired (by an idle scene or an ended pipeline), still
-/// freeing their compositor: no new one starts before they end, so two
-/// Vulkan devices never coexist, across pipelines too.
-static RETIRING: Mutex<Vec<JoinHandle<()>>> = Mutex::new(Vec::new());
+/// Threads freeing a compositor (retired overlay threads, failed
+/// compositors), and since when: no new compositor starts before they end,
+/// so two Vulkan devices never coexist, across pipelines too.
+static RETIRING: Mutex<Vec<(Duration, JoinHandle<()>)>> = Mutex::new(Vec::new());
 
-/// Whether a retired overlay thread still runs; joins the finished ones.
-fn retiring() -> bool {
+/// A thread freeing a compositor this long is stuck in the driver: new
+/// compositors start anyway.
+pub(crate) const RETIRING_STUCK: Duration = Duration::from_secs(10);
+
+fn retire_thread(t: JoinHandle<()>) {
+    lock(&RETIRING).push((monotonic_now(), t));
+}
+
+/// How long the oldest thread still freeing a compositor has been at it;
+/// joins the finished ones.
+pub(crate) fn retiring() -> Option<Duration> {
     let mut list = lock(&RETIRING);
-    let (done, running): (Vec<_>, Vec<_>) = list.drain(..).partition(JoinHandle::is_finished);
+    let (done, running): (Vec<_>, Vec<_>) = list.drain(..).partition(|(_, t)| t.is_finished());
     *list = running;
-    let busy = !list.is_empty();
+    let oldest = list.iter().map(|(since, _)| *since).min();
     drop(list);
-    for t in done {
+    for (_, t) in done {
         let _ = t.join();
     }
-    busy
+    oldest.map(|t| monotonic_now().saturating_sub(t))
 }
 
 /// What the compositor gave this tick.
@@ -1935,6 +1944,8 @@ struct Stage {
     backoff: Duration,
     /// The user was told overlays are off; reset by a composition.
     told: bool,
+    /// The user was told a previous compositor is stuck.
+    stuck_told: bool,
     on_event: OnEvent,
     #[cfg(test)]
     probe: Option<Arc<Probe>>,
@@ -1962,6 +1973,7 @@ impl Stage {
             retry: None,
             backoff: RETRY_FIRST,
             told: false,
+            stuck_told: false,
             on_event: on_event.clone(),
             #[cfg(test)]
             probe: settings.game.as_ref().map(|g| g.0.probe.clone()),
@@ -2044,9 +2056,17 @@ impl Stage {
             return;
         }
         if self.overlays.is_none() {
-            // A retired thread first frees its device (`poll` asks again).
-            if retiring() {
-                return;
+            // A retired thread first frees its device (`poll` asks again),
+            // unless it is stuck in the driver.
+            match retiring() {
+                Some(age) if age < RETIRING_STUCK => return,
+                Some(_) if !std::mem::replace(&mut self.stuck_told, true) => {
+                    log!("scene compositor: a previous one is stuck freeing its device");
+                    (self.on_event)(Event::Notice(
+                        "Scene overlays may be unavailable: the GPU is busy".into(),
+                    ));
+                }
+                _ => {}
             }
             match Overlays::start() {
                 Ok(o) => self.overlays = Some(o),
@@ -2108,7 +2128,7 @@ impl Stage {
 
     fn retire(&mut self) {
         if let Some(o) = self.overlays.take() {
-            lock(&RETIRING).push(o.retire());
+            retire_thread(o.retire());
         }
     }
 
@@ -2326,9 +2346,12 @@ impl Stage {
         let lost = slot.as_ref().is_some_and(Compositor::is_lost);
         let old = slot.take();
         drop(slot);
-        let _ = std::thread::Builder::new()
+        if let Ok(t) = std::thread::Builder::new()
             .name("vesper-compose-drop".into())
-            .spawn(move || drop(old));
+            .spawn(move || drop(old))
+        {
+            retire_thread(t);
+        }
         self.fail(if lost {
             format!("the GPU stopped answering ({why})")
         } else {
