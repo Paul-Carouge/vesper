@@ -191,6 +191,7 @@ fn row(ui: &AppWindow, track: &Track) -> AudioTrack {
         muted: track.muted,
         volume_db: track.volume_db,
         filters: crate::filters::rows(&track.filters),
+        voice: track.ducking.voice,
         duck: track.ducking.duck,
         duck_level: level_index(track.ducking.duck_level),
         music: track.ducking.music,
@@ -213,6 +214,7 @@ fn level_at(i: i32) -> Level {
 /// A row's ducking.
 fn ducking(row: &AudioTrack) -> Ducking {
     Ducking {
+        voice: row.voice,
         duck: row.duck,
         duck_level: level_at(row.duck_level),
         music: row.music,
@@ -534,9 +536,10 @@ pub fn wire(ui: &AppWindow, rec: &Shared) {
 
     let weak = ui.as_weak();
     let r = rec.clone();
-    ui.on_track_ducking_changed(move |i, duck, duck_level, music, music_level| {
+    ui.on_track_ducking_changed(move |i, voice, duck, duck_level, music, music_level| {
         let Some(ui) = weak.upgrade() else { return };
         let Some(row) = edit_row(&ui, i, |t| {
+            t.voice = voice;
             (t.duck, t.duck_level) = (duck, level_index(level_at(duck_level)));
             (t.music, t.music_level) = (music, level_index(level_at(music_level)));
         }) else {
@@ -638,6 +641,8 @@ pub fn wire(ui: &AppWindow, rec: &Shared) {
             return;
         }
         log!("track-source: {} ({})", tracks[i].name, option.source);
+        // Back to the new source's default: a microphone is a voice.
+        tracks[i].ducking.voice = Ducking::for_source(&source).voice;
         tracks[i].source = source;
         show_tracks(&ui, &tracks);
         show_known_sources(&ui);

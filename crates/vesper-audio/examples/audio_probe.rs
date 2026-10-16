@@ -51,6 +51,7 @@ fn main() -> Result<(), Error> {
             on_state: None,
             on_signal: None,
             voice: None,
+            speaks: false,
             ducking: Default::default(),
         };
         let capture = AudioCapture::start(source.clone(), options, move |p| drop(tx.send(p)))?;

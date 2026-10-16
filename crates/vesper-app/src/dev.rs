@@ -470,6 +470,7 @@ fn look(ui: &AppWindow, step: &str) -> bool {
                 Track::new("Microphone", Source::Microphone),
                 Track {
                     ducking: Ducking {
+                        voice: false,
                         duck: true,
                         duck_level: Level::Medium,
                         music: true,

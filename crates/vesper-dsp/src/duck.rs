@@ -70,6 +70,11 @@ const LEVEL_MIN_DB: f32 = -30.0;
 const LEVEL_MAX_DB: f32 = 6.0;
 /// Leveler speed, dB/s: down fast (a loud song starts), up slowly.
 const LEVEL_DOWN: f32 = 10.0;
+/// Down speed once music mode turned on, after [`CATCH_UP_BLOCKS`] blocks
+/// measured, until the leveler reached its first target: a loud song is
+/// not left loud for seconds.
+const LEVEL_CATCH_UP: f32 = 100.0;
+const CATCH_UP_BLOCKS: usize = 3;
 const LEVEL_UP: f32 = 2.0;
 
 /// Compressor of background music: peaks this far over the target
@@ -213,6 +218,8 @@ pub struct Ducker {
     next: usize,
     /// Music mode in the last block: turned on, the leveler starts over.
     music: bool,
+    /// Blocks measured since music mode turned on, while it catches up.
+    catch_up: Option<usize>,
     /// Gain the leveler goes to, dB.
     level_target: f32,
     /// Gains, dB: leveler, compressor, duck.
@@ -238,6 +245,7 @@ impl Ducker {
             blocks: [0.0; BLOCKS],
             next: 0,
             music: false,
+            catch_up: None,
             level_target: 0.0,
             level: 0.0,
             comp: 0.0,
@@ -279,10 +287,11 @@ impl Ducker {
         if music.is_some() && !self.music {
             // A new measurement: the old one may be of other music.
             (self.blocks, self.power, self.frames) = ([0.0; BLOCKS], 0.0, 0);
+            self.catch_up = Some(0);
         }
         self.music = music.is_some();
         if music.is_none() {
-            self.level_target = 0.0;
+            (self.level_target, self.catch_up) = (0.0, None);
         }
         self.dip.target = if music.is_some() { DIP_DB } else { 0.0 };
         let per_chunk = CHUNK as f32 / FS;
@@ -301,6 +310,12 @@ impl Ducker {
             if !self.dip.settled() {
                 self.dip_c = Coefs::peaking(DIP_HZ, DIP_Q, self.dip.step());
             }
+            let mut peak = 0f32;
+            // Measured before the dip: the leveler hears the music as it is.
+            if let Some(lufs) = music {
+                self.measure(chunk, lufs);
+                peak = chunk.iter().fold(0f32, |m, s| m.max(s.abs()));
+            }
             if self.dip.cur != 0.0 {
                 for frame in chunk.chunks_exact_mut(ch) {
                     for (s, z) in frame.iter_mut().zip(&mut self.dip_z) {
@@ -308,23 +323,27 @@ impl Ducker {
                     }
                 }
             }
-            let mut peak = 0f32;
-            if let Some(lufs) = music {
-                self.measure(chunk, lufs);
-                peak = chunk.iter().fold(0f32, |m, s| m.max(s.abs()));
-            }
             // Out of music mode the leveler goes back fast.
             let up = if music.is_some() {
                 LEVEL_UP
             } else {
                 LEVEL_DOWN
             };
+            let down = match self.catch_up {
+                Some(n) if n >= CATCH_UP_BLOCKS => LEVEL_CATCH_UP,
+                _ => LEVEL_DOWN,
+            };
             self.level = slew(
                 self.level,
                 self.level_target,
-                LEVEL_DOWN * per_chunk,
+                down * per_chunk,
                 up * per_chunk,
             );
+            if self.catch_up.is_some_and(|n| n >= CATCH_UP_BLOCKS)
+                && self.level <= self.level_target
+            {
+                self.catch_up = None;
+            }
             let gc = match music {
                 Some(lufs) => curve(lin_to_db(peak) + self.level, lufs + COMP_ABOVE),
                 None => 0.0,
@@ -384,6 +403,9 @@ impl Ducker {
         self.blocks[self.next] = (self.power / self.frames as f64) as f32;
         self.next = (self.next + 1) % BLOCKS;
         (self.power, self.frames) = (0.0, 0);
+        if let Some(n) = &mut self.catch_up {
+            *n += 1;
+        }
         let gate = db_to_lin(GATE_LUFS + 0.691).powi(2);
         let (sum, n) = self
             .blocks
@@ -570,16 +592,33 @@ mod tests {
 
     #[test]
     fn leveler_brings_loud_music_to_the_target_and_raises_quiet_music_a_little() {
-        // White noise music at about -6 LUFS, 12 s: leveled to the target.
-        let mut buf = noise(12 * 48_000 * CH, 0.5, 4);
+        // White noise music at about -6 LUFS, 12 s: leveled to the target
+        // (measured before the dip, so the gain is target minus input).
+        let input = noise(12 * 48_000 * CH, 0.5, 4);
+        let mut buf = input.clone();
         let d = duck(&mut buf, music(-26.0), |_| false);
-        let l = loudness(&buf[9 * 48_000 * CH..]);
-        assert!((l + 26.0).abs() < 1.0, "{l} LUFS");
+        let want = -26.0 - loudness(&input[9 * 48_000 * CH..]);
+        assert!((d.level - want).abs() < 0.5, "{} dB, want {want}", d.level);
         assert_eq!(d.ducking_db(), 0.0);
         // About -39 LUFS: raised by the most the leveler does.
         let mut buf = noise(12 * 48_000 * CH, 0.01, 4);
         let d = duck(&mut buf, music(-26.0), |_| false);
         assert!((d.level - LEVEL_MAX_DB).abs() < 0.01, "{}", d.level);
+    }
+
+    #[test]
+    fn leveler_catches_a_loud_song_up_at_once() {
+        // -6 LUFS music, turned on: within 0.6 s near its target, not
+        // ~20 dB over it for seconds.
+        let input = noise(48_000 * CH, 0.5, 4);
+        let want = -26.0 - loudness(&input);
+        let mut d = Ducker::new(CH);
+        let mut buf = input.clone();
+        for b in buf[..30 * BLK * CH].chunks_mut(BLK * CH) {
+            d.process(b, music(-26.0), false);
+        }
+        assert!((d.level - want).abs() < 2.0, "{} dB, want {want}", d.level);
+        assert!(d.catch_up.is_none());
     }
 
     #[test]

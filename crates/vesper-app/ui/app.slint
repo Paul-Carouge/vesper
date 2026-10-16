@@ -20,7 +20,7 @@ export struct FilterKind { kind: string, title: string }
 /// One audio track. `source` is the backend's id of what it records;
 /// `source-label` names it ("Desktop audio", "Headset", "Firefox") and
 /// `device` is the device it records, if named ("Speakers (USB DAC)").
-export struct AudioTrack { name: string, source: string, source-label: string, device: string, kind: TrackKind, enabled: bool, muted: bool, volume-db: float, filters: [FilterRow], duck: bool, duck-level: int, music: bool, music-level: int }
+export struct AudioTrack { name: string, source: string, source-label: string, device: string, kind: TrackKind, enabled: bool, muted: bool, volume-db: float, filters: [FilterRow], voice: bool, duck: bool, duck-level: int, music: bool, music-level: int }
 /// A source a picker offers. `section` heads the first of a group; `added`:
 /// a track records it; `detail` is shown after the label ("Default",
 /// "Disconnected").
@@ -766,7 +766,7 @@ component DuckOption inherits VerticalLayout {
             color: Theme.text-muted;
             wrap: word-wrap;
         }
-        if root.checked: Segmented {
+        if root.checked && root.levels.length > 0: Segmented {
             label: root.level-label;
             options: root.levels;
             selected: root.level;
@@ -1029,8 +1029,8 @@ export component AppWindow inherits Window {
     callback track-renamed(int, string);
     callback track-enabled-changed(int, bool);
     callback track-removed(int);
-    /// Track, lower when I speak and how much, background music and its level.
-    callback track-ducking-changed(int, bool, int, bool, int);
+    /// Track, a voice, lower when I speak and how much, background music and its level.
+    callback track-ducking-changed(int, bool, bool, int, bool, int);
     /// A list of sources or devices is shown (or none any more): the backend
     /// watches them meanwhile.
     callback sources-watch-changed(bool);
@@ -2185,14 +2185,24 @@ export component AppWindow inherits Window {
                                         color: Theme.text-muted;
                                     }
                                 }
-                                // Under the voice: for what plays, not for a microphone.
-                                if track.kind != TrackKind.microphone && track.kind != TrackKind.input: VerticalLayout {
+                                // Under the voice; an input may be the voice.
+                                VerticalLayout {
                                     spacing: Theme.space-sm;
                                     padding-top: Theme.space-xs;
                                     SectionLabel {
                                         text: @tr("WITH YOUR VOICE");
                                     }
-                                    DuckOption {
+                                    if track.kind == TrackKind.microphone || track.kind == TrackKind.input: DuckOption {
+                                        title: @tr("This is a voice");
+                                        hint: @tr("The tracks set to lower when you speak go down while it is heard.");
+                                        label: @tr("{} is a voice", track.name);
+                                        checked: track.voice;
+                                        levels: [];
+                                        toggled(on) => {
+                                            root.track-ducking-changed(i, on, track.duck, track.duck-level, track.music, track.music-level);
+                                        }
+                                    }
+                                    if !track.voice: DuckOption {
                                         title: @tr("Lower when I speak");
                                         hint: @tr("Turned down while your microphone hears you, back up after.");
                                         label: @tr("Lower {} when I speak", track.name);
@@ -2201,13 +2211,13 @@ export component AppWindow inherits Window {
                                         level-label: @tr("How much {} is lowered", track.name);
                                         level: track.duck-level;
                                         toggled(on) => {
-                                            root.track-ducking-changed(i, on, track.duck-level, track.music, track.music-level);
+                                            root.track-ducking-changed(i, track.voice, on, track.duck-level, track.music, track.music-level);
                                         }
                                         level-changed(l) => {
-                                            root.track-ducking-changed(i, track.duck, l, track.music, track.music-level);
+                                            root.track-ducking-changed(i, track.voice, track.duck, l, track.music, track.music-level);
                                         }
                                     }
-                                    DuckOption {
+                                    if !track.voice: DuckOption {
                                         title: @tr("Background music");
                                         hint: @tr("Soft and even, kept under your voice and out of its way.");
                                         label: @tr("{} as background music", track.name);
@@ -2216,10 +2226,10 @@ export component AppWindow inherits Window {
                                         level-label: @tr("Level of {} as background music", track.name);
                                         level: track.music-level;
                                         toggled(on) => {
-                                            root.track-ducking-changed(i, track.duck, track.duck-level, on, track.music-level);
+                                            root.track-ducking-changed(i, track.voice, track.duck, track.duck-level, on, track.music-level);
                                         }
                                         level-changed(l) => {
-                                            root.track-ducking-changed(i, track.duck, track.duck-level, track.music, l);
+                                            root.track-ducking-changed(i, track.voice, track.duck, track.duck-level, track.music, l);
                                         }
                                     }
                                 }

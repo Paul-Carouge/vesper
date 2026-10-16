@@ -339,11 +339,14 @@ impl Level {
     pub const ALL: [Self; 3] = [Self::Low, Self::Medium, Self::High];
 }
 
-/// A track that is lowered while a microphone speaks, or played as
-/// background music (see `vesper_dsp::Ducker`). A level is kept while
-/// its switch is off.
+/// A track that is a voice, lowered while a voice speaks, or played as
+/// background music (see `vesper_dsp::Ducker`). A level is kept while its
+/// switch is off.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Ducking {
+    /// A voice: the other tracks duck under it, and it does not duck.
+    /// By default only the Microphone track (see [`Ducking::for_source`]).
+    pub voice: bool,
     /// Lowered while the voice speaks, by `duck_level`.
     pub duck: bool,
     pub duck_level: Level,
@@ -354,6 +357,14 @@ pub struct Ducking {
 }
 
 impl Ducking {
+    /// The default of a track on `source`: a voice for the Microphone.
+    pub fn for_source(source: &Source) -> Self {
+        Self {
+            voice: *source == Source::Microphone,
+            ..Self::default()
+        }
+    }
+
     pub fn settings(&self) -> DuckSettings {
         let duck_db = match self.duck_level {
             Level::Low => 6.0,
@@ -393,12 +404,12 @@ impl Track {
     pub fn new(name: &str, source: Source) -> Self {
         Self {
             name: name.to_owned(),
-            source,
             enabled: true,
             muted: false,
             volume_db: 0.0,
             filters: Vec::new(),
-            ducking: Ducking::default(),
+            ducking: Ducking::for_source(&source),
+            source,
         }
     }
 }
@@ -649,6 +660,7 @@ impl Pipeline {
         }
         if let Some(c) = capture {
             c.set_ducking(ducking.settings());
+            c.set_speaks(ducking.voice);
         }
     }
 
@@ -1040,6 +1052,7 @@ fn start_audio(sources: &AudioSources, sinks: &SharedSinks, on_event: &OnEvent) 
             })),
             voice: Some(voice.clone()),
             ducking: track.ducking.settings(),
+            speaks: track.ducking.voice,
         };
         match AudioCapture::start(track.source.clone(), options, move |packet| {
             write_audio(&sinks, index.get(), packet)
@@ -1075,6 +1088,7 @@ fn start_audio(sources: &AudioSources, sinks: &SharedSinks, on_event: &OnEvent) 
             capture.set_muted(t.muted);
             capture.set_volume_db(t.volume_db);
             capture.set_ducking(t.ducking.settings());
+            capture.set_speaks(t.ducking.voice);
             control.set(&active_filters(&t.filters));
         }
     }

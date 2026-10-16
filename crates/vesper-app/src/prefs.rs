@@ -15,7 +15,7 @@ use vesper_audio::{MAX_DB, MIN_DB, Source};
 
 use crate::i18n::Language;
 use crate::outputs::{Kind, SourceLabel};
-use crate::recorder::{Level, MAX_FILTERS, MAX_TRACKS, Track, TrackFilter};
+use crate::recorder::{Ducking, Level, MAX_FILTERS, MAX_TRACKS, Track, TrackFilter};
 use crate::scenes::{self, Scenes};
 use crate::stream::{Service, StreamSettings};
 use crate::{AppWindow, LiveService, QualityPreset, SourceKind, VideoCodec};
@@ -208,6 +208,15 @@ impl Prefs {
                         }
                     }
                 }
+                // Overrides the source's default (see `Ducking::for_source`).
+                "voice" => {
+                    let track = last_track.and_then(|i| tracks.as_mut()?.get_mut(i));
+                    if let Some(track) = track
+                        && let Some(on) = flag(value)
+                    {
+                        track.ducking.voice = on;
+                    }
+                }
                 "audio_mix" => set(&mut self.audio_mix, flag(value)),
                 "desktop_device" => set(&mut self.desktop_device, Device::parse(value)),
                 "mic_device" => set(&mut self.mic_device, Device::parse(value)),
@@ -306,6 +315,9 @@ impl Prefs {
                 text += &format!("filter={}|{}\n", filter.enabled, filter.spec);
             }
             let d = track.ducking;
+            if d.voice != Ducking::for_source(&track.source).voice {
+                text += &format!("voice={}\n", d.voice);
+            }
             for (key, on, level) in [
                 ("duck", d.duck, d.duck_level),
                 ("music", d.music, d.music_level),
@@ -600,12 +612,12 @@ fn parse_track(value: &str) -> Option<Track> {
     let name = fields.next()?;
     (volume_db.is_finite() && valid_track_name(name)).then(|| Track {
         name: name.to_owned(),
-        source,
         enabled,
         muted,
         volume_db: volume_db.clamp(MIN_DB, MAX_DB),
         filters: Vec::new(),
-        ducking: Default::default(),
+        ducking: Ducking::for_source(&source),
+        source,
     })
 }
 
@@ -835,6 +847,7 @@ mod tests {
                     muted: true,
                     volume_db: -3.5,
                     ducking: crate::recorder::Ducking {
+                        voice: false,
                         duck: true,
                         duck_level: Level::High,
                         music: true,
@@ -859,6 +872,11 @@ mod tests {
                             spec,
                         })
                         .collect(),
+                    // An input device that is a voice.
+                    ducking: crate::recorder::Ducking {
+                        voice: true,
+                        ..Default::default()
+                    },
                     ..Track::new("Mic", Source::Input("alsa_input.pci-0000_0c_00.6".into()))
                 },
                 Track {
@@ -1377,8 +1395,24 @@ mod tests {
         let prefs = defaults().parse(text);
         let d = prefs.tracks[0].ducking;
         assert!(!d.duck && d.music && d.music_level == Level::High);
-        assert_eq!(prefs.tracks[1].ducking, Default::default());
+        assert_eq!(
+            prefs.tracks[1].ducking,
+            Ducking::for_source(&Source::Microphone)
+        );
+        assert!(prefs.tracks[1].ducking.voice);
         // Defaults are not written.
-        assert!(!defaults().serialize(DEFAULT).contains("duck="));
+        let text = defaults().serialize(DEFAULT);
+        assert!(!text.contains("duck=") && !text.contains("voice="));
+        // Only the Microphone is a voice by default; a line says otherwise.
+        let text = "tracks=\ntrack=true|false|0|input:x|Line in\n\
+                    track=true|false|0|input:y|Guest\nvoice=true\n\
+                    track=true|false|0|microphone|Mic\nvoice=false\n";
+        let voices: Vec<_> = defaults()
+            .parse(text)
+            .tracks
+            .iter()
+            .map(|t| t.ducking.voice)
+            .collect();
+        assert_eq!(voices, [false, true, false]);
     }
 }
