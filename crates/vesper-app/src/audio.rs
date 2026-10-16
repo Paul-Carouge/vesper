@@ -16,7 +16,7 @@ use vesper_audio::{MAX_DB, MIN_DB, Node, NodeWatch, Peaks, Source};
 
 use crate::meter::MeterState;
 use crate::prefs::{self, Device, Prefs};
-use crate::recorder::{MAX_TRACKS, Pipeline, Track};
+use crate::recorder::{Ducking, Level, MAX_TRACKS, Pipeline, Track};
 use crate::{
     AppWindow, AudioTrack, DeviceChoice, METER_TICK, Shared, SourceOption, TrackKind, TrackMeter,
 };
@@ -34,6 +34,9 @@ thread_local! {
     // UI thread only.
     static SOURCES: RefCell<Sources> = RefCell::default();
 }
+
+/// A track lowered by more than this (dB) shows it is.
+const DUCKED_DB: f32 = 1.0;
 
 /// Volume changes are saved once the slider rests this long.
 const SAVE_DELAY: Duration = Duration::from_millis(400);
@@ -188,6 +191,32 @@ fn row(ui: &AppWindow, track: &Track) -> AudioTrack {
         muted: track.muted,
         volume_db: track.volume_db,
         filters: crate::filters::rows(&track.filters),
+        duck: track.ducking.duck,
+        duck_level: level_index(track.ducking.duck_level),
+        music: track.ducking.music,
+        music_level: level_index(track.ducking.music_level),
+    }
+}
+
+fn level_index(level: Level) -> i32 {
+    Level::ALL.iter().position(|l| *l == level).unwrap_or(1) as i32
+}
+
+/// The level at `i` in the UI's pickers (Medium if out of range).
+fn level_at(i: i32) -> Level {
+    usize::try_from(i)
+        .ok()
+        .and_then(|i| Level::ALL.get(i).copied())
+        .unwrap_or_default()
+}
+
+/// A row's ducking.
+fn ducking(row: &AudioTrack) -> Ducking {
+    Ducking {
+        duck: row.duck,
+        duck_level: level_at(row.duck_level),
+        music: row.music,
+        music_level: level_at(row.music_level),
     }
 }
 
@@ -196,6 +225,7 @@ pub fn tracks_from_ui(ui: &AppWindow) -> Vec<Track> {
     ui.get_tracks()
         .iter()
         .filter_map(|t| {
+            let ducking = ducking(&t);
             Some(Track {
                 name: t.name.into(),
                 source: prefs::audio_source_from_id(&t.source)?,
@@ -203,6 +233,7 @@ pub fn tracks_from_ui(ui: &AppWindow) -> Vec<Track> {
                 muted: t.muted,
                 volume_db: t.volume_db,
                 filters: crate::filters::from_rows(&t.filters),
+                ducking,
             })
         })
         .collect()
@@ -503,6 +534,24 @@ pub fn wire(ui: &AppWindow, rec: &Shared) {
 
     let weak = ui.as_weak();
     let r = rec.clone();
+    ui.on_track_ducking_changed(move |i, duck, duck_level, music, music_level| {
+        let Some(ui) = weak.upgrade() else { return };
+        let Some(row) = edit_row(&ui, i, |t| {
+            (t.duck, t.duck_level) = (duck, level_index(level_at(duck_level)));
+            (t.music, t.music_level) = (music, level_index(level_at(music_level)));
+        }) else {
+            return;
+        };
+        if let Some(p) = r.borrow().as_ref() {
+            p.set_ducking(i as usize, ducking(&row));
+        }
+        Prefs::from_ui(&ui).save();
+        // The track may show it is lowered from now on.
+        ui.invoke_meters_wake();
+    });
+
+    let weak = ui.as_weak();
+    let r = rec.clone();
     ui.on_track_renamed(move |i, name| {
         let Some(ui) = weak.upgrade() else { return };
         let Some(name) = clean_name(&name) else {
@@ -668,6 +717,8 @@ pub fn start_meters(ui: &AppWindow, rec: &Shared) -> Rc<slint::Timer> {
     let meters: Rc<RefCell<Vec<MeterState>>> = Rc::default();
     let shown = Rc::new(VecModel::<TrackMeter>::default());
     ui.set_track_meters(shown.clone().into());
+    let ducked = Rc::new(VecModel::default());
+    ui.set_track_ducked(ducked.clone().into());
     let reductions = Rc::new(VecModel::default());
     ui.set_filter_reductions(reductions.clone().into());
     // Peaks gathered while the window was away are stale: the first tick
@@ -697,6 +748,7 @@ pub fn start_meters(ui: &AppWindow, rec: &Shared) -> Rc<slint::Timer> {
                 .map(|(kind, _)| MeterState::new(stereo_source(*kind)))
                 .collect();
             model.set_vec(meters.iter().map(MeterState::shown).collect::<Vec<_>>());
+            ducked.set_vec(vec![false; meters.len()]);
         }
         // The real time since the last tick (timers slip under load), at
         // most a few ticks: the first one after a stop is not a long silence.
@@ -719,8 +771,14 @@ pub fn start_meters(ui: &AppWindow, rec: &Shared) -> Rc<slint::Timer> {
             if model.row_data(i).as_ref() != Some(&now) {
                 model.set_row_data(i, now);
             }
+            let lowered = rec.as_ref().is_some_and(|r| r.ducking_db(i) > DUCKED_DB);
+            if ducked.row_data(i) != Some(lowered) {
+                ducked.set_row_data(i, lowered);
+            }
         }
-        let rested = meters.iter().all(MeterState::rested) && reductions.iter().all(|r| r == 0.0);
+        let rested = meters.iter().all(MeterState::rested)
+            && reductions.iter().all(|r| r == 0.0)
+            && ducked.iter().all(|d| !d);
         quiet = if rested { quiet + 1 } else { 0 };
         let on_screen = crate::scene_ui::shown_on_screen(&ui);
         if quiet >= REST_TICKS || !on_screen {

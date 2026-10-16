@@ -15,7 +15,7 @@ use vesper_audio::{MAX_DB, MIN_DB, Source};
 
 use crate::i18n::Language;
 use crate::outputs::{Kind, SourceLabel};
-use crate::recorder::{MAX_FILTERS, MAX_TRACKS, Track, TrackFilter};
+use crate::recorder::{Level, MAX_FILTERS, MAX_TRACKS, Track, TrackFilter};
 use crate::scenes::{self, Scenes};
 use crate::stream::{Service, StreamSettings};
 use crate::{AppWindow, LiveService, QualityPreset, SourceKind, VideoCodec};
@@ -194,6 +194,20 @@ impl Prefs {
                         track.filters.push(filter);
                     }
                 }
+                // `true|high`: a switch and its level, after the track's line.
+                key @ ("duck" | "music") => {
+                    let track = last_track.and_then(|i| tracks.as_mut()?.get_mut(i));
+                    if let Some(track) = track
+                        && let Some((on, level)) = parse_ducking(value)
+                    {
+                        let d = &mut track.ducking;
+                        if key == "duck" {
+                            (d.duck, d.duck_level) = (on, level);
+                        } else {
+                            (d.music, d.music_level) = (on, level);
+                        }
+                    }
+                }
                 "audio_mix" => set(&mut self.audio_mix, flag(value)),
                 "desktop_device" => set(&mut self.desktop_device, Device::parse(value)),
                 "mic_device" => set(&mut self.mic_device, Device::parse(value)),
@@ -290,6 +304,15 @@ impl Prefs {
             text += &format!("track={}\n", serialize_track(track));
             for filter in &track.filters {
                 text += &format!("filter={}|{}\n", filter.enabled, filter.spec);
+            }
+            let d = track.ducking;
+            for (key, on, level) in [
+                ("duck", d.duck, d.duck_level),
+                ("music", d.music, d.music_level),
+            ] {
+                if on || level != Level::default() {
+                    text += &format!("{key}={on}|{}\n", level_name(level));
+                }
             }
         }
         text += &format!("audio_mix={}\n", self.audio_mix);
@@ -582,7 +605,25 @@ fn parse_track(value: &str) -> Option<Track> {
         muted,
         volume_db: volume_db.clamp(MIN_DB, MAX_DB),
         filters: Vec::new(),
+        ducking: Default::default(),
     })
+}
+
+fn level_name(level: Level) -> &'static str {
+    match level {
+        Level::Low => "low",
+        Level::Medium => "medium",
+        Level::High => "high",
+    }
+}
+
+/// `enabled|level` of a track's `duck` or `music` line.
+fn parse_ducking(value: &str) -> Option<(bool, Level)> {
+    let (on, level) = value.split_once('|')?;
+    let level = Level::ALL
+        .into_iter()
+        .find(|l| level_name(*l) == level.trim())?;
+    Some((flag(on)?, level))
 }
 
 /// `enabled|name:key=value,...`, after its track's line.
@@ -793,6 +834,12 @@ mod tests {
                 Track {
                     muted: true,
                     volume_db: -3.5,
+                    ducking: crate::recorder::Ducking {
+                        duck: true,
+                        duck_level: Level::High,
+                        music: true,
+                        music_level: Level::Low,
+                    },
                     ..Track::new("Game | voice", Source::App("Elden Ring".into()))
                 },
                 Track {
@@ -820,6 +867,11 @@ mod tests {
                         spec: FilterSpec::Gain { db: -3.25 },
                     }],
                     muted: true,
+                    // A level is kept while its switch is off.
+                    ducking: crate::recorder::Ducking {
+                        duck_level: Level::Low,
+                        ..Default::default()
+                    },
                     ..Track::new("Desktop", Source::Desktop)
                 },
             ],
@@ -1316,5 +1368,17 @@ mod tests {
         if denied {
             assert!(result.is_err());
         }
+    }
+
+    #[test]
+    fn ducking_lines_belong_to_their_track_and_bad_ones_are_dropped() {
+        let text = "duck=true|high\ntracks=\ntrack=true|false|0|desktop|Desktop\n\
+                    duck=true|loud\nmusic=true|high\ntrack=true|false|0|microphone|Mic\n";
+        let prefs = defaults().parse(text);
+        let d = prefs.tracks[0].ducking;
+        assert!(!d.duck && d.music && d.music_level == Level::High);
+        assert_eq!(prefs.tracks[1].ducking, Default::default());
+        // Defaults are not written.
+        assert!(!defaults().serialize(DEFAULT).contains("duck="));
     }
 }

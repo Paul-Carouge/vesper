@@ -96,6 +96,9 @@ msgstr "Auto"
 msgid "BACKGROUND"
 msgstr "ARRIÈRE-PLAN"
 
+msgid "Background music"
+msgstr "Musique de fond"
+
 msgid "Balanced"
 msgstr "Équilibré"
 
@@ -483,6 +486,9 @@ msgstr "Masquer {}"
 msgid "High-pass"
 msgstr "Passe-haut"
 
+msgid "How much {} is lowered"
+msgstr "De combien {} est baissée"
+
 msgid "INPUT DEVICES"
 msgstr "PÉRIPHÉRIQUES D’ENTRÉE"
 
@@ -549,6 +555,12 @@ msgstr "Disposition"
 msgid "Left"
 msgstr "Gauche"
 
+msgid "Level of {} as background music"
+msgstr "Niveau de {} en musique de fond"
+
+msgid "Light"
+msgstr "Léger"
+
 msgid "Limiter"
 msgstr "Limiteur"
 
@@ -573,8 +585,23 @@ msgstr "Anticipation"
 msgid "Looking for cameras…"
 msgstr "Recherche des caméras…"
 
+msgid "Louder"
+msgstr "Plus fort"
+
+msgid "Lower when I speak"
+msgstr "Baisser quand je parle"
+
+msgid "Lower {} when I speak"
+msgstr "Baisser {} quand je parle"
+
+msgid "Lowered"
+msgstr "Baissée"
+
 msgid "Makeup"
 msgstr "Compensation"
+
+msgid "Medium"
+msgstr "Moyen"
 
 msgid "Microphone"
 msgstr "Micro"
@@ -665,6 +692,9 @@ msgstr "Aucune clé de stream {0} sauvegardée : collez la clé {0} dans les pa
 
 msgid "Noise suppression"
 msgstr "Réduction de bruit"
+
+msgid "Normal"
+msgstr "Normal"
 
 msgid "Not installed"
 msgstr "Non installée"
@@ -767,6 +797,9 @@ msgstr "Qualité"
 
 msgid "Quality preset"
 msgstr "Préréglage de qualité"
+
+msgid "Quiet"
+msgstr "Discret"
 
 msgid "Quit"
 msgstr "Quitter"
@@ -1008,6 +1041,9 @@ msgstr "Taille"
 msgid "Smallest files at a given quality. Needs a recent player."
 msgstr "Les plus petits fichiers à qualité égale. Demande un lecteur récent."
 
+msgid "Soft and even, kept under your voice and out of its way."
+msgstr "Douce et régulière, gardée sous votre voix sans la gêner."
+
 msgid "Source"
 msgstr "Source"
 
@@ -1103,6 +1139,9 @@ msgstr "Direct sans son : aucune piste audio ne tourne"
 
 msgid "Stretch"
 msgstr "Étirer"
+
+msgid "Strong"
+msgstr "Fort"
 
 msgid "Suppression"
 msgstr "Atténuation"
@@ -1209,6 +1248,9 @@ msgstr "Piste"
 msgid "Track name"
 msgstr "Nom de la piste"
 
+msgid "Turned down while your microphone hears you, back up after."
+msgstr "Baissée tant que votre micro vous entend, remontée ensuite."
+
 msgid "Type a name"
 msgstr "Saisissez un nom"
 
@@ -1247,6 +1289,9 @@ msgstr "Préréglage voix"
 
 msgid "Volume of {}"
 msgstr "Volume de {}"
+
+msgid "WITH YOUR VOICE"
+msgstr "AVEC VOTRE VOIX"
 
 msgid "Waiting for a game"
 msgstr "En attente d’un jeu"
@@ -1331,6 +1376,9 @@ msgstr "{} (démarrage)"
 
 msgid "{} Mbit/s"
 msgstr "{} Mbit/s"
+
+msgid "{} as background music"
+msgstr "{} en musique de fond"
 
 msgid "{} colour {}"
 msgstr "{}, couleur {}"

@@ -20,7 +20,7 @@ export struct FilterKind { kind: string, title: string }
 /// One audio track. `source` is the backend's id of what it records;
 /// `source-label` names it ("Desktop audio", "Headset", "Firefox") and
 /// `device` is the device it records, if named ("Speakers (USB DAC)").
-export struct AudioTrack { name: string, source: string, source-label: string, device: string, kind: TrackKind, enabled: bool, muted: bool, volume-db: float, filters: [FilterRow] }
+export struct AudioTrack { name: string, source: string, source-label: string, device: string, kind: TrackKind, enabled: bool, muted: bool, volume-db: float, filters: [FilterRow], duck: bool, duck-level: int, music: bool, music-level: int }
 /// A source a picker offers. `section` heads the first of a group; `added`:
 /// a track records it; `detail` is shown after the label ("Default",
 /// "Disconnected").
@@ -222,6 +222,8 @@ component AudioRow inherits HorizontalLayout {
     in property <bool> interactive: true;
     /// Its settings are shown below it.
     in property <bool> open;
+    /// Lowered under the voice right now.
+    in property <bool> ducked;
     callback toggle-mute;
     callback toggle-open;
     callback clear-clip;
@@ -256,10 +258,12 @@ component AudioRow inherits HorizontalLayout {
         Text {
             text: !root.track.enabled ? @tr("Not recorded")
                 : root.track.muted ? @tr("Muted")
+                : root.ducked ? @tr("Lowered")
                 : root.track.volume-db != 0 ? TrackText.volume(root.track.volume-db) : TrackText.source(root.track);
             font-size: Theme.font-caption;
             font-weight: root.track.muted && root.track.enabled ? 600 : 400;
-            color: root.track.muted && root.track.enabled ? Theme.rec : Theme.text-muted;
+            color: root.track.muted && root.track.enabled ? Theme.rec
+                : root.ducked && root.track.enabled ? Theme.accent : Theme.text-muted;
             overflow: elide;
         }
     }
@@ -716,6 +720,63 @@ component FilterCard inherits Rectangle {
 }
 
 // A plain choice in an inline menu.
+// A switch with its title and a one-line why, and how much under it while
+// it is on.
+component DuckOption inherits VerticalLayout {
+    in property <string> title;
+    in property <string> hint;
+    in property <string> label;
+    in property <bool> checked;
+    in property <[string]> levels;
+    in property <string> level-label;
+    in property <int> level;
+    callback toggled(bool);
+    callback level-changed(int);
+
+    spacing: 2px;
+    HorizontalLayout {
+        spacing: Theme.space-sm;
+        Switch {
+            label: root.label;
+            checked: root.checked;
+            toggled(on) => {
+                root.toggled(on);
+            }
+        }
+        Text {
+            horizontal-stretch: 1;
+            text: root.title;
+            vertical-alignment: center;
+            font-size: Theme.font-small;
+            font-weight: 500;
+            color: Theme.text;
+            overflow: elide;
+        }
+    }
+    // Under the title, not beside the switch: a wrapped text in a row
+    // would be measured on one line.
+    VerticalLayout {
+        padding-left: 44px + Theme.space-sm;
+        spacing: Theme.space-xs;
+        Text {
+            text: root.hint;
+            // The scroll view sizes to min-heights: count the wrapped lines.
+            min-height: self.preferred-height;
+            font-size: Theme.font-caption;
+            color: Theme.text-muted;
+            wrap: word-wrap;
+        }
+        if root.checked: Segmented {
+            label: root.level-label;
+            options: root.levels;
+            selected: root.level;
+            changed(i) => {
+                root.level-changed(i);
+            }
+        }
+    }
+}
+
 component MenuRow inherits FocusScope {
     in property <string> text;
     in property <string> label: root.text;
@@ -908,6 +969,8 @@ export component AppWindow inherits Window {
     in property <[AudioTrack]> tracks;
     /// Level meter of each track.
     in property <[TrackMeter]> track-meters;
+    /// Per track: lowered under the voice right now.
+    in property <[bool]> track-ducked;
     /// What "Add track" and a track's Source offer, kept current while
     /// `watching-sources`.
     in property <[SourceOption]> source-options;
@@ -966,6 +1029,8 @@ export component AppWindow inherits Window {
     callback track-renamed(int, string);
     callback track-enabled-changed(int, bool);
     callback track-removed(int);
+    /// Track, lower when I speak and how much, background music and its level.
+    callback track-ducking-changed(int, bool, int, bool, int);
     /// A list of sources or devices is shown (or none any more): the backend
     /// watches them meanwhile.
     callback sources-watch-changed(bool);
@@ -2014,6 +2079,7 @@ export component AppWindow inherits Window {
                                 track: track;
                                 meter: root.track-meters[i];
                                 open: root.open-track == i;
+                                ducked: root.track-ducked[i];
                                 toggle-mute => {
                                     root.track-mute-toggled(i);
                                 }
@@ -2119,6 +2185,44 @@ export component AppWindow inherits Window {
                                         color: Theme.text-muted;
                                     }
                                 }
+                                // Under the voice: for what plays, not for a microphone.
+                                if track.kind != TrackKind.microphone && track.kind != TrackKind.input: VerticalLayout {
+                                    spacing: Theme.space-sm;
+                                    padding-top: Theme.space-xs;
+                                    SectionLabel {
+                                        text: @tr("WITH YOUR VOICE");
+                                    }
+                                    DuckOption {
+                                        title: @tr("Lower when I speak");
+                                        hint: @tr("Turned down while your microphone hears you, back up after.");
+                                        label: @tr("Lower {} when I speak", track.name);
+                                        checked: track.duck;
+                                        levels: [@tr("Light"), @tr("Medium"), @tr("Strong")];
+                                        level-label: @tr("How much {} is lowered", track.name);
+                                        level: track.duck-level;
+                                        toggled(on) => {
+                                            root.track-ducking-changed(i, on, track.duck-level, track.music, track.music-level);
+                                        }
+                                        level-changed(l) => {
+                                            root.track-ducking-changed(i, track.duck, l, track.music, track.music-level);
+                                        }
+                                    }
+                                    DuckOption {
+                                        title: @tr("Background music");
+                                        hint: @tr("Soft and even, kept under your voice and out of its way.");
+                                        label: @tr("{} as background music", track.name);
+                                        checked: track.music;
+                                        levels: [@tr("Quiet"), @tr("Normal"), @tr("Louder")];
+                                        level-label: @tr("Level of {} as background music", track.name);
+                                        level: track.music-level;
+                                        toggled(on) => {
+                                            root.track-ducking-changed(i, track.duck, track.duck-level, on, track.music-level);
+                                        }
+                                        level-changed(l) => {
+                                            root.track-ducking-changed(i, track.duck, track.duck-level, track.music, l);
+                                        }
+                                    }
+                                }
                                 // Filters: live, even while recording.
                                 HorizontalLayout {
                                     spacing: Theme.space-xs;
@@ -2168,6 +2272,7 @@ export component AppWindow inherits Window {
                                 }
                                 if track.filters.length == 0 && !root.adding-filter: Text {
                                     text: @tr("No filter: the track is recorded as is.");
+                                    min-height: self.preferred-height;
                                     font-size: Theme.font-small;
                                     color: Theme.text-muted;
                                     wrap: word-wrap;

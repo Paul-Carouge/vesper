@@ -7,7 +7,7 @@
 //!   notification, both for `VESPER_DEMO_FILE`.
 //!   Looks without a capture or a game, for screenshots: `screen-look`,
 //!   `game-look`, `game-window-look`, `consent-look`, `starting-look`, `stopping-look`, `layer-installed`, `layer-missing`,
-//!   `replay-on`, `replay-off`, `filters-look`, `live-look`, `live-dropping-look`,
+//!   `replay-on`, `replay-off`, `filters-look`, `ducking-look`, `live-look`, `live-dropping-look`,
 //!   `live-reconnecting-look`, `live-key-look`; `scroll-end` scrolls the settings
 //!   to the end, `scroll:<px>` that far.
 //!   `track-source` opens the first track's Source list, `desktop-devices` and
@@ -460,6 +460,33 @@ fn look(ui: &AppWindow, step: &str) -> bool {
                 ((-16.0, -16.0), (-10.0, -10.0), false, false),
             ]));
             ui.set_filter_reductions(model(&[0.0, 0.0, 0.0, 4.2, 1.5, 0.8]));
+        }
+        // Music lowered under the voice, its settings open.
+        "ducking-look" => {
+            use crate::recorder::{Ducking, Level, Track};
+            use vesper_audio::Source;
+            let tracks = [
+                Track::new("Desktop", Source::Desktop),
+                Track::new("Microphone", Source::Microphone),
+                Track {
+                    ducking: Ducking {
+                        duck: true,
+                        duck_level: Level::Medium,
+                        music: true,
+                        music_level: Level::Low,
+                    },
+                    ..Track::new("Spotify", Source::App("Spotify".into()))
+                },
+            ];
+            crate::audio::show_tracks(ui, &tracks);
+            ui.invoke_open_track_settings(2);
+            ui.set_track_meters(demo_meters(&[
+                ((-30.0, -31.0), (-24.0, -25.0), true, false),
+                ((-14.0, -14.0), (-9.0, -9.0), false, false),
+                ((-36.0, -37.0), (-30.0, -31.0), true, false),
+            ]));
+            let ducked = vec![false, false, true];
+            ui.set_track_ducked(std::rc::Rc::new(slint::VecModel::from(ducked)).into());
         }
         // On air for 12:34 on Twitch, as the stats show it.
         "live-look" => {
