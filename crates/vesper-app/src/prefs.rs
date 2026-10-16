@@ -217,6 +217,15 @@ impl Prefs {
                         track.ducking.voice = on;
                     }
                 }
+                // `false`: the app stays in the desktop track too.
+                "leave_desktop" => {
+                    let track = last_track.and_then(|i| tracks.as_mut()?.get_mut(i));
+                    if let Some(track) = track
+                        && let Some(on) = flag(value)
+                    {
+                        track.leave_desktop = on;
+                    }
+                }
                 "audio_mix" => set(&mut self.audio_mix, flag(value)),
                 "desktop_device" => set(&mut self.desktop_device, Device::parse(value)),
                 "mic_device" => set(&mut self.mic_device, Device::parse(value)),
@@ -325,6 +334,9 @@ impl Prefs {
                 if on || level != Level::default() {
                     text += &format!("{key}={on}|{}\n", level_name(level));
                 }
+            }
+            if !track.leave_desktop {
+                text += "leave_desktop=false\n";
             }
         }
         text += &format!("audio_mix={}\n", self.audio_mix);
@@ -617,6 +629,7 @@ fn parse_track(value: &str) -> Option<Track> {
         volume_db: volume_db.clamp(MIN_DB, MAX_DB),
         filters: Vec::new(),
         ducking: Ducking::for_source(&source),
+        leave_desktop: true,
         source,
     })
 }
@@ -853,6 +866,7 @@ mod tests {
                         music: true,
                         music_level: Level::Low,
                     },
+                    leave_desktop: false,
                     ..Track::new("Game | voice", Source::App("Elden Ring".into()))
                 },
                 Track {

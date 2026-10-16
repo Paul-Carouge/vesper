@@ -591,6 +591,24 @@ msgstr "Plus fort"
 msgid "Lower when I speak"
 msgstr "Baisser quand je parle"
 
+msgid "Leave out of desktop audio"
+msgstr "Retirer du son du bureau"
+
+msgid "Applies once the recording ends."
+msgstr "S'applique à la fin de l'enregistrement."
+
+msgid "Desktop audio does not record this app a second time."
+msgstr "Le son du bureau n'enregistre pas cette application une deuxième fois."
+
+msgid "{} left out of desktop audio"
+msgstr "{} retiré du son du bureau"
+
+msgid "Without {}"
+msgstr "Sans : {}"
+
+msgid "{} · without {}"
+msgstr "{} · sans {}"
+
 msgid "Lower {} when I speak"
 msgstr "Baisser {} quand je parle"
 

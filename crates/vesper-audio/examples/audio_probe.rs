@@ -7,6 +7,8 @@
 //! `VESPER_PROBE_VOICE=desktop,microphone` runs the voice filter chain on
 //! those tracks (the `Source` names, lowercase), e.g. to check that its
 //! delay is compensated against an unfiltered `output:<sink>` track.
+//! `VESPER_PROBE_DESKTOP_EXCEPT=app1,app2` leaves those apps out of the
+//! desktop track.
 
 use std::sync::mpsc;
 use std::time::Duration;
@@ -35,6 +37,15 @@ fn main() -> Result<(), Error> {
         .chain(apps)
         .collect();
     let voice = std::env::var("VESPER_PROBE_VOICE").unwrap_or_default();
+    // Apps left out of the desktop track, comma-separated: their app
+    // tracks hold them while they capture, as in the app.
+    let except: Vec<String> = std::env::var("VESPER_PROBE_DESKTOP_EXCEPT")
+        .unwrap_or_default()
+        .split(',')
+        .filter(|a| !a.is_empty())
+        .map(str::to_owned)
+        .collect();
+    let exclusions = vesper_audio::Exclusions::new(None);
     let mut tracks = Vec::new();
     let anchor = monotonic_now();
     let (mix_tx, mix_rx) = mpsc::channel::<EncodedPacket>();
@@ -53,6 +64,11 @@ fn main() -> Result<(), Error> {
             voice: None,
             speaks: false,
             ducking: Default::default(),
+            exclusions: match &source {
+                Source::App(app) if !except.contains(app) => None,
+                _ if except.is_empty() => None,
+                _ => Some(exclusions.clone()),
+            },
         };
         let capture = AudioCapture::start(source.clone(), options, move |p| drop(tx.send(p)))?;
         tracks.push((source, capture, rx));

@@ -30,6 +30,7 @@
 //! delays, as any duck without lookahead would.
 
 mod aac;
+mod exclusions;
 mod mix;
 mod nodes;
 mod pw;
@@ -49,6 +50,7 @@ use vesper_core::EncodedPacket;
 use vesper_dsp::{Ducker, VOICE_HOLD_FRAMES, VoiceDetector};
 
 pub use aac::Aac;
+pub use exclusions::{Exclusions, Hold, OnExclusions};
 pub use mix::{Mix, MixInput};
 pub use nodes::{Node, NodeWatch};
 pub use vesper_dsp::DuckSettings;
@@ -204,6 +206,13 @@ pub struct Options {
     pub speaks: bool,
     /// Ducking and background music of a track that is not a voice.
     pub ducking: DuckSettings,
+    /// Apps with their own track, left out of the desktop: a
+    /// [`Source::App`] track holds its app there while it captures; a
+    /// [`Source::Desktop`] or [`Source::Output`] track leaves out the apps
+    /// held, following changes. It then links the sink's other playback
+    /// streams to itself instead of reading its monitor; with no app held
+    /// it reads the monitor, as without this. `None`: neither.
+    pub exclusions: Option<Arc<Exclusions>>,
 }
 
 /// See [`Options::on_signal`].
@@ -376,10 +385,10 @@ impl AudioCapture {
             .spawn(move || encode_loop(enc, chunk_rx))?;
         let (stop, stop_rx) = ::pipewire::channel::channel();
         let (ready_tx, ready_rx) = mpsc::channel();
-        let on_state = options.on_state;
+        let (on_state, except) = (options.on_state, options.exclusions);
         let pw_thread = std::thread::Builder::new()
             .name("vesper-audio-pw".into())
-            .spawn(move || pw::run(source, chunk_tx, stop_rx, ready_tx, on_state))?;
+            .spawn(move || pw::run(source, except, chunk_tx, stop_rx, ready_tx, on_state))?;
         let capture = Self {
             shared,
             extradata,

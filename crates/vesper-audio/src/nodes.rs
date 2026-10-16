@@ -93,7 +93,7 @@ fn classify(p: &Props) -> Option<Node> {
 
 /// The `node.name` in a `default.audio.sink` or `default.audio.source`
 /// metadata value, `{"name":"alsa_output.x"}`.
-fn default_name(json: &str) -> Option<String> {
+pub(crate) fn default_name(json: &str) -> Option<String> {
     let rest = json.split_once("\"name\"")?.1.trim_start();
     let rest = rest.strip_prefix(':')?.trim_start().strip_prefix('"')?;
     let name = &rest[..rest.find('"')?];
