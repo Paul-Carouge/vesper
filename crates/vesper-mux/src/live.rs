@@ -261,6 +261,8 @@ fn handshake_failure(host: &str, speaks_tls: bool) -> LiveError {
 impl Live {
     /// Connects to `url` (it holds the stream key: never log it) and writes
     /// the stream header. Gives up after `timeout`, or when `abort` is set.
+    /// A failed `rtmps://` handshake is probed again within that same
+    /// `timeout` to say why it failed.
     pub fn connect(
         url: &str,
         video: &VideoTrack,
@@ -401,8 +403,11 @@ impl Live {
                 && let Some((host, port)) = &endpoint
                 && !live.tls_handshake(host, *port, true)
             {
+                // A probe cut short by a stop or the deadline says nothing.
+                live.interrupted()?;
                 // Without the certificate check: is it TLS at all?
                 let speaks_tls = live.tls_handshake(host, *port, false);
+                live.interrupted()?;
                 return Err(handshake_failure(host, speaks_tls));
             }
             connected?;
@@ -456,6 +461,18 @@ impl Live {
         Err(LiveError::new(kind, format!("{what}: {why}")))
     }
 
+    /// `Aborted` or `Unreachable` if the last blocking call was cut short.
+    fn interrupted(&self) -> Result<(), LiveError> {
+        let i = &self.interrupt;
+        if i.abort.load(Ordering::Relaxed) {
+            Err(LiveError::new(LiveErrorKind::Aborted, "stopped"))
+        } else if i.timed_out.load(Ordering::Relaxed) {
+            Err(LiveError::new(LiveErrorKind::Unreachable, "timed out"))
+        } else {
+            Ok(())
+        }
+    }
+
     /// Whether a TLS connection to `host:port` succeeds, the certificate
     /// checked when `verify`. Nothing is sent over it.
     fn tls_handshake(&self, host: &str, port: u16, verify: bool) -> bool {
@@ -467,7 +484,7 @@ impl Live {
         let Ok(url) = CString::new(format!("tls://{host}:{port}")) else {
             return false;
         };
-        self.interrupt.arm(Duration::from_secs(5));
+        // No new deadline: the probe stays within the one of `connect`.
         let mut pb = ptr::null_mut();
         unsafe {
             let mut opts = open_options(true, true);
@@ -877,6 +894,52 @@ mod tests {
             }
         });
         assert_eq!(connect_kind(port), LiveErrorKind::NotTls);
+    }
+
+    /// A listener that answers its first connection like an RTMP server (no
+    /// TLS) and holds later ones open, silent; `on_hold` runs at each of them.
+    fn plain_then_silent(on_hold: impl Fn() + Send + 'static) -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for (n, s) in listener.incoming().flatten().enumerate() {
+                let mut s = s;
+                if n == 0 {
+                    use std::io::Write;
+                    let mut reply = vec![0u8; 1537];
+                    reply[0] = 3;
+                    let _ = s.write_all(&reply);
+                } else {
+                    on_hold();
+                    held.push(s);
+                }
+            }
+        });
+        port
+    }
+
+    /// A stop or the deadline during the TLS probe is not blamed on TLS.
+    #[test]
+    fn an_interrupted_tls_probe_says_why() {
+        let abort = Arc::new(AtomicBool::new(false));
+        let a = abort.clone();
+        let port = plain_then_silent(move || a.store(true, Ordering::Relaxed));
+        let url = format!("rtmps://localhost:{port}/app/key");
+        let e = Live::connect(&url, &video(), None, abort, Duration::from_secs(10))
+            .err()
+            .unwrap();
+        assert_eq!(e.kind(), LiveErrorKind::Aborted, "{e}");
+
+        let port = plain_then_silent(|| {});
+        let url = format!("rtmps://localhost:{port}/app/key");
+        let abort = Arc::new(AtomicBool::new(false));
+        let t = Instant::now();
+        let e = Live::connect(&url, &video(), None, abort, Duration::from_secs(1))
+            .err()
+            .unwrap();
+        assert_eq!(e.kind(), LiveErrorKind::Unreachable, "{e}");
+        assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
     }
 
     /// Plain TCP takes `tcp_nodelay` (RTMP passes its options down to it).
