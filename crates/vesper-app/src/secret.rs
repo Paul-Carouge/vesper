@@ -22,6 +22,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use futures_lite::StreamExt;
 use futures_lite::future::block_on;
@@ -113,6 +114,27 @@ async fn proxy<'a>(
 /// The error of every call when the session has no Secret Service.
 const ABSENT: &str = "no Secret Service on the session bus";
 
+/// How long a Secret Service call may stay unanswered: a bus that can start
+/// one (activatable) that never comes up would otherwise hold go-live for
+/// the bus's ~25 s activation timeout. Unlock dialogs are not bounded: the
+/// `Prompt` call returns at once, and its answer comes as a signal.
+const CALL_TIMEOUT: Duration = Duration::from_secs(4);
+
+/// The error of a Secret Service that did not answer in time.
+const NO_ANSWER: &str = "the Secret Service did not answer";
+
+/// Whether `e` says the call went unanswered.
+fn timed_out(e: &zbus::Error) -> bool {
+    match e {
+        zbus::Error::InputOutput(e) => e.kind() == std::io::ErrorKind::TimedOut,
+        zbus::Error::MethodError(name, _, _) => matches!(
+            name.as_str(),
+            "org.freedesktop.DBus.Error.NoReply" | "org.freedesktop.DBus.Error.TimedOut"
+        ),
+        _ => false,
+    }
+}
+
 /// Whether `e` says nothing provides the Secret Service.
 fn absent(e: &zbus::Error) -> bool {
     match e {
@@ -126,11 +148,14 @@ fn absent(e: &zbus::Error) -> bool {
 }
 
 /// A connection and a "plain" session (the bus is local: no transport
-/// encryption needed). [`ABSENT`] when there is no service.
+/// encryption needed). [`ABSENT`] when there is no service, [`NO_ANSWER`]
+/// when it does not answer within [`CALL_TIMEOUT`].
 async fn open() -> Result<(zbus::Connection, OwnedObjectPath)> {
-    let conn = zbus::Connection::session()
-        .await
-        .map_err(|_| ABSENT.to_owned())?;
+    let conn = match zbus::connection::Builder::session() {
+        Ok(b) => b.method_timeout(CALL_TIMEOUT).build().await,
+        Err(e) => Err(e),
+    }
+    .map_err(|_| ABSENT.to_owned())?;
     let service = proxy(&conn, SERVICE, "org.freedesktop.Secret.Service").await?;
     let (_, session): (OwnedValue, OwnedObjectPath) = service
         .call("OpenSession", &("plain", Value::from("")))
@@ -138,6 +163,8 @@ async fn open() -> Result<(zbus::Connection, OwnedObjectPath)> {
         .map_err(|e| {
             if absent(&e) {
                 ABSENT.to_owned()
+            } else if timed_out(&e) {
+                NO_ANSWER.to_owned()
             } else {
                 e.to_string()
             }
@@ -550,7 +577,8 @@ pub fn load(id: &str) -> Option<StreamKey> {
 }
 
 /// Saves `key` for `id`: in the keyring, or in the private file if there
-/// is no keyring.
+/// is no keyring. One that does not answer may still be there: no copy in
+/// clear then either.
 pub fn store(id: &str, key: &StreamKey) -> std::result::Result<Store, String> {
     let _writing = writing();
     match block_on(keyring_store(id, key)) {
@@ -564,6 +592,10 @@ pub fn store(id: &str, key: &StreamKey) -> std::result::Result<Store, String> {
             file_store(id, key)
                 .map(|()| Store::File)
                 .map_err(|e| format!("Could not save the stream key: {e}"))
+        }
+        Err(e) if e == NO_ANSWER => {
+            log!("secret service: {e}");
+            Err("The keyring did not answer: key not saved".into())
         }
         // There is a keyring, which refused (locked, prompt dismissed): no
         // copy in clear.
@@ -821,6 +853,27 @@ mod tests {
         assert_eq!(block_on(keyring_migrate("test-locked")), Ok(Migrated::Kept));
         assert_eq!(block_on(old_items()), 1);
         assert!(!block_on(keyring_has("test-locked")).unwrap());
+    }
+
+    /// With the fake started as `HANG=1` (it never answers `OpenSession`):
+    /// every call gives up after `CALL_TIMEOUT`, a load falls back to the
+    /// file and a store says so instead of writing the key in clear.
+    #[test]
+    #[ignore = "needs the fake Secret Service with HANG=1"]
+    fn a_hung_keyring_gives_up_quickly() {
+        let started = std::time::Instant::now();
+        assert_eq!(block_on(keyring_load("test-hung")), Err(NO_ANSWER.into()));
+        assert_eq!(load("test-hung"), None);
+        assert_eq!(
+            store("test-hung", &key("live_test_key_123")),
+            Err("The keyring did not answer: key not saved".into())
+        );
+        assert_eq!(file_load("test-hung"), None);
+        clear("test-hung");
+        assert_eq!(saved("test-hung"), None);
+        // Five calls, each bounded.
+        let limit = CALL_TIMEOUT * 5 + Duration::from_secs(2);
+        assert!(started.elapsed() < limit, "{:?}", started.elapsed());
     }
 
     /// `EXPECT=absent` on a private bus without a Secret Service, or
