@@ -41,9 +41,10 @@ const MIN_TLS_AVFORMAT: u32 = 62;
 #[cfg(test)]
 static TEST_CA: std::sync::Mutex<Option<CString>> = std::sync::Mutex::new(None);
 
-/// Options of every `avio_open2`: the protocol whitelist, and certificate
-/// checks for TLS. Freed by the caller.
-fn open_options(tls: bool) -> *mut ff::AVDictionary {
+/// Options of every `avio_open2`: the protocol whitelist, certificate
+/// checks for TLS, and no Nagle delay over TCP (RTMP, RTMPS). Freed by the
+/// caller.
+fn open_options(tls: bool, tcp: bool) -> *mut ff::AVDictionary {
     let mut opts = ptr::null_mut();
     unsafe {
         ff::av_dict_set(
@@ -52,6 +53,10 @@ fn open_options(tls: bool) -> *mut ff::AVDictionary {
             PROTOCOLS.as_ptr(),
             0,
         );
+        if tcp {
+            // Small FLV packets otherwise wait for ACKs: tens of ms of jitter.
+            ff::av_dict_set(&mut opts, c"tcp_nodelay".as_ptr(), c"1".as_ptr(), 0);
+        }
         if tls {
             ff::av_dict_set(&mut opts, c"tls_verify".as_ptr(), c"1".as_ptr(), 0);
             #[cfg(test)]
@@ -117,8 +122,10 @@ pub enum LiveErrorKind {
     /// started: most often a wrong stream key.
     Rejected,
     /// The TLS handshake of an `rtmps://` server failed: its certificate is
-    /// not trusted (an interception, a captive portal) or it is no TLS server.
+    /// not trusted (an interception, a captive portal).
     Insecure,
+    /// An `rtmps://` server does not speak TLS (most often a plain RTMP one).
+    NotTls,
     /// `abort` was set.
     Aborted,
     /// Anything else (a write that failed once live, a bad URL).
@@ -235,6 +242,22 @@ fn endpoint(url: &str) -> Option<(String, u16)> {
     }
 }
 
+/// The error for a failed TLS handshake with `host`: an untrusted
+/// certificate if a handshake without the check succeeds, else no TLS server.
+fn handshake_failure(host: &str, speaks_tls: bool) -> LiveError {
+    if speaks_tls {
+        LiveError::new(
+            LiveErrorKind::Insecure,
+            format!("TLS handshake with {host} failed: certificate not trusted"),
+        )
+    } else {
+        LiveError::new(
+            LiveErrorKind::NotTls,
+            format!("TLS handshake with {host} failed: the server does not speak TLS"),
+        )
+    }
+}
+
 impl Live {
     /// Connects to `url` (it holds the stream key: never log it) and writes
     /// the stream header. Gives up after `timeout`, or when `abort` is set.
@@ -260,6 +283,7 @@ impl Live {
             c"flv"
         };
         let tls = url.starts_with("rtmps://");
+        let srt = url.starts_with("srt://");
         // SAFETY: a plain getter.
         if tls && unsafe { ff::avformat_version() } >> 16 < MIN_TLS_AVFORMAT {
             return Err(LiveError::new(
@@ -349,7 +373,7 @@ impl Live {
                 set_extradata(par, &a.extradata).map_err(|e| LiveError::new(Other, e.0))?;
             }
 
-            let mut opts = open_options(tls);
+            let mut opts = open_options(tls, !srt);
             let ret = ff::avio_open2(
                 &mut (*live.ctx).pb,
                 curl.as_ptr(),
@@ -369,22 +393,17 @@ impl Live {
             }
             // An SRT caller with no listener fails with a generic error:
             // never blame the key for it. RTMP gets refused instead.
-            let fallback = if url.starts_with("srt://") {
-                Unreachable
-            } else {
-                Rejected
-            };
+            let fallback = if srt { Unreachable } else { Rejected };
             let connected = live.check(ret, "connect", fallback);
             // A failed TLS handshake is a plain EIO too: try one alone.
             if connected.as_ref().is_err_and(|e| e.kind == Rejected)
                 && tls
                 && let Some((host, port)) = &endpoint
-                && !live.tls_handshake(host, *port)
+                && !live.tls_handshake(host, *port, true)
             {
-                return Err(LiveError::new(
-                    Insecure,
-                    format!("TLS handshake with {host} failed"),
-                ));
+                // Without the certificate check: is it TLS at all?
+                let speaks_tls = live.tls_handshake(host, *port, false);
+                return Err(handshake_failure(host, speaks_tls));
             }
             connected?;
             // No seek back to patch the header at the end: it is a stream.
@@ -437,8 +456,9 @@ impl Live {
         Err(LiveError::new(kind, format!("{what}: {why}")))
     }
 
-    /// Whether a TLS connection to `host:port` succeeds (certificate checked).
-    fn tls_handshake(&self, host: &str, port: u16) -> bool {
+    /// Whether a TLS connection to `host:port` succeeds, the certificate
+    /// checked when `verify`. Nothing is sent over it.
+    fn tls_handshake(&self, host: &str, port: u16, verify: bool) -> bool {
         let host = if host.contains(':') {
             format!("[{host}]")
         } else {
@@ -450,7 +470,10 @@ impl Live {
         self.interrupt.arm(Duration::from_secs(5));
         let mut pb = ptr::null_mut();
         unsafe {
-            let mut opts = open_options(true);
+            let mut opts = open_options(true, true);
+            if !verify {
+                ff::av_dict_set(&mut opts, c"tls_verify".as_ptr(), c"0".as_ptr(), 0);
+            }
             let ret = ff::avio_open2(
                 &mut pb,
                 url.as_ptr(),
@@ -458,7 +481,7 @@ impl Live {
                 &(*self.ctx).interrupt_callback,
                 &mut opts,
             );
-            let unchecked = unconsumed(opts, c"tls_verify");
+            let unchecked = verify && unconsumed(opts, c"tls_verify");
             ff::av_dict_free(&mut opts);
             ff::avio_closep(&mut pb);
             ret >= 0 && !unchecked
@@ -827,6 +850,55 @@ mod tests {
             "certificate for another host"
         );
         assert_ne!(trusted, LiveErrorKind::Insecure, "trusted CA, right host");
+    }
+
+    #[test]
+    fn handshake_failures_tell_certificate_from_no_tls() {
+        let e = handshake_failure("h", true);
+        assert_eq!(e.kind(), LiveErrorKind::Insecure);
+        assert!(e.to_string().contains("certificate"), "{e}");
+        let e = handshake_failure("h", false);
+        assert_eq!(e.kind(), LiveErrorKind::NotTls);
+        assert!(e.to_string().contains("does not speak TLS"), "{e}");
+    }
+
+    /// `rtmps://` to a plain RTMP server: no TLS, not an untrusted certificate.
+    #[test]
+    fn rtmps_to_a_plain_server_says_it_is_no_tls() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            // Answers every connection like an RTMP server: S0 (version 3), S1.
+            for mut s in listener.incoming().flatten() {
+                use std::io::Write;
+                let mut reply = vec![0u8; 1537];
+                reply[0] = 3;
+                let _ = s.write_all(&reply);
+            }
+        });
+        assert_eq!(connect_kind(port), LiveErrorKind::NotTls);
+    }
+
+    /// Plain TCP takes `tcp_nodelay` (RTMP passes its options down to it).
+    #[test]
+    fn tcp_takes_nodelay() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = CString::new(format!("tcp://{}", listener.local_addr().unwrap())).unwrap();
+        unsafe {
+            let mut opts = open_options(false, true);
+            let mut pb = ptr::null_mut();
+            let ret = ff::avio_open2(
+                &mut pb,
+                url.as_ptr(),
+                ff::AVIO_FLAG_WRITE,
+                ptr::null(),
+                &mut opts,
+            );
+            let left = unconsumed(opts, c"tcp_nodelay");
+            ff::av_dict_free(&mut opts);
+            ff::avio_closep(&mut pb);
+            assert!(ret >= 0 && !left, "{ret} {left}");
+        }
     }
 
     #[test]
