@@ -4,7 +4,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use pipewire as pw;
 use pw::properties::PropertiesBox;
@@ -118,13 +118,44 @@ impl Backoff {
     }
 }
 
+impl Default for Backoff {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A connection that streamed this long resets the backoff and ends the
+/// outage. Shorter runs are a flapping source: they keep backing off.
+const HEALTHY: Duration = Duration::from_secs(30);
+
+/// Reconnection across connections: the backoff and the current outage.
+#[derive(Debug, Default)]
+struct Reconnect {
+    backoff: Backoff,
+    /// An outage began and no connection has been healthy since.
+    outage: bool,
+}
+
+impl Reconnect {
+    /// After losing a connection that streamed for `up` (`None`: never
+    /// streamed): the wait before the next attempt, and whether a new outage
+    /// begins (worth a warning).
+    fn lost(&mut self, up: Option<Duration>) -> (Duration, bool) {
+        if up.is_some_and(|up| up >= HEALTHY) {
+            *self = Self::default();
+        }
+        let new = !std::mem::replace(&mut self.outage, true);
+        (self.backoff.next(), new)
+    }
+}
+
 /// How one connection to PipeWire is doing, seen from its callbacks.
 #[derive(Default)]
 struct Health {
     /// Why the connection is lost, once it is.
     lost: RefCell<Option<String>>,
-    /// The stream reached `Streaming`.
-    streamed: Cell<bool>,
+    /// When the stream first reached `Streaming`.
+    streaming_since: Cell<Option<Instant>>,
 }
 
 impl Health {
@@ -171,7 +202,7 @@ pub fn run(
         None => Rc::new(|_| {}),
     };
     let mut ready = Some(ready);
-    let mut backoff = Backoff::new();
+    let mut reconnect = Reconnect::default();
     loop {
         let health = Rc::new(Health::default());
         let running = {
@@ -204,16 +235,19 @@ pub fn run(
         if stopped.get() {
             return;
         }
-        if health.streamed.get() {
-            backoff = Backoff::new();
-        }
         let reason = health.lost.take().unwrap_or_else(|| "stream ended".into());
-        let wait = backoff.next();
-        // Warned once per outage: a removed device retries every 2 s.
-        if reconnecting.replace(true) {
-            debug!("{source:?}: {reason}; reconnecting in {wait:?}");
-        } else {
+        let up = health.streaming_since.get().map(|t| t.elapsed());
+        let (wait, new_outage) = reconnect.lost(up);
+        // Warned once per outage: a removed device retries every 2 s, and a
+        // flapping one keeps backing off within the same outage.
+        if new_outage {
             warn!("{source:?}: {reason}; reconnecting");
+        } else {
+            debug!("{source:?}: {reason}; reconnecting in {wait:?}");
+        }
+        // The track went back to running since the last report (a flap):
+        // the backoff spaces these out.
+        if !reconnecting.replace(true) {
             on_state(TrackState::Reconnecting(reason));
         }
         let timer = mainloop.loop_().add_timer({
@@ -330,7 +364,9 @@ impl Session {
                     // until the reconnection.
                     match new {
                         pw::stream::StreamState::Streaming => {
-                            health.streamed.set(true);
+                            if health.streaming_since.get().is_none() {
+                                health.streaming_since.set(Some(Instant::now()));
+                            }
                             running();
                         }
                         pw::stream::StreamState::Error(e) => {
@@ -878,6 +914,34 @@ mod tests {
         let waits: Vec<_> = (0..7).map(|_| b.next().as_millis()).collect();
         assert_eq!(waits, [100, 200, 400, 800, 1_600, 2_000, 2_000]);
         assert_eq!(Backoff::new(), Backoff(BACKOFF_FIRST));
+    }
+
+    #[test]
+    fn flapping_keeps_backing_off_in_one_outage() {
+        let mut r = Reconnect::default();
+        let brief = Some(Duration::from_millis(50));
+        // A device that streams for an instant, then drops, again and again.
+        let flaps: Vec<_> = (0..7)
+            .map(|_| r.lost(brief))
+            .map(|(wait, new)| (wait.as_millis(), new))
+            .collect();
+        assert_eq!(
+            flaps,
+            [
+                (100, true),
+                (200, false),
+                (400, false),
+                (800, false),
+                (1_600, false),
+                (2_000, false),
+                (2_000, false)
+            ]
+        );
+        // Never streamed: same outage, still backing off.
+        assert_eq!(r.lost(None), (Duration::from_secs(2), false));
+        // A healthy run ends it: a real unplug retries fast and warns again.
+        assert_eq!(r.lost(Some(HEALTHY)), (BACKOFF_FIRST, true));
+        assert_eq!(r.lost(None), (2 * BACKOFF_FIRST, false));
     }
 
     #[test]
