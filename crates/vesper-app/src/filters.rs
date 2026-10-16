@@ -46,13 +46,17 @@ static PLUGINS: Mutex<Vec<PluginInfo>> = Mutex::new(Vec::new());
 /// Makes the tracks' chains able to run VST3 plugins (settings in
 /// `~/.config/vesper/vst3/`, hosts from `vesper-vst-host` next to Vesper).
 pub fn install_plugins() {
-    if let Some(dir) = dirs::config_dir() {
-        let dir = dir.join("vesper").join("vst3");
+    if let Some(dir) = plugin_dir() {
         vesper_vst::install(vesper_vst::Registry::new(
             dir,
             vesper_vst::HostCommand::installed(),
         ));
     }
+}
+
+/// `$XDG_CONFIG_HOME/vesper/vst3`: the plugin instances' settings files.
+pub fn plugin_dir() -> Option<std::path::PathBuf> {
+    dirs::config_dir().map(|d| d.join("vesper").join("vst3"))
 }
 
 /// Title shown for a filter.

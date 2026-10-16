@@ -11,7 +11,10 @@
 //!   `live-reconnecting-look`, `live-key-look`; `scroll-end` scrolls the settings
 //!   to the end, `scroll:<px>` that far.
 //!   `track-source` opens the first track's Source list, `desktop-devices` and
-//!   `mic-devices` a device list of the settings.
+//!   `mic-devices` a device list of the settings. `profiles` opens the
+//!   profile menu, `profile-new` with a new profile's name field,
+//!   `profile-delete` with the delete confirmation; `profile:<slug>`
+//!   switches to that profile.
 //! - `VESPER_SNAPSHOT=<file.ppm>` saves the window as a PPM image once the
 //!   demo settled, then quits. Nothing outside the window is captured.
 //! - `VESPER_DEMO_DELAY=<ms>` runs `VESPER_DEMO` that long after launch
@@ -260,8 +263,14 @@ pub fn apply(ui: &AppWindow) {
                 "track-source" => ui.invoke_open_track_source(0),
                 "desktop-devices" => ui.invoke_open_device_list(1),
                 "mic-devices" => ui.invoke_open_device_list(2),
+                "profiles" => ui.invoke_open_profile_menu(0),
+                "profile-new" => ui.invoke_open_profile_menu(1),
+                "profile-delete" => ui.invoke_open_profile_menu(4),
                 "tab" => press_key(&ui, Key::Tab.into(), false),
                 "esc" => press_key(&ui, Key::Escape.into(), false),
+                step if step.starts_with("profile:") => {
+                    ui.invoke_profile_switch(step["profile:".len()..].into());
+                }
                 other => match other.strip_prefix("ctrl+") {
                     Some("comma") => press_key(&ui, ",".into(), true),
                     Some(key) if !key.is_empty() => press_key(&ui, key.into(), true),

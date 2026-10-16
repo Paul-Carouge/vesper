@@ -22,6 +22,7 @@ mod live;
 mod meter;
 mod outputs;
 mod prefs;
+mod profiles;
 mod recorder;
 mod secret;
 mod shortcuts;
@@ -153,7 +154,9 @@ fn main() -> Result<(), slint::PlatformError> {
     }
     ui.set_replay_enabled(true);
     audio::show_tracks(&ui, &prefs::default_tracks());
-    Prefs::load(Prefs::from_ui(&ui)).apply(&ui);
+    // Also the settings of a new profile.
+    let defaults = Prefs::from_ui(&ui);
+    Prefs::load(defaults.clone()).apply(&ui);
     // The entry may have been removed elsewhere (e.g. System Settings).
     ui.set_autostart(autostart::enabled());
     show_output_folder(&ui);
@@ -166,6 +169,7 @@ fn main() -> Result<(), slint::PlatformError> {
     wire_callbacks(&ui, &recording, &games);
     wire_game_callbacks(&ui, &games);
     live::wire(&ui, &recording, &games);
+    profiles::wire(&ui, &recording, &games, defaults);
     wire_global_shortcuts(&ui);
     let tray = spawn_tray(&ui);
     wire_background(&ui, tray.as_ref());
@@ -372,17 +376,7 @@ fn wire_callbacks(ui: &AppWindow, recording: &Shared, games: &Games) {
         log!("replay-changed: enabled={enabled} seconds={seconds}");
         update_replay_memory(&ui);
         Prefs::from_ui(&ui).save();
-        let applied = rec
-            .borrow()
-            .as_ref()
-            .is_some_and(|p| p.set_replay(replay_span(&ui)));
-        if !applied
-            && enabled
-            && let Err(e) = start_pipeline(&ui, &rec, &g, None, None)
-        {
-            ui.set_replay_enabled(false);
-            flash_notice(&ui, &e);
-        }
+        apply_replay(&ui, &rec, &g);
     });
 
     // Mute and volume apply live; the next recording reads the UI state.
@@ -463,19 +457,42 @@ fn wire_callbacks(ui: &AppWindow, recording: &Shared, games: &Games) {
         }
         set_source_mode(&ui, &g, game);
         Prefs::from_ui(&ui).save();
-        if !ui.get_replay_enabled() {
-            return;
-        }
-        // Without a saved source the portal picker would pop up right away.
-        if !game && recorder::load_restore_token().is_none() {
-            flash_notice(&ui, "Replay starts once a source is picked");
-        } else if game && g.borrow().is_none() {
-            // The start error is shown; the games tick starts the replay
-            // buffer once game capture runs.
-        } else if let Err(e) = start_pipeline(&ui, &rec, &g, None, None) {
-            flash_notice(&ui, &e);
-        }
+        start_replay(&ui, &rec, &g);
     });
+}
+
+/// Hands the replay switch and length to the pipeline, or starts one for
+/// the replay buffer.
+fn apply_replay(ui: &AppWindow, rec: &Shared, games: &Games) {
+    let applied = rec
+        .borrow()
+        .as_ref()
+        .is_some_and(|p| p.set_replay(replay_span(ui)));
+    if !applied
+        && ui.get_replay_enabled()
+        && let Err(e) = start_pipeline(ui, rec, games, None, None)
+    {
+        ui.set_replay_enabled(false);
+        flash_notice(ui, &e);
+    }
+}
+
+/// Starts the replay buffer, if it is on, on the source mode just set (the
+/// previous pipeline ended).
+fn start_replay(ui: &AppWindow, rec: &Shared, games: &Games) {
+    if !ui.get_replay_enabled() {
+        return;
+    }
+    let game = ui.get_source_kind() == SourceKind::Game;
+    // Without a saved source the portal picker would pop up right away.
+    if !game && recorder::load_restore_token().is_none() {
+        flash_notice(ui, "Replay starts once a source is picked");
+    } else if game && games.borrow().is_none() {
+        // The start error is shown; the games tick starts the replay
+        // buffer once game capture runs.
+    } else if let Err(e) = start_pipeline(ui, rec, games, None, None) {
+        flash_notice(ui, &e);
+    }
 }
 
 /// SIGTERM (the session ends) and SIGINT take the Quit path, so a recording
