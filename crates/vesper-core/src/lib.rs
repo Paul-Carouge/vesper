@@ -7,6 +7,7 @@
 use std::fmt;
 use std::os::fd::OwnedFd;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 /// One plane of a DMA-BUF. Several planes may share the same buffer object
@@ -59,12 +60,26 @@ pub struct VideoFrame {
     /// Index of the buffer in the producer's pool. Stable for the lifetime of
     /// a pool, so consumers can cache imports (one VA surface per buffer).
     pub buffer_id: u32,
-    /// Bumped whenever the pool is renegotiated (size, format, modifier).
+    /// Identifies the pool: a new one whenever the pool is renegotiated
+    /// (size, format, modifier) or another producer takes over. Taken from
+    /// [`next_pool_generation`], so it is unique across all producers in the
+    /// process: one consumer can be fed by several (portal window, game).
     /// Consumers must drop cached imports when it changes.
     pub pool_generation: u32,
     /// `CLOCK_MONOTONIC` presentation time.
     pub pts: Duration,
     pub release: ReleaseGuard,
+}
+
+/// A pool generation no producer in this process used yet. Never 0.
+pub fn next_pool_generation() -> u32 {
+    static NEXT: AtomicU32 = AtomicU32::new(1);
+    loop {
+        let g = NEXT.fetch_add(1, Ordering::Relaxed);
+        if g != 0 {
+            return g;
+        }
+    }
 }
 
 /// Video codecs supported by the hardware encoder.
@@ -91,7 +106,27 @@ pub struct EncodedPacket {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU32, Ordering};
+
+    #[test]
+    fn pool_generations_are_unique_across_threads_and_never_0() {
+        let threads: Vec<_> = (0..4)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    (0..1000)
+                        .map(|_| next_pool_generation())
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let mut all: Vec<u32> = threads
+            .into_iter()
+            .flat_map(|t| t.join().unwrap())
+            .collect();
+        assert!(!all.contains(&0));
+        all.sort_unstable();
+        all.dedup();
+        assert_eq!(all.len(), 4000);
+    }
 
     #[test]
     fn release_guard_fires_once_on_drop() {
