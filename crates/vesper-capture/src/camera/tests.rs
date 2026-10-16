@@ -357,6 +357,12 @@ fn gpu_surfaces_keep_their_buffer_id_and_return_on_release() {
         .collect();
     let distinct: std::collections::BTreeSet<_> = held.iter().map(|f| f.buffer_id).collect();
     assert_eq!(distinct.len(), held.len());
+    // A reopened camera (new decoder) never reuses a generation.
+    let mut again = decode::Decoder::gpu().unwrap();
+    let CameraFrame::Gpu(f) = again.decode(&jpeg, Duration::ZERO).unwrap() else {
+        panic!("not a GPU frame");
+    };
+    assert!(held.iter().all(|h| h.pool_generation != f.pool_generation));
 }
 
 #[test]

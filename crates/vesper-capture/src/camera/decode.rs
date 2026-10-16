@@ -219,7 +219,9 @@ impl Decoder {
                 // A new size (or decoder pool): new RGB surfaces, new ids.
                 self.graph = None;
                 self.ids.clear();
-                self.generation = self.generation.wrapping_add(1);
+                // Unique in the process: a reopened camera never hits the cache
+                // entries of the previous one.
+                self.generation = vesper_core::next_pool_generation();
                 self.graph = Some(vpp_graph(dec, key)?);
             }
             let graph = self.graph.as_ref().expect("built above");
