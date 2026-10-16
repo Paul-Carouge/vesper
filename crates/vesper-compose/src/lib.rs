@@ -124,8 +124,9 @@ fn place(d: &Draw, tw: u32, th: u32, cw: u32, ch: u32) -> Option<GpuLayer> {
     let (mut dx0, mut dy0, mut dx1, mut dy1) = (x * cw, y * ch, (x + w) * cw, (y + h) * ch);
     let (sw, sh, dw, dh) = (sx1 - sx0, sy1 - sy0, dx1 - dx0, dy1 - dy0);
     let opacity = d.opacity.clamp(0.0, 1.0);
+    let finite = d.rect.iter().chain(&d.crop).all(|v| v.is_finite()) && opacity.is_finite();
     // Written so NaN fails too.
-    if !(sw > 0.0 && sh > 0.0 && dw > 0.0 && dh > 0.0 && opacity > 0.0) {
+    if !(finite && sw > 0.0 && sh > 0.0 && dw > 0.0 && dh > 0.0 && opacity > 0.0) {
         return None;
     }
     match d.fit {
@@ -148,6 +149,12 @@ fn place(d: &Draw, tw: u32, th: u32, cw: u32, ch: u32) -> Option<GpuLayer> {
         return None;
     }
     let (kx, ky) = ((sx1 - sx0) / (dx1 - dx0), (sy1 - sy0) / (dy1 - dy0));
+    if ![dx0, dy0, dx1, dy1, sx0, sy0, kx, ky]
+        .iter()
+        .all(|v| v.is_finite())
+    {
+        return None;
+    }
     let exact = kx == 1.0 && ky == 1.0 && sx0.fract() == 0.0 && sy0.fract() == 0.0;
     Some(GpuLayer {
         dst: [dx0, dy0, dx1, dy1],
@@ -210,8 +217,22 @@ struct Buffer {
 /// A main frame imported from its DMA-BUF, kept while its producer's pool lives.
 struct Import {
     buffer_id: u32,
-    key: (u32, u32, u32, u64),
+    /// Size, fourcc, modifier and the DMA-BUF's inode: a recycled
+    /// (buffer_id, generation) on another buffer never hits.
+    key: (u32, u32, u32, u64, u64),
     image: Image,
+}
+
+/// Inode of a DMA-BUF: unique per buffer while it lives.
+fn inode(fd: &OwnedFd) -> Result<u64> {
+    let mut st = unsafe { std::mem::zeroed::<libc::stat>() };
+    if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } != 0 {
+        return Err(Error(format!(
+            "stat DMA-BUF: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok(st.st_ino)
 }
 
 struct Texture {
@@ -252,6 +273,9 @@ pub struct Compositor {
     /// implicit fence), which Vulkan on RADV does not wait for by itself.
     acquire: vk::Semaphore,
     memory: vk::PhysicalDeviceMemoryProperties,
+    physical: vk::PhysicalDevice,
+    /// DRM modifiers the device supports per import format.
+    modifiers: HashMap<vk::Format, Vec<vk::DrmFormatModifierPropertiesEXT>>,
     queue: vk::Queue,
     family: u32,
     pool: vk::CommandPool,
@@ -316,6 +340,8 @@ impl Compositor {
                 semaphore_fd: ash::khr::external_semaphore_fd::Device::new(&instance, &device),
                 acquire: vk::Semaphore::null(),
                 memory: instance.get_physical_device_memory_properties(physical),
+                physical,
+                modifiers: HashMap::new(),
                 queue: device.get_device_queue(family, 0),
                 _entry: entry,
                 instance,
@@ -518,7 +544,10 @@ impl Compositor {
 
     /// Sets (or replaces) texture `id` from `width` x `height` premultiplied
     /// RGBA8 pixels, with a full mip chain for downscaled draws. Blocks until
-    /// the upload is done; call it when the content changes, not per frame.
+    /// the upload is done and builds the mips on the calling thread (a few
+    /// ms per megapixel): call it when the content changes, not per frame,
+    /// and off the pipeline thread for large images. Levels at least twice
+    /// the canvas size are dropped.
     pub fn set_texture(&mut self, id: u32, width: u32, height: u32, rgba: &[u8]) -> Result<()> {
         self.check_alive()?;
         if width == 0 || height == 0 || width > 16384 || height > 16384 {
@@ -531,7 +560,17 @@ impl Compositor {
                 rgba.len()
             )));
         }
-        let texture = unsafe { self.upload(width, height, rgba)? };
+        // Drawn at most canvas-sized: levels at least twice the canvas are
+        // never sampled, so they are not built or uploaded.
+        // shortcut: a crop zooming into a huge image loses that detail; keep
+        // more levels if the editor ever allows such zooms.
+        let (mut w, mut h) = (width as usize, height as usize);
+        let mut px = std::borrow::Cow::Borrowed(rgba);
+        while w / 2 >= self.width as usize && h / 2 >= self.height as usize {
+            let (p, nw, nh) = half(&px, w, h);
+            (px, w, h) = (std::borrow::Cow::Owned(p), nw, nh);
+        }
+        let texture = unsafe { self.upload(w as u32, h as u32, &px)? };
         if let Some(old) = self.textures.insert(id, texture) {
             // `upload` waited for the queue: nothing uses the old one.
             unsafe { old.image.destroy(&self.device) };
@@ -549,7 +588,8 @@ impl Compositor {
     /// Requests a [`PREVIEW_WIDTH`] x [`PREVIEW_HEIGHT`] RGBA8 downscale of
     /// the next composition and returns the latest finished one not returned
     /// yet. Never waits for the GPU; the small extra pass runs inside the
-    /// next `compose` only after a request.
+    /// next `compose` only after a request. A plain bilinear downscale of the
+    /// canvas (no mips): fine details may alias.
     pub fn preview(&mut self) -> Option<&[u8]> {
         if self.lost {
             return None;
@@ -574,6 +614,8 @@ impl Compositor {
     /// it, ready for the encoder (the GPU is done with it). `main` is released
     /// as soon as the GPU has read it. Draws of a missing source are skipped.
     /// The frame's pts is `main`'s, or zero without one: set it as needed.
+    /// `main` is sampled without mips: a large downscale of it may alias.
+    /// Without `main`, the previous producer's imports are freed.
     pub fn compose(&mut self, main: Option<VideoFrame>, draws: &[Draw]) -> Result<VideoFrame> {
         self.check_alive()?;
         if draws.len() > MAX_LAYERS {
@@ -589,7 +631,12 @@ impl Compositor {
             .ok_or_else(|| Error("every composed frame is still in use".into()))?;
         let main_import = match &main {
             Some(f) => Some(unsafe { self.import(f)? }),
-            None => None,
+            None => {
+                // No main (e.g. the game quit): free its pool's images now
+                // rather than pin them until another producer shows up.
+                self.drop_imports();
+                None
+            }
         };
 
         let mut params = Params {
@@ -712,6 +759,20 @@ impl Compositor {
         })
     }
 
+    /// Frees every imported main frame (nothing is in flight between calls).
+    pub fn drop_imports(&mut self) {
+        for i in self.imports.drain(..) {
+            unsafe { i.image.destroy(&self.device) };
+        }
+        self.import_generation = None;
+    }
+
+    /// True once a composition timed out (the GPU hung or was reset). Every
+    /// call fails from then on: drop this compositor and create another.
+    pub fn is_lost(&self) -> bool {
+        self.lost
+    }
+
     fn check_alive(&self) -> Result<()> {
         if self.lost {
             return Err(Error("the GPU stopped answering".into()));
@@ -815,9 +876,11 @@ impl Compositor {
                     self.family,
                 ));
             }
+            // Source stage = the semaphore's wait stage: the layout
+            // transitions run after the implicit fence.
             d.cmd_pipeline_barrier(
                 cmd,
-                vk::PipelineStageFlags::TOP_OF_PIPE,
+                stage,
                 stage,
                 vk::DependencyFlags::empty(),
                 &[],
@@ -1038,12 +1101,20 @@ impl Compositor {
         if self.import_generation != Some(frame.pool_generation) {
             // A new producer pool: the old buffers are gone (nothing is in
             // flight, `compose` waits for the GPU).
-            for i in self.imports.drain(..) {
-                unsafe { i.image.destroy(&self.device) };
-            }
+            self.drop_imports();
             self.import_generation = Some(frame.pool_generation);
         }
-        let key = (frame.width, frame.height, frame.fourcc, frame.modifier);
+        let first = frame
+            .planes
+            .first()
+            .ok_or_else(|| Error("frame without planes".into()))?;
+        let key = (
+            frame.width,
+            frame.height,
+            frame.fourcc,
+            frame.modifier,
+            inode(&first.fd)?,
+        );
         if let Some(i) = self
             .imports
             .iter()
@@ -1055,6 +1126,7 @@ impl Compositor {
             let old = self.imports.swap_remove(i);
             unsafe { old.image.destroy(&self.device) };
         }
+        unsafe { self.check_importable(frame)? };
         let image = unsafe { self.import_dmabuf(frame)? };
         self.imports.push(Import {
             buffer_id: frame.buffer_id,
@@ -1062,6 +1134,93 @@ impl Compositor {
             image,
         });
         Ok(self.imports.len() - 1)
+    }
+
+    /// Rejects what the driver cannot import, before it reads the frame's
+    /// plane layouts: the producer (a game, through the layer) is not
+    /// trusted to send a modifier with its real plane count.
+    unsafe fn check_importable(&mut self, f: &VideoFrame) -> Result<()> {
+        let (format, _) = import_format(f.fourcc).ok_or_else(|| {
+            Error(format!(
+                "unsupported format {:?}",
+                String::from_utf8_lossy(&f.fourcc.to_le_bytes())
+            ))
+        })?;
+        let (instance, physical) = (&self.instance, self.physical);
+        let list = self.modifiers.entry(format).or_insert_with(|| unsafe {
+            let mut list = vk::DrmFormatModifierPropertiesListEXT::default();
+            let mut props = vk::FormatProperties2::default().push_next(&mut list);
+            instance.get_physical_device_format_properties2(physical, format, &mut props);
+            let mut out = vec![
+                vk::DrmFormatModifierPropertiesEXT::default();
+                list.drm_format_modifier_count as usize
+            ];
+            let mut list = vk::DrmFormatModifierPropertiesListEXT::default()
+                .drm_format_modifier_properties(&mut out);
+            let mut props = vk::FormatProperties2::default().push_next(&mut list);
+            instance.get_physical_device_format_properties2(physical, format, &mut props);
+            let n = list.drm_format_modifier_count as usize;
+            out.truncate(n);
+            out
+        });
+        let m = list
+            .iter()
+            .find(|m| m.drm_format_modifier == f.modifier)
+            .ok_or_else(|| Error(format!("modifier {:#x} not supported", f.modifier)))?;
+        if m.drm_format_modifier_plane_count as usize != f.planes.len() {
+            return Err(Error(format!(
+                "modifier {:#x} has {} plane(s), the frame {}",
+                f.modifier,
+                m.drm_format_modifier_plane_count,
+                f.planes.len()
+            )));
+        }
+        if !m
+            .drm_format_modifier_tiling_features
+            .contains(vk::FormatFeatureFlags::SAMPLED_IMAGE)
+        {
+            return Err(Error(format!(
+                "modifier {:#x} cannot be sampled",
+                f.modifier
+            )));
+        }
+        let mut drm = vk::PhysicalDeviceImageDrmFormatModifierInfoEXT::default()
+            .drm_format_modifier(f.modifier)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let mut ext = vk::PhysicalDeviceExternalImageFormatInfo::default()
+            .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+        let info = vk::PhysicalDeviceImageFormatInfo2::default()
+            .format(format)
+            .ty(vk::ImageType::TYPE_2D)
+            .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
+            .usage(vk::ImageUsageFlags::SAMPLED)
+            .push_next(&mut ext)
+            .push_next(&mut drm);
+        let mut ext_props = vk::ExternalImageFormatProperties::default();
+        let mut props = vk::ImageFormatProperties2::default().push_next(&mut ext_props);
+        unsafe {
+            self.instance.get_physical_device_image_format_properties2(
+                self.physical,
+                &info,
+                &mut props,
+            )
+        }
+        .map_err(|e| Error(format!("modifier {:#x} not importable: {e}", f.modifier)))?;
+        let max = props.image_format_properties.max_extent;
+        if f.width == 0 || f.height == 0 || f.width > max.width || f.height > max.height {
+            return Err(Error(format!(
+                "frame {}x{} out of {}x{}",
+                f.width, f.height, max.width, max.height
+            )));
+        }
+        if !ext_props
+            .external_memory_properties
+            .external_memory_features
+            .contains(vk::ExternalMemoryFeatureFlags::IMPORTABLE)
+        {
+            return Err(Error(format!("modifier {:#x} not importable", f.modifier)));
+        }
+        Ok(())
     }
 
     unsafe fn import_dmabuf(&self, f: &VideoFrame) -> Result<Image> {
@@ -1078,15 +1237,9 @@ impl Compositor {
         if f.planes.len() > 1 {
             // Planes (e.g. DCC metadata) must share one buffer object: each fd
             // is a duplicate. Disjoint planes are not supported.
-            let ino = |p: &DmaBufPlane| {
-                p.fd.try_clone()
-                    .and_then(|fd| std::fs::File::from(fd).metadata())
-                    .map(|m| m.ino())
-                    .map_err(|e| Error(format!("stat DMA-BUF: {e}")))
-            };
-            let a = ino(first)?;
+            let a = inode(&first.fd)?;
             for p in &f.planes[1..] {
-                if ino(p)? != a {
+                if inode(&p.fd)? != a {
                     return Err(Error("DMA-BUF planes in separate buffers".into()));
                 }
             }
@@ -1137,6 +1290,15 @@ impl Compositor {
                     .fd
                     .try_clone()
                     .map_err(|e| Error(format!("dup DMA-BUF: {e}")))?;
+                // A DMA-BUF's size is its end offset. Never bind memory the
+                // image would overrun (bogus offsets or strides).
+                let size = libc::lseek(fd.as_raw_fd(), 0, libc::SEEK_END);
+                if size < 0 || (size as u64) < reqs.size {
+                    return Err(Error(format!(
+                        "DMA-BUF of {size} bytes, the image needs {}",
+                        reqs.size
+                    )));
+                }
                 let mut props = vk::MemoryFdPropertiesKHR::default();
                 self.memory_fd
                     .get_memory_fd_properties(
@@ -1901,6 +2063,21 @@ mod tests {
         );
         let mut d = draw(full, [0.0; 4], Fit::Contain);
         d.opacity = 0.0;
+        assert!(place(&d, 10, 10, 100, 100).is_none());
+        // Non-finite input never reaches the shader.
+        let inf = f32::INFINITY;
+        for (rect, crop) in [
+            ([-inf, 0.0, inf, 1.0], [0.0; 4]),
+            ([0.0, 0.0, 1.0, inf], [0.0; 4]),
+            (full, [0.0, f32::NAN, 0.0, 0.0]),
+            (full, [-inf, 0.0, 0.0, 0.0]),
+        ] {
+            for fit in [Fit::Contain, Fit::Cover, Fit::Stretch] {
+                assert!(place(&draw(rect, crop, fit), 10, 10, 100, 100).is_none());
+            }
+        }
+        let mut d = draw(full, [0.0; 4], Fit::Contain);
+        d.opacity = f32::NAN;
         assert!(place(&d, 10, 10, 100, 100).is_none());
     }
 

@@ -341,3 +341,80 @@ unsafe fn decode(extradata: &[u8], packets: &[vesper_core::EncodedPacket]) -> Ve
         out
     }
 }
+
+/// A producer's frame description is not trusted: a plane count or a
+/// modifier the driver does not have is an error, never an import.
+#[test]
+fn rejects_frames_the_driver_cannot_import() {
+    if !gpu() {
+        return;
+    }
+    let (w, h) = (PREVIEW_WIDTH, PREVIEW_HEIGHT);
+    let producer = unsafe { Producer::new(w, h) };
+    let mut c = Compositor::new(w, h).unwrap();
+    let draws = [full(Source::Main, Fit::Contain, 1.0)];
+
+    let mut extra = unsafe { producer.frame(0, 0, 0, Duration::ZERO) };
+    let dup = extra.planes[0].fd.try_clone().unwrap();
+    extra.planes.push(vesper_core::DmaBufPlane {
+        fd: dup,
+        offset: 0,
+        stride: extra.planes[0].stride,
+    });
+    let e = c.compose(Some(extra), &draws).unwrap_err();
+    assert!(e.to_string().contains("plane"), "{e}");
+
+    let mut odd = unsafe { producer.frame(1, 0, 0, Duration::ZERO) };
+    odd.modifier = 0x00de_adbe_ef00_0000;
+    assert!(c.compose(Some(odd), &draws).is_err());
+
+    let mut huge = unsafe { producer.frame(2, 0, 0, Duration::ZERO) };
+    huge.height = 100_000;
+    assert!(c.compose(Some(huge), &draws).is_err());
+
+    // Still fine with a real frame afterwards.
+    let ok = unsafe { producer.frame(3, 2, 0, Duration::ZERO) };
+    let (_, px) = compose_read(&mut c, Some(ok), &draws);
+    let [b, g, r] = pattern(w, h, 2, 300, 200);
+    let i = ((200 * w + 300) * 4) as usize;
+    assert_eq!(px[i..i + 4], [r, g, b, 255]);
+}
+
+/// Two producers reusing the same buffer id and generation (another pool)
+/// must not hit each other's cached import.
+#[test]
+fn same_buffer_id_and_generation_on_another_buffer_is_reimported() {
+    if !gpu() {
+        return;
+    }
+    let (w, h) = (PREVIEW_WIDTH, PREVIEW_HEIGHT);
+    let a = unsafe { Producer::new(w, h) };
+    let b = unsafe { Producer::new(w, h) };
+    let mut c = Compositor::new(w, h).unwrap();
+    let draws = [full(Source::Main, Fit::Contain, 1.0)];
+    for (producer, t) in [(&a, 0), (&b, 3), (&a, 5)] {
+        let f = unsafe { producer.frame(0, t, 7, Duration::ZERO) };
+        let (_, px) = compose_read(&mut c, Some(f), &draws);
+        // Outside every box of these frames.
+        let (x, y) = (470, 265);
+        let [bb, g, r] = pattern(w, h, t, x, y);
+        let i = ((y * w + x) * 4) as usize;
+        assert_eq!(px[i..i + 4], [r, g, bb, 255], "frame t={t}");
+    }
+}
+
+/// Textures far bigger than the canvas lose their unused top levels but
+/// still draw right.
+#[test]
+fn huge_textures_are_reduced_and_still_drawn() {
+    if !gpu() {
+        return;
+    }
+    let (w, h) = (PREVIEW_WIDTH, PREVIEW_HEIGHT);
+    let mut c = Compositor::new(w, h).unwrap();
+    c.set_texture(1, 4000, 2000, &solid(4000, 2000, [10, 200, 30, 255]))
+        .unwrap();
+    let (_, px) = compose_read(&mut c, None, &[full(Source::Texture(1), Fit::Cover, 1.0)]);
+    let i = ((135 * w + 240) * 4) as usize;
+    assert_eq!(px[i..i + 4], [10, 200, 30, 255]);
+}
