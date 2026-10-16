@@ -1,5 +1,5 @@
 # S2: SIGKILL of the recorder mid-recording; the file must stay playable to the last cluster
-. $LABROOT/lib.sh
+. "${LABROOT:?not in the lab, use go or r2}/lib.sh" || exit 1
 . $LABROOT/audio_up.sh
 audio_up
 start_game s2

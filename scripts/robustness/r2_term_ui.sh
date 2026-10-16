@@ -2,7 +2,7 @@
 # after 10 s of both. Checks: exit time, recording finalized (all tracks end
 # together), the receiver saw a clean end (stream closed) or not, no leftover
 # host/ffmpeg children. Env: SIG, WHEN (seconds of recording+live before the signal, 10).
-. $LABROOT/lib.sh
+. "${LABROOT:?not in the lab, use go or r2}/lib.sh" || exit 1
 . $LABROOT/audio_up.sh
 SIG=${SIG:-TERM}
 audio_up
@@ -15,12 +15,12 @@ export DEMO="recording,ctrl+l" DELAY=8000
 gamescope --backend headless -W 1280 -H 800 -- bash $LABROOT/ui_child.sh > $L/log/gs.log 2>&1 &
 GS=$!
 sleep $((8 + ${WHEN:-10} + 4))
-V=$(pgrep -x vesper | head -1)
+V=$(pid_of vesper)
 echo "vesper pid $V; $(rss $V)"
 grep -E "Started|go-live|live: connected|Stream\(Live" $L/log/ui.log | cut -c1-120 | tail -4
 t0=$(date +%s%N)
 if [ "$SIG" = GAMEKILL ]; then
-  kill -9 $(pgrep -x vkcube)
+  kill_game_client
   echo "game killed; watching 25 s"
   sleep 25
   grep -vE "Stats|start-pipeline|inotify|zbus|randr" $L/log/ui.log | cut -c1-200 | tail -8
@@ -39,6 +39,6 @@ sleep 1
 echo "ffmpeg server still running: $(kill -0 $SRV 2>/dev/null && echo yes || echo no)"
 cat $L/log/rtmp-term.log | head -5
 ffprobe -v error -show_entries format=duration -of csv=p=0 $L/live-term.flv
-echo "stray processes: $(pgrep -c vesper-vst-host)"
+echo "stray processes: $(grep -lx vesper-vst-host /proc/[0-9]*/comm 2>/dev/null | wc -l)"
 kill $GS 2>/dev/null; wait $GS 2>/dev/null
 kill $SRV 2>/dev/null

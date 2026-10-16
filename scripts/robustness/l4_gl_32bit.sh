@@ -7,7 +7,7 @@
 #   cargo build -p vesper-vklayer -p vesper-glcapture --target i686-unknown-linux-gnu
 # CASES="gl64-glx gl32-egl ..." picks some; SECS (default 8) per run; SIZE
 # (default 1280x720) of the OpenGL windows.
-. $LABROOT/lib.sh
+. "${LABROOT:?not in the lab, use go or r2}/lib.sh" || exit 1
 SECS=${SECS:-8}
 SIZE=${SIZE:-1280x720}
 B=$L/apps

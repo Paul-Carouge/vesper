@@ -2,7 +2,7 @@
 # the capture stream reaches Streaming, then WirePlumber answers "defined target not found",
 # over and over (backoff reset by pw.rs: streamed). Prints the CPU of the loop.
 # Env: TRACK (output:labsink), DEFAULT (name of the sink made default first; empty: leave).
-. $LABROOT/lib.sh
+. "${LABROOT:?not in the lab, use go or r2}/lib.sh" || exit 1
 . $LABROOT/audio_up.sh
 audio_up
 pw-dump | jq -r '.[] | select(.type=="PipeWire:Interface:Node") | [.id, .info.state, .info.props["media.class"], .info.props["node.name"]] | @tsv'

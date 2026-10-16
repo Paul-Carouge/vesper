@@ -1,5 +1,5 @@
 # L2: games starting/quitting (sizes alternate) while Vesper records; fd/thread counts, file validity
-. $LABROOT/lib.sh
+. "${LABROOT:?not in the lab, use go or r2}/lib.sh" || exit 1
 $VESPER --record-game 50 > $L/log/vesper-l2.log 2>&1 &
 V=$!
 sleep 1

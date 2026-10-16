@@ -2,7 +2,7 @@
 # plugin installed. Each variant records the game for 12 s with a mic filter
 # chain; the recording must succeed and Vesper must neither hang nor balloon.
 # Env: VST (a .vst3 bundle).
-. $LABROOT/lib.sh
+. "${LABROOT:?not in the lab, use go or r2}/lib.sh" || exit 1
 . $LABROOT/audio_up.sh
 audio_up
 mkdir -p $HOME/.vst3 $L/cfg/vesper/vst3
@@ -19,7 +19,7 @@ run() { # run <label>
   sleep 9
   local rs=$(grep VmRSS /proc/$v/status | tr -s ' ' | cut -d' ' -f2)
   local th=$(ls /proc/$v/task | wc -l)
-  local kids=$(pgrep -P $v -c)
+  local kids=$(cat /proc/$v/task/*/children 2>/dev/null | wc -w)
   for i in $(seq 1 100); do kill -0 $v 2>/dev/null || break; sleep 0.2; done
   if kill -0 $v 2>/dev/null; then echo "$1: HUNG after 29 s"; kill -9 $v; wait $v; return; fi
   wait $v; local rc=$?

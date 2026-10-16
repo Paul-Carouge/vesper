@@ -5,7 +5,7 @@
 # tray at all), MIX (true), MUTED (false), DEMO (VESPER_DEMO intents, e.g.
 # settings,desktop-devices to open the device list: NodeWatch runs), CHURN (1:
 # short-lived audio streams come and go on the graph).
-. $LABROOT/lib.sh
+. "${LABROOT:?not in the lab, use go or r2}/lib.sh" || exit 1
 . $LABROOT/audio_up.sh
 audio_up
 WARM=${WARM:-12}
@@ -18,7 +18,8 @@ if [ "${TRAY:-1}" = 1 ]; then
   sleep 1
 fi
 export GAME SHIM ARGS DEMO
-export SHIM_OUT=$L/shim.out
+# SHIM_OUT makes r2_sample.py send SIGUSR2: only with the shim loaded.
+[ -n "$SHIM" ] && export SHIM_OUT=$L/shim.out
 gamescope --backend headless -W 1280 -H 800 -r 60 -- bash $LABROOT/r2_ui_child.sh > $L/log/gs.log 2>&1 &
 GS=$!
 if [ "${CHURN:-0}" = 1 ]; then
@@ -29,7 +30,7 @@ if [ "${CHURN:-0}" = 1 ]; then
   CH=$!
 fi
 sleep 4
-V=$(pgrep -x vesper | head -1)
+V=$(pid_of vesper)
 echo "vesper pid $V; tray: $(tr '\n' ' ' < $L/log/tray.log)"
 sleep $WARM
 python3 -I $LABROOT/r2_sample.py $V $WIN "ui replay=${REPLAY:-false} hide_at=${HIDE_AT:-never} game=${GAME:-0} tray=${TRAY:-1}"

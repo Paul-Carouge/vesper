@@ -3,7 +3,7 @@
 # 6 Mbit/s), then streamed sharing the recording's encode (HEVC, native).
 # VESPER_BIN: an optimized build with the dev flags, e.g.
 # CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS=true cargo build --release -p vesper-app.
-. $LABROOT/lib.sh
+. "${LABROOT:?not in the lab, use go or r2}/lib.sh" || exit 1
 . $LABROOT/audio_up.sh
 audio_up
 start_game t5 ${SIZE:-2560x1440}

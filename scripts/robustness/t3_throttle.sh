@@ -1,7 +1,7 @@
 # T3: the uplink is slower than the stream (tc on the lab's loopback): the
 # stream drops video until keyframes and reports it; the recording and the
 # encode ticks must not suffer. Env: RATE (3mbit), KBPS (6000).
-. $LABROOT/lib.sh
+. "${LABROOT:?not in the lab, use go or r2}/lib.sh" || exit 1
 . $LABROOT/audio_up.sh
 audio_up
 start_game t3

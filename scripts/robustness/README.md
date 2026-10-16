@@ -1,10 +1,16 @@
 # Robustness lab
 
 How the lab works, and the round 1 scenarios: see the header of `run.sh`.
-Every scenario runs inside `run.sh`'s private namespaces; `lib.sh` refuses to
-run (exit 1) when `WAYLAND_DISPLAY`/`DISPLAY` is set, `/run/user` is visible,
-there is no user namespace or `HOME` is not the lab's. Never run a scenario,
-`$VESPER` or a test binary from a normal shell.
+Every scenario runs inside `run.sh`'s private namespaces. Each one starts with
+`. "${LABROOT:?...}/lib.sh" || exit 1`, and `lib.sh` (also sourced first by
+`session.sh`) exits when `WAYLAND_DISPLAY`/`DISPLAY` is set, `/run/user` is
+visible, there is no user namespace or `HOME` is not the lab's. The gamescope
+children (`ui_child.sh`, `r2_ui_child.sh`, `game_loop.sh`), which get a
+`DISPLAY`, check the rest themselves, and `r2_fake_tray.py` refuses to run
+when `/run/user` is visible. Scenarios find their processes only through the
+pid files their launchers write in `$L/run` (`pid_of`, `kill_game_client`,
+`children_named` in `lib.sh`), never by name. Never run a scenario, `$VESPER`
+or a test binary from a normal shell.
 
 ## Round 2: performance and robustness
 
@@ -16,7 +22,12 @@ points `--record-game`, `--stream-game` and `VESPER_DEMO` need them):
 
 `r2` is `go` with `BUILD=target-da/release` and a malloc counting shim
 (`r2_allocshim.c`, built on first use into the lab data dir and passed as
-`SHIM`; `r2_perf.sh` and `r2_ui.sh` preload it). Raise `TMO` (seconds, default 110) for long runs.
+`SHIM`; `r2_perf.sh`, `r2_ui.sh` and `r2_mem.sh` preload it, and
+`r2_sample.py` signals the process only when the shim is mapped in it).
+`r2` also passes the real `CARGO_HOME` and `RUSTUP_HOME` (default
+`~/.cargo`, `~/.rustup`) into the lab, so `r2_flakes.sh` can run cargo
+there (the toolchains are read from the real home; the lab's `HOME` stays
+its own). Raise `TMO` (seconds, default 110) for long runs.
 
 | Scenario | What it measures |
 | --- | --- |

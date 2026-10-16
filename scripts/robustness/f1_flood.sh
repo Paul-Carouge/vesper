@@ -1,5 +1,5 @@
 # F1: hostile clients on the live socket while a real game is recorded; and idle clients hogging the slots
-. $LABROOT/lib.sh
+. "${LABROOT:?not in the lab, use go or r2}/lib.sh" || exit 1
 start_game f1
 $VESPER --record-game 40 > $L/log/vesper-f1.log 2>&1 &
 V=$!

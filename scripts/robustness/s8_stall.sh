@@ -1,5 +1,5 @@
 # S8: Vesper itself stalls (SIGSTOP 8 s, like a suspended laptop or a swapping machine) mid-recording
-. $LABROOT/lib.sh
+. "${LABROOT:?not in the lab, use go or r2}/lib.sh" || exit 1
 . $LABROOT/audio_up.sh
 audio_up
 mkdir -p $L/cfg/vesper

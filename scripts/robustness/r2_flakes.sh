@@ -4,7 +4,7 @@
 # (recorder_gpu_tests, vesper-encode) and the timing tests are load-sensitive.
 # usage: TMO=7200 scripts/robustness/r2 flakes r2_flakes.sh N=10
 # (r2 passes CARGO_HOME and RUSTUP_HOME in: the lab has its own HOME.)
-. $LABROOT/lib.sh
+. "${LABROOT:?not in the lab, use go or r2}/lib.sh" || exit 1
 cd "$R" || exit 1
 OUT=${OUT:-$L/flakes}
 mkdir -p "$OUT"

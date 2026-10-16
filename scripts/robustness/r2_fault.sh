@@ -4,7 +4,7 @@
 # Env: DEAD (50 s the server stays down), SECS (50), STREAM (own|shared), VST
 # (a .vst3 bundle for the vst faults).  Prints the stream/recording state and
 # what the recording looks like afterwards (frames, gaps, per-track spans).
-. $LABROOT/lib.sh
+. "${LABROOT:?not in the lab, use go or r2}/lib.sh" || exit 1
 . $LABROOT/audio_up.sh
 FAULT=${FAULT:-none}
 SECS=${SECS:-50}
@@ -67,7 +67,7 @@ esac
 VESPER_STREAM_RECORD=1 $VESPER --stream-game $SECS $URL > $L/log/vesper-flt.log 2>&1 &
 V=$!
 sleep 12
-host() { pgrep -P $V -x vesper-vst-host; }
+host() { children_named $V vesper-vst-host; }
 echo "t=12 fault $FAULT: $(rss $V)"
 case $FAULT in
   serverdead)

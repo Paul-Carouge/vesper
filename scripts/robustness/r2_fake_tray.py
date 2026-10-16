@@ -6,8 +6,13 @@ Each argument is a time in seconds after the first item registered: the item
 gets a left click (`Activate`, which shows or hides the window) then. Run it
 inside the lab's D-Bus session, before Vesper.
 """
+import os
 import sys
 import time
+
+# Never take the tray name on the real session bus.
+if os.listdir("/run/user") or "/run/user" in os.environ.get("DBUS_SESSION_BUS_ADDRESS", ""):
+    sys.exit("r2_fake_tray.py: not in the lab (/run/user visible), refusing to run")
 
 import dbus
 import dbus.mainloop.glib

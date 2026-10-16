@@ -1,5 +1,5 @@
 # A2: device unplug (destroyed null sink used as a track), app exit/restart, mid-recording.
-. $LABROOT/lib.sh
+. "${LABROOT:?not in the lab, use go or r2}/lib.sh" || exit 1
 tone() { # tone <target> <freq> <appname> -> pid in TP
   ffmpeg -loglevel quiet -re -f lavfi -i "sine=frequency=$2" -f s16le -ar 48000 -ac 2 - 2>/dev/null | pw-cat -p --raw --rate 48000 --channels 2 --format s16 --target $1 -P "{ application.name=$3 }" - > /dev/null 2>&1 &
   TP=$!
@@ -26,7 +26,7 @@ sleep 10
 echo "== t=10: destroy labsink2, kill the app"
 id=$(pw-cli ls Node | grep -B40 'node.name = "labsink2"' | grep -oE 'id [0-9]+' | tail -1 | grep -oE '[0-9]+')
 pw-cli destroy $id
-kill $APP 2>/dev/null; pkill -P $DEV 2>/dev/null
+kill $APP 2>/dev/null; kill $(cat /proc/$DEV/task/*/children 2>/dev/null) 2>/dev/null
 sleep 10
 echo "== t=20: sink2 back, app back"
 mkfifo $L/cmd; pw-cli < $L/cmd > $L/log/pwcli.log 2>&1 &

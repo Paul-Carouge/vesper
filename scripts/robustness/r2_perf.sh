@@ -3,7 +3,7 @@
 # Env: SIZE (2560x1440), HZ (144), WARM (10), WIN (20), SHIM (allocshim .so),
 # VST (a .vst3 bundle, only for rec3-vst), SECS (total, default WARM+WIN+8).
 # Needs a build with the dev flags: see r2_build.sh.
-. $LABROOT/lib.sh
+. "${LABROOT:?not in the lab, use go or r2}/lib.sh" || exit 1
 . $LABROOT/audio_up.sh
 CASE=${CASE:-rec}
 WARM=${WARM:-10}
@@ -37,9 +37,9 @@ serve() {
   SRV=$!
   sleep 1
 }
-export SHIM_OUT=$L/shim.out
+# SHIM_OUT makes r2_sample.py send SIGUSR2: only with the shim loaded.
 PRE=
-[ -n "$SHIM" ] && PRE="LD_PRELOAD=$SHIM"
+[ -n "$SHIM" ] && PRE="LD_PRELOAD=$SHIM" && export SHIM_OUT=$L/shim.out
 case $CASE in
   stream-own) serve; env $PRE VESPER_STREAM_RECORD=1 $VESPER --stream-game $SECS rtmp://127.0.0.1:1935/live/test > $L/log/vesper-perf.log 2>&1 & ;;
   stream-shared) serve; env $PRE VESPER_STREAM_RECORD=1 VESPER_STREAM_CODEC=hevc VESPER_STREAM_HEIGHT=0 VESPER_STREAM_KBPS=50000 $VESPER --stream-game $SECS rtmp://127.0.0.1:1935/live/test > $L/log/vesper-perf.log 2>&1 & ;;
@@ -48,7 +48,7 @@ esac
 V=$!
 sleep $WARM
 echo "vesper $V: $(rss $V)"
-HOST=$(pgrep -P $V -x vesper-vst-host | head -1)
+HOST=$(children_named $V vesper-vst-host | head -1)
 [ -n "$HOST" ] && python3 -I $LABROOT/r2_sample.py $HOST $WIN "vst host $HOST" > $L/host-sample.txt &
 python3 -I $LABROOT/r2_sample.py $V $WIN "$CASE ${SIZE:-2560x1440}@${HZ:-144}"
 sleep 2

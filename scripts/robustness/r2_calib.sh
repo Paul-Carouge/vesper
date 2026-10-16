@@ -1,7 +1,7 @@
 # R2 calibration of r2_latency.sh's receiver: a smooth ffmpeg -re source
 # (x264, 60 fps, 6 Mbit/s) to the same ffprobe listener. What it shows is the
 # receiver's own jitter, to subtract from the Vesper numbers.
-. $LABROOT/lib.sh
+. "${LABROOT:?not in the lab, use go or r2}/lib.sh" || exit 1
 ffprobe -v error -listen 1 -fflags nobuffer -show_entries packet=stream_index,pts_time,size,flags -of csv rtmp://127.0.0.1:1935/live/test 2> $L/log/probe-cal.err | python3 -I $LABROOT/r2_arrival.py 3 > $L/cal.out &
 P=$!
 sleep 1

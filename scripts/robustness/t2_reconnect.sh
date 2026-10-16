@@ -1,6 +1,6 @@
 # T2: the RTMP server dies mid-stream and comes back 6 s later. The
 # recording must go on untouched; the stream reconnects on its own.
-. $LABROOT/lib.sh
+. "${LABROOT:?not in the lab, use go or r2}/lib.sh" || exit 1
 . $LABROOT/audio_up.sh
 audio_up
 start_game t2

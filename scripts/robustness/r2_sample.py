@@ -15,6 +15,12 @@ import time
 pid, secs = int(sys.argv[1]), float(sys.argv[2])
 label = sys.argv[3] if len(sys.argv) > 3 else ""
 shim = os.environ.get("SHIM_OUT")
+# SIGUSR2 kills a process without the shim's handler: only signal when it is loaded.
+try:
+    if shim and "r2_allocshim" not in open(f"/proc/{pid}/maps").read():
+        shim = None
+except OSError:
+    shim = None
 
 
 def tasks():

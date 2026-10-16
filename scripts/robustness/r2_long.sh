@@ -3,7 +3,7 @@
 # fds, CPU every 60 s; at the end checks the recording (ffprobe: streams,
 # last pts of each track, drift between them) and the received stream.
 # Env: LONG_SECS, SIZE (2560x1440), HZ (144), STREAM (own|shared|none).
-. $LABROOT/lib.sh
+. "${LABROOT:?not in the lab, use go or r2}/lib.sh" || exit 1
 . $LABROOT/audio_up.sh
 SECS=${LONG_SECS:-3600}
 audio_up

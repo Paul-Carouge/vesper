@@ -1,5 +1,5 @@
 # A4: graph quantum changes while capturing (audio_probe with tracing on)
-. $LABROOT/lib.sh
+. "${LABROOT:?not in the lab, use go or r2}/lib.sh" || exit 1
 . $LABROOT/audio_up.sh
 audio_up
 (

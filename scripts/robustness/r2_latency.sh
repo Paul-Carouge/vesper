@@ -1,7 +1,7 @@
 # R2 latency: arrival jitter of a stream at a local receiver (ffprobe as the
 # RTMP listener) and burstiness on the wire (r2_wire.py proxy in front of it).
 # Env: CODEC (h264|hevc), H (1080|0), KBPS, SECS (50), REC (1), SIZE (2560x1440), HZ (144).
-. $LABROOT/lib.sh
+. "${LABROOT:?not in the lab, use go or r2}/lib.sh" || exit 1
 . $LABROOT/audio_up.sh
 audio_up
 mkdir -p $L/cfg/vesper

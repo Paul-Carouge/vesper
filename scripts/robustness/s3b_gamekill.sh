@@ -1,5 +1,5 @@
 # S3b: UI recording a game; the game is killed -9 mid-recording
-. $LABROOT/lib.sh
+. "${LABROOT:?not in the lab, use go or r2}/lib.sh" || exit 1
 . $LABROOT/audio_up.sh
 audio_up
 mkdir -p $L/cfg/vesper
@@ -7,9 +7,9 @@ printf 'game_source=true\nreplay=false\n' > $L/cfg/vesper/settings
 gamescope --backend headless -W 1280 -H 800 -- bash $LABROOT/ui_child.sh > $L/log/gs.log 2>&1 &
 GS=$!
 sleep 15
-V=$(pgrep -x vesper | head -1)
+V=$(pid_of vesper)
 echo "vesper pid $V; rec started: $(grep -c 'Started' $L/log/ui.log)"
-kill -9 $(pgrep -x vkcube)
+kill_game_client
 echo "killed the game"
 sleep 8
 grep -vE "Stats|start-pipeline" $L/log/ui.log | cut -c1-250 | tail -8

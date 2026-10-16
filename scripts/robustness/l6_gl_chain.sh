@@ -1,7 +1,7 @@
 # L6: the OpenGL interposer chains with another preloaded interposer (Steam's
 # overlay, MangoHud...) in both LD_PRELOAD orders: each swap reaches the fake
 # libGL exactly once, never recursing. No GPU or display needed.
-. $LABROOT/lib.sh
+. "${LABROOT:?not in the lab, use go or r2}/lib.sh" || exit 1
 B=$L/chain
 mkdir -p $B/lib
 cat > $B/gl.c <<'C'

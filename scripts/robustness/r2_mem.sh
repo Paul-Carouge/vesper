@@ -2,7 +2,7 @@
 # receiver, for MEM_SECS (1200); RSS/threads/fds every 30 s. The stream is
 # started by the Ctrl+L intent once the game is up.
 # Env: MEM_SECS, SHIM (unset: none), REPLAY_S (120), SAVE (1: Ctrl+S at the end).
-. $LABROOT/lib.sh
+. "${LABROOT:?not in the lab, use go or r2}/lib.sh" || exit 1
 . $LABROOT/audio_up.sh
 audio_up
 mkdir -p $L/cfg/vesper
@@ -12,15 +12,11 @@ SRV=$!
 sleep 1
 export GAME=1 SHIM
 export DEMO="ctrl+l"
-cat > $L/mem_child.sh <<'E'
-env SteamAppId=1 vkcube --wsi xcb --width 1280 --height 720 > $L/log/cube.log 2>&1 &
-sleep 2
-exec env VESPER_DEMO="$DEMO" VESPER_DEMO_DELAY=${DELAY:-12000} $VESPER > $L/log/ui.log 2>&1
-E
-gamescope --backend headless -W 1280 -H 800 -r 60 -- bash $L/mem_child.sh > $L/log/gs.log 2>&1 &
+export DELAY=${DELAY:-12000}
+gamescope --backend headless -W 1280 -H 800 -r 60 -- bash $LABROOT/r2_ui_child.sh > $L/log/gs.log 2>&1 &
 GS=$!
 sleep 6
-V=$(pgrep -x vesper | head -1)
+V=$(pid_of vesper)
 t=6
 end=$((${MEM_SECS:-1200}))
 rm -f $L/log/mem-samples.log
