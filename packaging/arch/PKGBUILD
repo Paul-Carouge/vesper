@@ -7,7 +7,7 @@
 pkgname=vesper-git
 pkgver=0.1.0
 pkgrel=1
-pkgdesc='Fast, bloat-free screen recorder with replay buffer and Vulkan game capture'
+pkgdesc='Fast, bloat-free screen recorder with replay buffer and Vulkan/OpenGL game capture'
 arch=('x86_64')
 url='https://github.com/Paul-Carouge/vesper'
 # No license file in the repository yet.
@@ -29,6 +29,7 @@ depends=(
 )
 optdepends=(
   'vulkan-icd-loader: game capture (the opt-in Vulkan layer)'
+  'lib32-vulkan-icd-loader: game capture of 32-bit Vulkan games'
   'xdg-desktop-portal-kde: screen capture and global shortcuts on KDE'
 )
 makedepends=('cargo' 'clang' 'git')
@@ -42,6 +43,18 @@ options=('!lto')
 source=("vesper::git+file://$(realpath "$startdir/../..")#commit=$(git -C "$startdir" rev-parse HEAD)")
 sha256sums=('SKIP')
 
+# The 32-bit game capture libraries (32-bit Vulkan layer and OpenGL
+# interposer, in /usr/lib32/vesper/) are built only when the i686 Rust target
+# and a 32-bit C toolchain are there: `rustup target add
+# i686-unknown-linux-gnu` (or lib32-rust-libs with the system rust), and
+# lib32-glibc + lib32-gcc-libs (multilib). Without them the package has no
+# 32-bit game capture.
+_i686=i686-unknown-linux-gnu
+_lib32() {
+  [ -d "$(rustc --print target-libdir --target $_i686 2>/dev/null)" ] \
+    && echo 'int main(void){return 0;}' | cc -m32 -x c - -o /dev/null 2>/dev/null
+}
+
 pkgver() {
   cd vesper
   local version
@@ -53,6 +66,7 @@ prepare() {
   cd vesper
   export RUSTUP_TOOLCHAIN=stable
   cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+  if _lib32; then cargo fetch --locked --target $_i686; fi
 }
 
 build() {
@@ -60,6 +74,11 @@ build() {
   export RUSTUP_TOOLCHAIN=stable
   export CARGO_TARGET_DIR=target
   cargo build --release --locked --frozen --workspace
+  if _lib32; then
+    cargo build --release --locked --frozen --target $_i686 -p vesper-vklayer -p vesper-glcapture
+  else
+    echo "No i686 Rust target or 32-bit toolchain: no 32-bit game capture" >&2
+  fi
 }
 
 check() {
@@ -75,6 +94,13 @@ package() {
   # Only the library: the per-user settings switch is the only way to enable
   # it, so no manifest in /usr/share/vulkan/implicit_layer.d/.
   install -Dm644 target/release/libvesper_vklayer.so -t "$pkgdir/usr/lib/vesper/"
+  # OpenGL games: only through `vesper-gl %command%`, per game (LD_PRELOAD).
+  install -Dm644 target/release/libvesper_glcapture.so -t "$pkgdir/usr/lib/vesper/"
+  install -Dm755 crates/vesper-glcapture/vesper-gl -t "$pkgdir/usr/bin/"
+  if [ -f target/$_i686/release/libvesper_vklayer.so ]; then
+    install -Dm644 target/$_i686/release/libvesper_vklayer.so \
+      target/$_i686/release/libvesper_glcapture.so -t "$pkgdir/usr/lib32/vesper/"
+  fi
   # VST3 plugin host, started by Vesper (one process per plugin instance).
   install -Dm755 target/release/vesper-vst-host -t "$pkgdir/usr/lib/vesper/"
   install -Dm644 crates/vesper-app/data/io.github.PaulCarouge.Vesper.desktop \

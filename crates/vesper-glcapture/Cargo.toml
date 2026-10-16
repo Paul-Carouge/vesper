@@ -1,0 +1,11 @@
+[package]
+name = "vesper-glcapture"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+libc = "0.2"
+vesper-gamecapture.workspace = true

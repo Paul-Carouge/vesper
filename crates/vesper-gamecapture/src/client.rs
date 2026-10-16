@@ -1,4 +1,7 @@
-//! Connection to Vesper, one per process.
+//! Game side of the protocol, shared by the Vulkan layer (`vesper-vklayer`)
+//! and the OpenGL interposer (`vesper-glcapture`): the connection to Vesper
+//! (one per process), the blocklist, and the helpers both need to stay out
+//! of the game's way.
 //!
 //! A background thread connects when Vesper's socket appears (inotify on its
 //! directory; once per second while that directory does not exist), so the
@@ -11,14 +14,135 @@ use std::ffi::CString;
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, Once};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard, Once};
 use std::time::Duration;
 
-use vesper_gamecapture::protocol::{self, Msg};
+use crate::protocol::{self, Msg};
 
-use crate::LockExt;
+/// Process names never captured: compositors, browsers, Electron apps,
+/// Vesper itself. The layer stays a pure pass-through there.
+const BLOCKLIST: &[&str] = &[
+    "kwin_wayland",
+    "kwin_x11",
+    "plasmashell",
+    "xwayland",
+    "gamescope",
+    "gamescope-wl",
+    "steam",
+    "steamwebhelper",
+    "vesper",
+    "obs",
+    "firefox",
+    "firefox-bin",
+    "librewolf",
+    "chromium",
+    "chrome",
+    "brave",
+    "msedge",
+    "thunderbird",
+    "electron",
+    "code",
+    "discord",
+    "slack",
+    "spotify",
+    "signal-desktop",
+    "obsidian",
+    // Windows launchers and embedded browsers, under Wine/Proton.
+    "battle.net.exe",
+    "eadesktop.exe",
+    "upc.exe",
+    "ubisoftconnect.exe",
+    "epicgameslauncher.exe",
+    "qtwebengineprocess.exe",
+    "cefsharp.browsersubprocess.exe",
+    "steamwebhelper.exe",
+    "steam.exe",
+];
+
+/// Longest process name the kernel keeps (`comm`, TASK_COMM_LEN - 1).
+const COMM_LEN: usize = 15;
+
+/// `name` comes from `/proc/self/comm`: at most 15 bytes, so long entries
+/// (e.g. `epicgameslauncher.exe` -> `EpicGamesLaunch`) match on their first
+/// 15 bytes, ignoring case.
+pub fn is_blocked(name: &str) -> bool {
+    let name = name.as_bytes();
+    BLOCKLIST.iter().any(|b| {
+        let b = &b.as_bytes()[..b.len().min(COMM_LEN)];
+        b.eq_ignore_ascii_case(name)
+    })
+}
+
+/// Pure pass-through for this process (blocklisted).
+pub fn passive() -> bool {
+    static PASSIVE: LazyLock<bool> = LazyLock::new(|| is_blocked(&protocol::process_name()));
+    *PASSIVE
+}
+
+fn debug_enabled() -> bool {
+    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("VESPER_LAYER_DEBUG").is_some());
+    *ON
+}
+
+/// Writes a line to stderr only if that cannot block: these run on the
+/// game's render thread, and a full pipe must not stall it.
+fn log(msg: &str) {
+    let line = format!("[vesper layer] {msg}\n");
+    let mut pfd = libc::pollfd {
+        fd: 2,
+        events: libc::POLLOUT,
+        revents: 0,
+    };
+    // POLLOUT on a pipe means at least PIPE_BUF bytes free: a short line fits.
+    if line.len() <= libc::PIPE_BUF
+        && unsafe { libc::poll(&mut pfd, 1, 0) } == 1
+        && pfd.revents & libc::POLLOUT != 0
+    {
+        let _ = unsafe { libc::write(2, line.as_ptr().cast(), line.len()) };
+    }
+}
+
+pub fn warn(msg: &str) {
+    log(msg);
+}
+
+/// Logged only with `VESPER_LAYER_DEBUG` set.
+pub fn debug(msg: &str) {
+    if debug_enabled() {
+        log(msg);
+    }
+}
+
+/// Locks, ignoring poisoning: a panic caught in one hook must not turn
+/// every later call (and the destroy paths) into panics.
+pub trait LockExt<T> {
+    fn locked(&self) -> MutexGuard<'_, T>;
+}
+
+impl<T> LockExt<T> for Mutex<T> {
+    fn locked(&self) -> MutexGuard<'_, T> {
+        self.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// Runs `f`, turning a panic into `fallback`: unwinding into the loader or
+/// the game would abort it.
+pub fn guard<R>(fallback: R, f: impl FnOnce() -> R) -> R {
+    catch_unwind(AssertUnwindSafe(f)).unwrap_or(fallback)
+}
+
+/// `CLOCK_MONOTONIC` in ns, the clock of `Frame::pts_ns`.
+pub fn now_ns() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+}
 
 pub struct Ipc {
     /// A server is connected. The only check on the present path when not.
@@ -72,7 +196,7 @@ pub fn ensure_thread() {
         // The loader unloads layers on vkDestroyInstance; the thread runs our
         // code forever, so keep the library mapped.
         if !pin_library() {
-            crate::warn("cannot pin the layer library; capture disabled");
+            warn("cannot pin the layer library; capture disabled");
             return;
         }
         IPC.pid.store(std::process::id(), Ordering::SeqCst);
@@ -91,7 +215,7 @@ pub fn ensure_thread() {
             r
         };
         if let Err(e) = spawned {
-            crate::warn(&format!("cannot start the IPC thread: {e}"));
+            warn(&format!("cannot start the IPC thread: {e}"));
         }
     });
 }
@@ -311,6 +435,21 @@ pub fn take_releases() -> Vec<(u32, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blocklist_ignores_case() {
+        assert!(is_blocked("kwin_wayland"));
+        assert!(is_blocked("Xwayland"));
+        assert!(is_blocked("Discord"));
+        assert!(!is_blocked("vkcube"));
+        assert!(!is_blocked("eldenring.exe"));
+        // Wine processes: the .exe name, cut to 15 bytes.
+        assert!(is_blocked("Battle.net.exe"));
+        assert!(is_blocked("EpicGamesLaunch"));
+        assert!(is_blocked("steamwebhelper."));
+        assert!(is_blocked("CefSharp.Browse"));
+        assert!(!is_blocked("EpicGames"));
+    }
 
     #[test]
     fn wakes_when_the_socket_appears() {

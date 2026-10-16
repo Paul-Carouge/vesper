@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use ash::vk::{self, Handle};
 use vesper_gamecapture::protocol::{self, Msg, Plane};
 
-use crate::ipc::{self, IPC};
+use crate::ipc::{self, IPC, now_ns};
 use crate::{Instance, LockExt, debug, device_for, guard, key, warn};
 
 /// Images in the export ring. Three skipped frames at 160 fps with an
@@ -69,15 +69,6 @@ fn ring_format(format: vk::Format) -> Option<(vk::Format, u32, bool)> {
         F::R16G16B16A16_SFLOAT => (F::B8G8R8A8_UNORM, xr24, true),
         _ => return None,
     })
-}
-
-fn now_ns() -> u64 {
-    let mut ts = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
-    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
 }
 
 fn check<T>(r: ash::prelude::VkResult<T>, what: &str) -> Result<T, String> {

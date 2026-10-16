@@ -1570,7 +1570,7 @@ export component AppWindow inherits Window {
                             wrap: word-wrap;
                         }
                         Text {
-                            text: "A Vulkan app asks to be recorded. Allow only games you recognize.";
+                            text: "An app asks to be recorded. Allow only games you recognize.";
                             font-size: Theme.font-small;
                             color: Theme.text-muted;
                             wrap: word-wrap;
@@ -1623,7 +1623,7 @@ export component AppWindow inherits Window {
                                 subtitle: root.game
                                     ? (root.source-name != ""
                                         ? "Game" + (root.source-detail != "" ? " · " + root.source-detail : "")
-                                        : root.game-layer-installed || root.pending-game != "" ? "Start a Vulkan game" : root.game-layer-available ? "Turn on game capture in settings" : "Game capture layer not built")
+                                        : root.game-layer-installed || root.pending-game != "" ? "Start a game" : root.game-layer-available ? "Turn on game capture in settings" : "Game capture layer not built")
                                     : root.source-kind == SourceKind.none
                                         ? "Pick a screen or a window to record"
                                         : root.source-detail != "" ? root.source-detail : root.source-kind == SourceKind.screen ? "Screen" : "Window";
@@ -2608,7 +2608,7 @@ export component AppWindow inherits Window {
 
                     SettingGroup {
                         label: "GAME CAPTURE";
-                        hint: "Records Vulkan games (Proton included) at their own frame rate, without the screen picker. Installs a small layer that loads into your Vulkan apps and stays idle until Vesper captures a game you allowed. Some anti-cheats may reject it: launch those games with VESPER_CAPTURE_DISABLE=1.";
+                        hint: "Records Vulkan games (Proton and 32-bit included) at their own frame rate, without the screen picker. Installs a small layer that loads into your Vulkan apps and stays idle until Vesper captures a game you allowed. Some anti-cheats may reject it: launch those games with VESPER_CAPTURE_DISABLE=1.";
                         HorizontalLayout {
                             spacing: Theme.space-md;
                             Labeled {
@@ -2640,6 +2640,16 @@ export component AppWindow inherits Window {
                                     }
                                 }
                             }
+                        }
+                    }
+
+                    SettingGroup {
+                        label: "OPENGL GAMES";
+                        hint: "Native OpenGL games (Terraria, many indie games, emulators) are captured per game: put this in the game's launch options in Steam (Properties > General). Only that game loads the capture library, with the same consent as Vulkan games; the switch above is not needed.";
+                        Labeled {
+                            title: "vesper-gl %command%";
+                            wrap-subtitle: true;
+                            subtitle: "Steam launch options";
                         }
                     }
 
