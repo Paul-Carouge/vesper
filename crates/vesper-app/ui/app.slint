@@ -2,11 +2,11 @@
 // owns the truth and writes back the `in` properties.
 
 import { Theme, Icons } from "theme.slint";
-import { Icon, Logo, Card, Button, IconButton, Switch, Segmented, Meter, SectionLabel, FocusRing, Slider, TextField, SelectField } from "components.slint";
+import { Icon, Logo, Card, Button, IconButton, Switch, Segmented, Meter, TrackMeter, SectionLabel, FocusRing, Slider, TextField, SelectField } from "components.slint";
 
 import { SceneBar, SceneEditor, SceneStore, LayerKind, LayerRow, SceneRow, CameraChoice } from "scenes.slint";
 
-export { Theme, SceneStore, LayerKind, LayerRow, SceneRow, CameraChoice }
+export { Theme, SceneStore, LayerKind, LayerRow, SceneRow, CameraChoice, TrackMeter }
 
 export enum TrackKind { desktop, microphone, output, input, app }
 /// A filter parameter. `index` is its place in the filter's parameters.
@@ -218,13 +218,13 @@ global TrackText {
 
 component AudioRow inherits HorizontalLayout {
     in property <AudioTrack> track;
-    in property <float> level;
-    in property <float> peak;
+    in property <TrackMeter> meter;
     in property <bool> interactive: true;
     /// Its settings are shown below it.
     in property <bool> open;
     callback toggle-mute;
     callback toggle-open;
+    callback clear-clip;
 
     property <bool> silent: root.track.muted || !root.track.enabled;
 
@@ -268,9 +268,11 @@ component AudioRow inherits HorizontalLayout {
         alignment: center;
         horizontal-stretch: 1;
         Meter {
-            level: root.level;
-            peak: root.peak;
+            meter: root.meter;
             muted: root.silent;
+            clear-clip => {
+                root.clear-clip();
+            }
         }
     }
 
@@ -903,9 +905,8 @@ export component AppWindow inherits Window {
 
     // ---- Audio --------------------------------------------------------
     in property <[AudioTrack]> tracks;
-    /// Linear levels of each track, 0..1.
-    in property <[float]> track-levels;
-    in property <[float]> track-peaks;
+    /// Level meter of each track.
+    in property <[TrackMeter]> track-meters;
     /// What "Add track" and a track's Source offer, kept current while
     /// `watching-sources`.
     in property <[SourceOption]> source-options;
@@ -1050,6 +1051,8 @@ export component AppWindow inherits Window {
     // Restarts the level meters, which stop while nothing moves them or the
     // window is hidden.
     callback meters-wake();
+    // A click on a track's meter clears its clip indicator.
+    callback meter-clear-clip(int);
     // The tray mirrors these.
     callback tray-state-changed();
     changed rec-state => {
@@ -2008,11 +2011,13 @@ export component AppWindow inherits Window {
                             AudioRow {
                                 interactive: !root.settings-open;
                                 track: track;
-                                level: root.track-levels[i];
-                                peak: root.track-peaks[i];
+                                meter: root.track-meters[i];
                                 open: root.open-track == i;
                                 toggle-mute => {
                                     root.track-mute-toggled(i);
+                                }
+                                clear-clip => {
+                                    root.meter-clear-clip(i);
                                 }
                                 toggle-open => {
                                     let was-open = root.open-track == i;

@@ -7,17 +7,19 @@
 //! another source or device). Desktop audio and Microphone tracks record the
 //! devices chosen in the settings: see [`recorded_tracks`].
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::Duration;
 
 use slint::{ComponentHandle, Model, ModelRc, VecModel};
-use vesper_audio::{MAX_DB, MIN_DB, Node, NodeWatch, Source};
+use vesper_audio::{MAX_DB, MIN_DB, Node, NodeWatch, Peaks, Source};
 
-use crate::meter::{MeterState, visible_change};
+use crate::meter::MeterState;
 use crate::prefs::{self, Device, Prefs};
-use crate::recorder::{MAX_TRACKS, Pipeline, Track};
-use crate::{AppWindow, AudioTrack, DeviceChoice, METER_TICK, Shared, SourceOption, TrackKind};
+use crate::recorder::{MAX_TRACKS, Track};
+use crate::{
+    AppWindow, AudioTrack, DeviceChoice, METER_TICK, Shared, SourceOption, TrackKind, TrackMeter,
+};
 
 /// Devices and applications, from a [`NodeWatch`] that runs while the UI
 /// shows a list of them, and once at startup for the tracks' device names.
@@ -652,48 +654,68 @@ pub fn wire(ui: &AppWindow, rec: &Shared) {
     watch_sources(ui, true);
 }
 
-/// Feeds the meters from the pipeline's peaks at ~30 Hz. The timer stops
-/// once no audio runs and the meters rest, or the window is hidden;
-/// `meters-wake` restarts it. Keep the timer.
+/// Feeds the meters from the pipeline's peaks at ~30 Hz, only while the
+/// window is on screen. The timer stops once the meters rest (the tracks
+/// then wake it on their next signal, see
+/// [`crate::recorder::Pipeline::wake_meters_on_signal`])
+/// or the window is hidden, minimized or covered; `meters-wake` restarts it.
+/// Keep the timer.
 pub fn start_meters(ui: &AppWindow, rec: &Shared) -> Rc<slint::Timer> {
     let tick = Rc::new(slint::Timer::default());
     let weak = ui.as_weak();
     let rec = rec.clone();
     let this = Rc::downgrade(&tick);
-    let mut meters: Vec<MeterState> = Vec::new();
-    let (levels, peaks) = (Rc::new(VecModel::default()), Rc::new(VecModel::default()));
-    ui.set_track_levels(levels.clone().into());
-    ui.set_track_peaks(peaks.clone().into());
+    let meters: Rc<RefCell<Vec<MeterState>>> = Rc::default();
+    let shown = Rc::new(VecModel::<TrackMeter>::default());
+    ui.set_track_meters(shown.clone().into());
     let reductions = Rc::new(VecModel::default());
     ui.set_filter_reductions(reductions.clone().into());
+    // Peaks gathered while the window was away are stale: the first tick
+    // after it drops them (a clip still latches).
+    let stale = Rc::new(Cell::new(true));
+    let (m, model, was_away) = (meters.clone(), shown.clone(), stale.clone());
+    // Ticks in a row at rest: a few before stopping, so a replaced filter
+    // chain gets freed (`take_peaks`) and noise near the floor does not flap.
+    let mut quiet = 0;
     tick.start(slint::TimerMode::Repeated, METER_TICK, move || {
         let Some(ui) = weak.upgrade() else { return };
-        let n = ui.get_tracks().row_count();
-        if meters.len() != n {
-            meters = vec![MeterState::default(); n];
-            levels.set_vec(vec![0.0; n]);
-            peaks.set_vec(vec![0.0; n]);
+        let mut meters = m.borrow_mut();
+        let tracks = ui.get_tracks();
+        if meters.len() != tracks.row_count() {
+            *meters = tracks
+                .iter()
+                .map(|t| MeterState::new(stereo_source(t.kind)))
+                .collect();
+            model.set_vec(meters.iter().map(MeterState::shown).collect::<Vec<_>>());
         }
         crate::filters::feed_reductions(&ui, &rec, &reductions);
         let rec = rec.borrow();
-        let audio = rec.as_ref().is_some_and(Pipeline::audio_running);
+        let stale = was_away.replace(false);
         for (i, meter) in meters.iter_mut().enumerate() {
-            meter.feed(rec.as_ref().map_or(0.0, |r| r.peak(i)), METER_TICK);
-            // Only visible steps redraw.
-            if visible_change(levels.row_data(i).unwrap_or_default(), meter.level) {
-                levels.set_row_data(i, meter.level);
+            let mut peaks = rec.as_ref().map_or(Peaks::default(), |r| r.take_peaks(i));
+            if stale {
+                (peaks.left, peaks.right, peaks.fresh) = (0.0, 0.0, true);
             }
-            if visible_change(peaks.row_data(i).unwrap_or_default(), meter.peak) {
-                peaks.set_row_data(i, meter.peak);
+            meter.feed(peaks, METER_TICK);
+            // Only visible steps redraw.
+            let now = meter.shown();
+            if model.row_data(i).as_ref() != Some(&now) {
+                model.set_row_data(i, now);
             }
         }
-        let rested = !audio
-            && meters.iter().all(|m| m.level == 0.0 && m.peak == 0.0)
-            && reductions.iter().all(|r| r == 0.0);
-        if (rested || !ui.window().is_visible())
-            && let Some(tick) = this.upgrade()
-        {
-            tick.stop();
+        let rested = meters.iter().all(MeterState::rested) && reductions.iter().all(|r| r == 0.0);
+        quiet = if rested { quiet + 1 } else { 0 };
+        let on_screen = crate::scene_ui::shown_on_screen(&ui);
+        if quiet >= REST_TICKS || !on_screen {
+            quiet = 0;
+            if !on_screen {
+                was_away.set(true);
+            } else if let Some(p) = rec.as_ref() {
+                p.wake_meters_on_signal();
+            }
+            if let Some(tick) = this.upgrade() {
+                tick.stop();
+            }
         }
     });
     let t = Rc::downgrade(&tick);
@@ -704,7 +726,27 @@ pub fn start_meters(ui: &AppWindow, rec: &Shared) -> Rc<slint::Timer> {
             t.restart();
         }
     });
+    // A click on a meter clears its clip indicator.
+    ui.on_meter_clear_clip(move |i| {
+        let i = usize::try_from(i).unwrap_or(usize::MAX);
+        if let Some(meter) = meters.borrow_mut().get_mut(i) {
+            meter.clear_clip();
+            shown.set_row_data(i, meter.shown());
+        }
+    });
     tick
+}
+
+/// Ticks at rest (~330 ms) before the meters stop.
+const REST_TICKS: u32 = 10;
+
+/// Sources that are stereo by nature get two bars at once; the others
+/// (microphones, input devices) split once their channels differ.
+fn stereo_source(kind: TrackKind) -> bool {
+    matches!(
+        kind,
+        TrackKind::Desktop | TrackKind::Output | TrackKind::App
+    )
 }
 
 #[cfg(test)]

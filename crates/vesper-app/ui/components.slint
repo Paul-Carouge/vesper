@@ -388,40 +388,136 @@ export component Segmented inherits FocusScope {
     }
 }
 
-// Horizontal audio level meter. `level` is linear 0..1.
-export component Meter inherits Rectangle {
+/// What a track's level meter shows, from meter.rs: positions 0..1 on the
+/// dBFS scale (see `MeterScale`), the held peaks, a latched clip, and
+/// whether it shows two bars (left, right) or one (`left`).
+export struct TrackMeter { left: float, right: float, hold-left: float, hold-right: float, clip: bool, stereo: bool }
+
+// Positions of the scale's points on the meter: IEC 60268-18, as in meter.rs.
+global MeterScale {
+    // Zone edges: -12 dBFS and -3 dBFS.
+    out property <float> mid: 0.7;
+    out property <float> high: 0.925;
+    // Ticks: -40, -20, -12, -6, -3 dBFS.
+    out property <[float]> ticks: [0.15, 0.5, 0.7, 0.85, 0.925];
+}
+
+// One bar of the meter: the unlit zones, the lit level, the held peak.
+component MeterBar inherits Rectangle {
     in property <float> level;
+    in property <float> hold;
     in property <bool> muted;
-    // Peak hold, driven by the caller.
-    in property <float> peak;
 
-    height: 6px;
-    border-radius: self.height / 2;
-    background: Theme.meter-track;
+    border-radius: min(self.height / 2, 2px);
     clip: true;
-    // Purely visual: a 30 Hz value would flood screen readers. The mute
-    // button next to it carries the accessible state.
-    accessible-role: none;
+    // Unlit zones: the scale reads at rest, the lit part shows how hot.
+    background: @linear-gradient(90deg,
+        Theme.meter-low.with-alpha(Theme.meter-unlit) 0%, Theme.meter-low.with-alpha(Theme.meter-unlit) 70%,
+        Theme.meter-mid.with-alpha(Theme.meter-unlit) 70%, Theme.meter-mid.with-alpha(Theme.meter-unlit) 92.5%,
+        Theme.meter-high.with-alpha(Theme.meter-unlit) 92.5%, Theme.meter-high.with-alpha(Theme.meter-unlit) 100%);
 
-    fill := Rectangle {
+    // No `animate`: the ballistics run in Rust (meter.rs), which changes the
+    // values only by a visible step, so a resting meter costs no frame.
+    if !root.muted && root.level > 0: Rectangle {
         x: 0;
-        width: root.muted ? 0 : parent.width * clamp(root.level, 0, 1);
-        border-radius: parent.border-radius;
+        width: root.width * clamp(root.level, 0, 1);
         clip: true;
-        // No `animate`: the levels are smoothed in Rust (meter.rs) and only
-        // change by a visible step, so a resting meter costs no frame.
-        // Full-width gradient revealed by the fill, so "hot" only shows near 0 dBFS.
+        // Full-width zones revealed by the level.
         Rectangle {
             x: 0;
             width: root.width;
-            background: @linear-gradient(90deg, Theme.accent 0%, Theme.accent 72%, Theme.meter-hot 92%);
+            background: @linear-gradient(90deg,
+                Theme.meter-low 0%, Theme.meter-low 70%,
+                Theme.meter-mid 70%, Theme.meter-mid 92.5%,
+                Theme.meter-high 92.5%, Theme.meter-high 100%);
         }
     }
 
-    if !root.muted && root.peak > 0.02: Rectangle {
-        x: (parent.width - self.width) * clamp(root.peak, 0, 1);
+    if !root.muted && root.hold > 0: Rectangle {
+        x: (parent.width - self.width) * clamp(root.hold, 0, 1);
         width: 2px;
-        background: root.peak > 0.9 ? Theme.meter-hot : Theme.text-muted;
+        background: root.hold >= MeterScale.high ? Theme.meter-high
+            : root.hold >= MeterScale.mid ? Theme.meter-mid : Theme.meter-low;
+    }
+}
+
+// Horizontal audio level meter in dBFS: green, yellow and red zones, peak
+// hold, one bar or two (left over right), and a clip light at the end,
+// latched until a click on the meter clears it. Muted, it shows the
+// scale only.
+export component Meter inherits Rectangle {
+    in property <TrackMeter> meter;
+    in property <bool> muted;
+    callback clear-clip();
+
+    property <length> bar: root.meter.stereo ? 3px : 6px;
+    property <length> gap: 1px;
+    property <length> bars-height: root.meter.stereo ? 2 * root.bar + root.gap : root.bar;
+    property <length> light: 6px;
+    property <bool> clipped: root.meter.clip && !root.muted;
+
+    // The whole meter, not only the light, clears a clip: a big target.
+    min-height: Theme.control-height;
+    // Purely visual: a 30 Hz value would flood screen readers. The mute
+    // button next to it carries the accessible state; a clip is a button.
+    accessible-role: none;
+
+    bars := Rectangle {
+        x: 0;
+        y: (root.height - root.bars-height) / 2;
+        width: root.width - root.light - Theme.space-xs;
+        height: root.bars-height;
+        opacity: root.muted ? 0.5 : 1;
+
+        MeterBar {
+            y: 0;
+            height: root.bar;
+            level: root.meter.left;
+            hold: root.meter.hold-left;
+            muted: root.muted;
+        }
+
+        if root.meter.stereo: MeterBar {
+            y: root.bar + root.gap;
+            height: root.bar;
+            level: root.meter.right;
+            hold: root.meter.hold-right;
+            muted: root.muted;
+        }
+
+    }
+
+    // Scale: short ticks under the bars at -40, -20, -12, -6, -3 dBFS, when
+    // the meter is wide enough for them not to crowd.
+    for t in bars.width >= 96px ? MeterScale.ticks : []: Rectangle {
+        x: bars.width * t - 0.5px;
+        y: bars.y + bars.height + 2px;
+        width: 1px;
+        height: 3px;
+        background: Theme.text-faint.with-alpha(root.muted ? 0.3 : 0.55);
+    }
+
+    // Clip light: lit at full scale, until cleared.
+    Rectangle {
+        x: root.width - root.light;
+        y: (root.height - root.bars-height) / 2;
+        width: root.light;
+        height: root.bars-height;
+        border-radius: 1.5px;
+        background: root.clipped ? Theme.meter-high : Theme.meter-high.with-alpha(Theme.meter-unlit);
+        opacity: root.muted ? 0.5 : 1;
+    }
+
+    if root.clipped: TouchArea {
+        mouse-cursor: pointer;
+        accessible-role: button;
+        accessible-label: @tr("Clear the clip indicator");
+        accessible-action-default => {
+            root.clear-clip();
+        }
+        clicked => {
+            root.clear-clip();
+        }
     }
 }
 

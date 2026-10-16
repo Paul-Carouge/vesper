@@ -49,6 +49,7 @@ fn main() -> Result<(), Error> {
             mix: input.take(),
             process: voice_chain(&voice, &source),
             on_state: None,
+            on_signal: None,
         };
         let capture = AudioCapture::start(source.clone(), options, move |p| drop(tx.send(p)))?;
         tracks.push((source, capture, rx));
@@ -57,7 +58,12 @@ fn main() -> Result<(), Error> {
         std::thread::sleep(Duration::from_millis(500));
         let peaks: Vec<_> = tracks
             .iter()
-            .map(|(s, c, _)| format!("{s:?} {:.3}", c.peak()))
+            .map(|(s, c, _)| {
+                format!("{s:?} {:.3}", {
+                    let p = c.take_peaks();
+                    p.left.max(p.right)
+                })
+            })
             .collect();
         println!("peak: {}", peaks.join("  "));
     }

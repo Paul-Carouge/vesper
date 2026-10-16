@@ -269,6 +269,8 @@ fn apply(ui: &AppWindow, rec: &Shared, track: i32) {
     };
     if let (Some(row), Some(p)) = (ui.get_tracks().row_data(index), rec.borrow().as_ref()) {
         p.set_filters(index, from_rows(&row.filters));
+        // The meters' ticks free the chain it replaces: they must run.
+        ui.invoke_meters_wake();
     }
 }
 
