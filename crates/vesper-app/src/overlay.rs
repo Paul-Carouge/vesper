@@ -57,6 +57,9 @@ pub struct Shared {
     quit: AtomicBool,
     /// Compositors created.
     pub created: AtomicUsize,
+    /// Texture ids of the current compositor that are done: uploaded, or
+    /// failed to load (they will not come). Updated before `changed`.
+    pub done: Mutex<Vec<u32>>,
 }
 
 /// The textures one canvas needs: `(texture id, source)`.
@@ -152,6 +155,7 @@ fn run(rx: &Receiver<Job>, shared: &Shared) {
             drop(old);
             uploaded.clear();
             failed.clear();
+            lock(&shared.done).clear();
             // A compositor still being freed elsewhere goes first (unless
             // stuck in the driver): one device at a time.
             while crate::recorder::retiring()
@@ -182,7 +186,14 @@ fn run(rx: &Receiver<Job>, shared: &Shared) {
             if quit() {
                 break;
             }
-            if uploaded.contains(id) || failed.contains(key) {
+            if uploaded.contains(id) {
+                continue;
+            }
+            if failed.contains(key) {
+                let mut done = lock(&shared.done);
+                if !done.contains(id) {
+                    done.push(*id);
+                }
                 continue;
             }
             // Decoded and staged without the lock.
@@ -196,6 +207,8 @@ fn run(rx: &Receiver<Job>, shared: &Shared) {
                 Err(e) => {
                     log!("scene overlay: {e}");
                     failed.push(key.clone());
+                    lock(&shared.done).push(*id);
+                    shared.changed.store(true, Ordering::Release);
                     continue;
                 }
             };
@@ -204,6 +217,7 @@ fn run(rx: &Receiver<Job>, shared: &Shared) {
             match c.set_staged(*id, staged) {
                 Ok(()) => {
                     uploaded.push(*id);
+                    lock(&shared.done).push(*id);
                     shared.changed.store(true, Ordering::Release);
                 }
                 Err(e) => log!("scene overlay: upload failed: {e}"),
@@ -217,6 +231,7 @@ fn run(rx: &Receiver<Job>, shared: &Shared) {
                 }
                 keep
             });
+            lock(&shared.done).retain(|id| job.want.iter().any(|(w, _)| w == id));
         }
     }
     // The pipeline is done with it: the compositor dies here, never on its

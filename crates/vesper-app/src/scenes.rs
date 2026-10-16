@@ -795,14 +795,20 @@ impl Drag {
                     b = t + h;
                 }
             }
+            // Within the format's limits, the edges that do not move staying.
+            let fit = |lo: f32, hi: f32, moving_lo: bool| {
+                if moving_lo {
+                    (lo.max(hi - 2.0).max(-1.0).min(hi - MIN_SIDE), hi)
+                } else {
+                    let lo = lo.clamp(-1.0, 1.0);
+                    (lo, hi.min(lo + 2.0).max(lo + MIN_SIDE))
+                }
+            };
+            let ((l, r), (t, b)) = (fit(l, r, left), fit(t, b, top));
             [l, t, r - l, b - t]
         };
-        let [x, y, w, h] = [
-            rect[0].clamp(-1.0, 1.0),
-            rect[1].clamp(-1.0, 1.0),
-            rect[2].clamp(MIN_SIDE, 2.0),
-            rect[3].clamp(MIN_SIDE, 2.0),
-        ];
+        let [x, y, w, h] = rect;
+        let [x, y] = [x.clamp(-1.0, 1.0), y.clamp(-1.0, 1.0)];
         let on = |values: [f32; 3], lines: &[f32]| {
             snap.then(|| nearest(&values, lines, 1e-4).map(|s| s.1))
                 .flatten()
@@ -1228,6 +1234,12 @@ mod tests {
         let r = Drag::new(Handle::N, start, (0.01, 0.01), []).to(0.3, -0.195, false, true);
         assert!(close(r.rect, [0.2, 0.0, 0.4, 0.4]), "{r:?}");
         assert_eq!((r.guide_x, r.guide_y), (None, Some(0.0)));
+        // Shift at the minimum size: the opposite corner still stays.
+        let r = Drag::new(Handle::NW, start, (0.01, 0.01), []).to(1.0, 1.0, true, false);
+        assert!(close(r.rect, [0.56, 0.38, 0.04, 0.02]), "{r:?}");
+        // The left edge stops at -1, the right one stays.
+        let r = Drag::new(Handle::W, start, (0.01, 0.01), []).to(-5.0, 0.0, false, false);
+        assert!(close(r.rect, [-1.0, 0.2, 1.6, 0.2]), "{r:?}");
         assert_eq!(Handle::from_index(0), Some(Handle::Move));
         assert_eq!(Handle::from_index(8), Some(Handle::SW));
         assert_eq!(Handle::from_index(9), None);

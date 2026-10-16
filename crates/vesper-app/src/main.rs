@@ -302,6 +302,8 @@ fn main() -> Result<(), slint::PlatformError> {
     // Hiding the window does not end the loop: only Quit, Ctrl+Q, or closing
     // the window without a tray does.
     let result = slint::run_event_loop_until_quit();
+    // Changes still waiting for a delayed save (volume, filters, scenes).
+    Prefs::from_ui(&ui).save();
     if let Some(conn) = instance {
         instance::release(conn);
     }
@@ -970,7 +972,10 @@ fn on_recorder_event(ui: &AppWindow, generation: u64, event: Event) {
             flash_notice(ui, &format!("{name}: reconnecting…"));
         }
         Event::AudioMissing(text) | Event::Notice(text) => flash_notice(ui, &text),
-        Event::Camera(on) => log!("webcam {}", if on { "on" } else { "off" }),
+        Event::Camera(on) => {
+            log!("webcam {}", if on { "on" } else { "off" });
+            ui.global::<SceneStore>().set_camera_on(on);
+        }
         Event::AudioTrack(name, TrackState::Running) => {
             flash_notice(ui, &format!("{name}: audio is back"));
         }

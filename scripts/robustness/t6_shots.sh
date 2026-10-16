@@ -35,3 +35,4 @@ shot scenes-editor-empty-light light scene-editor
 SIZE=360x700 shot scenes-editor-narrow-dark dark scenes-look,scene-editor,scene-layer:1
 SIZE=1280x800 SCALE=1 shot scenes-editor-wide-dark dark scenes-look,scene-editor,scene-layer:2
 SIZE=1280x800 SCALE=1 shot scenes-editor-wide-light light scenes-look,scene-editor,scene-layer:1
+shot scenes-editor-typing-dark dark scenes-look,scene-editor,scene-layer:2,scroll:${SCROLL:-700},click:200:290,type:XYZ

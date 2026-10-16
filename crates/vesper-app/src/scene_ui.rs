@@ -13,6 +13,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
@@ -40,6 +41,10 @@ const LIVE_STALE: Duration = Duration::from_millis(600);
 /// Font families listed at most (the search narrows them).
 const MAX_FONTS: usize = 200;
 
+/// The rasters the edited scene needs: the raster thread skips the others
+/// (a text typed or a size dragged queues many).
+static WANTED: Mutex<Vec<Key>> = Mutex::new(Vec::new());
+
 thread_local! {
     /// Rasters of images and text for the preview, newest last.
     static RASTERS: RefCell<Vec<(Key, Image)>> = const { RefCell::new(Vec::new()) };
@@ -56,6 +61,9 @@ thread_local! {
     /// When the last composed picture came.
     static LIVE_AT: Cell<Option<Instant>> = const { Cell::new(None) };
     static PIPELINE: RefCell<Option<Shared>> = const { RefCell::new(None) };
+    /// The compositor says the window cannot be seen (minimized, another
+    /// virtual desktop).
+    static OCCLUDED: Cell<bool> = const { Cell::new(false) };
     static TICK: slint::Timer = slint::Timer::default();
     static SAVE: slint::Timer = slint::Timer::default();
 }
@@ -283,6 +291,15 @@ pub fn show(ui: &AppWindow, scenes: &Scenes) {
     ui.invoke_tray_state_changed();
 }
 
+/// `new`, showing `old`'s raster until its own is ready: an edit never
+/// blinks the preview.
+fn keep_raster(mut new: LayerRow, old: LayerRow) -> LayerRow {
+    if new.raster.size().width == 0 && new.kind == old.kind {
+        new.raster = old.raster;
+    }
+    new
+}
+
 /// The layers model of scene `scene`, to change rows in place.
 fn layers_model(ui: &AppWindow, scene: usize) -> Option<ModelRc<LayerRow>> {
     Some(
@@ -303,10 +320,12 @@ fn request_rasters(ui: &AppWindow) {
     let Some(model) = layers_model(ui, store.get_editing().max(0) as usize) else {
         return;
     };
-    for r in model.iter() {
-        let Some(key) = layer(&r).and_then(|l| key(&l.source)) else {
-            continue;
-        };
+    let keys: Vec<Key> = model
+        .iter()
+        .filter_map(|r| layer(&r).and_then(|l| key(&l.source)))
+        .collect();
+    crate::recorder::lock(&WANTED).clone_from(&keys);
+    for key in keys {
         if cached(key.clone()).is_some() || PENDING.with_borrow(|p| p.contains(&key)) {
             continue;
         }
@@ -326,20 +345,33 @@ fn request_rasters(ui: &AppWindow) {
 fn spawn_rasterizer(weak: slint::Weak<AppWindow>) -> Sender<Key> {
     let (tx, rx) = std::sync::mpsc::channel::<Key>();
     let run = move |rx: Receiver<Key>| {
-        for key in rx {
-            let raster = match &key {
-                Key::Image(path) => overlay::image(path).map(|r| shrink(r, PREVIEW_SIDE)),
-                Key::Text(style) => overlay::text(style),
-            };
-            let pixels = raster
-                .map_err(|e| log!("scene preview: {e}"))
-                .ok()
-                .map(|r| {
-                    let mut buffer = SharedPixelBuffer::<Rgba8Pixel>::new(r.width, r.height);
-                    buffer.make_mut_bytes().copy_from_slice(&r.rgba);
-                    buffer
-                });
-            let _ = weak.upgrade_in_event_loop(move |ui| rastered(&ui, key, pixels));
+        while let Ok(first) = rx.recv() {
+            let keys: Vec<Key> = std::iter::once(first).chain(rx.try_iter()).collect();
+            for key in keys {
+                let wanted = crate::recorder::lock(&WANTED).contains(&key);
+                let raster = if wanted {
+                    match &key {
+                        Key::Image(path) => overlay::image(path),
+                        Key::Text(style) => overlay::text(style),
+                    }
+                    .map(|r| shrink(r, PREVIEW_SIDE))
+                } else {
+                    Err(String::new())
+                };
+                let pixels = raster
+                    .map_err(|e| {
+                        if !e.is_empty() {
+                            log!("scene preview: {e}");
+                        }
+                    })
+                    .ok()
+                    .map(|r| {
+                        let mut buffer = SharedPixelBuffer::<Rgba8Pixel>::new(r.width, r.height);
+                        buffer.make_mut_bytes().copy_from_slice(&r.rgba);
+                        buffer
+                    });
+                let _ = weak.upgrade_in_event_loop(move |ui| rastered(&ui, key, pixels));
+            }
         }
     };
     if let Err(e) = std::thread::Builder::new()
@@ -462,7 +494,7 @@ pub fn next(ui: &AppWindow) -> Option<usize> {
 fn update_preview(ui: &AppWindow) {
     let store = ui.global::<SceneStore>();
     let want = store.get_open()
-        && ui.window().is_visible()
+        && shown_on_screen(ui)
         && store.get_active() >= 0
         && store.get_editing() == store.get_active();
     crate::recorder::PREVIEW.store(want, Ordering::Relaxed);
@@ -470,6 +502,11 @@ fn update_preview(ui: &AppWindow) {
         LIVE_AT.set(None);
         store.set_live(false);
     }
+}
+
+/// The window is visible, not minimized, not hidden by the compositor.
+fn shown_on_screen(ui: &AppWindow) -> bool {
+    ui.window().is_visible() && !ui.window().is_minimized() && !OCCLUDED.get()
 }
 
 /// A composed picture from the pipeline.
@@ -502,6 +539,11 @@ fn shown(ui: &AppWindow) {
             move || {
                 let Some(ui) = weak.upgrade() else { return };
                 update_preview(&ui);
+                // Started again when the window shows (see `wire`).
+                if !shown_on_screen(&ui) {
+                    TICK.with(slint::Timer::stop);
+                    return;
+                }
                 if LIVE_AT.get().is_none_or(|t| t.elapsed() > LIVE_STALE) {
                     ui.global::<SceneStore>().set_live(false);
                 }
@@ -511,9 +553,9 @@ fn shown(ui: &AppWindow) {
 }
 
 /// A new layer of `kind` on top of the edited scene, selected.
-fn add_layer(ui: &AppWindow, rec: &Shared, source: LayerSource) {
+fn add_layer(ui: &AppWindow, rec: &Shared, scene: usize, source: LayerSource) {
     let mut scenes = from_ui(ui);
-    let Some(scene) = scenes.list.get_mut(editing(ui)) else {
+    let Some(scene) = scenes.list.get_mut(scene) else {
         return;
     };
     if scene.layers.len() >= MAX_LAYERS {
@@ -559,6 +601,29 @@ fn set_canvas(ui: &AppWindow, rec: &Shared, games: &Games, canvas: Canvas) {
 
 pub fn wire(ui: &AppWindow, rec: &Shared, games: &Games) {
     let store = ui.global::<SceneStore>();
+
+    // Shown again (restored, focused, back from the tray): the editor's
+    // preview resumes.
+    let weak = ui.as_weak();
+    slint::winit_030::WinitWindowAccessor::on_winit_window_event(ui.window(), move |_, event| {
+        use slint::winit_030::winit::event::WindowEvent;
+        let back = match event {
+            &WindowEvent::Occluded(hidden) => {
+                OCCLUDED.set(hidden);
+                !hidden
+            }
+            WindowEvent::Focused(true) | WindowEvent::Resized(_) => true,
+            _ => false,
+        };
+        if let Some(ui) = weak.upgrade() {
+            if back && ui.global::<SceneStore>().get_open() && !TICK.with(slint::Timer::running) {
+                shown(&ui);
+            } else if !back && OCCLUDED.get() {
+                update_preview(&ui);
+            }
+        }
+        slint::winit_030::EventResult::Propagate
+    });
 
     let (weak, r) = (ui.as_weak(), rec.clone());
     store.on_switch(move |i| {
@@ -642,7 +707,7 @@ pub fn wire(ui: &AppWindow, rec: &Shared, games: &Games) {
             }),
             _ => return,
         };
-        add_layer(&ui, &r, source);
+        add_layer(&ui, &r, editing(&ui), source);
     });
 
     let (weak, r) = (ui.as_weak(), rec.clone());
@@ -677,10 +742,8 @@ pub fn wire(ui: &AppWindow, rec: &Shared, games: &Games) {
             return;
         };
         let Some(l) = layer(&new) else { return };
-        if i >= model.row_count() {
-            return;
-        }
-        model.set_row_data(i, row(&l));
+        let Some(old) = model.row_data(i) else { return };
+        model.set_row_data(i, keep_raster(row(&l), old));
         request_rasters(&ui);
         apply(&ui, &r);
         save_soon(&ui);
@@ -696,14 +759,23 @@ pub fn wire(ui: &AppWindow, rec: &Shared, games: &Games) {
         let name = from_ui(&ui).list.get(scene).map(|s| s.name.clone());
         let current = usize::try_from(i).ok().and_then(|i| {
             let row = layers_model(&ui, scene)?.row_data(i)?;
-            Some(PathBuf::from(row.value.as_str()))
+            (row.kind == LayerKind::Image).then(|| PathBuf::from(row.value.as_str()))
         });
+        if i >= 0 && current.is_none() {
+            return;
+        }
         let weak = weak.clone();
-        crate::desktop::pick_image(current, move |result| {
+        crate::desktop::pick_image(current.clone(), move |result| {
             let _ = weak.upgrade_in_event_loop(move |ui| match result {
                 Ok(Some(path)) => {
                     if let Some(r) = PIPELINE.with_borrow(Clone::clone) {
-                        image_chosen(&ui, &r, scene, name, i, path);
+                        let target = Target {
+                            scene,
+                            name,
+                            layer: i,
+                            old: current,
+                        };
+                        image_chosen(&ui, &r, target, path);
                     }
                 }
                 Ok(None) => {}
@@ -771,7 +843,13 @@ pub fn wire(ui: &AppWindow, rec: &Shared, games: &Games) {
         let store = ui.global::<SceneStore>();
         store.set_guide_x(-1.0);
         store.set_guide_y(-1.0);
-        if DRAG.take().is_some() {
+        let Some((scene, i, drag)) = DRAG.take() else {
+            return;
+        };
+        let moved = layers_model(&ui, scene)
+            .and_then(|m| m.row_data(i))
+            .is_some_and(|r| [r.x, r.y, r.w, r.h] != drag.start);
+        if moved {
             save_soon(&ui);
         }
     });
@@ -853,8 +931,12 @@ pub fn wire(ui: &AppWindow, rec: &Shared, games: &Games) {
     store.on_canvas_changed(move |fixed, w, h| {
         let Some(ui) = weak.upgrade() else { return };
         let canvas = if fixed {
-            let side = |v: i32| (v.clamp(128, 8192) as u32) & !1;
-            Canvas::Fixed(side(w), side(h))
+            let ok = |v: i32| (128..=8192).contains(&v);
+            if !ok(w) || !ok(h) {
+                flash_notice(&ui, "Canvas sides are 128 to 8192 pixels");
+                return show(&ui, &from_ui(&ui));
+            }
+            Canvas::Fixed(w as u32 & !1, h as u32 & !1)
         } else {
             Canvas::Auto
         };
@@ -878,34 +960,44 @@ fn show_fonts(ui: &AppWindow) {
 
 /// An image picked for layer `i` (-1: a new layer) of scene `scene`, if
 /// that scene is still there under `name`.
-fn image_chosen(
-    ui: &AppWindow,
-    rec: &Shared,
+/// What an image picker was opened for: layer `layer` (-1: a new one) of
+/// scene `scene`, named `name`, showing `old`.
+struct Target {
     scene: usize,
     name: Option<String>,
-    i: i32,
-    path: PathBuf,
-) {
+    layer: i32,
+    old: Option<PathBuf>,
+}
+
+/// An image picked for `target`, if that scene and layer are still there
+/// as they were (the user may have edited them meanwhile).
+fn image_chosen(ui: &AppWindow, rec: &Shared, target: Target, path: PathBuf) {
     let scenes = from_ui(ui);
-    if scenes.list.get(scene).map(|s| &s.name) != name.as_ref() {
+    if scenes.list.get(target.scene).map(|s| &s.name) != target.name.as_ref() {
         return;
     }
     if !Path::new(&path).is_absolute() {
         return;
     }
     log!("scene image: {}", path.display());
-    let Ok(i) = usize::try_from(i) else {
-        return add_layer(ui, rec, LayerSource::Image { path });
+    let Ok(i) = usize::try_from(target.layer) else {
+        return add_layer(ui, rec, target.scene, LayerSource::Image { path });
     };
-    let Some(model) = layers_model(ui, scene) else {
+    let Some(model) = layers_model(ui, target.scene) else {
         return;
     };
-    let Some(mut r) = model.row_data(i) else {
+    let Some(old) = model.row_data(i) else {
         return;
     };
+    let same = old.kind == LayerKind::Image
+        && target.old.as_deref() == Some(Path::new(old.value.as_str()));
+    if !same {
+        return;
+    }
+    let mut r = old.clone();
     r.value = path.display().to_string().into();
     let Some(l) = layer(&r) else { return };
-    model.set_row_data(i, row(&l));
+    model.set_row_data(i, keep_raster(row(&l), old));
     request_rasters(ui);
     apply(ui, rec);
     save_soon(ui);

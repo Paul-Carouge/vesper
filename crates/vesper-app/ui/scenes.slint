@@ -68,6 +68,8 @@ export global SceneStore {
     // 0 not looked for, 1 looking, 2 listed.
     in property <int> cameras-state;
     in-out property <string> name-error;
+    // A webcam of the recorded scene is streaming.
+    in property <bool> camera-on;
 
     // Records scene `i` from now on (also while recording or streaming).
     callback switch(int);
@@ -203,6 +205,27 @@ export component SceneBar inherits Card {
                 horizontal-stretch: 1;
                 text: "SCENE";
                 vertical-alignment: center;
+            }
+            if SceneStore.camera-on: HorizontalLayout {
+                spacing: 6px;
+                accessible-role: text;
+                accessible-label: "Camera on";
+                VerticalLayout {
+                    alignment: center;
+                    Rectangle {
+                        width: 6px;
+                        height: 6px;
+                        border-radius: 3px;
+                        background: Theme.rec;
+                    }
+                }
+                Text {
+                    text: "Camera on";
+                    vertical-alignment: center;
+                    font-size: Theme.font-caption;
+                    font-weight: 600;
+                    color: Theme.text-muted;
+                }
             }
             Button {
                 text: "Edit";
