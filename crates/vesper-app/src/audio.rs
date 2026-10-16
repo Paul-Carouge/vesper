@@ -33,8 +33,9 @@ struct Sources {
 thread_local! {
     // UI thread only.
     static SOURCES: RefCell<Sources> = RefCell::default();
-    // The apps the desktop subtitles say are left out.
-    static SHOWN_EXCEPT: RefCell<Vec<String>> = RefCell::default();
+    // The apps the running audio leaves out of the desktop; `None` while
+    // no pipeline's audio runs.
+    static RUNNING_EXCEPT: RefCell<Option<Vec<String>>> = RefCell::default();
 }
 
 /// A track lowered by more than this (dB) shows it is.
@@ -211,29 +212,25 @@ fn without(source: &Source, except: &[String]) -> String {
     }
 }
 
-/// The apps to show left out: what the tracks ask, except while recording,
-/// where track changes apply once it ends: then what the recording does.
-fn shown_except(ui: &AppWindow, tracks: &[Track]) -> Vec<String> {
-    if ui.get_rec_state() == crate::RecState::Idle {
-        let except = crate::recorder::desktop_except(tracks);
-        SHOWN_EXCEPT.set(except.clone());
-        except
-    } else {
-        SHOWN_EXCEPT.with_borrow(Clone::clone)
-    }
+/// The apps to show left out: what the running audio does (track changes
+/// apply when it restarts), else what the tracks ask.
+fn shown_except(tracks: &[Track]) -> Vec<String> {
+    RUNNING_EXCEPT
+        .with_borrow(Clone::clone)
+        .unwrap_or_else(|| crate::recorder::desktop_except(tracks))
 }
 
-/// The recording now leaves out `apps` (an app track lost or got back its
-/// source): the subtitles say so.
-pub fn show_running_except(ui: &AppWindow, apps: Vec<String>) {
-    SHOWN_EXCEPT.set(apps);
+/// The running audio now leaves out `apps` (`None`: it stopped): the
+/// subtitles say so.
+pub fn show_running_except(ui: &AppWindow, apps: Option<Vec<String>>) {
+    RUNNING_EXCEPT.set(apps);
     show_without(ui);
 }
 
 /// Updates the rows' `without`, in place.
 pub fn show_without(ui: &AppWindow) {
     let tracks = tracks_from_ui(ui);
-    let except = shown_except(ui, &tracks);
+    let except = shown_except(&tracks);
     let model = ui.get_tracks();
     for (i, t) in tracks.iter().enumerate() {
         let text = without(&t.source, &except);
@@ -290,7 +287,7 @@ pub fn tracks_from_ui(ui: &AppWindow) -> Vec<Track> {
 }
 
 pub fn show_tracks(ui: &AppWindow, tracks: &[Track]) {
-    let except = shown_except(ui, tracks);
+    let except = shown_except(tracks);
     let rows: Vec<_> = tracks
         .iter()
         .map(|t| AudioTrack {

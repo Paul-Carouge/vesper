@@ -1669,6 +1669,8 @@ fn pump(
             // opens, so the tracks cover the first video tick.
             start_audio(sources, sinks, on_event);
             reset_ring_audio(sources, sinks);
+            let except = lock(sources).exclusions.as_ref().map(|e| e.apps());
+            on_event(Event::DesktopExcept(except.unwrap_or_default()));
             on_event(Event::AudioStarted);
             match Video::open(settings, width, height) {
                 Ok(v) => {
@@ -1783,6 +1785,8 @@ fn pump(
             stop_audio(sources);
             start_audio(sources, sinks, on_event);
             reset_ring_audio(sources, sinks);
+            let except = lock(sources).exclusions.as_ref().map(|e| e.apps());
+            on_event(Event::DesktopExcept(except.unwrap_or_default()));
             on_event(Event::AudioStarted);
         }
         let streams = lock(sources).streams();

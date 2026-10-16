@@ -958,13 +958,8 @@ fn on_recorder_event(ui: &AppWindow, generation: u64, event: Event) {
             prefs::save_source(&label);
         }
         Event::Source(_) => {}
-        Event::AudioStarted => {
-            // Track changes made while recording apply now.
-            audio::show_without(ui);
-            ui.invoke_meters_wake();
-        }
-        Event::AudioSignal => ui.invoke_meters_wake(),
-        Event::DesktopExcept(apps) => audio::show_running_except(ui, apps),
+        Event::AudioStarted | Event::AudioSignal => ui.invoke_meters_wake(),
+        Event::DesktopExcept(apps) => audio::show_running_except(ui, Some(apps)),
         Event::Started => {
             ui.set_rec_state(RecState::Recording);
             ui.set_elapsed_seconds(0);
@@ -991,6 +986,7 @@ fn on_recorder_event(ui: &AppWindow, generation: u64, event: Event) {
         }
         Event::Finished(result) => {
             ui.set_rec_state(RecState::Idle);
+            audio::show_without(ui);
             ui.set_elapsed_seconds(0);
             match result {
                 Ok(path) => {
@@ -1046,7 +1042,13 @@ fn on_recorder_event(ui: &AppWindow, generation: u64, event: Event) {
         // A clean stop always follows `Finished`: nothing to reset (a new
         // pipeline may already be starting).
         Event::Preview(pixels) => scene_ui::on_preview(ui, pixels),
-        Event::Stopped(None) => log!("pipeline stopped"),
+        Event::Stopped(None) => {
+            log!("pipeline stopped");
+            // Not a later pipeline's audio.
+            if generation == GENERATION.load(Ordering::Relaxed) {
+                audio::show_running_except(ui, None);
+            }
+        }
         Event::Stopped(Some(e)) if generation != GENERATION.load(Ordering::Relaxed) => {
             log!("earlier pipeline stopped: {e}");
         }
@@ -1054,6 +1056,7 @@ fn on_recorder_event(ui: &AppWindow, generation: u64, event: Event) {
             log!("pipeline stopped: {e}");
             // Neither a recording, the replay buffer nor a stream runs any more.
             ui.set_rec_state(RecState::Idle);
+            audio::show_running_except(ui, None);
             ui.set_elapsed_seconds(0);
             ui.set_replay_enabled(false);
             live::reset(ui);

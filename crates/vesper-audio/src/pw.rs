@@ -263,8 +263,9 @@ pub fn run(
     let _except = excluded.map(|ex| {
         let (ex, reopen, quit) = (ex.clone(), reopen.clone(), mainloop.clone());
         except_rx.attach(mainloop.loop_(), move |()| {
-            // Only a running session: a reconnection keeps its backoff.
-            if reopen.open.get() && *reopen.apps.borrow() != ex.apps() {
+            // Only a running session: a reconnection keeps its backoff. On
+            // the monitor, reopening would change nothing.
+            if reopen.open.get() && !reopen.monitor.get() && *reopen.apps.borrow() != ex.apps() {
                 reopen.wanted.set(true);
                 quit.quit();
             }
@@ -339,6 +340,9 @@ pub fn run(
             debug!("{source:?}: reopening for the apps left out");
             continue;
         }
+        // A new connection tries leaving apps out again: a restarted
+        // PipeWire may have lacked the default metadata only for a moment.
+        reopen.monitor.set(false);
         let reason = health.lost.take().unwrap_or_else(|| "stream ended".into());
         let up = health.streaming_since.get().map(|t| t.elapsed());
         let Retry {
@@ -675,23 +679,21 @@ fn link_targets(channel: &str) -> &'static [&'static str] {
 const FOLD: f32 = std::f32::consts::FRAC_1_SQRT_2;
 
 /// Interleaved F32 samples of `channels` channels as stereo: as is, or
-/// `LINKED` folded down (center and surrounds at -3 dB, LFE left out), as
-/// PipeWire's channel mixer does for the monitor.
+/// `LINKED` folded down with the usual gains (center and surrounds at
+/// -3 dB, LFE left out). Close to PipeWire's channel mixer on the monitor,
+/// not identical: it may mix the LFE in.
 fn to_stereo(bytes: &[u8], channels: usize) -> Vec<f32> {
-    let floats = bytes
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|&b| f32::from_le_bytes(b));
+    let f = |b: &[u8; 4]| f32::from_le_bytes(*b);
     if channels == STEREO.len() {
-        return floats.collect();
+        return bytes.as_chunks::<4>().0.iter().map(f).collect();
     }
-    let floats: Vec<f32> = floats.collect();
-    let mut out = Vec::with_capacity(floats.len() / channels * 2);
-    for f in floats.chunks_exact(channels) {
-        // FL FR FC LFE RL RR SL SR
-        out.push(f[0] + FOLD * (f[2] + f[4] + f[6]));
-        out.push(f[1] + FOLD * (f[2] + f[5] + f[7]));
+    // One frame of `LINKED`: FL FR FC LFE RL RR SL SR.
+    let frames = bytes.as_chunks::<32>().0;
+    let mut out = Vec::with_capacity(frames.len() * 2);
+    for frame in frames {
+        let c = frame.as_chunks::<4>().0;
+        out.push(f(&c[0]) + FOLD * (f(&c[2]) + f(&c[4]) + f(&c[6])));
+        out.push(f(&c[1]) + FOLD * (f(&c[2]) + f(&c[5]) + f(&c[7])));
     }
     out
 }
