@@ -12,8 +12,8 @@ cargo test -p vesper-app --bin vesper --no-run
 mode() {
     local vars=$1
     shift
-    local t
     t=$(mktemp -d)
+    trap 'rm -rf "$t"' EXIT
     echo "== fake Secret Service ${vars:-(default)}: $*"
     # shellcheck disable=SC2086 # $vars: zero or more VAR=value words.
     if ! env -u WAYLAND_DISPLAY -u DISPLAY -u XAUTHORITY -u XDG_STATE_HOME -u XDG_CONFIG_DIRS \
@@ -24,12 +24,15 @@ mode() {
             python3 -I scripts/fake_secret_service.py &
             fake=$!
             # Wait for the name: a call before it would start a real keyring.
-            for _ in $(seq 100); do
+            owned() {
                 dbus-send --session --print-reply --dest=org.freedesktop.DBus /org/freedesktop/DBus \
-                    org.freedesktop.DBus.NameHasOwner string:org.freedesktop.secrets \
-                    | grep -q true && break
+                    org.freedesktop.DBus.NameHasOwner string:org.freedesktop.secrets | grep -q true
+            }
+            for _ in $(seq 100); do
+                owned && break
                 sleep 0.1
             done
+            owned || { echo "the fake Secret Service did not start" >&2; exit 1; }
             cargo test -p vesper-app --bin vesper -- --ignored --exact --test-threads=1 "$@" | tee "$HOME/out"
             status=${PIPESTATUS[0]}
             kill "$fake"
