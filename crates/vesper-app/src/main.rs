@@ -142,6 +142,10 @@ fn main() -> Result<(), slint::PlatformError> {
             shortcuts::APP_ID
         );
     }
+    // Every recording, dev ones included, leaves a marker until it is finished.
+    if let Some(dir) = recording_markers() {
+        vesper_mux::set_marker_dir(dir);
+    }
     #[cfg(debug_assertions)]
     if let Some(seconds) = dev::record_seconds() {
         dev::record(seconds, default_settings());
@@ -183,6 +187,8 @@ fn main() -> Result<(), slint::PlatformError> {
             return Ok(());
         }
     };
+    // The only instance: a marker left by an earlier one is stale.
+    recover_recordings(&ui);
 
     // `VESPER_THEME=light|dark` overrides the system color scheme.
     match std::env::var("VESPER_THEME").as_deref() {
@@ -1332,6 +1338,45 @@ fn announce_saved(ui: &AppWindow, title: &str, file: PathBuf) {
         desktop::notify(title.to_owned(), name, Some(file.clone()));
     }
     show_notice(ui, title, Some(file));
+}
+
+/// Where recordings being written leave their marker (see `vesper_mux::recover_stale`).
+fn recording_markers() -> Option<PathBuf> {
+    dirs::state_dir().map(|d| d.join("vesper").join("recordings-in-progress"))
+}
+
+/// Repairs, on its own thread, the recordings a kill, crash or power cut
+/// left without cues and duration, and tells about each one.
+fn recover_recordings(ui: &AppWindow) {
+    let Some(dir) = recording_markers() else {
+        return;
+    };
+    let suffix = tr!("recovered");
+    let weak = ui.as_weak();
+    let spawned = std::thread::Builder::new()
+        .name("vesper-recover".into())
+        .spawn(move || {
+            for (path, outcome) in vesper_mux::recover_stale(&dir, suffix) {
+                log!("interrupted recording {}: {outcome:?}", path.display());
+                let name = path.file_name().map_or_else(
+                    || path.display().to_string(),
+                    |n| n.to_string_lossy().into_owned(),
+                );
+                let _ = weak.upgrade_in_event_loop(move |ui| match outcome {
+                    vesper_mux::Outcome::Recovered => {
+                        announce_saved(&ui, &tr!("Recording recovered: {}", name), path);
+                    }
+                    vesper_mux::Outcome::Failed(_) => flash_error(
+                        &ui,
+                        &tr!("Could not repair the interrupted recording {}", name),
+                    ),
+                    vesper_mux::Outcome::Complete | vesper_mux::Outcome::Missing => {}
+                });
+            }
+        });
+    if let Err(e) = spawned {
+        log!("could not start recovering recordings: {e}");
+    }
 }
 
 /// A failed save: the error as the notice, and a notification in the background.

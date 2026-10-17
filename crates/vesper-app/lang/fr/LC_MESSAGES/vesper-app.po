@@ -876,6 +876,15 @@ msgstr "Échec de l’enregistrement"
 msgid "Recording saved"
 msgstr "Enregistrement sauvegardé"
 
+msgid "Recording recovered: {}"
+msgstr "Enregistrement récupéré : {}"
+
+msgid "Could not repair the interrupted recording {}"
+msgstr "Impossible de réparer l’enregistrement interrompu {}"
+
+msgid "recovered"
+msgstr "récupéré"
+
 msgid "Recording without the audio track {}"
 msgstr "Enregistrement sans la piste audio {}"
 

@@ -5,7 +5,9 @@
 //! muxer rebases them to the recording start. Clusters are closed every second
 //! and written straight to the file, so a recording cut short by a crash or a
 //! kill of the process stays playable up to its last complete cluster (no cues,
-//! no duration). There is no fsync: a power loss or kernel crash can lose more.
+//! no duration), and [`recover_stale`] repairs it at the next launch. There is
+//! no fsync: writeback starts every couple of seconds (see `recovery`), so a
+//! power loss or kernel crash loses a few seconds more.
 //!
 //! Writes go through `write(2)` into the page cache and normally return in
 //! microseconds, but they can block under dirty-page writeback pressure (slow
@@ -25,7 +27,9 @@ use ffmpeg_next::ffi as ff;
 use vesper_core::{Codec, EncodedPacket};
 
 mod live;
+mod recovery;
 pub use live::{Live, LiveAudio, LiveError, LiveErrorKind, redact};
+pub use recovery::{Outcome, SYNC_PERIOD, finalized, recover, recover_stale, set_marker_dir};
 
 const NANOS: ff::AVRational = ff::AVRational {
     num: 1,
@@ -119,6 +123,8 @@ pub struct Muxer {
     /// (`.nfsXXXX`) and keeps a link, so the deletion goes unnoticed there;
     /// also compare the path's inode at finish if NFS output matters.
     file: Option<File>,
+    /// Marker and periodic writeback of the file (see `recovery`).
+    guard: Option<recovery::Guard>,
 }
 
 // SAFETY: the FFmpeg objects are owned by this struct and only used through
@@ -164,6 +170,7 @@ impl Muxer {
             got_keyframe: false,
             last_pts: vec![i64::MIN; 1 + audio.len()],
             file: None,
+            guard: None,
         };
         // On error, `m` is dropped and frees whatever was created so far.
         unsafe {
@@ -231,6 +238,10 @@ impl Muxer {
                 "open output file",
             )?;
             m.file = File::open(path).ok();
+            m.guard = m
+                .file
+                .as_ref()
+                .and_then(|f| recovery::Guard::start(path, f));
             // Hand each closed cluster to the OS at once: a kill loses at most ~1 s.
             (*m.ctx).flush_packets = 1;
             // A stalled track must not make libavformat hold more than a
@@ -346,6 +357,10 @@ impl Muxer {
             }
             ff::avformat_free_context(self.ctx);
             self.ctx = ptr::null_mut();
+            // A failed trailer keeps the marker: the next launch repairs the file.
+            if let Some(guard) = self.guard.take() {
+                guard.end(ret >= 0);
+            }
             check(ret, "write MKV trailer")?;
         }
         let file = self.file.take();
