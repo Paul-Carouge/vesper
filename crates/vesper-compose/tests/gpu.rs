@@ -417,6 +417,130 @@ fn huge_textures_are_reduced_and_still_drawn() {
     assert_eq!(px[i..i + 4], [10, 200, 30, 255]);
 }
 
+/// RGBA test picture a bad downscale gets most wrong: 1-pixel checks, colour
+/// noise and thin lines (text-like detail), premultiplied (opaque).
+fn detailed(w: u32, h: u32) -> Vec<u8> {
+    let mut v = Vec::with_capacity((w * h * 4) as usize);
+    for y in 0..h {
+        for x in 0..w {
+            let n = common::noise;
+            let px = match x * 3 / w {
+                0 => [if (x + y) % 2 == 0 { 250 } else { 5 }, 40, 200],
+                1 => [n(x, y), n(y, x), n(x ^ y, x)],
+                _ if x % 3 == 0 || y % 5 == 0 => [230, 230, 230],
+                _ => [30, 30, 46],
+            };
+            v.extend_from_slice(&[px[0], px[1], px[2], 255]);
+        }
+    }
+    v
+}
+
+/// Box (area) filter of the `sw` x `sh` region at (x0, y0) of an RGBA
+/// picture `w` wide into `ow` x `oh`: each output pixel is the average of the
+/// source area it covers, partial texels weighted by their overlap.
+fn area(src: &[u8], w: u32, region: [u32; 4], ow: u32, oh: u32) -> Vec<[f64; 3]> {
+    let [x0, y0, sw, sh] = region;
+    let weights = |o: u32, n: u32, on: u32| {
+        let k = f64::from(n) / f64::from(on);
+        let (lo, hi) = (f64::from(o) * k, f64::from(o + 1) * k);
+        (lo.floor() as u32..hi.ceil() as u32)
+            .map(move |i| (i, (hi.min(f64::from(i + 1)) - lo.max(f64::from(i))) / k))
+    };
+    let mut out = Vec::with_capacity((ow * oh) as usize);
+    for oy in 0..oh {
+        for ox in 0..ow {
+            let mut c = [0.0; 3];
+            for (y, wy) in weights(oy, sh, oh) {
+                for (x, wx) in weights(ox, sw, ow) {
+                    let i = (((y0 + y) * w + x0 + x) * 4) as usize;
+                    for (k, c) in c.iter_mut().enumerate() {
+                        *c += wx * wy * f64::from(src[i + k]);
+                    }
+                }
+            }
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Largest difference between an RGBA picture and a reference, in 8-bit steps.
+fn max_error(px: &[u8], reference: &[[f64; 3]]) -> f64 {
+    px.as_chunks::<4>()
+        .0
+        .iter()
+        .zip(reference)
+        .flat_map(|(p, r)| (0..3).map(move |k| (f64::from(p[k]) - r[k]).abs()))
+        .fold(0.0, f64::max)
+}
+
+/// A main capture drawn smaller than its size is box filtered: 4K into
+/// the 480x270 preview canvas (8:1), and crops at 2:1 (4K into 1080p) and
+/// 4:3 (1440p into 1080p, not a whole ratio) and 8:1 by 2:1, each within rounding of an
+/// exact area filter (bilinear sampling was off by more than 100).
+#[test]
+fn downscaled_main_matches_an_area_filter() {
+    if !gpu() {
+        return;
+    }
+    let (w, h) = (3840, 2160);
+    let src = detailed(w, h);
+    let mut big = Compositor::new(w, h).unwrap();
+    big.set_texture(1, w, h, &src).unwrap();
+    let mut small = Compositor::new(PREVIEW_WIDTH, PREVIEW_HEIGHT).unwrap();
+    // Source regions (x, y, width, height) drawn over the whole canvas.
+    for region in [
+        [0, 0, w, h],
+        [960, 540, 960, 540],
+        [1000, 600, 640, 360],
+        // Anisotropic: 8:1 across, 2:1 down.
+        [0, 1000, w, 540],
+    ] {
+        let main = big
+            .compose(None, &[full(Source::Texture(1), Fit::Stretch, 1.0)])
+            .unwrap();
+        let [x, y, rw, rh] = region.map(|v| v as f32);
+        let (w, h) = (w as f32, h as f32);
+        let draw = Draw {
+            crop: [x / w, y / h, 1.0 - (x + rw) / w, 1.0 - (y + rh) / h],
+            ..full(Source::Main, Fit::Stretch, 1.0)
+        };
+        let (_, px) = compose_read(&mut small, Some(main), &[draw]);
+        let reference = area(&src, 3840, region, PREVIEW_WIDTH, PREVIEW_HEIGHT);
+        let e = max_error(&px, &reference);
+        assert!(e <= 1.0, "region {region:?}: off by {e}");
+    }
+}
+
+/// A texture drawn much smaller reads the mip where a pixel spans 2 to 4
+/// texels and box filters it: within the mips' own rounding of an area
+/// filter of the full picture.
+#[test]
+fn downscaled_textures_match_an_area_filter() {
+    if !gpu() {
+        return;
+    }
+    let src = detailed(800, 800);
+    let mut c = Compositor::new(PREVIEW_WIDTH, PREVIEW_HEIGHT).unwrap();
+    c.set_texture(1, 800, 800, &src).unwrap();
+    // 100x100 pixels at (40, 20): 8:1, filtered on mip 2.
+    let (cw, ch) = (PREVIEW_WIDTH as f32, PREVIEW_HEIGHT as f32);
+    let draw = Draw {
+        rect: [40.0 / cw, 20.0 / ch, 100.0 / cw, 100.0 / ch],
+        ..full(Source::Texture(1), Fit::Stretch, 1.0)
+    };
+    let (_, px) = compose_read(&mut c, None, &[draw]);
+    let reference = area(&src, 800, [0, 0, 800, 800], 100, 100);
+    let mut drawn = Vec::new();
+    for y in 20..120 {
+        let row = (y * PREVIEW_WIDTH + 40) as usize * 4;
+        drawn.extend_from_slice(&px[row..row + 400]);
+    }
+    let e = max_error(&drawn, &reference);
+    assert!(e <= 2.0, "off by {e}");
+}
+
 /// A kept copy of the main frame stands in for it, bit-exact, once the
 /// frame itself went back to its producer.
 #[test]
