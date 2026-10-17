@@ -64,20 +64,16 @@ impl Capture {
     /// no frame follows. Dropping the `Capture` from `on_frame` is allowed,
     /// but blocks the PipeWire loop while the D-Bus session closes (at most
     /// [`CLOSE_TIMEOUT`]).
-    /// Blocks until the user picks a source.
+    /// Blocks until the user picks a source; `cancel` ends the wait for the
+    /// portal, closing its picker.
     pub fn start(
         restore_token: Option<&str>,
+        cancel: &Cancel,
         max_fps: u32,
         on_frame: impl FnMut(Result<VideoFrame>) + Send + 'static,
     ) -> Result<Self> {
         let sources = SourceType::Monitor | SourceType::Window;
-        Self::start_with(
-            sources,
-            restore_token,
-            &Cancel::default(),
-            max_fps,
-            on_frame,
-        )
+        Self::start_with(sources, restore_token, cancel, max_fps, on_frame)
     }
 
     /// [`Capture::start`], offering windows only (a game's window). `cancel`
@@ -193,7 +189,8 @@ pub fn is_refused(error: &Error) -> bool {
 
 const CANCELLED: &str = "the capture was cancelled";
 
-/// Ends a [`Capture::start_window`] still waiting on the portal.
+/// Ends a [`Capture::start`] or [`Capture::start_window`] still waiting on
+/// the portal.
 #[derive(Debug, Clone, Default)]
 pub struct Cancel(Arc<CancelState>);
 

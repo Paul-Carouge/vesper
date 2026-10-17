@@ -1498,3 +1498,12 @@ msgid "{n} dropped"
 msgid_plural "{n} dropped"
 msgstr[0] "{n} image perdue"
 msgstr[1] "{n} images perdues"
+
+msgid "Source lost: reconnecting…"
+msgstr "Source perdue : reconnexion…"
+
+msgid "Source back"
+msgstr "Source retrouvée"
+
+msgid "The source was not picked again: capture stopped"
+msgstr "La source n’a pas été choisie de nouveau : capture arrêtée"

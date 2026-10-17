@@ -62,6 +62,7 @@ use crate::stream::{AudioTap, LiveSink, StreamRequest, StreamState, live_audio, 
 mod audio;
 mod clock;
 mod pump;
+mod reconnect;
 mod ring;
 mod sinks;
 mod stage;
@@ -70,6 +71,7 @@ mod streaming;
 pub use audio::*;
 use clock::*;
 use pump::*;
+use reconnect::{Change, Portal, Starter};
 use ring::*;
 use sinks::*;
 pub(crate) use stage::*;
@@ -410,6 +412,19 @@ impl Pipeline {
         stream: Option<StreamRequest>,
         on_event: impl Fn(Event) + Send + Sync + 'static,
     ) -> std::io::Result<Self> {
+        Self::spawn(settings, replay, record, stream, None, on_event)
+    }
+
+    /// [`Pipeline::start`], capturing with `capture` instead of the portal
+    /// (when not in game mode).
+    fn spawn(
+        settings: Settings,
+        replay: Option<Duration>,
+        record: Option<PathBuf>,
+        stream: Option<StreamRequest>,
+        capture: Option<Starter>,
+        on_event: impl Fn(Event) + Send + Sync + 'static,
+    ) -> std::io::Result<Self> {
         let control = Arc::new(Mutex::new(Control {
             record,
             replay,
@@ -431,7 +446,15 @@ impl Pipeline {
             .spawn(move || {
                 // A panic must still end in `Stopped`, or the UI stays stuck.
                 let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                    run(&settings, &slot, &ctl, &started_flag, &sources, &on_event)
+                    run(
+                        &settings,
+                        capture,
+                        &slot,
+                        &ctl,
+                        &started_flag,
+                        &sources,
+                        &on_event,
+                    )
                 }))
                 .unwrap_or_else(|_| Err(tr!("Internal error: the recorder crashed").into()));
                 lock(&ctl).ended = true;
@@ -832,6 +855,7 @@ mod tests {
             let result = pump(
                 &settings,
                 &Mailbox::default(),
+                None,
                 &control,
                 &SharedSinks::default(),
                 &AudioSources::default(),
