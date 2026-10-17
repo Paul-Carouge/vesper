@@ -92,6 +92,7 @@ check() {
 }
 
 package() {
+  export RUSTUP_TOOLCHAIN=stable
   cd vesper
   install -Dm755 target/release/vesper -t "$pkgdir/usr/bin/"
   # Only the library: the per-user settings switch is the only way to enable

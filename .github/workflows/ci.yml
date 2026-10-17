@@ -55,6 +55,9 @@ jobs:
       # 32-bit games: the i686 layer and GL interposer, with code generation
       # (an rlib, so no lib32 link) so the x86 `naked_asm!` is assembled too.
       - name: Build the i686 layer and GL interposer
+        # For every crate, so x86-only warnings in the shared client fail too.
+        env:
+          RUSTFLAGS: -D warnings
         run: |
-          cargo rustc --target i686-unknown-linux-gnu -p vesper-vklayer --lib --crate-type rlib -- -D warnings
-          cargo rustc --target i686-unknown-linux-gnu -p vesper-glcapture --lib --crate-type rlib -- -D warnings
+          cargo rustc --target i686-unknown-linux-gnu -p vesper-vklayer --lib --crate-type rlib
+          cargo rustc --target i686-unknown-linux-gnu -p vesper-glcapture --lib --crate-type rlib

@@ -154,6 +154,7 @@ fn cpu_fallback_repacks_jpeg_samples_as_bt601_full_range() {
     for (sampling, layout) in [("yuvj422p", CpuLayout::Yuy2), ("yuvj420p", CpuLayout::Nv12)] {
         // Odd sizes: the last chroma column and row must be there too.
         let Some(jpeg) = jpeg(RGB, 641, 361, sampling) else {
+            assert!(!vesper_core::gpu_required(), "no ffmpeg CLI");
             eprintln!("no ffmpeg CLI, skipping");
             return;
         };
@@ -286,6 +287,7 @@ fn gpu_decodes_mjpeg_to_an_exported_rgb_frame() {
     .enumerate()
     {
         let Some(jpeg) = jpeg(RGB, w, h, sampling) else {
+            assert!(!vesper_core::gpu_required(), "no ffmpeg CLI");
             eprintln!("no ffmpeg CLI, skipping");
             return;
         };
@@ -329,6 +331,7 @@ fn gpu_surfaces_keep_their_buffer_id_and_return_on_release() {
         return;
     }
     let Some(jpeg) = jpeg(RGB, 640, 480, "yuvj422p") else {
+        assert!(!vesper_core::gpu_required(), "no ffmpeg CLI");
         eprintln!("no ffmpeg CLI, skipping");
         return;
     };
@@ -365,6 +368,7 @@ fn gpu_surfaces_keep_their_buffer_id_and_return_on_release() {
 #[test]
 fn cpu_decoder_rejects_444_jpegs_as_unsupported() {
     let Some(jpeg) = jpeg(RGB, 64, 64, "yuvj444p") else {
+        assert!(!vesper_core::gpu_required(), "no ffmpeg CLI");
         eprintln!("no ffmpeg CLI, skipping");
         return;
     };
