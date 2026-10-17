@@ -5201,6 +5201,7 @@ name = "vesper-mux"
 version = "0.1.0"
 dependencies = [
  "ffmpeg-next",
+ "libc",
  "vesper-core",
  "vesper-encode",
 ]

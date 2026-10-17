@@ -11,6 +11,7 @@ doctest = false
 [dependencies]
 vesper-core.workspace = true
 ffmpeg-next.workspace = true
+libc = "0.2"
 
 [dev-dependencies]
 vesper-encode.workspace = true
