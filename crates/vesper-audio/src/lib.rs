@@ -43,7 +43,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use ffmpeg::format::Sample;
 use ffmpeg::format::sample::Type;
@@ -963,13 +963,15 @@ fn encode_loop(mut enc: Encoder<impl FnMut(EncodedPacket)>, mut rx: ring::Reader
     let mut stalled = false;
     // Length of the last buffer: about a quantum.
     let mut quantum = Duration::ZERO;
-    // The last buffer or fill: a stall is counted from there.
-    let mut since = Instant::now();
+    // When the last buffer reached the ring (not when it was read: the
+    // last few may wait there for a whole block), or the last fill: a
+    // stall is counted from there.
+    let mut since = monotonic_now();
     loop {
         // Before draining: what was pushed before the close is drained.
         let closed = rx.closed();
-        let (mut pad, skip, repeat) = if let Some(start) = rx.next(&mut samples) {
-            (stalled, since) = (false, Instant::now());
+        let (mut pad, skip, repeat) = if let Some((start, pushed)) = rx.next(&mut samples) {
+            (stalled, since) = (false, pushed);
             quantum = frames_to_duration(samples.len() / ch);
             timeline.place(start, samples.len() / ch)
         } else {
@@ -979,7 +981,7 @@ fn encode_loop(mut enc: Encoder<impl FnMut(EncodedPacket)>, mut rx: ring::Reader
                 warn!("audio encoder is behind: {dropped} frames dropped");
             }
             let wait = if stalled { STALL_FILL } else { STALL };
-            let waited = since.elapsed();
+            let waited = monotonic_now().saturating_sub(since);
             if closed {
                 // A stalled track lags by up to `STALL` and one fill: fill
                 // it up to the stop, so it ends with the video.
@@ -1002,7 +1004,7 @@ fn encode_loop(mut enc: Encoder<impl FnMut(EncodedPacket)>, mut rx: ring::Reader
             // the tolerance and a quantum (or a fill, if longer) ago does not
             // cover audio that resumes, and the track keeps up with the
             // others. An input's is stamped its capture delay ago.
-            (stalled, since) = (true, Instant::now());
+            (stalled, since) = (true, monotonic_now());
             let lag = if input {
                 STALL
             } else {
@@ -1443,6 +1445,38 @@ mod tests {
             .map(|(at, pts)| at.saturating_sub(pts))
             .max()
             .unwrap()
+    }
+
+    #[test]
+    fn a_stall_counts_from_the_last_buffer_pushed_not_read() {
+        // Less than a block arrives while the encode thread waits for one:
+        // it stays in the ring, and the stall must still be seen `STALL`
+        // after it came, not `STALL` after it was read.
+        let anchor = monotonic_now();
+        let (chunk_tx, chunk_rx) = ring::ring();
+        let (tx, rx) = mpsc::channel();
+        let enc = Encoder::new(open_encoder().unwrap(), anchor, Arc::default(), move |_| {
+            tx.send(monotonic_now()).unwrap()
+        });
+        let encoder = std::thread::spawn(move || encode_loop(enc, chunk_rx, false));
+        std::thread::sleep(Duration::from_millis(50));
+        let pushed = monotonic_now();
+        // Kept, as a stream keeps it: dropping it would wake the reader.
+        let mut producer = chunk_tx.producer().unwrap();
+        // Captured at the anchor: no gap, so only the fill makes packets.
+        assert!(producer.push(anchor, 100, |_| 0.0));
+        std::thread::sleep(Duration::from_millis(700));
+        drop(producer);
+        drop(chunk_tx);
+        encoder.join().unwrap();
+        let first = rx.iter().next().unwrap();
+        // The first fill makes the first packet.
+        let margin = Duration::from_millis(30);
+        assert!(
+            first < pushed + STALL + STALL_FILL + margin,
+            "first packet {:?} after the buffer",
+            first - pushed
+        );
     }
 
     #[test]

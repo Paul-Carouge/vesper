@@ -1,6 +1,6 @@
 //! Hand-off from the PipeWire real-time thread to the encode thread: a
 //! preallocated, lock-free single-producer single-consumer ring of samples,
-//! with a ring of per-buffer marks (capture time, length) beside it.
+//! with a ring of per-buffer marks (capture time, length, arrival) beside it.
 //!
 //! The producer side is real-time safe: no allocation, no lock, no logging.
 //! Its only syscall is a futex wake of the encode thread (as PipeWire's own
@@ -126,9 +126,13 @@ impl<T: Copy + Default> Queue<T> {
 struct Ring {
     /// Interleaved stereo F32.
     samples: Queue<f32>,
-    /// Per buffer: capture time of its first frame (ns on `CLOCK_MONOTONIC`)
-    /// and its length in frames. Pushed after its samples.
-    marks: Queue<(u64, u32)>,
+    /// Per buffer: capture time of its first frame and when it was pushed
+    /// (ns on `CLOCK_MONOTONIC`), and its length in frames. Pushed after its
+    /// samples.
+    marks: Queue<(u64, u64, u32)>,
+    /// Frames of the marks published and not yet read: what the consumer
+    /// can take now (the samples alone may be ahead of their mark).
+    published: AtomicUsize,
     /// Frames dropped since the consumer last took the count.
     dropped: AtomicU64,
     /// A producer exists: there is only ever one at a time.
@@ -148,9 +152,9 @@ impl Ring {
         }
     }
 
-    /// Frames waiting.
+    /// Frames the consumer can take.
     fn frames(&self) -> usize {
-        self.samples.len() / usize::from(CHANNELS)
+        self.published.load(Ordering::Acquire)
     }
 }
 
@@ -165,6 +169,7 @@ fn ring_of(frames: usize, marks: usize) -> (Writer, Reader) {
     let ring = Arc::new(Ring {
         samples: Queue::new(frames * usize::from(CHANNELS)),
         marks: Queue::new(marks),
+        published: AtomicUsize::new(0),
         dropped: AtomicU64::new(0),
         producing: AtomicBool::new(false),
         closed: AtomicBool::new(false),
@@ -222,9 +227,11 @@ impl Producer {
         // room only grows meanwhile. Samples before their mark.
         unsafe {
             ring.samples.push(n, sample);
+            let pushed = crate::monotonic_now().as_nanos() as u64;
             ring.marks
-                .push(1, |_| (start.as_nanos() as u64, frames as u32));
+                .push(1, |_| (start.as_nanos() as u64, pushed, frames as u32));
         }
+        ring.published.fetch_add(frames, Ordering::Release);
         if self.due() {
             // Again on each push until the consumer runs: a no-op (no
             // syscall) while it is not parked.
@@ -254,22 +261,24 @@ impl Drop for Producer {
 pub(crate) struct Reader(Arc<Ring>);
 
 impl Reader {
-    /// The next buffer: its samples into `out` (replacing what it held), and
-    /// the capture time of its first frame. `None` when none is waiting.
-    pub(crate) fn next(&mut self, out: &mut Vec<f32>) -> Option<Duration> {
+    /// The next buffer: its samples into `out` (replacing what it held), the
+    /// capture time of its first frame and when it was pushed
+    /// (`CLOCK_MONOTONIC`). `None` when none is waiting.
+    pub(crate) fn next(&mut self, out: &mut Vec<f32>) -> Option<(Duration, Duration)> {
         let ring = &*self.0;
         if ring.marks.len() == 0 {
             return None;
         }
         // SAFETY: the only consumer (`&mut self`, one `Reader` per ring); a
         // mark is published after its samples, so they are there.
-        let (start, frames) = unsafe { ring.marks.pop_one() };
+        let (start, pushed, frames) = unsafe { ring.marks.pop_one() };
+        ring.published.fetch_sub(frames as usize, Ordering::Relaxed);
         out.clear();
         unsafe {
             ring.samples
                 .pop(frames as usize * usize::from(CHANNELS), out)
         };
-        Some(Duration::from_nanos(start))
+        Some((Duration::from_nanos(start), Duration::from_nanos(pushed)))
     }
 
     /// The writer is gone. Buffers may still wait: drain them first.
@@ -322,7 +331,10 @@ mod tests {
         for k in 0..500 {
             let frames = 7 + k % 31;
             assert!(p.push(Duration::from_nanos(k as u64), frames, buffer(k)));
-            assert_eq!(r.next(&mut out), Some(Duration::from_nanos(k as u64)));
+            assert_eq!(
+                r.next(&mut out).map(|m| m.0),
+                Some(Duration::from_nanos(k as u64))
+            );
             expect(k, frames, &out);
         }
         assert_eq!(r.next(&mut out), None);
@@ -475,7 +487,7 @@ mod tests {
             let closed = r.closed();
             match r.next(&mut out) {
                 Some(start) => {
-                    let k = start.as_nanos() as usize;
+                    let k = start.0.as_nanos() as usize;
                     expect(k % 10_000, frames(k), &out);
                     got.push(k);
                 }

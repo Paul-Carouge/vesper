@@ -458,7 +458,11 @@ struct Session {
     links: Option<(pw::registry::Listener, Rc<RefCell<AppLinks>>)>,
     listener: Option<pw::stream::StreamListener<()>>,
     /// The real-time process callback. Dropping it is safe while the data
-    /// thread runs: PipeWire clears it under the data loop's lock.
+    /// thread runs: PipeWire (`src/pipewire/stream.c`, checked in 1.6.0)
+    /// calls `process` through `rt_callbacks`, set from the first listener
+    /// with one, not through the hook list, and the hook's `removed`
+    /// (`hook_removed`) clears it under the data loop's lock
+    /// (`pw_loop_locked`) before the closure is freed.
     process: Option<pw::stream::StreamListener<Producer>>,
     stream: pw::stream::StreamRc,
     _core_listener: pw::core::Listener,
