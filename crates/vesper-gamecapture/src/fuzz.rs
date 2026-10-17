@@ -273,6 +273,7 @@ fn server(real_checks: bool) -> (Server, mpsc::Receiver<VideoFrame>) {
         select: Mutex::new(None),
         allowed: Mutex::new(Vec::new()),
         fps: AtomicU32::new(60),
+        sessions: AtomicU32::new(0),
         stop: AtomicBool::new(false),
     });
     let (tx, rx) = mpsc::channel();

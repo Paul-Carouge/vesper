@@ -32,6 +32,7 @@ its own). Raise `TMO` (seconds, default 110) for long runs.
 | Scenario | What it measures |
 | --- | --- |
 | `r2_perf.sh` | CPU, wakeups, mallocs, GPU per thread group while recording or streaming a game. `CASE`: rec, rec3, rec3-vst, stream-own, stream-shared |
+| `r2_pace.sh` | The layer's pacing while recording a game faster than the recording rate (`HZ`, `SIZE`): wakeups of the capture server and of the game's IPC thread, repeated frames in the file (framemd5) |
 | `r2_ui.sh` | Idle cost of the real window under headless gamescope with a fake tray (`r2_fake_tray.py`): shown, hidden, replay on, device list open, audio churn |
 | `r2_latency.sh` / `r2_calib.sh` | Stream arrival jitter at a local RTMP receiver and burstiness on the wire (`r2_wire.py`); `r2_calib.sh` measures the receiver's own jitter with ffmpeg as the source |
 | `r2_fault.sh` | Faults while recording and streaming. `FAULT`: serverdead, tls-untrusted, tls-plain, tls-die (`r2_tlsproxy.py`), pwrestart, pwfreeze, diskfull, gamekill, vstkill, vststorm, vstfreeze, term |
