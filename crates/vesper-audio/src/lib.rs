@@ -1,9 +1,11 @@
 //! Audio capture through PipeWire (desktop, microphone, a device, or an
 //! application's streams), encoded to Opus.
 //!
-//! [`AudioCapture::start`] runs one PipeWire stream (its own thread) and one
-//! encode thread per source. Packets carry `CLOCK_MONOTONIC` pts like the
-//! video frames, so the muxer can put both on one time base. Tracks started
+//! [`AudioCapture::start`] runs one PipeWire stream (its own thread, its
+//! samples copied on PipeWire's real-time thread into a lock-free ring) and
+//! one encode thread per source, woken once per 20 ms block whatever the
+//! graph quantum. Packets carry `CLOCK_MONOTONIC` pts like the video frames,
+//! so the muxer can put both on one time base. Tracks started
 //! with the same anchor are sample-aligned, so a [`Mix`] can sum them.
 //! [`NodeWatch`] lists the devices and applications that can be recorded.
 //!
@@ -35,12 +37,13 @@ mod exclusions;
 mod mix;
 mod nodes;
 mod pw;
+mod ring;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::mpsc;
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ffmpeg::format::Sample;
 use ffmpeg::format::sample::Type;
@@ -380,8 +383,8 @@ impl AudioCapture {
             .gain
             .store(db_to_gain(options.volume_db).to_bits(), Ordering::Relaxed);
         shared.set_ducking(options.ducking);
-        // ~1 s of buffers at the default quantum.
-        let (chunk_tx, chunk_rx) = mpsc::sync_channel(50);
+        // A time's worth of audio, whatever the quantum.
+        let (chunk_tx, chunk_rx) = ring::ring();
         let mut enc = Encoder::new(encoder, options.anchor, shared.clone(), on_packet);
         enc.process = options.process;
         enc.mix = options.mix;
@@ -466,8 +469,8 @@ impl AudioCapture {
 impl Drop for AudioCapture {
     fn drop(&mut self) {
         let _ = self.stop.send(());
-        // The PipeWire thread drops the chunk sender on exit, which ends the
-        // encode thread after it flushed.
+        // The PipeWire thread drops the ring's writer on exit, which ends the
+        // encode thread after it drained and flushed.
         for thread in [self.pw_thread.take(), self.encode_thread.take()]
             .into_iter()
             .flatten()
@@ -664,6 +667,11 @@ impl<F: FnMut(EncodedPacket)> Encoder<F> {
             on_signal: None,
             on_packet,
         }
+    }
+
+    /// Frames waiting for a whole block: the next one needs `FRAME` minus that.
+    fn pending_frames(&self) -> usize {
+        self.pending.len() / usize::from(CHANNELS)
     }
 
     fn push(&mut self, samples: &[f32]) {
@@ -946,26 +954,46 @@ impl Slew {
     }
 }
 
-fn encode_loop(
-    mut enc: Encoder<impl FnMut(EncodedPacket)>,
-    rx: mpsc::Receiver<pw::Chunk>,
-    input: bool,
-) {
+fn encode_loop(mut enc: Encoder<impl FnMut(EncodedPacket)>, mut rx: ring::Reader, input: bool) {
     let mut timeline = Timeline::new(enc.anchor);
     let mut slew = Slew::default();
     let mut out = Vec::new();
+    let mut samples = Vec::new();
     let ch = usize::from(CHANNELS);
     let mut stalled = false;
     // Length of the last buffer: about a quantum.
     let mut quantum = Duration::ZERO;
+    // The last buffer or fill: a stall is counted from there.
+    let mut since = Instant::now();
     loop {
-        let wait = if stalled { STALL_FILL } else { STALL };
-        let (mut pad, skip, repeat, samples) = match rx.recv_timeout(wait) {
-            Ok(chunk) => {
-                stalled = false;
-                quantum = frames_to_duration(chunk.samples.len() / ch);
-                let (pad, skip, repeat) = timeline.place(chunk.start, chunk.samples.len() / ch);
-                (pad, skip, repeat, chunk.samples)
+        // Before draining: what was pushed before the close is drained.
+        let closed = rx.closed();
+        let (mut pad, skip, repeat) = if let Some(start) = rx.next(&mut samples) {
+            (stalled, since) = (false, Instant::now());
+            quantum = frames_to_duration(samples.len() / ch);
+            timeline.place(start, samples.len() / ch)
+        } else {
+            // Drained: what the real-time side could not take, once per burst.
+            let dropped = rx.take_dropped();
+            if dropped > 0 {
+                warn!("audio encoder is behind: {dropped} frames dropped");
+            }
+            let wait = if stalled { STALL_FILL } else { STALL };
+            let waited = since.elapsed();
+            if closed {
+                // A stalled track lags by up to `STALL` and one fill: fill
+                // it up to the stop, so it ends with the video.
+                if stalled {
+                    let drops = slew.flush(&mut out);
+                    enc.push(&out);
+                    let (pad, _, _) = timeline.place(monotonic_now(), 0);
+                    enc.push(&vec![0.0; pad.saturating_sub(drops) * ch]);
+                }
+                break;
+            }
+            if waited < wait {
+                rx.wait(FRAME.saturating_sub(enc.pending_frames()), wait - waited);
+                continue;
             }
             // Stalled source (no device, suspended, nothing playing to an
             // app track or a sink): keep the track continuous. A playback
@@ -974,26 +1002,14 @@ fn encode_loop(
             // the tolerance and a quantum (or a fill, if longer) ago does not
             // cover audio that resumes, and the track keeps up with the
             // others. An input's is stamped its capture delay ago.
-            Err(RecvTimeoutError::Timeout) => {
-                stalled = true;
-                let lag = if input {
-                    STALL
-                } else {
-                    TOLERANCE + STALL_FILL.max(quantum)
-                };
-                let (pad, _, _) = timeline.place(monotonic_now().saturating_sub(lag), 0);
-                (pad, 0, 0, Vec::new())
-            }
-            // A stalled track lags by up to `STALL` and one fill: fill it up
-            // to the stop, so it ends with the video.
-            Err(RecvTimeoutError::Disconnected) if stalled => {
-                let drops = slew.flush(&mut out);
-                enc.push(&out);
-                let (pad, _, _) = timeline.place(monotonic_now(), 0);
-                enc.push(&vec![0.0; pad.saturating_sub(drops) * ch]);
-                break;
-            }
-            Err(RecvTimeoutError::Disconnected) => break,
+            (stalled, since) = (true, Instant::now());
+            let lag = if input {
+                STALL
+            } else {
+                TOLERANCE + STALL_FILL.max(quantum)
+            };
+            samples.clear();
+            timeline.place(monotonic_now().saturating_sub(lag), 0)
         };
         // One frame repeated or dropped is a drift correction, faded in;
         // anything else jumps.
@@ -1029,6 +1045,12 @@ fn encode_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pushes a buffer of interleaved stereo `samples` captured from `start`.
+    fn push(w: &ring::Writer, start: Duration, samples: &[f32]) {
+        let mut producer = w.producer().unwrap();
+        assert!(producer.push(start, samples.len() / 2, |i| samples[i]));
+    }
 
     #[test]
     fn timeline_pads_gaps_and_drops_overlaps() {
@@ -1312,19 +1334,14 @@ mod tests {
         assert_eq!(head[9], CHANNELS as u8);
         let (tx, rx) = mpsc::channel();
         let anchor = Duration::from_secs(10);
-        let (chunk_tx, chunk_rx) = mpsc::channel();
+        let (chunk_tx, chunk_rx) = ring::ring();
         // 1 s of a full-scale square wave, in odd-sized chunks.
         let samples: Vec<f32> = (0..SAMPLE_RATE as usize * 2)
             .map(|i| if (i / 200) % 2 == 0 { 0.5 } else { -0.5 })
             .collect();
         for (i, c) in samples.chunks(1_234).enumerate() {
             let start = anchor + frames_to_duration(i * 1_234 / 2);
-            chunk_tx
-                .send(pw::Chunk {
-                    start,
-                    samples: c.to_vec(),
-                })
-                .unwrap();
+            push(&chunk_tx, start, c);
         }
         drop(chunk_tx);
         let enc = Encoder::new(encoder, anchor, Arc::default(), move |p| {
@@ -1340,15 +1357,51 @@ mod tests {
     }
 
     #[test]
+    fn small_buffers_are_encoded_in_whole_20ms_blocks() {
+        // 1 s of a 1 kHz tone in 64-frame buffers (a 64 quantum), pushed by
+        // another thread in bursts while the encode thread waits for them.
+        let anchor = Duration::from_secs(10);
+        let tone: Vec<f32> = (0..SAMPLE_RATE as usize)
+            .flat_map(|i| [0.5 * (std::f32::consts::TAU * i as f32 / 48.0).sin(); 2])
+            .collect();
+        let (chunk_tx, chunk_rx) = ring::ring();
+        let producer = std::thread::spawn(move || {
+            for (k, c) in tone.chunks(64 * 2).enumerate() {
+                push(&chunk_tx, anchor + frames_to_duration(k * 64), c);
+                if k % 15 == 14 {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+        });
+        let (tx, rx) = mpsc::channel();
+        let encoder = open_encoder().unwrap();
+        let head = opus_head(&encoder).unwrap();
+        let enc = Encoder::new(encoder, anchor, Arc::default(), move |p| {
+            tx.send(p).unwrap()
+        });
+        encode_loop(enc, chunk_rx, false);
+        producer.join().unwrap();
+        let packets: Vec<_> = rx.iter().collect();
+        // 50 blocks and the encoder's padding, back to back.
+        assert!((51..=53).contains(&packets.len()), "{}", packets.len());
+        for w in packets.windows(2) {
+            assert_eq!(w[1].pts - w[0].pts, Duration::from_millis(20));
+        }
+        // No hole: the tone is in every 20 ms of the second (the last fades
+        // out in the codec).
+        let pre_skip = usize::from(u16::from_le_bytes([head[10], head[11]]));
+        let decoded = &decode(&head, &packets)[pre_skip..];
+        for (i, block) in decoded.chunks(FRAME).take(49).enumerate() {
+            let rms = (block.iter().map(|s| s * s).sum::<f32>() / FRAME as f32).sqrt();
+            assert!(rms > 0.3, "block {i}: rms {rms}");
+        }
+    }
+
+    #[test]
     fn stalled_track_is_filled_up_to_the_stop() {
         let anchor = monotonic_now();
-        let (chunk_tx, chunk_rx) = mpsc::channel();
-        chunk_tx
-            .send(pw::Chunk {
-                start: anchor,
-                samples: vec![0.0; FRAME * 2],
-            })
-            .unwrap();
+        let (chunk_tx, chunk_rx) = ring::ring();
+        push(&chunk_tx, anchor, &vec![0.0; FRAME * 2]);
         // The source then stalls for 700 ms before the capture stops.
         let stopper = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(700));
@@ -1373,13 +1426,8 @@ mod tests {
     /// its first buffer of `frames`, once it is stalled (past 450 ms).
     fn stalled_lag(input: bool, frames: usize) -> Duration {
         let anchor = monotonic_now();
-        let (chunk_tx, chunk_rx) = mpsc::channel();
-        chunk_tx
-            .send(pw::Chunk {
-                start: anchor,
-                samples: vec![0.0; frames * 2],
-            })
-            .unwrap();
+        let (chunk_tx, chunk_rx) = ring::ring();
+        push(&chunk_tx, anchor, &vec![0.0; frames * 2]);
         let stopper = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(900));
             drop(chunk_tx);
@@ -1457,15 +1505,10 @@ mod tests {
                 }; 2]
             })
             .collect();
-        let (chunk_tx, chunk_rx) = mpsc::channel();
+        let (chunk_tx, chunk_rx) = ring::ring();
         for (i, c) in samples.chunks(1_024 * 2).enumerate() {
             let start = anchor + frames_to_duration(i * 1_024);
-            chunk_tx
-                .send(pw::Chunk {
-                    start,
-                    samples: c.to_vec(),
-                })
-                .unwrap();
+            push(&chunk_tx, start, c);
         }
         drop(chunk_tx);
         let (tx, rx) = mpsc::channel();
