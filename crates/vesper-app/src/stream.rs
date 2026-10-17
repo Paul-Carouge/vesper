@@ -378,7 +378,8 @@ impl LiveSink {
         }
         (q.want_key, q.congested) = (false, false);
         q.video.push_back((p, Instant::now()));
-        let span = q.video.back().unwrap().0.pts - q.video.front().unwrap().0.pts;
+        // Saturating: pts may go back (an encoder restart), never panic on it.
+        let span = (q.video.back().unwrap().0.pts).saturating_sub(q.video.front().unwrap().0.pts);
         if span > MAX_QUEUE {
             // Congested: drop what waits rather than fall further behind,
             // and resume on the next keyframe.
@@ -625,11 +626,10 @@ impl AudioIn {
             return;
         }
         q.audio.push_back((p, Instant::now()));
-        while q
-            .audio
-            .front()
-            .is_some_and(|(f, _)| q.audio.back().unwrap().0.pts - f.pts > MAX_AUDIO_QUEUE)
-        {
+        // Saturating: `Aac::push` rebases its pts on a jump, so they may go back.
+        while q.audio.front().is_some_and(|(f, _)| {
+            q.audio.back().unwrap().0.pts.saturating_sub(f.pts) > MAX_AUDIO_QUEUE
+        }) {
             q.audio.pop_front();
         }
         drop(q);
@@ -837,6 +837,19 @@ mod tests {
         let q = lock(&s.shared.queue);
         assert_eq!(q.dropped, 65);
         assert_eq!(q.video.len(), 1);
+    }
+
+    #[test]
+    fn pts_going_back_does_not_panic() {
+        let s = sink();
+        lock(&s.shared.queue).connected = true;
+        s.push_video(packet(500, true));
+        s.push_video(packet(100, true));
+        let audio = s.audio_in();
+        audio.push(packet(500, true));
+        audio.push(packet(100, true));
+        let q = lock(&s.shared.queue);
+        assert_eq!((q.video.len(), q.audio.len()), (2, 2));
     }
 
     #[test]
