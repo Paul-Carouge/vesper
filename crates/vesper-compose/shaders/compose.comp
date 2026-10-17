@@ -4,7 +4,10 @@
 // Layers are drawn bottom to top over opaque black. Colours stay in their
 // sRGB encoding: a fully opaque pixel is copied as is (bit-exact when the
 // layer is not scaled), and only pixels with alpha < 1 are blended, in
-// linear light. Textures hold premultiplied alpha.
+// linear light. Textures hold premultiplied alpha. A layer drawn smaller
+// than its source is box filtered (each output pixel averages the source
+// area it covers, in sRGB encoding like the mips and common scalers), so a
+// downscale neither aliases nor skips detail.
 #version 450
 
 layout(local_size_x = 16, local_size_y = 16) in;
@@ -12,7 +15,7 @@ layout(local_size_x = 16, local_size_y = 16) in;
 struct Layer {
     vec4 dst;   // destination rect in output pixels: x0, y0, x1, y1
     vec4 src;   // source texel at dst (x0, y0), then texels per output pixel (x, y)
-    vec4 misc;  // opacity, mip level, 1 / texture width, 1 / texture height
+    vec4 misc;  // opacity, mip level of the box filter, 1 / texture width, 1 / texture height
     uvec4 flags; // x: FLAG_* bits
 };
 
@@ -26,6 +29,10 @@ layout(set = 0, binding = 2) uniform sampler2D textures[16];
 const uint FLAG_NO_ALPHA = 1u; // X formats: the alpha byte is padding
 const uint FLAG_SWAP_RB = 2u;  // the texture holds BGRA
 const uint FLAG_EXACT = 4u;    // 1:1 at whole-pixel offsets: fetch, do not filter
+// Bilinear taps per axis of the box filter at most: past it, every n-th pair.
+// Worst case 64 x 64 taps per pixel (footprints over 126 texels per axis on
+// an image without mips, i.e. a 126:1 downscale of a capture or camera).
+const int MAX_TAPS = 64;
 
 vec3 to_linear(vec3 c) {
     return mix(c / 12.92, pow((c + 0.055) / 1.055, vec3(2.4)), greaterThan(c, vec3(0.04045)));
@@ -33,6 +40,46 @@ vec3 to_linear(vec3 c) {
 
 vec3 to_srgb(vec3 c) {
     return mix(c * 12.92, 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055, greaterThan(c, vec3(0.0031308)));
+}
+
+// Length of [a, b] inside texel `t`.
+float overlap(float a, float b, int t) {
+    return max(min(b, float(t + 1)) - max(a, float(t)), 0.0);
+}
+
+// Average of the source area a pixel covers: `s` is its centre and `k` its
+// size in level-0 texels. Exact overlap weights over the texels of `level`
+// (where a mipmapped texture spans 2 to 4 texels per pixel), two texels per
+// axis per bilinear tap (placed between them by their weights); an axis not
+// downscaled gets a 1-texel footprint, which is bilinear filtering. The
+// weights are exact to the GPU's sub-texel precision (8 bits on RDNA).
+vec4 box(uint i, vec2 s, vec2 k, float level) {
+    int lv = min(int(level), textureQueryLevels(textures[i]) - 1);
+    vec2 size = vec2(textureSize(textures[i], lv));
+    // Mip texel j covers level-0 texels [j, j + 1) * 2^lv (odd edges dropped).
+    vec2 r = vec2(exp2(-float(lv)));
+    vec2 half_k = 0.5 * max(k * r, vec2(1.0));
+    vec2 a = s * r - half_k;
+    vec2 b = s * r + half_k;
+    ivec2 lo = ivec2(floor(a));
+    ivec2 hi = ivec2(ceil(b)) - 1;
+    ivec2 step = 2 * ((hi - lo) / (2 * MAX_TAPS) + 1);
+    vec4 sum = vec4(0.0);
+    float total = 0.0;
+    for (int y = lo.y; y <= hi.y; y += step.y) {
+        float y1 = overlap(a.y, b.y, y + 1);
+        float wy = overlap(a.y, b.y, y) + y1;
+        float py = (float(y) + 0.5 + y1 / wy) / size.y;
+        for (int x = lo.x; x <= hi.x; x += step.x) {
+            float x1 = overlap(a.x, b.x, x + 1);
+            float wx = overlap(a.x, b.x, x) + x1;
+            float px = (float(x) + 0.5 + x1 / wx) / size.x;
+            float w = wx * wy;
+            sum += w * textureLod(textures[i], vec2(px, py), float(lv));
+            total += w;
+        }
+    }
+    return sum / total;
 }
 
 void main() {
@@ -52,8 +99,10 @@ void main() {
         vec4 t;
         if ((l.flags.x & FLAG_EXACT) != 0u) {
             t = texelFetch(textures[i], ivec2(s), 0);
+        } else if (l.src.z > 1.0 || l.src.w > 1.0) {
+            t = box(i, s, l.src.zw, l.misc.y);
         } else {
-            t = textureLod(textures[i], s * l.misc.zw, l.misc.y);
+            t = textureLod(textures[i], s * l.misc.zw, 0.0);
         }
         if ((l.flags.x & FLAG_SWAP_RB) != 0u) {
             t = t.bgra;

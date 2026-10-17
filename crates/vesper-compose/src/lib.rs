@@ -6,7 +6,8 @@
 //! (`/dev/dri/renderD128`, never the iGPU), at low global priority when the
 //! driver allows it so a game keeps the GPU first. One compute shader
 //! (`shaders/compose.comp`, SPIR-V committed) draws up to [`MAX_LAYERS`]
-//! layers per frame. [`Compositor::submit`] queues a composition and
+//! layers per frame; a layer drawn smaller than its source is box filtered
+//! (no aliasing). [`Compositor::submit`] queues a composition and
 //! [`Compositor::poll`] hands the frame over once its fence signalled (VA
 //! has no implicit sync with Vulkan on radeonsi): a caller on a frame clock
 //! never waits longer than it chooses for a GPU busy with a game.
@@ -288,10 +289,22 @@ fn place(d: &Draw, tw: u32, th: u32, cw: u32, ch: u32) -> Option<GpuLayer> {
         return None;
     }
     let exact = kx == 1.0 && ky == 1.0 && sx0.fract() == 0.0 && sy0.fract() == 0.0;
+    // The box filter reads the mip where a pixel spans 2 to 4 texels, or a
+    // lower one where a crop edge would cut a mip texel: no cropped-away
+    // content may enter the edge pixels.
+    let mut level = (kx.min(ky).log2().floor() - 1.0).max(0.0);
+    let cuts = |v: f32, size: f32, step: f32| v != 0.0 && v != size && (v / step).fract() != 0.0;
+    while level > 0.0
+        && [(sx0, tw), (sx1, tw), (sy0, th), (sy1, th)]
+            .iter()
+            .any(|&(v, size)| cuts(v, size, level.exp2()))
+    {
+        level -= 1.0;
+    }
     Some(GpuLayer {
         dst: [dx0, dy0, dx1, dy1],
         src: [sx0, sy0, kx, ky],
-        misc: [opacity, kx.max(ky).log2().max(0.0), 1.0 / tw, 1.0 / th],
+        misc: [opacity, level, 1.0 / tw, 1.0 / th],
         flags: [if exact { FLAG_EXACT } else { 0 }, 0, 0, 0],
     })
 }
@@ -1075,8 +1088,8 @@ impl Compositor {
         self.height
     }
 
-    /// GPU time of the last composition (timestamp queries), when the queue
-    /// supports them.
+    /// GPU time of the last composition (timestamp queries), preview pass
+    /// included, when the queue supports them.
     pub fn gpu_time(&self) -> Option<Duration> {
         self.gpu_time
     }
@@ -1227,8 +1240,8 @@ impl Compositor {
     /// Requests a [`PREVIEW_WIDTH`] x [`PREVIEW_HEIGHT`] RGBA8 downscale of
     /// the next composition and returns the latest finished one not returned
     /// yet. Never waits for the GPU; the small extra pass runs inside the
-    /// next `compose` only after a request. A plain bilinear downscale of the
-    /// canvas (no mips): fine details may alias.
+    /// next `compose` only after a request. A box-filtered downscale of the
+    /// canvas.
     pub fn preview(&mut self) -> Option<&[u8]> {
         if self.lost {
             return None;
@@ -1278,8 +1291,7 @@ impl Compositor {
     /// GPU has read it. Draws of a missing source are skipped. Without
     /// `main`, `Source::Main` draws the kept copy of an earlier one, if any
     /// (else the previous producer's imports are freed). `keep_base`: also
-    /// copy `main` for that (one more pass over it). `main` is sampled
-    /// without mips: a large downscale of it may alias. Fails while another
+    /// copy `main` for that (one more pass over it). Fails while another
     /// composition is in flight.
     pub fn submit(
         &mut self,
@@ -1871,10 +1883,6 @@ impl Compositor {
                     )],
                 );
             }
-            if let Some((pool, _)) = self.queries {
-                d.cmd_write_timestamp(cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, pool, 1);
-            }
-
             if let Some(p) = self.preview.as_ref().filter(|_| preview) {
                 let to_read = [
                     barrier(
@@ -1970,6 +1978,11 @@ impl Compositor {
                         .dst_queue_family_index(ignored)],
                     &[],
                 );
+            }
+
+            // After the preview pass: its cost counts.
+            if let Some((pool, _)) = self.queries {
+                d.cmd_write_timestamp(cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, pool, 1);
             }
 
             // Hand both DMA-BUFs back to their external users (VA, the producer).
@@ -3106,7 +3119,7 @@ mod tests {
         .unwrap();
         assert_eq!(l.dst, [0.0, 0.0, 500.0, 250.0]);
         assert_eq!(l.src[..2], [2000.0, 0.0]);
-        assert_eq!(l.misc[1], 2.0);
+        assert_eq!(l.misc[1], 1.0, "2 texels per pixel on mip 1");
     }
 
     #[test]
