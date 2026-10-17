@@ -885,6 +885,9 @@ msgstr "Impossible de réparer l’enregistrement interrompu {}"
 msgid "recovered"
 msgstr "récupéré"
 
+msgid "The interrupted recording {} still cannot be reached to repair it"
+msgstr "L’enregistrement interrompu {} reste inaccessible et n’a pas pu être réparé"
+
 msgid "Recording partly recovered: {}, the original is kept beside it"
 msgstr "Enregistrement en partie récupéré : {}, l’original est gardé à côté"
 

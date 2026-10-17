@@ -1396,7 +1396,17 @@ fn recover_recordings(ui: &AppWindow) {
                         &ui,
                         &tr!("Could not repair the interrupted recording {}", file),
                     ),
-                    Outcome::Complete | Outcome::Missing | Outcome::Postponed(_) => {}
+                    // Told once: the file still waits after that many launches.
+                    Outcome::Postponed { tries, .. } if tries == vesper_mux::NOTIFY_AFTER_TRIES => {
+                        flash_error(
+                            &ui,
+                            &tr!(
+                                "The interrupted recording {} still cannot be reached to repair it",
+                                file
+                            ),
+                        );
+                    }
+                    Outcome::Complete | Outcome::Missing | Outcome::Postponed { .. } => {}
                 });
             }
         });

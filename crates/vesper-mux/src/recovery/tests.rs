@@ -240,7 +240,10 @@ fn an_unreachable_file_keeps_its_marker() {
     std::fs::set_permissions(&locked, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
     assert_eq!(out.len(), 2);
     for (_, outcome) in &out {
-        assert!(matches!(outcome, Outcome::Postponed(_)), "{outcome:?}");
+        assert!(
+            matches!(outcome, Outcome::Postponed { tries: 1, .. }),
+            "{outcome:?}"
+        );
     }
     assert!(unmounted.exists() && denied.exists());
     std::fs::remove_dir_all(&dir).unwrap();
@@ -351,8 +354,8 @@ fn the_guard_removes_its_marker_only_on_a_clean_end() {
         .next()
         .unwrap()
         .unwrap();
-    let (writer, path) = read_marker(std::fs::read(first.path()).unwrap()).unwrap();
-    assert_eq!((writer, path), (Writer::me(), mkv.clone()));
+    let (writer, path, tries) = read_marker(std::fs::read(first.path()).unwrap()).unwrap();
+    assert_eq!((writer, path, tries), (Writer::me(), mkv.clone(), 0));
     assert!(Writer::me().running());
     clean.end(true);
     wait(0);
@@ -376,4 +379,90 @@ fn cues_positions_past_the_end_are_refused() {
         0x53, 0xac, 0x88, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
     ]);
     assert_eq!(cues_position(&b), None);
+}
+
+#[test]
+fn postponed_tries_are_counted_in_the_marker() {
+    let dir = scratch("tries");
+    let m = marker(&dir, "1-0", &dead(), &dir.join("usb/v.mkv"));
+    for n in 1..=3 {
+        let out = recover_all(&dir);
+        assert!(
+            matches!(out[0].1, Outcome::Postponed { tries, .. } if tries == n),
+            "{:?}",
+            out[0].1
+        );
+        let (_, path, tries) = read_marker(std::fs::read(&m).unwrap()).unwrap();
+        assert_eq!((path, tries), (dir.join("usb/v.mkv"), n));
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn a_refused_packet_keeps_both_files_instead_of_retrying() {
+    let dir = scratch("refused");
+    let mkv = dir.join("v.mkv");
+    record(&mkv, 5, false);
+    // Moves a video block 100+ ms into a cluster back to its start
+    // (SimpleBlock header: A3, size 2004, track 1, relative timecode): its
+    // dts goes backwards, which the muxer refuses with EINVAL.
+    let mut bytes = std::fs::read(&mkv).unwrap();
+    let block = [0xa3, 0x47, 0xd4, 0x81];
+    let at = (bytes.len() / 2..bytes.len())
+        .find(|&i| {
+            bytes[i..].starts_with(&block) && i16::from_be_bytes([bytes[i + 4], bytes[i + 5]]) > 100
+        })
+        .expect("a video block");
+    bytes[at + 4..at + 6].copy_from_slice(&[0, 0]);
+    std::fs::write(&mkv, &bytes).unwrap();
+    let m = marker(&dir, "1-0", &dead(), &mkv);
+
+    let out = recover_all(&dir);
+
+    let Outcome::Partial { copy, reason } = &out[0].1 else {
+        panic!("{:?}", out[0].1);
+    };
+    assert!(reason.contains("1 refused"), "{reason}");
+    assert_eq!(
+        std::fs::read(&mkv).unwrap(),
+        bytes,
+        "the original is untouched"
+    );
+    assert!(finalized(copy).unwrap());
+    assert!(!m.exists(), "not tried again at every launch");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn only_disk_errors_are_transient() {
+    use ffmpeg_next::Error::Other;
+    assert!(transient(&Other { errno: libc::EIO }));
+    assert!(transient(&Other {
+        errno: libc::ENOSPC
+    }));
+    assert!(!transient(&Other {
+        errno: libc::EINVAL
+    }));
+    assert!(!transient(&ffmpeg_next::Error::InvalidData));
+}
+
+#[test]
+fn an_original_changed_during_the_copy_is_not_replaced() {
+    let dir = scratch("changed");
+    let mkv = dir.join("v.mkv");
+    record(&mkv, 3, false);
+    marker(&dir, "1-0", &dead(), &mkv);
+    // Something appends to the original while it is copied.
+    let busy = || {
+        let mut f = std::fs::OpenOptions::new().append(true).open(&mkv).unwrap();
+        f.write_all(b"x").unwrap();
+        false
+    };
+    let out = recover_stale(&dir.join("markers"), "recovered", &busy);
+    let Outcome::Partial { reason, .. } = &out[0].1 else {
+        panic!("{:?}", out[0].1);
+    };
+    assert!(reason.contains("changed"), "{reason}");
+    assert_eq!(names(&dir), ["markers", "v (recovered).mkv", "v.mkv"]);
+    std::fs::remove_dir_all(&dir).unwrap();
 }

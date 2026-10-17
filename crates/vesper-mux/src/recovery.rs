@@ -8,6 +8,12 @@
 //! files with cues and duration. A copy that holds every packet of the
 //! original replaces it; any doubt keeps both files.
 //!
+//! Residual risk: damage the demuxer skips without an error, a log line or
+//! a short track goes unnoticed, and that copy replaces the original. On
+//! the safe side, a track that ends more than 10 s before the end of the
+//! file (where the copy's last packets are read back) counts as short, and
+//! keeps both files.
+//!
 //! The same per-file thread writes the marker (with fsync, off the caller's
 //! thread) and asks the kernel to start writing the file back every
 //! [`SYNC_PERIOD`] (`sync_file_range`, no wait), so a power cut loses seconds
@@ -206,8 +212,9 @@ fn write_marker(dir: &Path, mkv: &Path) -> std::io::Result<PathBuf> {
     Ok(path)
 }
 
-/// Parses a marker: its writer and the file it names.
-fn read_marker(bytes: Vec<u8>) -> Option<(Writer, PathBuf)> {
+/// Parses a marker: its writer, the file it names, and how many times the
+/// recovery was postponed (an optional 4th field).
+fn read_marker(bytes: Vec<u8>) -> Option<(Writer, PathBuf, u32)> {
     let nl = bytes.iter().position(|&b| b == b'\n')?;
     let head = std::str::from_utf8(&bytes[..nl]).ok()?;
     let mut fields = head.split(' ');
@@ -216,9 +223,32 @@ fn read_marker(bytes: Vec<u8>) -> Option<(Writer, PathBuf)> {
         start: fields.next()?.parse().ok()?,
         boot: fields.next()?.to_owned(),
     };
+    let tries = match fields.next() {
+        Some(t) => t.parse().ok()?,
+        None => 0,
+    };
     let path = PathBuf::from(std::ffi::OsString::from_vec(bytes[nl + 1..].to_vec()));
-    (fields.next().is_none() && path.is_absolute()).then_some((writer, path))
+    (fields.next().is_none() && path.is_absolute()).then_some((writer, path, tries))
 }
+
+/// Rewrites `marker` with one more postponed try (not durable: losing
+/// the count only delays the notice).
+fn count_try(marker: &Path, writer: &Writer, mkv: &Path, tries: u32) {
+    let mut bytes =
+        format!("{} {} {} {tries}\n", writer.pid, writer.start, writer.boot).into_bytes();
+    bytes.extend_from_slice(mkv.as_os_str().as_bytes());
+    let name = marker.file_name().unwrap_or_default().to_string_lossy();
+    let tmp = marker.with_file_name(format!(".{name}.tmp"));
+    if std::fs::write(&tmp, bytes)
+        .and_then(|()| std::fs::rename(&tmp, marker))
+        .is_err()
+    {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+/// Postponed tries after which the user is told (once) that a file waits.
+pub const NOTIFY_AFTER_TRIES: u32 = 5;
 
 /// What became of a file named by a stale marker.
 #[derive(Debug)]
@@ -237,8 +267,9 @@ pub enum Outcome {
     /// the next launch.
     NoSpace,
     /// The file cannot be reached now (unmounted disk, I/O error, full
-    /// disk): tried again at the next launch.
-    Postponed(Error),
+    /// disk): tried again at the next launch. `tries`: postponed so many
+    /// times in a row, this one included (see [`NOTIFY_AFTER_TRIES`]).
+    Postponed { error: Error, tries: u32 },
     /// The file cannot be read as a recording; it is left as it was.
     Failed(Error),
 }
@@ -246,7 +277,7 @@ pub enum Outcome {
 impl Outcome {
     /// Whether the marker stays for the next launch.
     fn retry(&self) -> bool {
-        matches!(self, Self::NoSpace | Self::Postponed(_))
+        matches!(self, Self::NoSpace | Self::Postponed { .. })
     }
 }
 
@@ -271,7 +302,7 @@ pub fn recover_stale(dir: &Path, suffix: &str, busy: &dyn Fn() -> bool) -> Vec<(
             }
             continue;
         }
-        let Some((writer, mkv)) = std::fs::read(&marker).ok().and_then(read_marker) else {
+        let Some((writer, mkv, tries)) = std::fs::read(&marker).ok().and_then(read_marker) else {
             eprintln!("[vesper] unreadable recording marker {}", marker.display());
             let _ = std::fs::remove_file(&marker);
             continue;
@@ -279,8 +310,13 @@ pub fn recover_stale(dir: &Path, suffix: &str, busy: &dyn Fn() -> bool) -> Vec<(
         if writer.running() {
             continue;
         }
-        let outcome = recover(&mkv, suffix, busy);
-        if !outcome.retry() {
+        let mut outcome = recover(&mkv, suffix, busy);
+        if let Outcome::Postponed { tries: t, .. } = &mut outcome {
+            *t = tries + 1;
+        }
+        if outcome.retry() {
+            count_try(&marker, &writer, &mkv, tries + 1);
+        } else {
             let _ = std::fs::remove_file(&marker);
         }
         out.push((mkv, outcome));
@@ -301,8 +337,7 @@ fn running_tmp(name: &[u8]) -> bool {
 /// a copy that holds all its packets, read back with cues and a duration,
 /// and synced to the disk; it is never removed or changed otherwise.
 fn recover(mkv: &Path, suffix: &str, busy: &dyn Fn() -> bool) -> Outcome {
-    let postponed =
-        |what: &str, e: std::io::Error| Outcome::Postponed(Error(format!("{what}: {e}")));
+    let postponed = |what: &str, e: std::io::Error| postpone(Error(format!("{what}: {e}")));
     match std::fs::symlink_metadata(mkv) {
         Ok(_) => {}
         // Gone, from a folder that is there: deleted, not unmounted.
@@ -317,13 +352,14 @@ fn recover(mkv: &Path, suffix: &str, busy: &dyn Fn() -> bool) -> Outcome {
     match finalized(mkv) {
         Ok(true) => return Outcome::Complete,
         Ok(false) => {}
-        Err(Fault::Io(e)) => return Outcome::Postponed(e),
+        Err(Fault::Io(e)) => return postpone(e),
         Err(Fault::Bad(e)) => return Outcome::Failed(e),
     }
-    let size = match std::fs::metadata(mkv) {
-        Ok(m) => m.len(),
+    let before = match std::fs::metadata(mkv) {
+        Ok(m) => m,
         Err(e) => return postponed("read the recording", e),
     };
+    let size = before.len();
     // The copy must leave room for a new recording.
     if free_space(mkv).is_some_and(|free| free < size + (size / 10).max(1 << 30)) {
         return Outcome::NoSpace;
@@ -341,6 +377,11 @@ fn recover(mkv: &Path, suffix: &str, busy: &dyn Fn() -> bool) -> Outcome {
                 Ok(false) => Some("the copy has no cues or duration".into()),
                 Err(Fault::Io(e) | Fault::Bad(e)) => Some(e.to_string()),
             });
+            // Something else wrote or replaced the original meanwhile.
+            let doubt = doubt.or_else(|| {
+                (std::fs::metadata(mkv).ok().map(|m| identity(&m)) != Some(identity(&before)))
+                    .then(|| "the original changed during the copy".into())
+            });
             match doubt {
                 None => replace(&tmp, mkv).map(|()| Outcome::Recovered),
                 Some(reason) => {
@@ -349,7 +390,7 @@ fn recover(mkv: &Path, suffix: &str, busy: &dyn Fn() -> bool) -> Outcome {
             }
             .unwrap_or_else(|e| postponed("save the copy", e))
         }
-        Err(Fault::Io(e)) => Outcome::Postponed(e),
+        Err(Fault::Io(e)) => postpone(e),
         Err(Fault::Bad(e)) => Outcome::Failed(e),
     };
     if !matches!(outcome, Outcome::Recovered | Outcome::Partial { .. }) {
@@ -357,6 +398,16 @@ fn recover(mkv: &Path, suffix: &str, busy: &dyn Fn() -> bool) -> Outcome {
         let _ = std::fs::remove_file(&tmp);
     }
     outcome
+}
+
+fn postpone(error: Error) -> Outcome {
+    Outcome::Postponed { error, tries: 0 }
+}
+
+/// What tells a file changed: device, inode, size, modification time.
+fn identity(m: &std::fs::Metadata) -> (u64, u64, u64, i64, i64) {
+    use std::os::unix::fs::MetadataExt;
+    (m.dev(), m.ino(), m.len(), m.mtime(), m.mtime_nsec())
 }
 
 /// Free bytes for this user on `path`'s file system.
@@ -411,15 +462,36 @@ enum Fault {
 }
 
 impl Fault {
-    /// Sorts an FFmpeg error: system errors (EIO, ENOSPC, EACCES...) may
-    /// pass, the rest is in the file.
+    /// Sorts an FFmpeg error: see [`transient`].
     fn ff(what: &str, e: ffmpeg_next::Error) -> Self {
         let error = Error(format!("{what}: {e}"));
-        match e {
-            ffmpeg_next::Error::Other { .. } => Self::Io(error),
-            _ => Self::Bad(error),
+        if transient(&e) {
+            Self::Io(error)
+        } else {
+            Self::Bad(error)
         }
     }
+}
+
+/// Whether an FFmpeg error comes from the disk or the mount, and may pass
+/// by the next launch. Others (e.g. EINVAL for a timestamp going back) are
+/// the file's own: trying again would fail the same way.
+fn transient(e: &ffmpeg_next::Error) -> bool {
+    matches!(
+        e,
+        ffmpeg_next::Error::Other {
+            errno: libc::EIO
+                | libc::ENOSPC
+                | libc::EDQUOT
+                | libc::EACCES
+                | libc::EPERM
+                | libc::EROFS
+                | libc::ENODEV
+                | libc::ENXIO
+                | libc::ESTALE
+                | libc::ENOTCONN
+        }
+    )
 }
 
 /// Whether `path` has a duration and cues, as a finished file has.
@@ -592,7 +664,7 @@ fn remux(src: &Path, dst: &Path, busy: &dyn Fn() -> bool) -> Result<Option<Strin
         match packet.read(&mut input) {
             Ok(()) => in_a_row = 0,
             Err(ffmpeg_next::Error::Eof) => break,
-            Err(e @ ffmpeg_next::Error::Other { .. }) => {
+            Err(e) if transient(&e) => {
                 return Err(Fault::Io(Error(format!("read the recording: {e}"))));
             }
             // The demuxer resyncs to the next cluster after damage.
@@ -625,7 +697,7 @@ fn remux(src: &Path, dst: &Path, busy: &dyn Fn() -> bool) -> Result<Option<Strin
         match packet.write_interleaved(&mut output) {
             Ok(()) => {}
             // The disk (full, failing): the copy is not worth keeping.
-            Err(e @ ffmpeg_next::Error::Other { .. }) => {
+            Err(e) if transient(&e) => {
                 return Err(Fault::Io(Error(format!("write the copy: {e}"))));
             }
             // E.g. a timestamp going back.
