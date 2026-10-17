@@ -266,7 +266,8 @@ pub fn tick_at(ns: u64, fps: u32) -> u64 {
 }
 
 /// Decides which presents the layer copies when recording at `fps`. Only a
-/// game at 4× the recording rate or more (e.g. uncapped) is paced, to about
+/// game at 2.25× the recording rate or more (e.g. 144 fps recorded at 60, or
+/// uncapped) is paced, to about
 /// one copy per recording tick: the newest that still reaches the recorder
 /// before its tick. Any slower game, or one too irregular for a safe window,
 /// has every frame copied as without pacing: the recording must never get a
@@ -279,7 +280,7 @@ pub struct Pacer {
     last_present: u64,
     /// Smoothed time between presents.
     interval: u64,
-    /// Pacing is on: at 4× the recording rate, off again below 3×.
+    /// Pacing is on: at 2.25× the recording rate, off again below 1.75×.
     paced: bool,
     /// Longest recent time between presents (rises at once, decays over
     /// about a second): irregular frame times must not fall through the
@@ -325,9 +326,9 @@ impl Pacer {
             return true;
         }
         // Hysteresis, so a game near the threshold does not flap.
-        if self.interval * 4 <= period {
+        if self.interval * 9 <= period * 4 {
             self.paced = true;
-        } else if self.interval * 3 > period {
+        } else if self.interval * 7 > period * 4 {
             self.paced = false;
         }
         if !self.paced {
@@ -630,14 +631,24 @@ pub(crate) fn create_private_dir(dir: &Path) -> io::Result<()> {
     }
     let mut st: libc::stat = unsafe { zeroed() };
     cvt(unsafe { libc::lstat(c.as_ptr(), &mut st) })?;
-    if st.st_mode & libc::S_IFMT != libc::S_IFDIR
-        || st.st_uid != unsafe { libc::getuid() }
-        || st.st_mode & 0o777 != 0o700
-    {
+    if st.st_uid != unsafe { libc::getuid() } {
+        // Only root can remove it (sticky /tmp): say who can act.
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!(
-                "{} is not a private directory of this user (owner, mode 0700, no symlink); \
+                "{} belongs to another user (uid {}), so game capture is off. \
+                 It goes away when /tmp is cleared at the next reboot, \
+                 or an administrator can remove it",
+                dir.display(),
+                st.st_uid
+            ),
+        ));
+    }
+    if st.st_mode & libc::S_IFMT != libc::S_IFDIR || st.st_mode & 0o777 != 0o700 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "{} is not a private directory (mode 0700, no symlink); \
                  remove it to enable game capture",
                 dir.display()
             ),
@@ -845,6 +856,14 @@ mod tests {
             (fps_of(120.0), 0.5, 60),
             (fps_of(144.0), 0.0, 60),
             (fps_of(144.0), 1.0, 60),
+            (fps_of(144.0), 2.0, 60),
+            (fps_of(150.0), 0.3, 60),
+            (fps_of(165.0), 0.3, 60),
+            (fps_of(165.0), 2.0, 60),
+            (fps_of(175.0), 0.3, 60),
+            (fps_of(180.0), 1.0, 60),
+            (fps_of(200.0), 0.3, 60),
+            (fps_of(90.0), 0.3, 30),
             (fps_of(240.0), 0.3, 60),
             (fps_of(1685.0), 0.1, 60),
             (fps_of(60.0), 0.5, 30),
@@ -885,17 +904,17 @@ mod tests {
                             repeats <= all_repeats,
                             "{case}: {repeats} > {all_repeats} repeats"
                         );
-                        if game < f64::from(fps) * 3.0 {
-                            // Below 3× the recording rate (e.g. 144 → 60, even
-                            // stuttering) every frame is copied.
+                        if game < f64::from(fps) * 1.75 {
+                            // Below 1.75× the recording rate (e.g. 90 → 60,
+                            // even stuttering) every frame is copied.
                             assert_eq!(copies, all, "{case}");
                             assert_eq!(repeats, all_repeats, "{case}");
                         } else if frames.len() == 1
                             && jitter < 500_000
-                            && game > f64::from(fps) * 4.2
+                            && game > f64::from(fps) * 2.3
                             && lat < tick_ns(1, fps) / 4
                         {
-                            // Regular, 4× above it or more, with a short copy
+                            // Regular, 2.3× above it or more, with a short copy
                             // (also soon after a pause): about one copy per
                             // tick. Irregular, or a slow copy, copies more.
                             assert!(
@@ -932,8 +951,20 @@ mod tests {
         let link = base.join("link");
         std::os::unix::fs::symlink(&dir, &link).unwrap();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-        assert!(create_private_dir(&link).is_err());
+        let err = create_private_dir(&link).unwrap_err().to_string();
+        assert!(err.contains("remove it to enable"), "{err}");
         std::fs::remove_dir_all(&base).unwrap();
+        // Another user's (root's /tmp): only an admin or a reboot clears it.
+        if unsafe { libc::getuid() } != 0 {
+            let err = create_private_dir(Path::new("/tmp"))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("another user (uid 0)"), "{err}");
+            assert!(
+                err.contains("reboot") && !err.contains("to enable"),
+                "{err}"
+            );
+        }
     }
 
     #[test]
