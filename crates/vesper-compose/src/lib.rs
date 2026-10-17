@@ -289,16 +289,22 @@ fn place(d: &Draw, tw: u32, th: u32, cw: u32, ch: u32) -> Option<GpuLayer> {
         return None;
     }
     let exact = kx == 1.0 && ky == 1.0 && sx0.fract() == 0.0 && sy0.fract() == 0.0;
+    // The box filter reads the mip where a pixel spans 2 to 4 texels, or a
+    // lower one where a crop edge would cut a mip texel: no cropped-away
+    // content may enter the edge pixels.
+    let mut level = (kx.min(ky).log2().floor() - 1.0).max(0.0);
+    let cuts = |v: f32, size: f32, step: f32| v != 0.0 && v != size && (v / step).fract() != 0.0;
+    while level > 0.0
+        && [(sx0, tw), (sx1, tw), (sy0, th), (sy1, th)]
+            .iter()
+            .any(|&(v, size)| cuts(v, size, level.exp2()))
+    {
+        level -= 1.0;
+    }
     Some(GpuLayer {
         dst: [dx0, dy0, dx1, dy1],
         src: [sx0, sy0, kx, ky],
-        // The box filter reads the mip where a pixel spans 2 to 4 texels.
-        misc: [
-            opacity,
-            (kx.min(ky).log2().floor() - 1.0).max(0.0),
-            1.0 / tw,
-            1.0 / th,
-        ],
+        misc: [opacity, level, 1.0 / tw, 1.0 / th],
         flags: [if exact { FLAG_EXACT } else { 0 }, 0, 0, 0],
     })
 }

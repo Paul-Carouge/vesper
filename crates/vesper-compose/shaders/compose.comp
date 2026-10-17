@@ -30,6 +30,8 @@ const uint FLAG_NO_ALPHA = 1u; // X formats: the alpha byte is padding
 const uint FLAG_SWAP_RB = 2u;  // the texture holds BGRA
 const uint FLAG_EXACT = 4u;    // 1:1 at whole-pixel offsets: fetch, do not filter
 // Bilinear taps per axis of the box filter at most: past it, every n-th pair.
+// Worst case 64 x 64 taps per pixel (footprints over 126 texels per axis on
+// an image without mips, i.e. a 126:1 downscale of a capture or camera).
 const int MAX_TAPS = 64;
 
 vec3 to_linear(vec3 c) {

@@ -541,6 +541,43 @@ fn downscaled_textures_match_an_area_filter() {
     assert!(e <= 2.0, "off by {e}");
 }
 
+/// A cropped texture drawn much smaller shows nothing of what the crop cut
+/// away, even when its edge falls inside a mip texel (odd sizes, crop at an
+/// odd column): pure red outside the crop must not tint the edge pixels.
+#[test]
+fn cropped_downscaled_textures_do_not_bleed() {
+    if !gpu() {
+        return;
+    }
+    let (tw, th, cut) = (801, 601, 103);
+    let mut src = detailed(tw, th);
+    for y in 0..th {
+        for x in 0..cut {
+            let i = ((y * tw + x) * 4) as usize;
+            src[i..i + 4].copy_from_slice(&[255, 0, 0, 255]);
+        }
+    }
+    let mut c = Compositor::new(PREVIEW_WIDTH, PREVIEW_HEIGHT).unwrap();
+    c.set_texture(1, tw, th, &src).unwrap();
+    // 698x601 texels into 87x75 pixels at (40, 20): about 8:1.
+    let (cw, ch) = (PREVIEW_WIDTH as f32, PREVIEW_HEIGHT as f32);
+    let (ow, oh) = (87, 75);
+    let draw = Draw {
+        rect: [40.0 / cw, 20.0 / ch, ow as f32 / cw, oh as f32 / ch],
+        crop: [cut as f32 / tw as f32, 0.0, 0.0, 0.0],
+        ..full(Source::Texture(1), Fit::Stretch, 1.0)
+    };
+    let (_, px) = compose_read(&mut c, None, &[draw]);
+    let reference = area(&src, tw, [cut, 0, tw - cut, th], ow, oh);
+    let mut drawn = Vec::new();
+    for y in 20..20 + oh {
+        let row = (y * PREVIEW_WIDTH + 40) as usize * 4;
+        drawn.extend_from_slice(&px[row..row + ow as usize * 4]);
+    }
+    let e = max_error(&drawn, &reference);
+    assert!(e <= 2.0, "off by {e}");
+}
+
 /// A kept copy of the main frame stands in for it, bit-exact, once the
 /// frame itself went back to its producer.
 #[test]
