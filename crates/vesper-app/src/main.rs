@@ -1346,8 +1346,11 @@ fn recording_markers() -> Option<PathBuf> {
 }
 
 /// Repairs, on its own thread, the recordings a kill, crash or power cut
-/// left without cues and duration, and tells about each one.
+/// left without cues and duration, and tells about each one. At idle I/O
+/// and CPU priority, and paused while a file is written: a recording or a
+/// game started meanwhile must not notice it.
 fn recover_recordings(ui: &AppWindow) {
+    use vesper_mux::Outcome;
     let Some(dir) = recording_markers() else {
         return;
     };
@@ -1356,26 +1359,65 @@ fn recover_recordings(ui: &AppWindow) {
     let spawned = std::thread::Builder::new()
         .name("vesper-recover".into())
         .spawn(move || {
-            for (path, outcome) in vesper_mux::recover_stale(&dir, suffix) {
+            lower_priority();
+            let mut told_space = false;
+            for (path, outcome) in vesper_mux::recover_stale(&dir, suffix, &vesper_mux::writing) {
                 log!("interrupted recording {}: {outcome:?}", path.display());
-                let name = path.file_name().map_or_else(
-                    || path.display().to_string(),
-                    |n| n.to_string_lossy().into_owned(),
-                );
+                let name = |p: &Path| {
+                    p.file_name().map_or_else(
+                        || p.display().to_string(),
+                        |n| n.to_string_lossy().into_owned(),
+                    )
+                };
+                let file = name(&path);
+                // One notice for all the files waiting for room.
+                if matches!(outcome, Outcome::NoSpace) && std::mem::replace(&mut told_space, true) {
+                    continue;
+                }
                 let _ = weak.upgrade_in_event_loop(move |ui| match outcome {
-                    vesper_mux::Outcome::Recovered => {
-                        announce_saved(&ui, &tr!("Recording recovered: {}", name), path);
+                    Outcome::Recovered => {
+                        announce_saved(&ui, &tr!("Recording recovered: {}", file), path);
                     }
-                    vesper_mux::Outcome::Failed(_) => flash_error(
+                    Outcome::Partial { copy, .. } => {
+                        let text = tr!(
+                            "Recording partly recovered: {}, the original is kept beside it",
+                            name(&copy)
+                        );
+                        announce_saved(&ui, &text, copy);
+                    }
+                    Outcome::NoSpace => flash_error(
                         &ui,
-                        &tr!("Could not repair the interrupted recording {}", name),
+                        &tr!(
+                            "Not enough free space to repair {}: it will be tried again at the next launch",
+                            file
+                        ),
                     ),
-                    vesper_mux::Outcome::Complete | vesper_mux::Outcome::Missing => {}
+                    Outcome::Failed(_) => flash_error(
+                        &ui,
+                        &tr!("Could not repair the interrupted recording {}", file),
+                    ),
+                    Outcome::Complete | Outcome::Missing | Outcome::Postponed(_) => {}
                 });
             }
         });
     if let Err(e) = spawned {
         log!("could not start recovering recordings: {e}");
+    }
+}
+
+/// Idle I/O class and lowest CPU priority for the calling thread.
+fn lower_priority() {
+    const IOPRIO_WHO_PROCESS: libc::c_int = 1;
+    const IOPRIO_CLASS_IDLE: libc::c_int = 3;
+    // Who 0: the calling thread. Best effort: a refusal leaves it as it was.
+    unsafe {
+        libc::syscall(
+            libc::SYS_ioprio_set,
+            IOPRIO_WHO_PROCESS,
+            0,
+            IOPRIO_CLASS_IDLE << 13,
+        );
+        libc::setpriority(libc::PRIO_PROCESS, libc::gettid() as libc::id_t, 19);
     }
 }
 

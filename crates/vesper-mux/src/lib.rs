@@ -29,7 +29,7 @@ use vesper_core::{Codec, EncodedPacket};
 mod live;
 mod recovery;
 pub use live::{Live, LiveAudio, LiveError, LiveErrorKind, redact};
-pub use recovery::{Outcome, SYNC_PERIOD, finalized, recover, recover_stale, set_marker_dir};
+pub use recovery::{Outcome, SYNC_PERIOD, recover_stale, set_marker_dir, writing};
 
 const NANOS: ff::AVRational = ff::AVRational {
     num: 1,

@@ -885,6 +885,12 @@ msgstr "Impossible de réparer l’enregistrement interrompu {}"
 msgid "recovered"
 msgstr "récupéré"
 
+msgid "Recording partly recovered: {}, the original is kept beside it"
+msgstr "Enregistrement en partie récupéré : {}, l’original est gardé à côté"
+
+msgid "Not enough free space to repair {}: it will be tried again at the next launch"
+msgstr "Pas assez d’espace libre pour réparer {} : nouvel essai au prochain lancement"
+
 msgid "Recording without the audio track {}"
 msgstr "Enregistrement sans la piste audio {}"
 
