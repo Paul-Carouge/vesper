@@ -94,7 +94,18 @@ struct Shared {
     /// Recording rate frames are wanted at, 0 for none
     /// ([`GameCapture::set_active`]).
     fps: AtomicU32,
+    /// Bumped when `fps` goes from 0 to a rate: a new recording.
+    sessions: AtomicU32,
     stop: AtomicBool,
+}
+
+impl Shared {
+    fn set_fps(&self, fps: Option<u32>) {
+        let fps = fps.map_or(0, |f| f.max(1));
+        if self.fps.swap(fps, Ordering::SeqCst) == 0 && fps > 0 {
+            self.sessions.fetch_add(1, Ordering::SeqCst);
+        }
+    }
 }
 
 /// A running game capture server. Dropping it stops the capture.
@@ -141,6 +152,7 @@ impl GameCapture {
             select: Mutex::new(None),
             allowed: Mutex::new(Vec::new()),
             fps: AtomicU32::new(0),
+            sessions: AtomicU32::new(0),
             stop: AtomicBool::new(false),
         });
         let s = shared.clone();
@@ -199,8 +211,7 @@ impl GameCapture {
     /// pass-through and [`Game::captured`] is false, but games and consent
     /// are still listed.
     pub fn set_active(&self, fps: Option<u32>) {
-        let fps = fps.map_or(0, |f| f.max(1));
-        self.shared.fps.store(fps, Ordering::SeqCst);
+        self.shared.set_fps(fps);
         self.wake();
     }
 
@@ -255,8 +266,6 @@ struct Client {
     height: u32,
     /// Order of its first non-empty `Swapchain` message, for auto-selection.
     announced: u64,
-    /// Order of its connection.
-    connected: u64,
     /// Ring announced by the layer while started.
     ring: Option<Ring>,
 }
@@ -285,12 +294,14 @@ struct Server {
     /// Reused every poll round.
     candidates: Vec<Candidate>,
     announce_seq: u64,
-    connect_seq: u64,
-    /// `connect_seq` when the captured game left while active: until the
-    /// capture goes inactive, automatic selection only takes games connected
-    /// since (a new launch), not the launcher it came from (Steam games pass
-    /// their `SteamAppId`, and with it consent, to their launcher).
+    /// `announced` of the captured game that left while active: until the
+    /// capture goes inactive, automatic selection only takes games announced
+    /// after it (a new launch, or a game that came up while its launcher was
+    /// captured), not the launcher it came from (Steam games pass their
+    /// `SteamAppId`, and with it consent, to their launcher).
     departed: Option<u64>,
+    /// `Shared::sessions` seen by the last `reselect`.
+    session: u32,
     pool_generation: u32,
     /// `protocol::is_sync_file` / `protocol::is_dmabuf`; replaced in tests
     /// (no GPU to make them).
@@ -404,8 +415,8 @@ impl Server {
             started_fps: 0,
             candidates: Vec::new(),
             announce_seq: 0,
-            connect_seq: 0,
             departed: None,
+            session: 0,
             pool_generation: 0,
             is_sync_file: protocol::is_sync_file,
             is_dmabuf: protocol::is_dmabuf,
@@ -522,7 +533,6 @@ impl Server {
     }
 
     fn add_client(&mut self, sock: OwnedFd, pid: u32, exe: String, steam: bool) {
-        self.connect_seq += 1;
         self.clients.push(Client {
             sock: Arc::new(sock),
             pid,
@@ -534,7 +544,6 @@ impl Server {
             width: 0,
             height: 0,
             announced: 0,
-            connected: self.connect_seq,
             ring: None,
         });
     }
@@ -781,7 +790,7 @@ impl Server {
         {
             self.started = None;
             if self.shared.fps.load(Ordering::SeqCst) > 0 {
-                self.departed = Some(self.connect_seq);
+                self.departed = Some(c.announced);
             }
         }
     }
@@ -793,6 +802,14 @@ impl Server {
     /// Starts the chosen game and stops the previous one.
     fn reselect(&mut self) {
         let select = *self.shared.select.lock().unwrap();
+        let fps = self.shared.fps.load(Ordering::SeqCst);
+        // Inactive, or a new recording (even if stopped and started again
+        // between two rounds).
+        let session = self.shared.sessions.load(Ordering::SeqCst);
+        if fps == 0 || session != self.session {
+            self.departed = None;
+            self.session = session;
+        }
         let current = self
             .started
             .as_ref()
@@ -809,13 +826,9 @@ impl Server {
                 // A game sending frames is alive: no syscall per frame.
                 stale: Some(i) == current
                     && (silent > STALE_AFTER || (silent > LIVENESS_AFTER && !(self.alive)(c.pid))),
-                fresh: self.departed.is_none_or(|d| c.connected > d),
+                fresh: self.departed.is_none_or(|d| c.announced > d),
             }
         }));
-        let fps = self.shared.fps.load(Ordering::SeqCst);
-        if fps == 0 {
-            self.departed = None;
-        }
         let want = if fps > 0 {
             choose(&candidates, select, current)
         } else {
@@ -1010,6 +1023,22 @@ mod tests {
     #[test]
     fn after_the_game_quits_only_a_new_launch_is_picked() {
         let (mut s, _rx) = server();
+        // Recording the launcher; the game comes up (connects, announces
+        // its swapchain) while the launcher still presents, then the
+        // launcher closes: the game is picked.
+        let (_, launcher) = connect(&mut s, "steam-launcher", true);
+        s.reselect();
+        assert!(matches!(next(&launcher), Some(Msg::Start { .. })));
+        let (_, game) = connect(&mut s, "game.exe", true);
+        s.reselect();
+        assert_eq!(next(&game), None);
+        s.remove_client(0);
+        s.reselect();
+        assert!(matches!(next(&game), Some(Msg::Start { .. })));
+        s.remove_client(0);
+        s.reselect();
+        assert!(s.started.is_none());
+
         // The launcher has a window and inherited the game's SteamAppId.
         let (_, launcher) = connect(&mut s, "steam-launcher", true);
         s.shared.select.lock().unwrap().replace(s.clients[0].pid);
@@ -1045,9 +1074,9 @@ mod tests {
         s.remove_client(g);
         s.reselect();
         assert_eq!(next(&launcher), None);
-        s.shared.fps.store(0, Ordering::SeqCst);
-        s.reselect();
-        s.shared.fps.store(60, Ordering::SeqCst);
+        // Stopped and started again before the server's next round.
+        s.shared.set_fps(None);
+        s.shared.set_fps(Some(60));
         s.reselect();
         assert!(matches!(next(&launcher), Some(Msg::Start { .. })));
     }
@@ -1093,6 +1122,7 @@ mod tests {
             select: Mutex::new(None),
             allowed: Mutex::new(Vec::new()),
             fps: AtomicU32::new(60),
+            sessions: AtomicU32::new(0),
             stop: AtomicBool::new(false),
         });
         let (tx, rx) = mpsc::channel();
