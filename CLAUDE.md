@@ -7,7 +7,7 @@ Fast, bloat-free screen recorder in Rust. See README.md for goals, architecture 
 - `crates/vesper-core`: shared types (`VideoFrame`, `EncodedPacket`, `Codec`). Change only with care: every crate depends on it.
 - `crates/vesper-capture`: xdg-desktop-portal ScreenCast + PipeWire, DMA-BUF frames; `camera` streams webcams straight from PipeWire (MJPEG decoded by VAAPI into DMA-BUF frames, raw YUY2/NV12 as CPU frames for the compositor to convert).
 - `crates/vesper-gamecapture`: game capture server (Unix socket) and its wire protocol, DMA-BUF frames from the layer; `client` is the game side shared by the layer and the GL interposer (connection thread, blocklist).
-- `crates/vesper-vklayer`: implicit Vulkan layer (cdylib) loaded into games; copies presented images into exported DMA-BUFs. Must never crash or block the game. `install.sh` installs it per user. Also built for i686 (32-bit games) when the target is installed; optional, CI does not build it.
+- `crates/vesper-vklayer`: implicit Vulkan layer (cdylib) loaded into games; copies presented images into exported DMA-BUFs. Must never crash or block the game. `install.sh` installs it per user. Also built for i686 (32-bit games) by `install.sh` and the PKGBUILD; CI compiles the i686 layer and GL interposer (no link).
 - `crates/vesper-glcapture`: `LD_PRELOAD` interposer (cdylib) for native OpenGL games, loaded per game by the `vesper-gl` wrapper; blits swapped frames into exported DMA-BUFs. Same rules as the layer.
 - `crates/vesper-encode`: VAAPI hardware encoding.
 - `crates/vesper-compose`: scene compositor (Vulkan compute through `ash`, libvulkan loaded at run time): imports the main frame's DMA-BUF, draws overlay textures and webcams (copied into its own images, YUV converted by `shaders/camera.comp`) with crop, fit and opacity, and returns an exported XR24 ring frame for `vesper-encode`. Runs on renderD128's async compute queue at low global priority. Its shaders' SPIR-V is committed: edit `shaders/*.comp`, then run `scripts/shaders.sh`.
@@ -26,6 +26,7 @@ KDE Plasma on Wayland, PipeWire 1.6, AMD RX 9070 (RDNA4, Mesa radeonsi) on `/dev
 - Keep frames on the GPU. No CPU readback in the hot path.
 - No dependency for a few lines of code.
 - User-visible text is translated: `@tr(...)` in Slint, `tr!(...)` in Rust (see `i18n.rs`), with its French in `crates/vesper-app/lang/fr/LC_MESSAGES/vesper-app.po`. The `every_string_has_a_french_translation` test fails on a missing entry and prints it.
-- Before every commit: `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`.
+- Before every commit: `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`, `VESPER_REQUIRE_GPU=1 cargo test --workspace`. GPU tests skip without `/dev/dri/renderD128` (CI); `VESPER_REQUIRE_GPU=1` makes them fail instead, so on the dev machine a skip can't pass for a run. New GPU tests start with `if !vesper_core::test_gpu() { return; }`.
+- The toolchain is pinned in `rust-toolchain.toml` (CI uses it too). Keyring tests are `#[ignore]`d; `scripts/secret_tests.sh` runs them against a fake Secret Service on a private bus (CI does).
 - Branches: `feat/<topic>`, `fix/<topic>`, `chore/<topic>`. One topic per branch, merged through a PR into `master`.
 - Commits: Conventional Commits, in English.

@@ -1,6 +1,5 @@
 mod common;
 
-use std::path::Path;
 use std::time::Duration;
 
 use common::producer::{POOL, Producer};
@@ -13,8 +12,7 @@ use vesper_mux::{Muxer, VideoTrack};
 
 #[test]
 fn muxes_hevc_and_opus_readable_by_libavformat() {
-    if !Path::new("/dev/dri/renderD128").exists() {
-        eprintln!("no GPU, skipping");
+    if !vesper_core::test_gpu() {
         return;
     }
     const FRAMES: u32 = 30;

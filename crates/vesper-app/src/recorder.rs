@@ -36,7 +36,6 @@
 use std::collections::VecDeque;
 use std::fs::OpenOptions;
 use std::io::ErrorKind;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -2867,17 +2866,9 @@ pub fn load_restore_token() -> Option<String> {
 
 fn save_restore_token(token: &str) -> std::io::Result<()> {
     let path = token_path().ok_or(std::io::ErrorKind::NotFound)?;
-    std::fs::create_dir_all(path.parent().unwrap_or(Path::new("/")))?;
-    // Private: the token lets anyone running as this user record the source.
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)?;
-    // `mode` only applies on creation; fix older files too.
-    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    std::io::Write::write_all(&mut file, token.as_bytes())
+    // Private (0600, the token lets anyone running as this user record the
+    // source) and atomic: a crash mid-write must not leave an empty token.
+    crate::prefs::write_file(&path, token.as_bytes(), true)
 }
 
 /// Forgets the source so the next recording opens the portal picker.

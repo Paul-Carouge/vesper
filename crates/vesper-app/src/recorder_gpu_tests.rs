@@ -77,8 +77,7 @@ struct Rig {
 
 impl Rig {
     fn new() -> Option<Self> {
-        if !Path::new("/dev/dri/renderD128").exists() {
-            eprintln!("no GPU, skipping");
+        if !vesper_core::test_gpu() {
             return None;
         }
         let route = GameFrames::default();
@@ -124,6 +123,7 @@ fn event(rx: &Receiver<Event>) -> Option<Event> {
                 | Event::DesktopExcept(_),
             ) => {}
             Ok(Event::Stopped(Some(e))) if e.contains("Could not open the encoder") => {
+                assert!(!vesper_core::gpu_required(), "no VAAPI encoder: {e}");
                 eprintln!("no VAAPI encoder ({e}), skipping");
                 return None;
             }

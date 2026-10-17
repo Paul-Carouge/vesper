@@ -82,6 +82,27 @@ pub fn next_pool_generation() -> u32 {
     }
 }
 
+/// Whether `VESPER_REQUIRE_GPU=1` is set: GPU tests must then fail, not skip,
+/// when the GPU is missing (the dev machine runs the suite this way).
+pub fn gpu_required() -> bool {
+    std::env::var_os("VESPER_REQUIRE_GPU").is_some_and(|v| v == "1")
+}
+
+/// For GPU tests: whether `/dev/dri/renderD128` exists. Without it the test
+/// should return early, unless [`gpu_required`], which panics instead so a
+/// skipped GPU test can't pass for a run one.
+pub fn test_gpu() -> bool {
+    let ok = std::path::Path::new("/dev/dri/renderD128").exists();
+    if !ok {
+        assert!(
+            !gpu_required(),
+            "VESPER_REQUIRE_GPU=1 but /dev/dri/renderD128 is missing"
+        );
+        eprintln!("no GPU, skipping");
+    }
+    ok
+}
+
 /// Video codecs supported by the hardware encoder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Codec {
