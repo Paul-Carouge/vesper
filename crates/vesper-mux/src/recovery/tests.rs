@@ -236,16 +236,20 @@ fn an_unreachable_file_keeps_its_marker() {
     std::fs::create_dir(&locked).unwrap();
     let denied = marker(&dir, "1-1", &dead(), &locked.join("v.mkv"));
     std::fs::set_permissions(&locked, std::os::unix::fs::PermissionsExt::from_mode(0o0)).unwrap();
+    // Root (e.g. a CI container) bypasses the mode: no EACCES to test there.
+    if unsafe { libc::geteuid() } == 0 {
+        std::fs::remove_file(&denied).unwrap();
+    }
     let out = recover_all(&dir);
     std::fs::set_permissions(&locked, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
-    assert_eq!(out.len(), 2);
+    assert_eq!(out.len(), if denied.exists() { 2 } else { 1 });
     for (_, outcome) in &out {
         assert!(
             matches!(outcome, Outcome::Postponed { tries: 1, .. }),
             "{outcome:?}"
         );
     }
-    assert!(unmounted.exists() && denied.exists());
+    assert!(unmounted.exists() && (denied.exists() || unsafe { libc::geteuid() } == 0));
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
