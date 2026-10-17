@@ -244,6 +244,10 @@ fn main() -> Result<(), slint::PlatformError> {
     let (mut failures, mut retry_at) = (0u32, Instant::now());
     let games_tick = move || {
         let Some(ui) = weak.upgrade() else { return };
+        // Back in game mode (the tick was stopped meanwhile): a fresh start.
+        if GAMES_TICK_FRESH.with(|f| f.replace(false)) {
+            (failures, retry_at) = (0, Instant::now());
+        }
         if ui.get_source_kind() != SourceKind::Game {
             failures = 0;
             return;
@@ -821,13 +825,18 @@ fn show_layer_state(ui: &AppWindow) {
 thread_local! {
     /// Game mode's tick (see `main`), stopped outside game mode.
     static GAMES_TICK_TIMER: slint::Timer = slint::Timer::default();
+    /// Set when the tick starts again: it forgets the last failures.
+    static GAMES_TICK_FRESH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Runs the games tick in game mode only: no wakeups otherwise. Does nothing
 /// before `main` starts it.
 fn set_games_tick(on: bool) {
     GAMES_TICK_TIMER.with(|t| match (on, t.running()) {
-        (true, false) => t.restart(),
+        (true, false) => {
+            GAMES_TICK_FRESH.with(|f| f.set(true));
+            t.restart();
+        }
         (false, true) => t.stop(),
         _ => {}
     });
@@ -1236,16 +1245,32 @@ fn show_error(ui: &AppWindow, text: &str) {
     ui.set_notice_error(true);
 }
 
-/// Hides the notice (its close button).
+thread_local! {
+    /// The last plain notice that came while an error was shown: it shows
+    /// once the error is closed.
+    static NOTICE_AFTER_ERROR: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+/// Hides the notice (its close button), then shows one that waited.
 fn dismiss_notice(ui: &AppWindow) {
     NOTICE_GENERATION.fetch_add(1, Ordering::Relaxed);
     ui.set_notice("".into());
     ui.set_notice_has_file(false);
     ui.set_notice_error(false);
+    if let Some(text) = NOTICE_AFTER_ERROR.with(|n| n.borrow_mut().take()) {
+        show_notice(ui, &text, None);
+    }
 }
 
-/// Shows a notice, with Open and Play buttons for `file`, then hides it.
+/// Shows a notice, with Open and Play buttons for `file`, then hides it. A
+/// plain notice waits while an error is shown: it would hide it for good.
 fn show_notice(ui: &AppWindow, text: &str, file: Option<PathBuf>) {
+    if file.is_none() && ui.get_notice_error() && !ui.get_notice().is_empty() {
+        NOTICE_AFTER_ERROR.with(|n| *n.borrow_mut() = Some(text.to_owned()));
+        return;
+    }
+    // A saved file replaces the error: what waited is old news.
+    NOTICE_AFTER_ERROR.with(|n| n.borrow_mut().take());
     let generation = NOTICE_GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
     ui.set_notice(text.into());
     ui.set_notice_has_file(file.is_some());
@@ -1357,10 +1382,14 @@ mod tests {
         assert!(!GAMES_TICK_TIMER.with(slint::Timer::running));
         set_games_tick(false);
         assert!(!GAMES_TICK_TIMER.with(slint::Timer::running));
+        GAMES_TICK_FRESH.with(|f| f.set(false));
         set_games_tick(true);
         assert!(GAMES_TICK_TIMER.with(slint::Timer::running));
+        // Started again: its next tick forgets the old failures.
+        assert!(GAMES_TICK_FRESH.with(|f| f.replace(false)));
         set_games_tick(true);
         assert!(GAMES_TICK_TIMER.with(slint::Timer::running));
+        assert!(!GAMES_TICK_FRESH.with(std::cell::Cell::get));
     }
 
     #[test]

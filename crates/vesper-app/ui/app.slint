@@ -1444,6 +1444,11 @@ export component AppWindow inherits Window {
                 root.open-settings();
                 return accept;
             }
+            // An error first: it stays until closed.
+            if (event.text == Key.Escape && root.notice != "" && root.notice-error) {
+                root.dismiss-notice();
+                return accept;
+            }
             if (event.text == Key.Escape && root.settings-open) {
                 root.close-settings();
                 return accept;
@@ -2424,9 +2429,14 @@ export component AppWindow inherits Window {
                         }
                         // The source picker: one tap adds a track.
                         if root.picking: VerticalLayout {
-                            // Shown once laid out, and as sources come and go.
+                            // Shown once laid out (its height is 0 at first),
+                            // not again as sources come and go.
+                            property <bool> revealed;
                             changed height => {
-                                root.reveal(self.absolute-position.y, self.height);
+                                if (!self.revealed && self.height > 0px) {
+                                    self.revealed = true;
+                                    root.reveal(self.absolute-position.y, self.height);
+                                }
                             }
                             padding-left: Theme.card-padding - Theme.space-xs - Theme.space-sm;
                             padding-bottom: Theme.space-xs;
