@@ -1,8 +1,12 @@
-//! The PipeWire thread: one capture stream, samples sent to the encode thread.
+//! The PipeWire thread: one capture stream, samples handed to the encode
+//! thread through a `ring`. The stream's process callback runs on
+//! PipeWire's real-time data thread (`RT_PROCESS`): it must not allocate,
+//! lock, log or block, and shares only atomics with the main loop.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
@@ -14,14 +18,8 @@ use pw::spa::pod::Pod;
 use pw::types::ObjectType;
 use tracing::{debug, error, info, warn};
 
-use crate::{CHANNELS, Error, Exclusions, OnState, SAMPLE_RATE, Source, TrackState};
-
-/// Interleaved F32 samples whose first frame was captured at `start`
-/// (`CLOCK_MONOTONIC`).
-pub struct Chunk {
-    pub start: Duration,
-    pub samples: Vec<f32>,
-}
+use crate::ring::{Producer, Writer};
+use crate::{Error, Exclusions, OnState, SAMPLE_RATE, Source, TrackState};
 
 /// Stereo: what we record.
 const STEREO: [u32; 2] = [
@@ -226,7 +224,7 @@ impl Health {
 pub fn run(
     source: Source,
     exclusions: Option<Arc<Exclusions>>,
-    tx: mpsc::SyncSender<Chunk>,
+    tx: Writer,
     stop: pw::channel::Receiver<()>,
     ready: mpsc::Sender<Result<(), Error>>,
     on_state: Option<OnState>,
@@ -298,15 +296,7 @@ pub fn run(
         } else {
             except
         };
-        let opened = Session::open(
-            &mainloop,
-            &source,
-            &except,
-            tx.clone(),
-            &health,
-            running,
-            &reopen,
-        );
+        let opened = Session::open(&mainloop, &source, &except, &tx, &health, running, &reopen);
         match opened {
             Ok(session) => {
                 // Before `ready`: the caller's hold is dropped after it.
@@ -466,7 +456,14 @@ struct Session {
     /// The app's links and their registry listener: our links go away with
     /// their proxies.
     links: Option<(pw::registry::Listener, Rc<RefCell<AppLinks>>)>,
-    listener: Option<pw::stream::StreamListener<mpsc::SyncSender<Chunk>>>,
+    listener: Option<pw::stream::StreamListener<()>>,
+    /// The real-time process callback. Dropping it is safe while the data
+    /// thread runs: PipeWire (`src/pipewire/stream.c`, checked in 1.6.0)
+    /// calls `process` through `rt_callbacks`, set from the first listener
+    /// with one, not through the hook list, and the hook's `removed`
+    /// (`hook_removed`) clears it under the data loop's lock
+    /// (`pw_loop_locked`) before the closure is freed.
+    process: Option<pw::stream::StreamListener<Producer>>,
     stream: pw::stream::StreamRc,
     _core_listener: pw::core::Listener,
     _core: pw::core::CoreRc,
@@ -478,6 +475,7 @@ impl Drop for Session {
         // Listeners first: our own disconnect must not count as a loss.
         self.links = None;
         self.listener = None;
+        self.process = None;
         if let Err(e) = self.stream.disconnect() {
             error!("pw_stream_disconnect failed: {e}");
         }
@@ -492,7 +490,7 @@ impl Session {
         mainloop: &pw::main_loop::MainLoopRc,
         source: &Source,
         except: &[String],
-        tx: mpsc::SyncSender<Chunk>,
+        tx: &Writer,
         health: &Rc<Health>,
         running: impl Fn() + 'static,
         reopen: &Rc<Reopen>,
@@ -559,7 +557,7 @@ impl Session {
         }
         let input = source.is_input();
         // How the sink an app plays to stamps its monitor; unused otherwise.
-        let timing = Rc::new(AppTiming::default());
+        let timing = Arc::new(AppTiming::default());
         // Leaving apps out needs the default sink: without it, the monitor.
         let fallback: Rc<dyn Fn(&str)> = {
             let (reopen, mainloop) = (reopen.clone(), mainloop.clone());
@@ -577,8 +575,11 @@ impl Session {
             STEREO.len()
         };
         let stream = pw::stream::StreamRc::new(core.clone(), name, props)?;
+        let producer = tx
+            .producer()
+            .ok_or("the previous stream still holds the ring")?;
         let listener = stream
-            .add_local_listener_with_user_data(tx)
+            .add_local_listener()
             .state_changed({
                 let (app, core) = (app.clone(), core.clone());
                 let (health, mainloop) = (health.clone(), mainloop.clone());
@@ -612,7 +613,12 @@ impl Session {
                     }
                 }
             })
-            .process(move |stream, tx| {
+            .register()?;
+        // Real-time: see the module docs. Reads only the stream, its buffer
+        // and `timing`'s atomics; the ring counts what it cannot take.
+        let process = stream
+            .add_local_listener_with_user_data(producer)
+            .process(move |stream, producer| {
                 let time = stream.time().ok();
                 let Some(mut buffer) = stream.dequeue_buffer() else {
                     return;
@@ -624,8 +630,8 @@ impl Session {
                 let Some(bytes) = data.data().and_then(|d| d.get(offset..offset + size)) else {
                     return;
                 };
-                let samples = to_stereo(bytes, channels);
-                let frames = samples.len() / usize::from(CHANNELS);
+                let src = bytes.as_chunks::<4>().0;
+                let frames = src.len() / channels;
                 let start = match time {
                     Some(t) if t.now() > 0 => buffer_start(
                         input,
@@ -638,15 +644,12 @@ impl Session {
                     ),
                     _ => crate::monotonic_now().saturating_sub(crate::frames_to_duration(frames)),
                 };
-                // Never block the PipeWire loop: the timeline fills the hole.
-                if let Err(mpsc::TrySendError::Full(_)) = tx.try_send(Chunk { start, samples }) {
-                    warn!("{name}: encoder is behind, audio buffer dropped");
-                }
+                producer.push(start, frames, |i| stereo_sample(src, channels, i));
             })
             .register()?;
         let pod = format_pod(if app.is_some() { &LINKED } else { &STEREO });
         let mut params = [Pod::from_bytes(&pod).ok_or("invalid audio format pod")?];
-        let mut flags = pw::stream::StreamFlags::MAP_BUFFERS;
+        let mut flags = pw::stream::StreamFlags::MAP_BUFFERS | pw::stream::StreamFlags::RT_PROCESS;
         if app.is_none() {
             flags |= pw::stream::StreamFlags::AUTOCONNECT;
         }
@@ -658,6 +661,7 @@ impl Session {
         Ok(Self {
             links,
             listener: Some(listener),
+            process: Some(process),
             stream,
             _core_listener: core_listener,
             _core: core,
@@ -687,24 +691,19 @@ fn link_targets(channel: &str) -> &'static [&'static str] {
 /// -3 dB: center and surround channels in a stereo downmix.
 const FOLD: f32 = std::f32::consts::FRAC_1_SQRT_2;
 
-/// Interleaved F32 samples of `channels` channels as stereo: as is, or
-/// `LINKED` folded down with the usual gains (center and surrounds at
-/// -3 dB, LFE left out). Close to PipeWire's channel mixer on the monitor,
-/// not identical: it may mix the LFE in.
-fn to_stereo(bytes: &[u8], channels: usize) -> Vec<f32> {
-    let f = |b: &[u8; 4]| f32::from_le_bytes(*b);
-    if channels == STEREO.len() {
-        return bytes.as_chunks::<4>().0.iter().map(f).collect();
+/// Sample `i` of interleaved stereo out of `src`, interleaved F32 samples of
+/// `channels` channels: as is, or `LINKED` folded down with the usual gains
+/// (center and surrounds at -3 dB, LFE left out). Close to PipeWire's
+/// channel mixer on the monitor, not identical: it may mix the LFE in.
+/// Real-time safe.
+fn stereo_sample(src: &[[u8; 4]], channels: usize, i: usize) -> f32 {
+    let f = |k: usize| f32::from_le_bytes(src[k]);
+    if channels != LINKED.len() {
+        return f(i);
     }
-    // One frame of `LINKED`: FL FR FC LFE RL RR SL SR.
-    let frames = bytes.as_chunks::<32>().0;
-    let mut out = Vec::with_capacity(frames.len() * 2);
-    for frame in frames {
-        let c = frame.as_chunks::<4>().0;
-        out.push(f(&c[0]) + FOLD * (f(&c[2]) + f(&c[4]) + f(&c[6])));
-        out.push(f(&c[1]) + FOLD * (f(&c[2]) + f(&c[5]) + f(&c[7])));
-    }
-    out
+    // One frame of `LINKED`: FL FR FC LFE RL RR SL SR; `side` 0 left, 1 right.
+    let (frame, side) = (i / 2 * LINKED.len(), i % 2);
+    f(frame + side) + FOLD * (f(frame + 2) + f(frame + 4 + side) + f(frame + 6 + side))
 }
 
 /// A port seen in the registry.
@@ -749,22 +748,63 @@ fn ticks_ns(ticks: i64, rate: spa::utils::Fraction) -> i128 {
 /// 0 on an ALSA sink's monitor) and no param gives it, so a timing-only
 /// capture of the monitor reports it (`reference_ns`). Measured with
 /// `audio_probe`: the app and monitor tracks then line up to the sample.
-#[derive(Debug, Default)]
+///
+/// Written on the main loop, read by the real-time process callback: atomics.
+#[derive(Debug)]
 pub(crate) struct AppTiming {
-    /// Output latency of the sink's monitor port.
-    monitor: Cell<Latency>,
-    /// `delay` of a capture of the sink's monitor, in ns.
-    reference_ns: Cell<Option<i128>>,
+    /// Output latency of the sink's monitor port, see `Latency::pack`.
+    monitor: AtomicU64,
+    monitor_ns: AtomicI64,
+    /// `delay` of a capture of the sink's monitor, in ns; `UNKNOWN` until
+    /// known.
+    reference_ns: AtomicI64,
+}
+
+/// `AppTiming::reference_ns` not known yet.
+const UNKNOWN: i64 = i64::MIN;
+
+impl Default for AppTiming {
+    fn default() -> Self {
+        Self {
+            monitor: AtomicU64::new(0),
+            monitor_ns: AtomicI64::new(0),
+            reference_ns: AtomicI64::new(UNKNOWN),
+        }
+    }
 }
 
 impl AppTiming {
     /// What to add to an app buffer's `now + delay` (`own_delay` in ticks of
-    /// `rate`); 0 until the monitor's delay is known.
+    /// `rate`); 0 until the monitor's delay is known. Real-time safe.
     fn extra_ns(&self, own_delay: i64, quantum_ns: i128, rate: spa::utils::Fraction) -> i128 {
-        self.reference_ns.get().map_or(0, |reference| {
-            reference + self.monitor.get().to_ns(quantum_ns, rate)
-                - ticks_ns(own_delay.max(0), rate)
-        })
+        match self.reference_ns.load(Ordering::Relaxed) {
+            UNKNOWN => 0,
+            reference => {
+                i128::from(reference) + self.monitor().to_ns(quantum_ns, rate)
+                    - ticks_ns(own_delay.max(0), rate)
+            }
+        }
+    }
+
+    // shortcut: the monitor latency is two atomics, so a buffer stamped
+    // while it changes may mix old and new; it changes about never.
+    fn monitor(&self) -> Latency {
+        Latency::unpack(
+            self.monitor.load(Ordering::Relaxed),
+            self.monitor_ns.load(Ordering::Relaxed),
+        )
+    }
+
+    fn set_monitor(&self, l: Latency) {
+        self.monitor.store(l.pack(), Ordering::Relaxed);
+        self.monitor_ns.store(l.ns, Ordering::Relaxed);
+    }
+
+    fn set_reference_ns(&self, ns: Option<i128>) {
+        let ns = ns.map_or(UNKNOWN, |ns| {
+            ns.clamp(i128::from(UNKNOWN) + 1, i128::from(i64::MAX)) as i64
+        });
+        self.reference_ns.store(ns, Ordering::Relaxed);
     }
 }
 
@@ -777,6 +817,19 @@ pub(crate) struct Latency {
 }
 
 impl Latency {
+    /// `quanta` and `frames` in one word, for `AppTiming`.
+    fn pack(self) -> u64 {
+        (u64::from(self.quanta.to_bits()) << 32) | u64::from(self.frames as u32)
+    }
+
+    fn unpack(word: u64, ns: i64) -> Self {
+        Self {
+            quanta: f32::from_bits((word >> 32) as u32),
+            frames: word as u32 as i32,
+            ns,
+        }
+    }
+
     /// In nanoseconds, with a quantum of `quantum_ns` and the graph `rate`.
     fn to_ns(self, quantum_ns: i128, rate: spa::utils::Fraction) -> i128 {
         let frames_ns = ticks_ns(i64::from(self.frames), rate);
@@ -900,7 +953,7 @@ pub(crate) struct AppLinks {
     /// The sink the app plays to: its id, a monitor port bound for its
     /// latency, and the timing-only capture of its monitor.
     sink: Option<SinkWatch>,
-    timing: Rc<AppTiming>,
+    timing: Arc<AppTiming>,
     /// The default sink's `node.name`, for the desktop.
     default_sink: Option<String>,
     /// The "default" metadata, followed for `default_sink`.
@@ -925,6 +978,9 @@ struct SinkWatch {
     _port_listener: pw::port::PortListener,
     _proxy: pw::port::Port,
     _reference_listener: pw::stream::StreamListener<()>,
+    /// Real-time, as the capture's (see `Session`): on the main loop it
+    /// would wake it every cycle.
+    _reference_process: pw::stream::StreamListener<()>,
     reference: pw::stream::StreamRc,
 }
 
@@ -937,7 +993,7 @@ impl Drop for SinkWatch {
 impl AppLinks {
     pub(crate) fn new(
         wanted: Wanted,
-        timing: Rc<AppTiming>,
+        timing: Arc<AppTiming>,
         fallback: Rc<dyn Fn(&str)>,
     ) -> Rc<RefCell<Self>> {
         Rc::new(RefCell::new(Self {
@@ -1189,8 +1245,8 @@ impl AppLinks {
         }
         let Some(sink) = sink else {
             self.sink = None;
-            self.timing.monitor.set(Latency::default());
-            self.timing.reference_ns.set(None);
+            self.timing.set_monitor(Latency::default());
+            self.timing.set_reference_ns(None);
             return None;
         };
         if self.sink.as_ref().is_some_and(|w| w.id == sink) || self.failed == Some(sink) {
@@ -1228,10 +1284,10 @@ impl AppLinks {
             .add_listener_local()
             .param(move |_, _, _, _, pod| {
                 if let Some(l) = pod.and_then(parse_latency)
-                    && l != timing.monitor.get()
+                    && l != timing.monitor()
                 {
                     info!("{app}: monitor latency of its sink {l:?}");
-                    timing.monitor.set(l);
+                    timing.set_monitor(l);
                 }
             })
             .register();
@@ -1253,17 +1309,20 @@ impl AppLinks {
         let timing = self.timing.clone();
         let app = self.wanted.to_string();
         let reference_listener = reference
-            .add_local_listener_with_user_data(())
+            .add_local_listener()
             .state_changed(move |_, _, _, new| match new {
                 pw::stream::StreamState::Streaming => info!("{app}: timing its sink's monitor"),
                 pw::stream::StreamState::Error(e) => warn!("{app}: sink monitor timing: {e}"),
                 _ => {}
             })
+            .register()?;
+        let reference_process = reference
+            .add_local_listener()
             .process(move |stream, _| {
                 if let Ok(t) = stream.time()
                     && t.now() > 0
                 {
-                    timing.reference_ns.set(Some(ticks_ns(t.delay(), t.rate())));
+                    timing.set_reference_ns(Some(ticks_ns(t.delay(), t.rate())));
                 }
                 // Given back at once: only the timing matters.
                 drop(stream.dequeue_buffer());
@@ -1274,7 +1333,7 @@ impl AppLinks {
         reference.connect(
             spa::utils::Direction::Input,
             None,
-            pw::stream::StreamFlags::AUTOCONNECT,
+            pw::stream::StreamFlags::AUTOCONNECT | pw::stream::StreamFlags::RT_PROCESS,
             &mut params,
         )?;
         Ok(SinkWatch {
@@ -1284,6 +1343,7 @@ impl AppLinks {
             _port_listener: port_listener,
             reference,
             _reference_listener: reference_listener,
+            _reference_process: reference_process,
         })
     }
 }
@@ -1331,15 +1391,15 @@ mod tests {
         // monitor's latency, minus the app stream's own delay.
         let timing = AppTiming::default();
         assert_eq!(timing.extra_ns(2_048, quantum_ns, rate), 0, "unknown yet");
-        timing.monitor.set(Latency {
+        timing.set_monitor(Latency {
             quanta: 1.0,
             ..Latency::default()
         });
-        timing.reference_ns.set(Some(0));
+        timing.set_reference_ns(Some(0));
         // ALSA sink, expected (not validated): monitor delay 0, app delay 1 quantum -> 0.
         assert_eq!(timing.extra_ns(1_024, quantum_ns, rate), 0);
         // Easy Effects: monitor delay 2 quanta -> 2 quanta later.
-        timing.reference_ns.set(Some(2 * quantum_ns));
+        timing.set_reference_ns(Some(2 * quantum_ns));
         assert_eq!(timing.extra_ns(1_024, quantum_ns, rate), 2 * quantum_ns);
         // Playback is stamped that much later; input never.
         let now = 10_000_000_000;
@@ -1495,11 +1555,16 @@ mod tests {
         for c in ["FL", "FRC", "TC", "RLC", "TRR", "SL", "SR", "RC", "MONO"] {
             assert!(link_targets(c).iter().all(|t| names.contains(t)), "{c}");
         }
-        let bytes = |v: &[f32]| v.iter().flat_map(|f| f.to_le_bytes()).collect::<Vec<_>>();
+        let to_stereo = |v: &[f32], channels: usize| {
+            let src: Vec<_> = v.iter().map(|f| f.to_le_bytes()).collect();
+            (0..v.len() / channels * 2)
+                .map(|i| stereo_sample(&src, channels, i))
+                .collect::<Vec<_>>()
+        };
         // Stereo stays as is.
-        assert_eq!(to_stereo(&bytes(&[0.1, -0.2]), 2), [0.1, -0.2]);
+        assert_eq!(to_stereo(&[0.1, -0.2], 2), [0.1, -0.2]);
         // 7.1: center and surrounds at -3 dB, LFE dropped.
-        let s = to_stereo(&bytes(&[0.5, 0.25, 0.2, 1.0, 0.1, 0.3, 0.4, 0.0]), 8);
+        let s = to_stereo(&[0.5, 0.25, 0.2, 1.0, 0.1, 0.3, 0.4, 0.0], 8);
         let close = |a: f32, b: f32| (a - b).abs() < 1e-6;
         assert!(
             close(s[0], 0.5 + FOLD * 0.7) && close(s[1], 0.25 + FOLD * 0.5),
@@ -1537,6 +1602,6 @@ mod tests {
         info.parse(pod).unwrap();
         assert_eq!(info.format(), spa::param::audio::AudioFormat::F32LE);
         assert_eq!(info.rate(), SAMPLE_RATE);
-        assert_eq!(info.channels(), u32::from(CHANNELS));
+        assert_eq!(info.channels(), u32::from(crate::CHANNELS));
     }
 }
