@@ -255,6 +255,8 @@ struct Client {
     height: u32,
     /// Order of its first non-empty `Swapchain` message, for auto-selection.
     announced: u64,
+    /// Order of its connection.
+    connected: u64,
     /// Ring announced by the layer while started.
     ring: Option<Ring>,
 }
@@ -283,6 +285,12 @@ struct Server {
     /// Reused every poll round.
     candidates: Vec<Candidate>,
     announce_seq: u64,
+    connect_seq: u64,
+    /// `connect_seq` when the captured game left while active: until the
+    /// capture goes inactive, automatic selection only takes games connected
+    /// since (a new launch), not the launcher it came from (Steam games pass
+    /// their `SteamAppId`, and with it consent, to their launcher).
+    departed: Option<u64>,
     pool_generation: u32,
     /// `protocol::is_sync_file` / `protocol::is_dmabuf`; replaced in tests
     /// (no GPU to make them).
@@ -294,6 +302,8 @@ struct Server {
     refused_uids: Vec<u32>,
     /// Pids of games with another protocol version, already warned about.
     refused_pids: Vec<u32>,
+    /// Already warned that `MAX_CLIENTS` are connected.
+    warned_full: bool,
 }
 
 /// What selection needs to know about a client.
@@ -305,13 +315,15 @@ struct Candidate {
     seq: u64,
     /// Captured but sent no frame for `STALE_AFTER`, or its process is gone.
     stale: bool,
+    /// Connected after the captured game left: may be picked automatically.
+    fresh: bool,
 }
 
 /// Picks the client to capture. Only allowed clients qualify. The current
 /// one is kept while it sends frames (games recreate their swapchain on
 /// resize or focus changes); a stale one is kept only if it is still the
 /// newest ready game (long loading screens must not flip). Otherwise the
-/// selected pid, or the newest ready client.
+/// selected pid, or the newest ready fresh client.
 fn choose(clients: &[Candidate], select: Option<u32>, current: Option<usize>) -> Option<usize> {
     let ok = |i: usize| {
         let c = &clients[i];
@@ -321,7 +333,7 @@ fn choose(clients: &[Candidate], select: Option<u32>, current: Option<usize>) ->
         Some(pid) => (0..clients.len()).find(|&i| clients[i].pid == pid && ok(i)),
         None => current.filter(|&i| ok(i) && !clients[i].stale).or_else(|| {
             (0..clients.len())
-                .filter(|&i| ok(i) && clients[i].ready)
+                .filter(|&i| ok(i) && clients[i].ready && clients[i].fresh)
                 .max_by_key(|&i| clients[i].seq)
         }),
     }
@@ -392,12 +404,15 @@ impl Server {
             started_fps: 0,
             candidates: Vec::new(),
             announce_seq: 0,
+            connect_seq: 0,
+            departed: None,
             pool_generation: 0,
             is_sync_file: protocol::is_sync_file,
             is_dmabuf: protocol::is_dmabuf,
             alive,
             refused_uids: Vec::new(),
             refused_pids: Vec::new(),
+            warned_full: false,
         }
     }
 
@@ -473,8 +488,8 @@ impl Server {
             Ok(s) => s,
             Err(e) => return warn!("accepting a game connection failed: {e}"),
         };
-        if self.clients.len() >= MAX_CLIENTS {
-            return warn!("{MAX_CLIENTS} games connected already, refusing one more");
+        if self.full() {
+            return;
         }
         let cred = match protocol::peer_cred(sock.as_fd()) {
             Ok(c) if c.uid == unsafe { libc::getuid() } => c,
@@ -495,7 +510,19 @@ impl Server {
         self.add_client(sock, cred.pid as u32, exe, steam);
     }
 
+    /// No room for another client. Warned once until one leaves: refused
+    /// layers reconnect every second.
+    fn full(&mut self) -> bool {
+        let full = self.clients.len() >= MAX_CLIENTS;
+        if full && !self.warned_full {
+            self.warned_full = true;
+            warn!("{MAX_CLIENTS} games connected already, refusing more");
+        }
+        full
+    }
+
     fn add_client(&mut self, sock: OwnedFd, pid: u32, exe: String, steam: bool) {
+        self.connect_seq += 1;
         self.clients.push(Client {
             sock: Arc::new(sock),
             pid,
@@ -507,6 +534,7 @@ impl Server {
             width: 0,
             height: 0,
             announced: 0,
+            connected: self.connect_seq,
             ring: None,
         });
     }
@@ -738,6 +766,7 @@ impl Server {
 
     fn remove_client(&mut self, i: usize) {
         let c = self.clients.remove(i);
+        self.warned_full = false;
         debug!("game disconnected: {} ({})", c.exe, c.pid);
         let mut select = self.shared.select.lock().unwrap();
         if *select == Some(c.pid) {
@@ -751,6 +780,9 @@ impl Server {
             .is_some_and(|s| Arc::ptr_eq(s, &c.sock))
         {
             self.started = None;
+            if self.shared.fps.load(Ordering::SeqCst) > 0 {
+                self.departed = Some(self.connect_seq);
+            }
         }
     }
 
@@ -777,9 +809,13 @@ impl Server {
                 // A game sending frames is alive: no syscall per frame.
                 stale: Some(i) == current
                     && (silent > STALE_AFTER || (silent > LIVENESS_AFTER && !(self.alive)(c.pid))),
+                fresh: self.departed.is_none_or(|d| c.connected > d),
             }
         }));
         let fps = self.shared.fps.load(Ordering::SeqCst);
+        if fps == 0 {
+            self.departed = None;
+        }
         let want = if fps > 0 {
             choose(&candidates, select, current)
         } else {
@@ -881,6 +917,7 @@ mod tests {
             ready,
             seq,
             stale: false,
+            fresh: true,
         }
     }
 
@@ -968,6 +1005,51 @@ mod tests {
         drop(capture);
         assert!(!name.exists());
         std::fs::remove_dir(&dir).unwrap();
+    }
+
+    #[test]
+    fn after_the_game_quits_only_a_new_launch_is_picked() {
+        let (mut s, _rx) = server();
+        // The launcher has a window and inherited the game's SteamAppId.
+        let (_, launcher) = connect(&mut s, "steam-launcher", true);
+        s.shared.select.lock().unwrap().replace(s.clients[0].pid);
+        s.reselect();
+        assert!(matches!(next(&launcher), Some(Msg::Start { .. })));
+        // The user picks the game, then it quits mid-recording.
+        let (g, game) = connect(&mut s, "game.exe", true);
+        s.shared.select.lock().unwrap().replace(s.clients[g].pid);
+        s.reselect();
+        assert_eq!(next(&launcher), Some(Msg::Stop));
+        assert!(matches!(next(&game), Some(Msg::Start { .. })));
+        s.remove_client(g);
+        s.reselect();
+        assert!(s.started.is_none());
+        assert_eq!(next(&launcher), None);
+        // Relaunched: the new instance is picked.
+        let (g, game) = connect(&mut s, "game.exe", true);
+        s.reselect();
+        assert!(matches!(next(&game), Some(Msg::Start { .. })));
+        // It quits again; an explicit selection still reaches the launcher.
+        s.remove_client(g);
+        s.reselect();
+        assert_eq!(next(&launcher), None);
+        s.shared.select.lock().unwrap().replace(s.clients[0].pid);
+        s.reselect();
+        assert!(matches!(next(&launcher), Some(Msg::Start { .. })));
+        // A new recording starts afresh: the launcher qualifies again.
+        s.shared.select.lock().unwrap().take();
+        s.remove_client(0);
+        let (_, launcher) = connect(&mut s, "steam-launcher", true);
+        let (g, _game) = connect(&mut s, "game.exe", true);
+        s.reselect();
+        s.remove_client(g);
+        s.reselect();
+        assert_eq!(next(&launcher), None);
+        s.shared.fps.store(0, Ordering::SeqCst);
+        s.reselect();
+        s.shared.fps.store(60, Ordering::SeqCst);
+        s.reselect();
+        assert!(matches!(next(&launcher), Some(Msg::Start { .. })));
     }
 
     #[test]
@@ -1162,6 +1244,23 @@ mod tests {
             exe: "x".into(),
         };
         assert!(!s.handle(i, hello, None));
+    }
+
+    #[test]
+    fn warns_once_while_full() {
+        let (mut s, _rx) = server();
+        for _ in 0..MAX_CLIENTS {
+            assert!(!s.full());
+            s.add_client(pair().0, 7, "game".into(), true);
+        }
+        assert!(s.full());
+        assert!(s.warned_full);
+        // Warned again only after a client left.
+        s.remove_client(0);
+        assert!(!s.warned_full);
+        s.add_client(pair().0, 7, "game".into(), true);
+        assert!(s.full());
+        assert!(s.warned_full);
     }
 
     #[test]

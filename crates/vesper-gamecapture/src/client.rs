@@ -10,6 +10,7 @@
 //! `Start`/`Stop`/`Release` from the server. The render thread sends its own
 //! messages with non-blocking writes.
 
+use std::cell::Cell;
 use std::ffi::CString;
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
@@ -128,10 +129,43 @@ impl<T> LockExt<T> for Mutex<T> {
     }
 }
 
+thread_local! {
+    /// Depth of `guard` calls on this thread.
+    static GUARDED: Cell<u32> = const { Cell::new(0) };
+}
+
 /// Runs `f`, turning a panic into `fallback`: unwinding into the loader or
 /// the game would abort it.
 pub fn guard<R>(fallback: R, f: impl FnOnce() -> R) -> R {
-    catch_unwind(AssertUnwindSafe(f)).unwrap_or(fallback)
+    static HOOK: Once = Once::new();
+    HOOK.call_once(quiet_panics_in_guards);
+    GUARDED.with(|g| g.set(g.get() + 1));
+    let r = catch_unwind(AssertUnwindSafe(f)).unwrap_or(fallback);
+    GUARDED.with(|g| g.set(g.get() - 1));
+    r
+}
+
+/// std's default panic hook writes to stderr with blocking writes, from the
+/// game's render thread. Panics inside `guard` go to `log` instead; any
+/// other panic (the game's own) still reaches the previous hook.
+fn quiet_panics_in_guards() {
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if GUARDED.try_with(Cell::get).unwrap_or(0) == 0 {
+            return prev(info);
+        }
+        let p = info.payload();
+        let msg = p
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| p.downcast_ref::<String>().map(String::as_str))
+            .unwrap_or("?");
+        let at = info
+            .location()
+            .map(|l| format!(" ({}:{})", l.file(), l.line()))
+            .unwrap_or_default();
+        log(&format!("panic caught: {msg}{at}"));
+    }));
 }
 
 /// `CLOCK_MONOTONIC` in ns, the clock of `Frame::pts_ns`.
@@ -435,6 +469,31 @@ pub fn take_releases() -> Vec<(u32, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn panics_in_guards_skip_the_default_hook() {
+        if std::env::var_os("VESPER_GUARD_PANIC_CHILD").is_some() {
+            assert_eq!(guard(7, || panic!("boom")), 7);
+            return;
+        }
+        // In a child: the test harness captures the default hook's output.
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "client::tests::panics_in_guards_skip_the_default_hook",
+                "--exact",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("VESPER_GUARD_PANIC_CHILD", "1")
+            .env("RUST_BACKTRACE", "1")
+            .output()
+            .unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{err}");
+        assert!(err.contains("[vesper capture] panic caught: boom"), "{err}");
+        assert!(!err.contains("panicked at"), "{err}");
+        assert!(!err.contains("backtrace"), "{err}");
+    }
 
     #[test]
     fn blocklist_ignores_case() {
