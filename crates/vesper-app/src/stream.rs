@@ -553,9 +553,11 @@ fn run(
             Err(e) if e.kind() == LiveErrorKind::Aborted => return None,
             Err(e) => {
                 log!("live: {e}");
+                // YouTube takes HEVC and AV1: a rejection there is the key.
                 if e.kind() == LiveErrorKind::Rejected
                     && on_air.is_none()
                     && video.codec != Codec::H264
+                    && !url.starts_with(YOUTUBE)
                 {
                     lock(&s.queue).codec_rejected = true;
                     return None;

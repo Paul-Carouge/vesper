@@ -559,6 +559,16 @@ struct Control {
 
 pub(crate) type OnEvent = Arc<dyn Fn(Event) + Send + Sync>;
 
+/// Queues the H.264 retry of a stream whose codec the server rejected,
+/// unless the user stopped it (the stop then sends its one `Ended`) or
+/// started another one meanwhile.
+fn queue_retry(c: &mut Control, request: StreamRequest, notice: String, on_event: &OnEvent) {
+    if !c.stop_stream && c.stream.is_none() {
+        on_event(Event::Notice(notice));
+        c.stream = Some(request);
+    }
+}
+
 pub struct Pipeline {
     control: Arc<Mutex<Control>>,
     /// Woken on requests while the pipeline waits for its first frame.
@@ -1482,7 +1492,7 @@ impl Streaming {
         } else {
             "HEVC"
         };
-        let notice = tr!("The server does not accept {}: streaming in H.264", name);
+        let notice = tr!("The server refused {}: trying H.264", name);
         Some((request, notice))
     }
 
@@ -1768,14 +1778,8 @@ fn pump(
             let mut c = lock(control);
             c.saves.extend(handle);
             if let Some((request, notice)) = retry {
-                log!("live: codec rejected, again in H.264");
-                // Unless stopped meanwhile (that `Ended` was never sent).
-                if c.stop_stream {
-                    on_event(Event::Stream(StreamState::Ended(None)));
-                } else {
-                    on_event(Event::Notice(notice));
-                    c.stream = Some(request);
-                }
+                log!("live: codec rejected, trying H.264");
+                queue_retry(&mut c, request, notice, on_event);
             }
         }
         let (record, stop, replay, save, go_live, scene) = {
@@ -2987,6 +2991,44 @@ mod gpu_tests;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_stop_during_the_h264_retry_wins() {
+        use crate::stream::{Service, StreamSettings};
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let s = seen.clone();
+        let on_event: OnEvent = Arc::new(move |e| lock(&s).push(format!("{e:?}")));
+        let request = || StreamRequest {
+            settings: StreamSettings {
+                service: Service::Custom,
+                ..StreamSettings::default()
+            },
+            key: None,
+        };
+        // Stopped meanwhile: no retry, and nothing sent here (the stop
+        // sends the one `Ended`).
+        let mut c = Control {
+            stop_stream: true,
+            ..Control::default()
+        };
+        queue_retry(&mut c, request(), "n".into(), &on_event);
+        assert!(c.stream.is_none() && lock(&seen).is_empty());
+        // Another stream asked for meanwhile: it stays.
+        let mut c = Control {
+            stream: Some(StreamRequest {
+                key: crate::stream::StreamKey::new("other"),
+                ..request()
+            }),
+            ..Control::default()
+        };
+        queue_retry(&mut c, request(), "n".into(), &on_event);
+        assert!(c.stream.as_ref().unwrap().key.is_some() && lock(&seen).is_empty());
+        // Otherwise: retried, with the notice.
+        let mut c = Control::default();
+        queue_retry(&mut c, request(), "n".into(), &on_event);
+        assert!(c.stream.is_some());
+        assert_eq!(lock(&seen).len(), 1);
+    }
+
     use super::*;
 
     #[test]

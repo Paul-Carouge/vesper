@@ -624,8 +624,8 @@ msgstr "L’encodeur du GPU ne suit pas l’enregistrement et le stream à la fo
 msgid "The GPU encoder cannot keep up with this size and frame rate: frames may be dropped."
 msgstr "L’encodeur du GPU ne suit pas à cette taille et cette fréquence d’images : des images peuvent être perdues."
 
-msgid "The server does not accept {}: streaming in H.264"
-msgstr "Le serveur n’accepte pas {} : stream en H.264"
+msgid "The server refused {}: trying H.264"
+msgstr "Le serveur a refusé {} : essai en H.264"
 
 msgid "{} left out of desktop audio"
 msgstr "{} retiré du son du bureau"
