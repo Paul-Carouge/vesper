@@ -9,8 +9,14 @@
 //! delay is compensated against an unfiltered `output:<sink>` track.
 //! `VESPER_PROBE_DESKTOP_EXCEPT=app1,app2` leaves those apps out of the
 //! desktop track.
+//! `VESPER_PROBE_TRACKS="desktop app:x output:sink"` replaces the track list
+//! (`desktop`, `microphone`, `output:<sink>`, `input:<source>`, `app:<name>`).
+//! `VESPER_PROBE_AAC=1` also taps the mix into AAC, as a live stream does.
+//! Each track prints its latency: how long after its pts a packet comes out
+//! (past the first second), which shows tracks stamped off from each other.
 
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ffmpeg::ffi as ff;
@@ -32,10 +38,23 @@ fn main() -> Result<(), Error> {
             Some(node) => Source::Output(node.into()),
             None => Source::App(a),
         });
-    let sources: Vec<_> = [Source::Desktop, Source::Microphone]
+    let mut sources: Vec<_> = [Source::Desktop, Source::Microphone]
         .into_iter()
         .chain(apps)
         .collect();
+    if let Ok(list) = std::env::var("VESPER_PROBE_TRACKS") {
+        sources = list
+            .split_whitespace()
+            .map(|t| match t.split_once(':') {
+                Some(("output", n)) => Ok(Source::Output(n.into())),
+                Some(("input", n)) => Ok(Source::Input(n.into())),
+                Some(("app", n)) => Ok(Source::App(n.into())),
+                None if t == "desktop" => Ok(Source::Desktop),
+                None if t == "microphone" => Ok(Source::Microphone),
+                _ => Err(format!("unknown track {t}")),
+            })
+            .collect::<Result<_, _>>()?;
+    }
     let voice = std::env::var("VESPER_PROBE_VOICE").unwrap_or_default();
     // Apps left out of the desktop track, comma-separated: their app
     // tracks hold them while they capture, as in the app.
@@ -49,7 +68,25 @@ fn main() -> Result<(), Error> {
     let mut tracks = Vec::new();
     let anchor = monotonic_now();
     let (mix_tx, mix_rx) = mpsc::channel::<EncodedPacket>();
-    let mix = Mix::start(anchor, move |p| drop(mix_tx.send(p)))?;
+    let mix_lat = Latency::new();
+    let mix = Mix::start(anchor, {
+        let lat = mix_lat.clone();
+        move |p| {
+            lat.add(anchor, &p);
+            drop(mix_tx.send(p))
+        }
+    })?;
+    let aac_lat = Latency::new();
+    let aac_on = std::env::var("VESPER_PROBE_AAC").is_ok_and(|v| !v.is_empty());
+    if aac_on {
+        let aac = Mutex::new(vesper_audio::Aac::new()?);
+        let lat = aac_lat.clone();
+        mix.set_tap(Some(Box::new(move |pts, samples| {
+            aac.lock()
+                .unwrap()
+                .push(pts, samples, &mut |p| lat.add(anchor, &p));
+        })));
+    }
     let mut inputs: Vec<_> = sources.iter().map(|_| Some(mix.input())).collect();
     for (source, input) in sources.into_iter().zip(&mut inputs) {
         let (tx, rx) = mpsc::channel::<EncodedPacket>();
@@ -70,14 +107,21 @@ fn main() -> Result<(), Error> {
                 _ => Some(exclusions.clone()),
             },
         };
-        let capture = AudioCapture::start(source.clone(), options, move |p| drop(tx.send(p)))?;
-        tracks.push((source, capture, rx));
+        let lat = Latency::new();
+        let capture = AudioCapture::start(source.clone(), options, {
+            let lat = lat.clone();
+            move |p| {
+                lat.add(anchor, &p);
+                drop(tx.send(p))
+            }
+        })?;
+        tracks.push((source, capture, rx, lat));
     }
     for _ in 0..secs * 2 {
         std::thread::sleep(Duration::from_millis(500));
         let peaks: Vec<_> = tracks
             .iter()
-            .map(|(s, c, _)| {
+            .map(|(s, c, _, _)| {
                 format!("{s:?} {:.3}", {
                     let p = c.take_peaks();
                     p.left.max(p.right)
@@ -89,15 +133,20 @@ fn main() -> Result<(), Error> {
     let mut collected = Vec::new();
     let mut streams: Vec<_> = tracks
         .into_iter()
-        .map(|(source, capture, rx)| {
+        .map(|(source, capture, rx, lat)| {
             let head = capture.extradata().to_vec();
             capture.stop();
+            println!("{source:?}: latency {}", lat.report());
             (format!("{source:?}"), head, rx)
         })
         .collect();
     // After its inputs: flushes the mix.
     let mix_head = mix.extradata().to_vec();
     drop(mix);
+    println!("Mix: latency {}", mix_lat.report());
+    if aac_on {
+        println!("AAC tap: latency {}", aac_lat.report());
+    }
     streams.insert(0, ("Mix".into(), mix_head, mix_rx));
     for (source, head, rx) in streams {
         let packets: Vec<_> = rx.iter().collect();
@@ -124,6 +173,30 @@ fn main() -> Result<(), Error> {
     write_mka(&path, &collected)?;
     println!("wrote {}", path.display());
     Ok(())
+}
+
+/// `now - pts` of the packets past the first second: sum, max, count (ms).
+#[derive(Clone)]
+struct Latency(Arc<Mutex<(f64, f64, u32)>>);
+
+impl Latency {
+    fn new() -> Self {
+        Self(Arc::new(Mutex::new((0.0, f64::MIN, 0))))
+    }
+
+    fn add(&self, anchor: Duration, p: &EncodedPacket) {
+        if p.pts < anchor + Duration::from_secs(1) {
+            return;
+        }
+        let ms = (monotonic_now().as_secs_f64() - p.pts.as_secs_f64()) * 1e3;
+        let mut l = self.0.lock().unwrap();
+        *l = (l.0 + ms, l.1.max(ms), l.2 + 1);
+    }
+
+    fn report(&self) -> String {
+        let (sum, max, n) = *self.0.lock().unwrap();
+        format!("avg {:.1} ms, max {:.1} ms", sum / f64::from(n.max(1)), max)
+    }
 }
 
 /// The voice chain, if `voice` names this source.

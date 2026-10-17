@@ -16,7 +16,8 @@
 //! Slow device clock drift is followed instead: the low-pass filtered error is
 //! corrected by repeating or dropping single frames, at most one per buffer
 //! and per 480 frames (~2000 ppm ceiling up to 480-frame buffers, ~977 ppm at
-//! 1024, ~488 ppm at 2048).
+//! 1024, ~488 ppm at 2048), each faded in over up to 100 ms ([`Slew`]) so it
+//! does not click.
 //!
 //! Voice ducking: tracks started with the same [`VoiceKey`] talk through it.
 //! A voice track ([`Options::speaks`]) tells it when it speaks, as heard
@@ -100,6 +101,13 @@ const DRIFT_ALPHA: f64 = 1.0 / 32.0;
 
 /// With no buffer for this long, the source is stalled: fill with silence.
 const STALL: Duration = Duration::from_millis(250);
+/// How often a stalled track is then filled: the mix and a live stream wait
+/// for its slowest track.
+const STALL_FILL: Duration = Duration::from_millis(20);
+/// Longest crossfade of a drift correction (100 ms): artefacts of a
+/// correction every 0.4 s (50 ppm) fall from -24 dB to under -60 dB on an
+/// 8 kHz tone.
+const SLEW_FRAMES: usize = 4_800;
 
 /// Lowest volume: at or below it a track is silent.
 pub const MIN_DB: f32 = -60.0;
@@ -382,7 +390,10 @@ impl AudioCapture {
         enc.voice = options.voice.map(Voice::new);
         let encode_thread = std::thread::Builder::new()
             .name("vesper-audio-enc".into())
-            .spawn(move || encode_loop(enc, chunk_rx))?;
+            .spawn({
+                let input = source.is_input();
+                move || encode_loop(enc, chunk_rx, input)
+            })?;
         let (stop, stop_rx) = ::pipewire::channel::channel();
         let (ready_tx, ready_rx) = mpsc::channel();
         let (on_state, except) = (options.on_state, options.exclusions);
@@ -832,44 +843,186 @@ impl<F: FnMut(EncodedPacket)> Encoder<F> {
     }
 }
 
-fn encode_loop(mut enc: Encoder<impl FnMut(EncodedPacket)>, rx: mpsc::Receiver<pw::Chunk>) {
+// `Slew` works on stereo frames.
+const _: () = assert!(CHANNELS == 2);
+
+/// Applies the timeline's drift corrections (one frame repeated or dropped)
+/// as a raised-cosine crossfade from the stream to its copy one frame later
+/// (a repeat) or earlier (a drop), instead of a jump that clicks on tonal
+/// sounds. Each fades over the interval between the timeline's last two
+/// corrections (shared with any still owed), up to [`SLEW_FRAMES`], so they
+/// keep pace with the drift. The frame count comes
+/// out as the timeline counts it, so pts stay exact; the audio is up to one
+/// frame (21 µs) off them while a fade runs.
+#[derive(Default)]
+struct Slew {
+    /// Corrections not started yet: + repeats, - drops.
+    owed: i32,
+    /// The one fading: +1 repeat, -1 drop, 0 none.
+    dir: i32,
+    pos: usize,
+    len: usize,
+    /// Input frames since the last `correct`.
+    gap: usize,
+    /// Input frames between the last two `correct`s (the first: since the start).
+    every: usize,
+    /// The previous input frame.
+    prev: [f32; 2],
+    /// Input frames still to drop (a drop applied at once by `flush`).
+    drop: usize,
+}
+
+impl Slew {
+    fn correct(&mut self, dir: i32) {
+        (self.every, self.gap) = (self.gap, 0);
+        self.owed += dir;
+    }
+
+    /// Interleaved stereo `input` into `out`, corrections faded in.
+    fn process(&mut self, input: &[f32], out: &mut Vec<f32>) {
+        out.clear();
+        if self.dir == 0 && self.owed == 0 && self.drop == 0 {
+            // Nearly always: nothing to fade.
+            self.gap += input.len() / 2;
+            self.prev = input.last_chunk().copied().unwrap_or(self.prev);
+            out.extend_from_slice(input);
+            return;
+        }
+        for &x in input.as_chunks::<2>().0 {
+            self.gap += 1;
+            if self.drop > 0 {
+                self.drop -= 1;
+                self.prev = x;
+                continue;
+            }
+            if self.dir == 0 && self.owed != 0 {
+                self.dir = self.owed.signum();
+                self.owed -= self.dir;
+                let share = self.every / (self.owed.unsigned_abs() as usize + 1);
+                (self.pos, self.len) = (0, share.clamp(DRIFT_SPACING, SLEW_FRAMES));
+                if self.dir < 0 {
+                    // Held back: each frame now comes out blended with the next.
+                    self.prev = x;
+                    continue;
+                }
+            }
+            if self.dir == 0 {
+                out.extend_from_slice(&x);
+            } else {
+                self.pos += 1;
+                let t = self.pos as f32 / self.len as f32;
+                let w = 0.5 - 0.5 * (std::f32::consts::PI * t).cos();
+                let (a, b) = if self.dir > 0 {
+                    (x, self.prev)
+                } else {
+                    (self.prev, x)
+                };
+                out.extend_from_slice(&[a[0] + w * (b[0] - a[0]), a[1] + w * (b[1] - a[1])]);
+                if self.pos == self.len {
+                    if self.dir > 0 {
+                        // Now one frame late: this one comes out next.
+                        out.extend_from_slice(&x);
+                    }
+                    self.dir = 0;
+                }
+            }
+            self.prev = x;
+        }
+    }
+
+    /// Completes every correction at once: a gap or the end follows, which
+    /// breaks the waveform anyway. Repeats go to `out`; returns the frames
+    /// still to drop, for the caller to take off its silence or else
+    /// (`drop`) off the next input.
+    fn flush(&mut self, out: &mut Vec<f32>) -> usize {
+        out.clear();
+        // A drop in progress is already a frame short.
+        let owed = self.owed + i32::from(self.dir > 0);
+        (self.owed, self.dir) = (0, 0);
+        for _ in 0..owed.max(0) {
+            out.extend_from_slice(&self.prev);
+        }
+        owed.min(0).unsigned_abs() as usize
+    }
+}
+
+fn encode_loop(
+    mut enc: Encoder<impl FnMut(EncodedPacket)>,
+    rx: mpsc::Receiver<pw::Chunk>,
+    input: bool,
+) {
     let mut timeline = Timeline::new(enc.anchor);
+    let mut slew = Slew::default();
+    let mut out = Vec::new();
     let ch = usize::from(CHANNELS);
     let mut stalled = false;
+    // Length of the last buffer: about a quantum.
+    let mut quantum = Duration::ZERO;
     loop {
-        let (pad, skip, repeat, samples) = match rx.recv_timeout(STALL) {
+        let wait = if stalled { STALL_FILL } else { STALL };
+        let (mut pad, skip, repeat, samples) = match rx.recv_timeout(wait) {
             Ok(chunk) => {
                 stalled = false;
+                quantum = frames_to_duration(chunk.samples.len() / ch);
                 let (pad, skip, repeat) = timeline.place(chunk.start, chunk.samples.len() / ch);
                 (pad, skip, repeat, chunk.samples)
             }
-            // Stalled source (no device, suspended): keep the track continuous.
+            // Stalled source (no device, suspended, nothing playing to an
+            // app track or a sink): keep the track continuous. A playback
+            // buffer is stamped when heard, about `now` or later, but may
+            // come a quantum early (a backlog, no graph time): silence up to
+            // the tolerance and a quantum (or a fill, if longer) ago does not
+            // cover audio that resumes, and the track keeps up with the
+            // others. An input's is stamped its capture delay ago.
             Err(RecvTimeoutError::Timeout) => {
                 stalled = true;
-                let (pad, _, _) = timeline.place(monotonic_now().saturating_sub(STALL), 0);
+                let lag = if input {
+                    STALL
+                } else {
+                    TOLERANCE + STALL_FILL.max(quantum)
+                };
+                let (pad, _, _) = timeline.place(monotonic_now().saturating_sub(lag), 0);
                 (pad, 0, 0, Vec::new())
             }
-            // A stalled track lags by up to two `STALL`s: fill it up to the
-            // stop, so it ends with the video.
+            // A stalled track lags by up to `STALL` and one fill: fill it up
+            // to the stop, so it ends with the video.
             Err(RecvTimeoutError::Disconnected) if stalled => {
+                let drops = slew.flush(&mut out);
+                enc.push(&out);
                 let (pad, _, _) = timeline.place(monotonic_now(), 0);
-                enc.push(&vec![0.0; pad * ch]);
+                enc.push(&vec![0.0; pad.saturating_sub(drops) * ch]);
                 break;
             }
             Err(RecvTimeoutError::Disconnected) => break,
         };
+        // One frame repeated or dropped is a drift correction, faded in;
+        // anything else jumps.
+        let drift = pad == 0 && skip + repeat == 1;
+        if !drift && pad + skip > 0 {
+            let drops = slew.flush(&mut out);
+            enc.push(&out);
+            let cut = drops.min(pad);
+            pad -= cut;
+            slew.drop += drops - cut;
+        }
         if pad > 0 {
-            // A stall fills every `STALL`: not worth a line each time.
+            // A stall fills every `STALL_FILL`: not worth a line each time.
             if !stalled {
                 warn!("audio timeline gap: {pad} frames of silence inserted");
             }
             enc.push(&vec![0.0; pad * ch]);
         }
-        for _ in 0..repeat {
-            enc.push(samples.get(..ch).unwrap_or_default());
-        }
-        enc.push(samples.get(skip * ch..).unwrap_or_default());
+        let kept = if drift {
+            slew.correct(if repeat == 1 { 1 } else { -1 });
+            &samples[..]
+        } else {
+            samples.get(skip * ch..).unwrap_or_default()
+        };
+        slew.process(kept, &mut out);
+        enc.push(&out);
     }
+    slew.flush(&mut out);
+    enc.push(&out);
     enc.finish();
 }
 
@@ -1009,6 +1162,148 @@ mod tests {
         assert!((9_550..=9_650).contains(&pad), "{pad} frames");
     }
 
+    /// Stereo frames of a sine at `freq`, from frame `from`.
+    fn sine(freq: f32, from: usize, frames: usize) -> Vec<f32> {
+        (from..from + frames)
+            .flat_map(|i| {
+                let s = (std::f64::consts::TAU * f64::from(freq) * i as f64 / 48_000.0).sin();
+                [s as f32 * 0.5; 2]
+            })
+            .collect()
+    }
+
+    /// Runs `slew` over `frames` of a sine at `freq` in 1024-frame chunks,
+    /// with a correction (`dir`) every `every` frames; the left channel.
+    fn slewed(freq: f32, frames: usize, every: usize, dir: i32, flush: bool) -> Vec<f32> {
+        let (mut slew, mut out, mut left) = (Slew::default(), Vec::new(), Vec::new());
+        for at in (0..frames).step_by(1_024) {
+            if at > 0 && at % every < 1_024 {
+                slew.correct(dir);
+            }
+            slew.process(&sine(freq, at, 1_024), &mut out);
+            left.extend(out.iter().step_by(2));
+        }
+        if flush {
+            assert_eq!(slew.flush(&mut out), 0, "drops are applied by the caller");
+            left.extend(out.iter().step_by(2));
+        }
+        left
+    }
+
+    /// In-place radix-2 FFT of (re, im), length a power of two.
+    fn fft(re: &mut [f64], im: &mut [f64]) {
+        let n = re.len();
+        let mut j = 0;
+        for i in 1..n {
+            let mut bit = n >> 1;
+            while j & bit != 0 {
+                j ^= bit;
+                bit >>= 1;
+            }
+            j |= bit;
+            if i < j {
+                re.swap(i, j);
+                im.swap(i, j);
+            }
+        }
+        let mut len = 2;
+        while len <= n {
+            let ang = -std::f64::consts::TAU / len as f64;
+            for start in (0..n).step_by(len) {
+                for k in 0..len / 2 {
+                    let (wr, wi) = ((ang * k as f64).cos(), (ang * k as f64).sin());
+                    let (a, b) = (start + k, start + k + len / 2);
+                    let (xr, xi) = (re[b] * wr - im[b] * wi, re[b] * wi + im[b] * wr);
+                    (re[b], im[b]) = (re[a] - xr, im[a] - xi);
+                    (re[a], im[a]) = (re[a] + xr, im[a] + xi);
+                }
+            }
+            len <<= 1;
+        }
+    }
+
+    /// Energy more than 30 Hz away from `freq` against the total, in dB
+    /// (Hann window over the first 2^17 frames).
+    fn off_tone_db(signal: &[f32], freq: f32) -> f64 {
+        let n = 1 << 17;
+        let mut re: Vec<f64> = signal[..n]
+            .iter()
+            .enumerate()
+            .map(|(i, &s)| {
+                let w = 0.5 - 0.5 * (std::f64::consts::TAU * i as f64 / n as f64).cos();
+                f64::from(s) * w
+            })
+            .collect();
+        let mut im = vec![0.0; n];
+        fft(&mut re, &mut im);
+        let (mut off, mut all) = (0.0, 0.0);
+        for k in 0..n / 2 {
+            let e = re[k] * re[k] + im[k] * im[k];
+            all += e;
+            if (k as f64 * 48_000.0 / n as f64 - f64::from(freq)).abs() > 30.0 {
+                off += e;
+            }
+        }
+        10.0 * (off / all).log10()
+    }
+
+    #[test]
+    fn drift_corrections_are_faded_in_without_clicks() {
+        // 50 ppm: a correction every 20 000 frames (0.42 s), both ways.
+        for dir in [1, -1] {
+            let db = off_tone_db(&slewed(8_000.0, 140_000, 20_000, dir, false), 8_000.0);
+            assert!(db < -60.0, "8 kHz, dir {dir}: {db:.1} dB off the tone");
+        }
+        // The same corrections as one-frame jumps, as before: clicks.
+        let mut jumped = Vec::new();
+        for at in (0..140_000).step_by(1_024) {
+            let chunk = sine(8_000.0, at, 1_024);
+            let skip = usize::from(at > 0 && at % 20_000 < 1_024);
+            jumped.extend(chunk[skip * 2..].iter().step_by(2));
+        }
+        let db = off_tone_db(&jumped, 8_000.0);
+        assert!(db > -30.0, "jumps: {db:.1} dB");
+    }
+
+    #[test]
+    fn drift_corrections_keep_the_frame_count_and_alignment() {
+        // Fast corrections (every 2048 frames) overlap the fades: still
+        // one frame each, the count exact once flushed.
+        for dir in [1, -1] {
+            let frames = 1_024 * 100;
+            let fixes = (1..100).filter(|k| (k * 1_024) % 2_048 < 1_024).count();
+            let out = slewed(440.0, frames, 2_048, dir, true);
+            let want = frames as i64 + i64::from(dir) * fixes as i64;
+            assert_eq!(out.len() as i64, want, "dir {dir}");
+        }
+        // A long first interval, then a correction every 1000 frames: the
+        // first fade is long, then they shorten and catch up instead of
+        // owing more and more.
+        let (mut slew, mut out) = (Slew::default(), Vec::new());
+        let block = sine(440.0, 0, 500);
+        for _ in 0..20 {
+            slew.process(&block, &mut out);
+        }
+        for k in 0..200 {
+            if k % 2 == 0 {
+                slew.correct(-1);
+            }
+            slew.process(&block, &mut out);
+            let most = if k < 100 { 6 } else { 1 };
+            assert!(slew.owed.abs() <= most, "{} owed at block {k}", slew.owed);
+        }
+        // Once a repeat is faded in, the output is the input one frame late.
+        let (mut slew, mut out) = (Slew::default(), Vec::new());
+        let input = sine(440.0, 0, 20_000);
+        slew.process(&input[..2_048], &mut out);
+        slew.correct(1);
+        let mut all = out.clone();
+        slew.process(&input[2_048..], &mut out);
+        all.extend_from_slice(&out);
+        assert_eq!(all.len(), input.len() + 2);
+        assert_eq!(all[all.len() - 4_000..], input[input.len() - 4_000..]);
+    }
+
     #[test]
     fn encoder_emits_continuous_20ms_packets_with_head() {
         let encoder = open_encoder().unwrap();
@@ -1035,7 +1330,7 @@ mod tests {
         let enc = Encoder::new(encoder, anchor, Arc::default(), move |p| {
             tx.send(p).unwrap()
         });
-        encode_loop(enc, chunk_rx);
+        encode_loop(enc, chunk_rx, false);
         let packets: Vec<_> = rx.iter().collect();
         assert!(packets.len() >= 50, "{} packets", packets.len());
         for w in packets.windows(2) {
@@ -1063,7 +1358,7 @@ mod tests {
         let enc = Encoder::new(open_encoder().unwrap(), anchor, Arc::default(), move |p| {
             tx.send(p).unwrap()
         });
-        encode_loop(enc, chunk_rx);
+        encode_loop(enc, chunk_rx, false);
         stopper.join().unwrap();
         let end = rx.iter().last().unwrap().pts + Duration::from_millis(20);
         // Not `STALL` (or two) short of the stop.
@@ -1072,6 +1367,52 @@ mod tests {
             "{:?}",
             end - anchor
         );
+    }
+
+    /// Worst `now - pts` of the packets out of a track that stalls after
+    /// its first buffer of `frames`, once it is stalled (past 450 ms).
+    fn stalled_lag(input: bool, frames: usize) -> Duration {
+        let anchor = monotonic_now();
+        let (chunk_tx, chunk_rx) = mpsc::channel();
+        chunk_tx
+            .send(pw::Chunk {
+                start: anchor,
+                samples: vec![0.0; frames * 2],
+            })
+            .unwrap();
+        let stopper = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(900));
+            drop(chunk_tx);
+        });
+        let (tx, rx) = mpsc::channel();
+        let enc = Encoder::new(open_encoder().unwrap(), anchor, Arc::default(), move |p| {
+            tx.send((monotonic_now(), p.pts)).unwrap()
+        });
+        encode_loop(enc, chunk_rx, input);
+        stopper.join().unwrap();
+        rx.iter()
+            .filter(|(at, _)| *at > anchor + Duration::from_millis(450))
+            .map(|(at, pts)| at.saturating_sub(pts))
+            .max()
+            .unwrap()
+    }
+
+    #[test]
+    fn a_stalled_playback_track_keeps_up_with_now() {
+        // Filled every 20 ms up to 25 ms ago (a fill and the tolerance): the
+        // mix and a live stream do not wait for it. Packets lag by that, a
+        // block and the encoder.
+        let lag = stalled_lag(false, FRAME);
+        let margin = TOLERANCE + STALL_FILL;
+        assert!(lag >= margin && lag < Duration::from_millis(150), "{lag:?}");
+        // A larger quantum: a resume can come that early, so that far back.
+        let lag = stalled_lag(false, 2_048);
+        let margin = TOLERANCE + frames_to_duration(2_048);
+        assert!(lag >= margin && lag < Duration::from_millis(170), "{lag:?}");
+        // An input's buffers are stamped in the past: it stays `STALL` back.
+        let lag = stalled_lag(true, FRAME);
+        assert!(lag >= STALL, "{lag:?}");
+        assert!(lag < STALL + Duration::from_millis(150), "{lag:?}");
     }
 
     /// Decodes Opus packets back to channel 0's samples.
@@ -1143,7 +1484,7 @@ mod tests {
             chain.process(buf);
             chain.latency()
         }));
-        encode_loop(enc, chunk_rx);
+        encode_loop(enc, chunk_rx, false);
         let packets: Vec<_> = rx.iter().collect();
         let decoded = decode(&head, &packets);
         let onset = decoded.iter().position(|s| s.abs() > 0.05).unwrap();

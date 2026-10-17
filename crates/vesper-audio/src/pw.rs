@@ -547,6 +547,15 @@ impl Session {
         if let Some(node) = target {
             props.insert(*pw::keys::TARGET_OBJECT, node.as_str());
             props.insert("node.dont-fallback", "true");
+            // WirePlumber 0.5 makes a stream linked to its defined target
+            // follow the default instead when that target is the default
+            // (metadata `target.node` = -1, as PulseAudio does). On the next
+            // rescan, which our own links trigger, `node.dont-fallback`
+            // then destroys it: "defined target not found". Not reconnecting
+            // skips that; a target that leaves still destroys the stream, and
+            // so does a link that fails to activate (the reconnect loop then
+            // opens a new one).
+            props.insert("node.dont-reconnect", "true");
         }
         let input = source.is_input();
         // How the sink an app plays to stamps its monitor; unused otherwise.
@@ -1235,6 +1244,8 @@ impl AppLinks {
             *pw::keys::STREAM_CAPTURE_SINK => "true",
             *pw::keys::TARGET_OBJECT => self.sinks[&sink].as_str(),
             "node.dont-fallback" => "true",
+            // See `Session::open`: else destroyed when the sink is the default.
+            "node.dont-reconnect" => "true",
             // Never keeps the sink running on its own.
             "node.passive" => "true",
         };
