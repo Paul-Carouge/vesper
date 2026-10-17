@@ -264,7 +264,7 @@ export component Switch inherits FocusScope {
         border-radius: self.height / 2;
         // Same dimming as a disabled button: visibly not available.
         opacity: root.enabled ? 1 : 0.4;
-        background: root.checked ? Theme.accent : Theme.border-strong;
+        background: root.checked ? Theme.accent : Theme.control-border;
         animate background { duration: Theme.fast; }
 
         knob := Rectangle {
@@ -642,7 +642,7 @@ export component Slider inherits FocusScope {
         border-radius: self.width / 2;
         background: #ffffff;
         border-width: 1px;
-        border-color: Theme.border-strong;
+        border-color: Theme.control-border;
         drop-shadow-blur: 3px;
         drop-shadow-color: #00000040;
         drop-shadow-offset-y: 1px;
@@ -695,7 +695,7 @@ export component TextField inherits Rectangle {
     border-radius: Theme.radius-sm;
     background: Theme.surface-raised;
     border-width: 1px;
-    border-color: input.has-focus ? Theme.accent : Theme.border-strong;
+    border-color: input.has-focus ? Theme.accent : Theme.control-border;
     opacity: root.enabled ? 1 : 0.4;
 
     if input.text == "" && root.placeholder != "": Text {
@@ -797,7 +797,7 @@ export component SelectField inherits FocusScope {
     Rectangle {
         border-radius: Theme.radius-md;
         border-width: 1px;
-        border-color: root.expanded ? Theme.accent : Theme.border-strong;
+        border-color: root.expanded ? Theme.accent : Theme.control-border;
         background: touch.pressed ? Theme.surface-pressed : touch.has-hover ? Theme.surface-hover : Theme.surface-raised;
         opacity: root.enabled ? 1 : 0.4;
         animate background { duration: Theme.fast; }

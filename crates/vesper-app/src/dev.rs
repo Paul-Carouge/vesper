@@ -250,6 +250,35 @@ pub fn apply(ui: &AppWindow) {
                 "ignore" => ui.invoke_ignore_game(),
                 "browse" => ui.invoke_pick_output_folder(),
                 "saved" => crate::show_notice(&ui, tr!("Replay saved"), Some(demo_file())),
+                // A long one: it wraps over several lines.
+                "error-long" => crate::show_error(
+                    &ui,
+                    &tr!(
+                        "Could not start the capture: {}",
+                        "the portal frontend implementing org.freedesktop.portal.ScreenCast was not found"
+                    ),
+                ),
+                "error" => crate::show_error(
+                    &ui,
+                    &tr!("Could not start: {}", tr!("The output folder is read-only")),
+                ),
+                // The clock and the stream's time go on, a second at a time,
+                // like the stats of a real recording or stream.
+                "tick" => {
+                    let weak = ui.as_weak();
+                    let timer = slint::Timer::default();
+                    timer.start(
+                        slint::TimerMode::Repeated,
+                        Duration::from_secs(1),
+                        move || {
+                            if let Some(ui) = weak.upgrade() {
+                                ui.set_elapsed_seconds(ui.get_elapsed_seconds() + 1);
+                                ui.set_live_seconds(ui.get_live_seconds() + 1);
+                            }
+                        },
+                    );
+                    std::mem::forget(timer);
+                }
                 "notify" => crate::desktop::notify(
                     tr!("Replay saved").into(),
                     demo_file().display().to_string(),

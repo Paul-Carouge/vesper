@@ -108,9 +108,10 @@ component RecordButton inherits FocusScope {
         reject
     }
 
-    // Soft halo that breathes while recording.
+    // Soft halo while recording. Static: an animation would redraw the
+    // whole window at the screen's refresh rate, on the game's GPU.
     halo := Rectangle {
-        property <float> phase: root.recording ? (1 + Math.sin(animation-tick() / 1.6s * 360deg)) / 2 : 0;
+        property <float> phase: root.recording ? 1 : 0;
         width: parent.width + 14px + 10px * self.phase;
         height: self.width;
         x: (parent.width - self.width) / 2;
@@ -164,8 +165,6 @@ component RecordButton inherits FocusScope {
 component Labeled inherits VerticalLayout {
     in property <string> title;
     in property <string> subtitle;
-    /// Wraps a long subtitle instead of eliding it.
-    in property <bool> wrap-subtitle;
     alignment: center;
     spacing: 2px;
     Text {
@@ -179,7 +178,9 @@ component Labeled inherits VerticalLayout {
         text: root.subtitle;
         font-size: Theme.font-small;
         color: Theme.text-muted;
-        wrap: root.wrap-subtitle ? word-wrap : no-wrap;
+        // Wrapped, not cut: instructions and states are read whole, in
+        // every language and at the narrowest width.
+        wrap: word-wrap;
         overflow: elide;
     }
 }
@@ -522,7 +523,7 @@ component ParamRow inherits HorizontalLayout {
     callback changed(float);
     spacing: Theme.space-sm;
     Text {
-        width: 76px;
+        width: 88px;
         text: root.param.label;
         vertical-alignment: center;
         font-size: Theme.font-small;
@@ -592,7 +593,7 @@ component FilterCard inherits Rectangle {
         spacing: Theme.space-xs;
         HorizontalLayout {
             spacing: Theme.space-sm;
-            height: 36px;
+            min-height: 36px;
             VerticalLayout {
                 alignment: center;
                 toggle := Switch {
@@ -603,6 +604,7 @@ component FilterCard inherits Rectangle {
                     }
                 }
             }
+            // Wrapped, not cut: the narrowest window leaves it about 90px.
             Text {
                 horizontal-stretch: 1;
                 text: root.filter.title;
@@ -610,37 +612,42 @@ component FilterCard inherits Rectangle {
                 font-size: Theme.font-body;
                 font-weight: 500;
                 color: root.filter.enabled ? Theme.text : Theme.text-muted;
-                overflow: elide;
+                wrap: word-wrap;
             }
-            up := IconButton {
-                width: 28px;
-                height: 36px;
-                icon: Icons.chevron-up;
-                label: @tr("Move {} up", root.filter.title);
-                enabled: !root.first;
-                opacity: self.enabled ? 1 : 0.35;
-                clicked => {
-                    root.move(-1);
+            // Packed together, to leave the title room.
+            HorizontalLayout {
+                spacing: 0px;
+                alignment: end;
+                up := IconButton {
+                    width: 28px;
+                    height: 36px;
+                    icon: Icons.chevron-up;
+                    label: @tr("Move {} up", root.filter.title);
+                    enabled: !root.first;
+                    opacity: self.enabled ? 1 : 0.35;
+                    clicked => {
+                        root.move(-1);
+                    }
                 }
-            }
-            down := IconButton {
-                width: 28px;
-                height: 36px;
-                icon: Icons.chevron-down;
-                label: @tr("Move {} down", root.filter.title);
-                enabled: !root.last;
-                opacity: self.enabled ? 1 : 0.35;
-                clicked => {
-                    root.move(1);
+                down := IconButton {
+                    width: 28px;
+                    height: 36px;
+                    icon: Icons.chevron-down;
+                    label: @tr("Move {} down", root.filter.title);
+                    enabled: !root.last;
+                    opacity: self.enabled ? 1 : 0.35;
+                    clicked => {
+                        root.move(1);
+                    }
                 }
-            }
-            IconButton {
-                width: 28px;
-                height: 36px;
-                icon: Icons.close;
-                label: @tr("Remove {}", root.filter.title);
-                clicked => {
-                    root.remove();
+                IconButton {
+                    width: 28px;
+                    height: 36px;
+                    icon: Icons.close;
+                    label: @tr("Remove {}", root.filter.title);
+                    clicked => {
+                        root.remove();
+                    }
                 }
             }
         }
@@ -657,7 +664,7 @@ component FilterCard inherits Rectangle {
                 height: 24px;
                 accessible-role: none;
                 Text {
-                    width: 76px;
+                    width: 88px;
                     text: @tr("Reduction");
                     vertical-alignment: center;
                     font-size: Theme.font-small;
@@ -1015,6 +1022,8 @@ export component AppWindow inherits Window {
     in property <string> notice;
     /// The notice is about a saved file: it offers Open and Play.
     in property <bool> notice-has-file;
+    /// The notice is an error: it stays until closed.
+    in property <bool> notice-error;
 
     in-out property <bool> settings-open;
     // Keys shown in hints: the global shortcuts once bound, else the in-window ones.
@@ -1059,6 +1068,27 @@ export component AppWindow inherits Window {
     callback pick-output-folder();
     callback open-notice-file();
     callback play-notice-file();
+    callback dismiss-notice();
+    // The toast's content, kept while it slides out.
+    property <string> toast-text;
+    property <bool> toast-error;
+    property <bool> toast-file;
+    function sync-toast() {
+        if (root.notice != "") {
+            root.toast-text = root.notice;
+            root.toast-error = root.notice-error;
+            root.toast-file = root.notice-has-file;
+        }
+    }
+    changed notice => {
+        root.sync-toast();
+    }
+    changed notice-error => {
+        root.sync-toast();
+    }
+    changed notice-has-file => {
+        root.sync-toast();
+    }
     callback source-mode-changed(bool);
     callback select-game(int);
     callback allow-game();
@@ -1152,8 +1182,6 @@ export component AppWindow inherits Window {
     // Anything but idle locks the source and output settings.
     property <bool> active: root.rec-state != RecState.idle;
     property <bool> game: root.source-kind == SourceKind.game;
-    // Open and Play only while idle: during a recording the stats keep the row.
-    property <bool> notice-actions: root.notice-has-file && root.notice != "" && !root.active;
     property <string> fps-text: (root.recording ? "\{Math.round(root.measured-fps * 10) / 10}" : "\{root.fps}") + " fps";
     // Audio card: the track whose settings are open (-1: none), and the picker.
     out property <int> open-track: -1;
@@ -1256,6 +1284,18 @@ export component AppWindow inherits Window {
         if (!root.active) {
             root.open-track-settings(i);
             root.choosing-source = true;
+        }
+    }
+
+    // Scrolls the page so a list or settings that just opened below the
+    // fold come into view (`top`: its y in the window), keeping its top on
+    // screen when it is taller than the window.
+    function reveal(top: length, height: length) {
+        let y = top - flick.absolute-position.y;
+        let over = y + height + Theme.space-lg + (toast.shown ? toast.height + Theme.space-lg : 0px) - flick.height;
+        let room = y - Theme.space-md;
+        if (over > 0px && room > 0px) {
+            flick.content-y = Math.max(flick.height - flick.content-height, flick.content-y - Math.min(over, room));
         }
     }
 
@@ -1412,6 +1452,10 @@ export component AppWindow inherits Window {
                 root.close-scenes();
                 return accept;
             }
+            if (event.text == Key.Escape && root.notice != "") {
+                root.dismiss-notice();
+                return accept;
+            }
             reject
         }
 
@@ -1476,7 +1520,7 @@ export component AppWindow inherits Window {
                     settings-button := IconButton {
                         enabled: !root.settings-open;
                         icon: Icons.sliders;
-                        label: @tr("Output settings");
+                        label: @tr("Settings");
                         active: root.settings-open;
                         clicked => {
                             root.open-settings();
@@ -1538,7 +1582,6 @@ export component AppWindow inherits Window {
                             }
                             if root.profile-mode == 0: HorizontalLayout {
                                 spacing: Theme.space-xs;
-                                alignment: start;
                                 Button {
                                     text: @tr("profile" => "New");
                                     small: true;
@@ -1568,13 +1611,19 @@ export component AppWindow inherits Window {
                                         root.set-profile-mode(3);
                                     }
                                 }
-                                Button {
-                                    text: @tr("Delete");
-                                    small: true;
-                                    kind: "ghost";
+                                // Apart and as an icon, like the layers' delete:
+                                // the row fits the narrowest window in French.
+                                Rectangle {
+                                    horizontal-stretch: 1;
+                                }
+                                IconButton {
+                                    width: Theme.control-height;
+                                    height: Theme.control-height-sm;
+                                    icon: Icons.trash;
                                     // Never the last one.
                                     enabled: !root.profiles-locked && root.profiles.length > 1;
-                                    accessible-label: @tr("Delete {}", root.profile-name);
+                                    opacity: self.enabled ? 1 : 0.35;
+                                    label: @tr("Delete {}", root.profile-name);
                                     accessible-description: root.profiles.length > 1 ? "" : @tr("The last profile cannot be deleted");
                                     clicked => {
                                         root.set-profile-mode(4);
@@ -1750,7 +1799,7 @@ export component AppWindow inherits Window {
                                     ? (root.source-name != ""
                                         ? (root.game-source == "window" ? @tr("Game window") : root.game-source != "" ? @tr("Game ({})", root.game-source) : @tr("Game"))
                                             + (root.source-detail != "" ? " · " + root.source-detail : "")
-                                        : root.game-layer-installed || root.pending-game != "" ? @tr("Start a game") : root.game-layer-available ? @tr("Start a game: its window is captured") : @tr("Game capture layer not built"))
+                                        : root.game-layer-installed || root.pending-game != "" ? @tr("Start a game") : root.game-layer-available ? @tr("Start a game: its window is captured") : @tr("Game capture is not in this build"))
                                     : root.source-kind == SourceKind.none
                                         ? @tr("Pick a screen or a window to record")
                                         : root.source-detail != "" ? root.source-detail : root.source-kind == SourceKind.screen ? @tr("Screen") : @tr("Window");
@@ -1856,7 +1905,8 @@ export component AppWindow inherits Window {
                                         height: 8px;
                                         border-radius: 4px;
                                         background: root.recording ? Theme.rec : Theme.text-faint;
-                                        opacity: root.recording ? 0.35 + 0.65 * Math.abs(Math.sin(animation-tick() / 2s * 360deg)) : 1;
+                                        // Blinks with the clock: one repaint a second.
+                                        opacity: root.recording && Math.mod(root.elapsed-seconds, 2) == 1 ? 0.35 : 1;
                                     }
                                 }
                                 Text {
@@ -1865,7 +1915,7 @@ export component AppWindow inherits Window {
                                     font-size: Theme.font-caption;
                                     font-weight: 700;
                                     letter-spacing: root.recording ? 1.2px : 0.3px;
-                                    color: root.recording ? Theme.rec : Theme.text-muted;
+                                    color: root.recording ? Theme.rec-text : Theme.text-muted;
                                 }
                             }
                         }
@@ -1912,7 +1962,7 @@ export component AppWindow inherits Window {
                                 horizontal-stretch: 1;
                                 title: @tr("Replay buffer");
                                 subtitle: root.replay-enabled
-                                    ? @tr("Last {}, {}", root.replay-seconds < 60 ? root.replay-seconds + " s" : root.replay-seconds / 60 + " min", root.replay-memory)
+                                    ? @tr("Last {}, {}", root.replay-seconds < 60 ? root.replay-seconds + "\u{a0}s" : root.replay-seconds / 60 + "\u{a0}min", root.replay-memory)
                                     : @tr("Off. Turn on to save past moments");
                             }
                             VerticalLayout {
@@ -1978,7 +2028,7 @@ export component AppWindow inherits Window {
                                         height: 8px;
                                         border-radius: 4px;
                                         background: Theme.rec;
-                                        opacity: 0.35 + 0.65 * Math.abs(Math.sin(animation-tick() / 2s * 360deg));
+                                        opacity: Math.mod(root.live-seconds, 2) == 1 ? 0.35 : 1;
                                     }
                                 }
                                 live-title := Text {
@@ -2002,13 +2052,14 @@ export component AppWindow inherits Window {
                             }
                             live-subtitle := Text {
                                 text: root.live-off
-                                    ? root.live-service-name + " · " + (root.live-height == 0 ? @tr("native size") : root.live-height + "p") + root.live-fps + " · " + root.live-bitrate + " Mbit/s"
+                                    ? root.live-service-name + " · " + (root.live-height == 0 ? @tr("native size") : root.live-height + "p") + root.live-fps + " · " + root.live-bitrate + "\u{a0}Mbit/s"
                                     : root.on-air
                                         ? root.live-detail + " · " + @tr("{n} dropped" | "{n} dropped" % root.live-dropped)
                                         : root.live-detail != "" ? root.live-detail : @tr("to {}", root.live-service-name);
                                 font-size: Theme.font-small;
                                 color: root.on-air && root.live-dropped > 0 ? Theme.warn : Theme.text-muted;
-                                overflow: elide;
+                                // The bitrate is the last item: wrapped, not cut.
+                                wrap: word-wrap;
                             }
                         }
                         VerticalLayout {
@@ -2102,6 +2153,14 @@ export component AppWindow inherits Window {
                             }
                             // Settings of the open track, under its name.
                             if root.open-track == i: VerticalLayout {
+                                // Shown once laid out (its height is 0 at first).
+                                property <bool> revealed;
+                                changed height => {
+                                    if (!self.revealed && self.height > 0px) {
+                                        self.revealed = true;
+                                        root.reveal(self.absolute-position.y, self.height);
+                                    }
+                                }
                                 padding-left: Theme.control-height + Theme.space-md;
                                 padding-bottom: Theme.space-sm;
                                 spacing: Theme.space-sm;
@@ -2342,7 +2401,7 @@ export component AppWindow inherits Window {
                                     }
                                     Text {
                                         horizontal-stretch: 1;
-                                        text: @tr("Recorded");
+                                        text: @tr("Record this track");
                                         vertical-alignment: center;
                                         font-size: Theme.font-small;
                                         color: Theme.text-muted;
@@ -2365,6 +2424,10 @@ export component AppWindow inherits Window {
                         }
                         // The source picker: one tap adds a track.
                         if root.picking: VerticalLayout {
+                            // Shown once laid out, and as sources come and go.
+                            changed height => {
+                                root.reveal(self.absolute-position.y, self.height);
+                            }
                             padding-left: Theme.card-padding - Theme.space-xs - Theme.space-sm;
                             padding-bottom: Theme.space-xs;
                             spacing: 2px;
@@ -2394,91 +2457,31 @@ export component AppWindow inherits Window {
                 }
 
                 // ---- Status line -------------------------------------------
-                // Fixed height, so a notice with buttons moves nothing. While
-                // recording the stats stay: a notice is text only, between them.
+                // Stats only: notices show in the toast, over the content.
                 HorizontalLayout {
                     height: 28px;
                     spacing: Theme.space-sm;
-                    if !root.notice-actions: Text {
+                    Text {
                         horizontal-stretch: 1;
-                        // With a notice beside it, the fps goes first so elision spares it.
-                        text: root.active && root.notice != ""
-                            ? root.fps-text
-                            : root.encoder + " " + root.codec-name + (root.resolution != "" ? "   ·   " + root.resolution : "") + "   ·   " + root.fps-text;
+                        text: root.encoder + " " + root.codec-name + (root.resolution != "" ? "   ·   " + root.resolution : "") + "   ·   " + root.fps-text;
                         vertical-alignment: center;
                         font-size: Theme.font-small;
                         color: Theme.text-faint;
                         overflow: elide;
                         accessible-role: text;
                     }
-                    if root.notice != "" && !root.notice-actions: HorizontalLayout {
-                        spacing: 6px;
-                        if root.notice-has-file: Icon {
-                            y: (parent.height - self.height) / 2;
-                            width: 14px;
-                            height: 14px;
-                            data: Icons.check;
-                            stroke: 2.25px;
-                            tint: Theme.accent;
-                        }
-                        Text {
-                            text: root.notice;
-                            vertical-alignment: center;
-                            font-size: Theme.font-small;
-                            font-weight: 600;
-                            color: Theme.accent;
-                            overflow: elide;
-                        }
-                    }
-                    if (root.notice == "" || root.active) && !root.notice-actions: Text {
+                    Text {
                         text: @tr("{n} dropped" | "{n} dropped" % root.dropped-frames);
                         vertical-alignment: center;
                         font-size: Theme.font-small;
                         font-weight: root.dropped-frames > 0 ? 600 : 400;
                         color: root.dropped-frames > 0 ? Theme.warn : Theme.text-faint;
                     }
-                    // A saved file while idle: what happened, and what to do with it.
-                    if root.notice-actions: HorizontalLayout {
-                        horizontal-stretch: 1;
-                        spacing: 6px;
-                        accessible-role: text;
-                        accessible-label: root.notice;
-                        Icon {
-                            y: (parent.height - self.height) / 2;
-                            width: 16px;
-                            height: 16px;
-                            data: Icons.check;
-                            stroke: 2.25px;
-                            tint: Theme.accent;
-                        }
-                        Text {
-                            horizontal-stretch: 1;
-                            text: root.notice;
-                            vertical-alignment: center;
-                            font-size: Theme.font-small;
-                            font-weight: 600;
-                            color: Theme.accent;
-                            overflow: elide;
-                        }
-                    }
-                    if root.notice-actions: Button {
-                        text: @tr("Open");
-                        kind: "ghost";
-                        small: true;
-                        accessible-label: @tr("Show the file in its folder");
-                        clicked => {
-                            root.open-notice-file();
-                        }
-                    }
-                    if root.notice-actions: Button {
-                        text: @tr("Play");
-                        kind: "ghost";
-                        small: true;
-                        accessible-label: @tr("Play the file");
-                        clicked => {
-                            root.play-notice-file();
-                        }
-                    }
+                }
+                // Room for the toast, so it never hides the end of the page.
+                Rectangle {
+                    height: toast.shown ? toast.height + Theme.space-sm : 0px;
+                    animate height { duration: Theme.medium; easing: ease-out-quart; }
                 }
             }
         }
@@ -2516,7 +2519,7 @@ export component AppWindow inherits Window {
             drop-shadow-color: #00000055;
             animate x { duration: Theme.medium; easing: ease-out-quart; }
             accessible-role: groupbox;
-            accessible-label: @tr("Output settings");
+            accessible-label: @tr("Settings");
 
             // Swallow clicks so they do not reach the scrim.
             TouchArea { }
@@ -2536,7 +2539,7 @@ export component AppWindow inherits Window {
                     HorizontalLayout {
                         Text {
                             horizontal-stretch: 1;
-                            text: @tr("Output");
+                            text: @tr("Settings");
                             vertical-alignment: center;
                             font-size: Theme.font-title;
                             font-weight: 700;
@@ -2561,7 +2564,7 @@ export component AppWindow inherits Window {
                             vertical-alignment: center;
                             font-size: Theme.font-small;
                             font-weight: 600;
-                            color: Theme.rec;
+                            color: Theme.rec-text;
                         }
                     }
 
@@ -2801,7 +2804,7 @@ export component AppWindow inherits Window {
                                 }
                             }
                             Field {
-                                title: @tr("Encoder");
+                                title: @tr("Codec");
                                 Segmented {
                                     label: @tr("Stream codec");
                                     enabled: root.live-off && root.live-service != LiveService.twitch;
@@ -2824,7 +2827,6 @@ export component AppWindow inherits Window {
                             Labeled {
                                 horizontal-stretch: 1;
                                 title: @tr("Game capture (Vulkan layer)");
-                                wrap-subtitle: true;
                                 subtitle: root.game-layer-outdated
                                     ? @tr("Update available")
                                     : root.game-layer-installed ? @tr("Installed for this user") : root.game-layer-available ? @tr("Not installed") : @tr("Layer not built: install the Vesper package or build the workspace");
@@ -2858,7 +2860,6 @@ export component AppWindow inherits Window {
                         hint: @tr("For the best performance in OpenGL games (Terraria, many indie games, emulators), add vesper-gl %command% to the game's launch options in Steam (Properties > General); otherwise Vesper captures the game window (the picker asks once per game). Only that game loads the capture library, with the same consent as Vulkan games. Don't use it on multiplayer games protected by VAC, EAC or BattlEye: risk of an account ban.");
                         Labeled {
                             title: "vesper-gl %command%";
-                            wrap-subtitle: true;
                             subtitle: @tr("Steam launch options");
                         }
                     }
@@ -2992,6 +2993,134 @@ export component AppWindow inherits Window {
             locked: root.active || !root.live-off;
             close => {
                 root.close-scenes();
+            }
+        }
+
+        // ---- Toast --------------------------------------------------------
+        // Notices, over everything and outside the scrolled page, so they
+        // show whatever the window's size. Errors stay until closed.
+        toast := Rectangle {
+            out property <bool> shown: root.notice != "";
+            // Kept while it slides out, so the text does not vanish first.
+            property <string> message: root.toast-text;
+            property <bool> error: root.toast-error;
+            property <bool> file: root.toast-file;
+            // Too narrow for the buttons beside the text: they go below it.
+            property <bool> stacked: self.width < 360px;
+            width: Math.min(parent.width - 2 * Theme.page-padding, 520px);
+            x: (parent.width - self.width) / 2;
+            height: toast-body.preferred-height;
+            y: self.shown ? parent.height - self.height - Theme.space-lg : parent.height + 8px;
+            opacity: self.shown ? 1 : 0;
+            visible: self.opacity > 0.01;
+            animate y, opacity { duration: Theme.medium; easing: ease-out-quart; }
+            border-radius: Theme.radius-md;
+            background: Theme.surface-raised;
+            border-width: 1px;
+            border-color: self.error ? Theme.rec : Theme.border-strong;
+            drop-shadow-blur: 16px;
+            drop-shadow-offset-y: 4px;
+            drop-shadow-color: Theme.dark ? #00000080 : #1a1a2a33;
+            accessible-role: text;
+            accessible-label: self.message;
+
+            // Clicks do not reach what is under it.
+            TouchArea { }
+
+            // The text alone in a vertical layout, so its wrapped height is
+            // known (in a horizontal one it is measured on one line). The
+            // icon and the buttons sit in its side paddings.
+            toast-body := VerticalLayout {
+                padding-left: Theme.space-md + 20px + Theme.space-sm;
+                padding-right: actions.width + Theme.space-xs;
+                padding-top: Theme.space-sm;
+                padding-bottom: Theme.space-sm;
+                spacing: Theme.space-xs;
+                message-text := Text {
+                    // One line: centered on the close button.
+                    min-height: Theme.control-height - Theme.space-sm;
+                    text: toast.message;
+                    vertical-alignment: center;
+                    font-size: Theme.font-body;
+                    font-weight: 600;
+                    color: Theme.text;
+                    wrap: word-wrap;
+                }
+                // Open and Play under the text, their labels lined up with it.
+                if toast.file && toast.stacked: Rectangle {
+                    height: Theme.control-height-sm;
+                    HorizontalLayout {
+                        x: -Theme.space-sm;
+                        width: self.preferred-width;
+                        spacing: Theme.space-xs;
+                        Button {
+                            text: @tr("Open");
+                            kind: "ghost";
+                            small: true;
+                            accessible-label: @tr("Show the file in its folder");
+                            clicked => {
+                                root.open-notice-file();
+                            }
+                        }
+                        Button {
+                            text: @tr("Play");
+                            kind: "ghost";
+                            small: true;
+                            accessible-label: @tr("Play the file");
+                            clicked => {
+                                root.play-notice-file();
+                            }
+                        }
+                    }
+                }
+            }
+
+            Icon {
+                x: Theme.space-md;
+                // Centered on one line, else beside the first line.
+                y: message-text.y + (message-text.height <= message-text.min-height + 1px ? (message-text.height - self.height) / 2 : 0px);
+                data: toast.error ? Icons.alert : toast.file ? Icons.check : Icons.info;
+                stroke: 2px;
+                tint: toast.error ? Theme.rec : Theme.accent;
+            }
+
+            actions := HorizontalLayout {
+                x: parent.width - self.width - Theme.space-xs;
+                y: Theme.space-xs;
+                width: self.preferred-width;
+                height: Theme.control-height;
+                spacing: 0px;
+                if toast.file && !toast.stacked: VerticalLayout {
+                    alignment: center;
+                    Button {
+                        text: @tr("Open");
+                        kind: "ghost";
+                        small: true;
+                        accessible-label: @tr("Show the file in its folder");
+                        clicked => {
+                            root.open-notice-file();
+                        }
+                    }
+                }
+                if toast.file && !toast.stacked: VerticalLayout {
+                    alignment: center;
+                    Button {
+                        text: @tr("Play");
+                        kind: "ghost";
+                        small: true;
+                        accessible-label: @tr("Play the file");
+                        clicked => {
+                            root.play-notice-file();
+                        }
+                    }
+                }
+                IconButton {
+                    icon: Icons.close;
+                    label: @tr("Close the message");
+                    clicked => {
+                        root.dismiss-notice();
+                    }
+                }
             }
         }
     }

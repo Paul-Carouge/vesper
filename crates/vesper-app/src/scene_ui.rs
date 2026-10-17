@@ -29,7 +29,7 @@ use crate::scenes::{
 };
 use crate::{
     AppWindow, CameraChoice, Games, LayerKind, LayerRow, LiveState, RecState, SceneRow, SceneStore,
-    Shared, flash_notice,
+    Shared, flash_error, flash_notice,
 };
 
 /// Rasters kept for the preview (images and text seen lately).
@@ -803,7 +803,7 @@ pub fn wire(ui: &AppWindow, rec: &Shared, games: &Games) {
                 Ok(None) => {}
                 Err(e) => {
                     log!("image picker: {e}");
-                    flash_notice(&ui, tr!("Could not open the file picker"));
+                    flash_error(&ui, tr!("Could not open the file picker"));
                 }
             });
         });

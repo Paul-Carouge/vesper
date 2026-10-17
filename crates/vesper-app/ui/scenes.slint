@@ -477,7 +477,7 @@ component TextBox inherits Rectangle {
     border-radius: Theme.radius-sm;
     background: Theme.surface-raised;
     border-width: 1px;
-    border-color: input.has-focus ? Theme.accent : Theme.border-strong;
+    border-color: input.has-focus ? Theme.accent : Theme.control-border;
 
     input := TextInput {
         x: Theme.space-sm + 2px;
@@ -962,7 +962,7 @@ component ScenesCard inherits Card {
             for scene[i] in SceneStore.scenes: ListRow {
                 text: scene.name;
                 selected: i == SceneStore.editing;
-                badge: i == SceneStore.active ? @tr("Recorded") : "";
+                badge: i == SceneStore.active ? @tr("Active") : "";
                 clicked => {
                     root.edit(i);
                 }
@@ -971,7 +971,6 @@ component ScenesCard inherits Card {
         if root.any: Divider { }
         if root.any && root.mode == 0: HorizontalLayout {
             spacing: Theme.space-xs;
-            alignment: start;
             Button {
                 text: @tr("scene" => "New");
                 small: true;
@@ -1003,11 +1002,16 @@ component ScenesCard inherits Card {
                     root.mode = 1;
                 }
             }
-            Button {
-                text: @tr("Delete");
-                small: true;
-                kind: "ghost";
-                accessible-label: @tr("Delete {}", root.name);
+            // Apart and as an icon, like the layers' delete: the row fits
+            // the narrowest window in French.
+            Rectangle {
+                horizontal-stretch: 1;
+            }
+            IconButton {
+                width: Theme.control-height;
+                height: Theme.control-height-sm;
+                icon: Icons.trash;
+                label: @tr("Delete {}", root.name);
                 clicked => {
                     root.mode = 2;
                 }
@@ -1123,7 +1127,7 @@ component PreviewCard inherits Card {
                 vertical-alignment: center;
             }
             Text {
-                text: SceneStore.live ? @tr("Live") : @tr("Layout");
+                text: SceneStore.live ? @tr("preview" => "Live") : @tr("Layout");
                 vertical-alignment: center;
                 font-size: Theme.font-caption;
                 font-weight: 600;

@@ -184,7 +184,7 @@ msgid "Close"
 msgstr "Fermer"
 
 msgid "Close settings"
-msgstr "Fermer les paramètres"
+msgstr "Fermer les réglages"
 
 msgid "Close the filter list"
 msgstr "Fermer la liste des filtres"
@@ -250,7 +250,7 @@ msgid "Could not read that profile"
 msgstr "Impossible de lire ce profil"
 
 msgid "Could not read the settings: changes are not saved"
-msgstr "Impossible de lire les paramètres : les changements ne sont pas sauvegardés"
+msgstr "Impossible de lire les réglages : les changements ne sont pas sauvegardés"
 
 msgid "Could not save the replay: {}"
 msgstr "Impossible de sauvegarder le replay : {}"
@@ -289,7 +289,7 @@ msgid "DESKTOP AND MICROPHONE"
 msgstr "BUREAU ET MICRO"
 
 msgid "De-esser"
-msgstr "De-esser"
+msgstr "Dé-esseur"
 
 msgid "Default"
 msgstr "Par défaut"
@@ -307,13 +307,13 @@ msgid "Delete “{}”?"
 msgstr "Supprimer « {} » ?"
 
 msgid "Delete “{}”? Its settings and plugin states are deleted."
-msgstr "Supprimer « {} » ? Ses paramètres et l’état de ses plugins sont supprimés."
+msgstr "Supprimer « {} » ? Ses réglages et l’état de ses plugins sont supprimés."
 
 msgid "Delete “{}”? Without scenes, the capture is recorded alone."
 msgstr "Supprimer « {} » ? Sans scène, la capture est enregistrée seule."
 
 msgid "Deleted {}"
-msgstr "{} supprimé"
+msgstr "Profil « {} » supprimé"
 
 msgid "Desktop"
 msgstr "Bureau"
@@ -328,7 +328,7 @@ msgid "Disconnected: recorded again once it is back"
 msgstr "Déconnecté : de nouveau enregistré dès son retour"
 
 msgid "Duplicate"
-msgstr "Copier"
+msgstr "Dupliquer"
 
 msgid "Duplicate {}"
 msgstr "Dupliquer {}"
@@ -350,9 +350,6 @@ msgstr "Temps écoulé"
 
 msgid "Empty: the scene records black."
 msgstr "Vide : la scène enregistre du noir."
-
-msgid "Encoder"
-msgstr "Encodeur"
 
 msgid "Encoding failed: {}"
 msgstr "Échec de l’encodage : {}"
@@ -376,7 +373,7 @@ msgid "Enter the server URL first: the key is saved for that server"
 msgstr "Saisissez d’abord l’URL du serveur : la clé est sauvegardée pour ce serveur"
 
 msgid "Enter the server URL in the settings first"
-msgstr "Saisissez d’abord l’URL du serveur dans les paramètres"
+msgstr "Saisissez d’abord l’URL du serveur dans les réglages"
 
 msgid "Expander"
 msgstr "Expandeur"
@@ -440,9 +437,6 @@ msgstr "Capture de jeu installée"
 
 msgid "Game capture is not running"
 msgstr "La capture de jeu n’est pas lancée"
-
-msgid "Game capture layer not built"
-msgstr "Couche de capture de jeu non compilée"
 
 msgid "Game capture removed"
 msgstr "Capture de jeu supprimée"
@@ -595,19 +589,19 @@ msgid "Leave out of desktop audio"
 msgstr "Retirer du son du bureau"
 
 msgid "Applies once the recording ends."
-msgstr "S'applique à la fin de l'enregistrement."
+msgstr "S’applique à la fin de l’enregistrement."
 
 msgid "Desktop audio does not record this app a second time."
-msgstr "Le son du bureau n'enregistre pas cette application une deuxième fois."
+msgstr "Le son du bureau n’enregistre pas cette application une deuxième fois."
 
 msgid "{} left out of desktop audio"
 msgstr "{} retiré du son du bureau"
 
 msgid "Without {}"
-msgstr "Sans : {}"
+msgstr "Sauf {}"
 
 msgid "{} · without {}"
-msgstr "{} · sans {}"
+msgstr "{} · sauf {}"
 
 msgid "Lower {} when I speak"
 msgstr "Baisser {} quand je parle"
@@ -649,7 +643,7 @@ msgid "New profile"
 msgstr "Nouveau profil"
 
 msgid "New profile, with the default settings"
-msgstr "Nouveau profil, avec les paramètres par défaut"
+msgstr "Nouveau profil, avec les réglages par défaut"
 
 msgid "New scene"
 msgstr "Nouvelle scène"
@@ -703,10 +697,10 @@ msgid "No system tray found: closing the window quits Vesper."
 msgstr "Aucune zone de notification trouvée : fermer la fenêtre quitte Vesper."
 
 msgid "No {0} stream key saved (one is saved for {1}): paste {0}'s key in the settings"
-msgstr "Aucune clé de stream {0} sauvegardée (il y en a une pour {1}) : collez la clé {0} dans les paramètres"
+msgstr "Aucune clé de stream {0} sauvegardée (il y en a une pour {1}) : collez la clé {0} dans les réglages"
 
 msgid "No {0} stream key saved: paste {0}'s key in the settings"
-msgstr "Aucune clé de stream {0} sauvegardée : collez la clé {0} dans les paramètres"
+msgstr "Aucune clé de stream {0} sauvegardée : collez la clé {0} dans les réglages"
 
 msgid "Noise suppression"
 msgstr "Réduction de bruit"
@@ -736,7 +730,7 @@ msgid "OUTPUT FOLDER"
 msgstr "DOSSIER DE SORTIE"
 
 msgid "Off. Turn on to save past moments"
-msgstr "Désactivé. Activez-le pour sauvegarder les derniers instants"
+msgstr "Désactivé : activez-le pour garder les derniers instants"
 
 msgid "Opacity"
 msgstr "Opacité"
@@ -748,22 +742,16 @@ msgid "Open folder"
 msgstr "Ouvrir le dossier"
 
 msgid "Open the game capture settings"
-msgstr "Ouvrir les paramètres de capture de jeu"
+msgstr "Ouvrir les réglages de la capture de jeu"
 
 msgid "Outline"
 msgstr "Contour"
-
-msgid "Output"
-msgstr "Sortie"
 
 msgid "Output device"
 msgstr "Périphérique de sortie"
 
 msgid "Output folder: {}"
 msgstr "Dossier de sortie : {}"
-
-msgid "Output settings"
-msgstr "Paramètres de sortie"
 
 msgid "PNG or JPEG"
 msgstr "PNG ou JPEG"
@@ -784,7 +772,7 @@ msgid "Performance"
 msgstr "Performance"
 
 msgid "Pick a screen or a window to record"
-msgstr "Choisissez un écran ou une fenêtre à enregistrer"
+msgstr "Choisissez l’écran ou la fenêtre à enregistrer"
 
 msgid "Play"
 msgstr "Lire"
@@ -846,9 +834,6 @@ msgstr "Enregistrer cette scène"
 msgid "Record {}"
 msgstr "Enregistrer {}"
 
-msgid "Recorded"
-msgstr "Enregistrée"
-
 msgid "Recorded by the Desktop audio and Microphone tracks. An unplugged device is waited for, never replaced by another one."
 msgstr "Enregistrés par les pistes Son du bureau et Micro. Un périphérique débranché est attendu, jamais remplacé par un autre."
 
@@ -901,7 +886,7 @@ msgid "Rename “{}”"
 msgstr "Renommer « {} »"
 
 msgid "Replaces the filters with high-pass, noise suppression, expander, compressor, de-esser and limiter"
-msgstr "Remplace les filtres par passe-haut, réduction de bruit, expandeur, compresseur, de-esser et limiteur"
+msgstr "Remplace les filtres par passe-haut, réduction de bruit, expandeur, compresseur, dé-esseur et limiteur"
 
 msgid "Replay buffer"
 msgstr "Tampon de replay"
@@ -1021,16 +1006,16 @@ msgid "Server URL"
 msgstr "URL du serveur"
 
 msgid "Set a stream key in the settings first"
-msgstr "Définissez d’abord une clé de stream dans les paramètres"
+msgstr "Définissez d’abord une clé de stream dans les réglages"
 
 msgid "Set up"
 msgstr "Configurer"
 
 msgid "Settings could not be read: nothing is saved"
-msgstr "Impossible de lire les paramètres : rien n’est sauvegardé"
+msgstr "Impossible de lire les réglages : rien n’est sauvegardé"
 
 msgid "Settings could not be read: profiles are unavailable"
-msgstr "Impossible de lire les paramètres : les profils sont indisponibles"
+msgstr "Impossible de lire les réglages : les profils sont indisponibles"
 
 msgid "Settings of {}"
 msgstr "Réglages de {}"
@@ -1174,10 +1159,10 @@ msgid "System"
 msgstr "Système"
 
 msgid "System default"
-msgstr "Défaut du système"
+msgstr "Par défaut (système)"
 
 msgid "System follows the language of the session."
-msgstr "Système suit la langue de la session."
+msgstr "« Système » suit la langue de la session."
 
 msgid "Text"
 msgstr "Texte"
@@ -1444,7 +1429,22 @@ msgid "{}: {} saved up to there"
 msgstr "{} : {} sauvegardé jusque-là"
 
 msgid "≈ {} MB at 4K{} {}"
-msgstr "≈ {} Mo en 4K{} {}"
+msgstr "≈ {} Mo en 4K{} {}"
+
+msgid "Active"
+msgstr "Active"
+
+msgid "Close the message"
+msgstr "Fermer le message"
+
+msgid "Game capture is not in this build"
+msgstr "Capture de jeu absente de cette version"
+
+msgid "Record this track"
+msgstr "Enregistrer cette piste"
+
+msgid "Settings"
+msgstr "Réglages"
 
 msgctxt "profile"
 msgid "New"
@@ -1465,6 +1465,10 @@ msgstr "Autre"
 msgctxt "button"
 msgid "Save replay"
 msgstr "Sauvegarder"
+
+msgctxt "preview"
+msgid "Live"
+msgstr "En cours"
 
 msgid "{n} dropped"
 msgid_plural "{n} dropped"
