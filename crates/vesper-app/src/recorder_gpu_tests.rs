@@ -1395,3 +1395,252 @@ fn a_lab_webcam_is_recorded_with_its_colour() {
     }
     std::fs::remove_dir_all(out).unwrap();
 }
+
+// --- a lost portal capture ---
+
+use super::reconnect::Started;
+
+/// A fake portal capture: streams the test pattern into the mailbox until
+/// dropped, or until `kill` (the stream closes, like a monitor turned off).
+/// Restarts fail while `down`.
+struct FakePortal {
+    kill: Arc<AtomicBool>,
+    down: Arc<AtomicBool>,
+    starts: Arc<AtomicUsize>,
+}
+
+impl FakePortal {
+    fn new() -> Self {
+        Self {
+            kill: Arc::default(),
+            down: Arc::default(),
+            starts: Arc::default(),
+        }
+    }
+
+    fn starter(&self) -> Starter {
+        let (kill, down, starts) = (self.kill.clone(), self.down.clone(), self.starts.clone());
+        Arc::new(move |_, slot| {
+            starts.fetch_add(1, Ordering::SeqCst);
+            if down.load(Ordering::SeqCst) {
+                return Err("portal gone".into());
+            }
+            kill.store(false, Ordering::SeqCst);
+            let live = Arc::new(AtomicBool::new(true));
+            let (l, kill) = (live.clone(), kill.clone());
+            let thread = std::thread::spawn(move || {
+                // Not Send: made here.
+                let producer = unsafe { Producer::new(W, H) };
+                let mut t = 0u32;
+                while l.load(Ordering::Relaxed) {
+                    if kill.load(Ordering::SeqCst) {
+                        slot.park(Err("stream closed".into()));
+                        return;
+                    }
+                    let frame = unsafe { producer.frame(t as usize % POOL, t, 0, monotonic_now()) };
+                    slot.park(Ok(frame));
+                    t += 1;
+                    std::thread::sleep(Duration::from_millis(33));
+                }
+            });
+            Ok(Started {
+                info: vesper_capture::SourceInfo::default(),
+                _guard: Box::new(Stream(live, Some(thread))),
+            })
+        })
+    }
+}
+
+/// Stops its feeder thread when the capture is dropped.
+struct Stream(Arc<AtomicBool>, Option<std::thread::JoinHandle<()>>);
+
+impl Drop for Stream {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Relaxed);
+        if let Some(t) = self.1.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+fn portal_settings() -> Settings {
+    Settings {
+        game: None,
+        ..settings(&GameFrames::default())
+    }
+}
+
+/// Next notice, skipping other events.
+fn notice(rx: &Receiver<Event>) -> String {
+    loop {
+        match event(rx) {
+            Some(Event::Notice(n)) => return n,
+            Some(Event::Finished(r)) => panic!("finished before the notice: {r:?}"),
+            Some(_) => {}
+            None => panic!("no encoder"),
+        }
+    }
+}
+
+/// The recording's file, once finished.
+fn finished(rx: &Receiver<Event>) -> Option<PathBuf> {
+    loop {
+        if let Event::Finished(r) = event(rx)? {
+            return Some(r.unwrap());
+        }
+    }
+}
+
+/// Video packet sizes of a file, in order.
+fn packet_sizes(path: &Path) -> Vec<usize> {
+    let mut input = ffmpeg_next::format::input(path).unwrap();
+    input
+        .packets()
+        .filter(|(s, _)| s.index() == 0)
+        .map(|(_, p)| p.size())
+        .collect()
+}
+
+/// The longest run of packets far smaller than the moving picture's first
+/// ones (a frozen picture; a lone keyframe in it does not end it), and
+/// where it ends.
+fn longest_freeze(sizes: &[usize]) -> (usize, usize) {
+    let mut first = sizes[..20].to_vec();
+    first.sort_unstable();
+    let small = |i: usize| sizes.get(i).is_some_and(|&s| s < first[10] / 4);
+    let (mut best, mut end, mut run) = (0, 0, 0);
+    for i in 0..sizes.len() {
+        let frozen = small(i) || (run > 0 && small(i + 1));
+        run = if frozen { run + 1 } else { 0 };
+        if run > best {
+            (best, end) = (run, i + 1);
+        }
+    }
+    (best, end)
+}
+
+/// The screen capture closes mid-recording (KWin restarted, monitor off),
+/// the portal is gone for a while, then comes back: one file, the picture
+/// frozen meanwhile, then moving again; the replay buffer kept its past.
+#[test]
+fn a_lost_screen_capture_freezes_then_resumes_in_one_file() {
+    if !vesper_core::test_gpu() {
+        return;
+    }
+    let out = dir("portal-back");
+    let fake = FakePortal::new();
+    let (tx, rx) = mpsc::channel();
+    let p = Pipeline::spawn(
+        portal_settings(),
+        Some(Duration::from_secs(30)),
+        Some(out.clone()),
+        None,
+        Some(fake.starter()),
+        move |e| drop(tx.send(e)),
+    )
+    .unwrap();
+    if !matches!(event(&rx), Some(Event::Started)) {
+        return;
+    }
+    let started = Instant::now();
+    std::thread::sleep(Duration::from_secs(1));
+    fake.down.store(true, Ordering::SeqCst);
+    fake.kill.store(true, Ordering::SeqCst);
+    assert_eq!(notice(&rx), "Source lost: reconnecting…");
+    let lost_at = started.elapsed();
+    // The first restart (after 1 s) fails, the second (2 s later) works.
+    std::thread::sleep(Duration::from_millis(1500));
+    fake.down.store(false, Ordering::SeqCst);
+    assert_eq!(notice(&rx), "Source back");
+    let gap = started.elapsed() - lost_at;
+    assert!(gap >= Duration::from_secs(3), "back after {gap:?}");
+    assert_eq!(fake.starts.load(Ordering::SeqCst), 3);
+    std::thread::sleep(Duration::from_secs(1));
+    let replays = out.join("replay");
+    assert!(p.save_replay(replays.clone()));
+    let saved = loop {
+        match event(&rx) {
+            Some(Event::ReplaySaved(r)) => break r.unwrap(),
+            Some(Event::Finished(r)) => panic!("finished before the save: {r:?}"),
+            Some(_) => {}
+            None => return,
+        }
+    };
+    p.stop_recording();
+    let Some(path) = finished(&rx) else { return };
+    let wall = started.elapsed().as_secs_f64();
+    p.join();
+    let files = std::fs::read_dir(&out).unwrap().count();
+    assert_eq!(files, 2, "one recording and the replay folder");
+
+    let (n, key, last) = inspect(&path);
+    assert!(key);
+    assert!(
+        (last - wall).abs() < 0.6,
+        "file {last:.2} s, wall {wall:.2} s"
+    );
+    assert!(n as f64 > wall * 28.0, "{n} packets in {wall:.2} s");
+    let sizes = packet_sizes(&path);
+    let (frozen, end) = longest_freeze(&sizes);
+    let want = gap.as_secs_f64() * 30.0;
+    assert!(
+        (frozen as f64) > want * 0.8 && (frozen as f64) < want * 1.2 + 10.0,
+        "frozen for {frozen} packets, lost for {gap:?}"
+    );
+    assert!(sizes.len() - end > 20, "moving again after the freeze");
+    // The replay buffer holds the seconds before the loss too.
+    let (rn, rkey, _) = inspect(&saved);
+    assert!(
+        rkey && rn as f64 > (wall - 1.5) * 28.0,
+        "replay of {rn} packets"
+    );
+    std::fs::remove_dir_all(out).unwrap();
+}
+
+/// The capture never comes back: the recording keeps its frame rate until
+/// the user stops it, the file is complete, and the stop does not wait for
+/// the pending restart.
+#[test]
+fn a_capture_that_never_comes_back_still_ends_in_a_finished_file() {
+    if !vesper_core::test_gpu() {
+        return;
+    }
+    let out = dir("portal-gone");
+    let fake = FakePortal::new();
+    let (tx, rx) = mpsc::channel();
+    let p = Pipeline::spawn(
+        portal_settings(),
+        None,
+        Some(out.clone()),
+        None,
+        Some(fake.starter()),
+        move |e| drop(tx.send(e)),
+    )
+    .unwrap();
+    if !matches!(event(&rx), Some(Event::Started)) {
+        return;
+    }
+    let started = Instant::now();
+    std::thread::sleep(Duration::from_secs(1));
+    fake.down.store(true, Ordering::SeqCst);
+    fake.kill.store(true, Ordering::SeqCst);
+    assert_eq!(notice(&rx), "Source lost: reconnecting…");
+    std::thread::sleep(Duration::from_millis(3500));
+    p.stop_recording();
+    let stop = Instant::now();
+    let Some(path) = finished(&rx) else { return };
+    let wall = started.elapsed().as_secs_f64();
+    p.join();
+    assert!(
+        stop.elapsed() < Duration::from_secs(1),
+        "stopped in {:?}",
+        stop.elapsed()
+    );
+    let (n, key, last) = inspect(&path);
+    assert!(
+        key && (last - wall).abs() < 0.6,
+        "file {last:.2} s, wall {wall:.2} s"
+    );
+    assert!(n as f64 > wall * 28.0, "{n} packets in {wall:.2} s");
+    std::fs::remove_dir_all(out).unwrap();
+}

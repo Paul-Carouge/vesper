@@ -4,39 +4,43 @@ use super::*;
 
 pub(super) fn run(
     settings: &Settings,
+    capture: Option<Starter>,
     slot: &Arc<Mailbox>,
     control: &Mutex<Control>,
     started: &AtomicBool,
     sources: &AudioSources,
     on_event: &OnEvent,
 ) -> Result<(), String> {
-    let capture = match &settings.game {
+    let mut portal = match &settings.game {
         Some(game) => {
             game.attach(slot, settings.fps);
             None
         }
         None => {
-            let s = slot.clone();
             // Twice the recording rate, not once: a compositor pacing frames
             // at exactly `fps` with a phase close to our ticks' would leave
             // some ticks without a new frame (a repeat, then a skipped one).
-            let max_fps = settings.fps.saturating_mul(2);
-            let capture = Capture::start(load_restore_token().as_deref(), max_fps, move |event| {
-                s.park(event.map_err(|e| e.to_string()));
-            })
-            .map_err(|e| tr!("Could not start the capture: {}", e))?;
-            if let Some(token) = capture.restore_token()
-                && let Err(e) = save_restore_token(token)
-            {
-                log!("could not save the restore token: {e}");
+            let start =
+                capture.unwrap_or_else(|| reconnect::portal(settings.fps.saturating_mul(2)));
+            let portal = Portal::start(start, slot.clone())
+                .map_err(|e| tr!("Could not start the capture: {}", e))?;
+            if let Some(source) = portal.source() {
+                on_event(Event::Source(crate::outputs::describe(source)));
             }
-            on_event(Event::Source(crate::outputs::describe(capture.source())));
-            Some(capture)
+            Some(portal)
         }
     };
     let sinks = SharedSinks::default();
     started.store(true, Ordering::Relaxed);
-    let result = pump(settings, slot, control, &sinks, sources, on_event);
+    let result = pump(
+        settings,
+        slot,
+        portal.as_mut(),
+        control,
+        &sinks,
+        sources,
+        on_event,
+    );
     if let Some(game) = &settings.game {
         game.detach(slot);
     }
@@ -48,7 +52,7 @@ pub(super) fn run(
         on_event(Event::Finished(r.finish(result.clone().err())));
     }
     // Last: closing the portal session may hang, the file is safe by now.
-    drop(capture);
+    drop(portal);
     result
 }
 
@@ -116,6 +120,7 @@ impl Video {
 pub(super) fn pump(
     settings: &Settings,
     slot: &Mailbox,
+    mut portal: Option<&mut Portal>,
     control: &Mutex<Control>,
     sinks: &SharedSinks,
     sources: &AudioSources,
@@ -156,8 +161,45 @@ pub(super) fn pump(
             ),
         }
         let (frame, ended) = slot.take();
-        if let Some(e) = ended {
-            error = Some(tr!("Capture ended: {}", e));
+        // A lost portal capture comes back in the background; the last
+        // picture repeats meanwhile.
+        let changes = match (portal.as_mut(), &ended) {
+            (Some(p), _) => p.tick(ended.is_some()).map_err(|e| e.to_string()),
+            (None, Some(e)) => Err(e.clone()),
+            (None, None) => Ok([None, None]),
+        };
+        let changes = match changes {
+            Ok(c) => c,
+            Err(e) => {
+                error = Some(tr!("Capture ended: {}", e));
+                break;
+            }
+        };
+        let mut stopped = false;
+        for change in changes.into_iter().flatten() {
+            match change {
+                Change::Found(source) => {
+                    on_event(Event::Notice(tr!("Source back").into()));
+                    on_event(Event::Source(crate::outputs::describe(&source)));
+                }
+                Change::Lost => {
+                    log!("capture lost: {}", ended.as_deref().unwrap_or_default());
+                    on_event(Event::Notice(tr!("Source lost: reconnecting…").into()));
+                }
+                // The file is kept: a clean stop, not a failure.
+                Change::Refused => {
+                    on_event(Event::Notice(
+                        tr!("The source was not picked again: capture stopped").into(),
+                    ));
+                    stopped = true;
+                }
+                Change::Failed(e) => {
+                    error = Some(tr!("Capture ended: {}", e));
+                    stopped = true;
+                }
+            }
+        }
+        if stopped {
             break;
         }
         // The canvas: a fixed one, else the first frame's size. A fixed

@@ -6,7 +6,7 @@
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use vesper_capture::Capture;
+use vesper_capture::{Cancel, Capture};
 
 fn main() -> vesper_capture::Result<()> {
     tracing_subscriber::fmt()
@@ -19,11 +19,17 @@ fn main() -> vesper_capture::Result<()> {
         .or_else(|| std::env::var("VESPER_RESTORE_TOKEN").ok());
 
     let (tx, rx) = mpsc::sync_channel(4);
-    let capture = Capture::start(token.as_deref(), 1000, move |event| match event {
-        // Full channel: drop the frame, which returns its buffer to PipeWire.
-        Ok(frame) => drop(tx.try_send(Ok(frame))),
-        Err(e) => drop(tx.send(Err(e))),
-    })?;
+    let capture =
+        Capture::start(
+            token.as_deref(),
+            &Cancel::default(),
+            1000,
+            move |event| match event {
+                // Full channel: drop the frame, which returns its buffer to PipeWire.
+                Ok(frame) => drop(tx.try_send(Ok(frame))),
+                Err(e) => drop(tx.send(Err(e))),
+            },
+        )?;
     println!("capture started");
 
     let end = Instant::now() + Duration::from_secs(5);
