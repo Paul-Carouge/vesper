@@ -843,6 +843,9 @@ impl<F: FnMut(EncodedPacket)> Encoder<F> {
     }
 }
 
+// `Slew` works on stereo frames.
+const _: () = assert!(CHANNELS == 2);
+
 /// Applies the timeline's drift corrections (one frame repeated or dropped)
 /// as a raised-cosine crossfade from the stream to its copy one frame later
 /// (a repeat) or earlier (a drop), instead of a jump that clicks on tonal
@@ -953,24 +956,31 @@ fn encode_loop(
     let mut out = Vec::new();
     let ch = usize::from(CHANNELS);
     let mut stalled = false;
+    // Length of the last buffer: about a quantum.
+    let mut quantum = Duration::ZERO;
     loop {
         let wait = if stalled { STALL_FILL } else { STALL };
         let (mut pad, skip, repeat, samples) = match rx.recv_timeout(wait) {
             Ok(chunk) => {
                 stalled = false;
+                quantum = frames_to_duration(chunk.samples.len() / ch);
                 let (pad, skip, repeat) = timeline.place(chunk.start, chunk.samples.len() / ch);
                 (pad, skip, repeat, chunk.samples)
             }
             // Stalled source (no device, suspended, nothing playing to an
             // app track or a sink): keep the track continuous. A playback
-            // buffer is stamped when heard, about `now` or later, so silence
-            // up to a fill (and the tolerance) ago does not cover audio that
-            // resumes, even a quantum early (a backlog, no graph time): the
-            // track keeps up with the others. An input's is stamped its
-            // capture delay ago.
+            // buffer is stamped when heard, about `now` or later, but may
+            // come a quantum early (a backlog, no graph time): silence up to
+            // the tolerance and a quantum (or a fill, if longer) ago does not
+            // cover audio that resumes, and the track keeps up with the
+            // others. An input's is stamped its capture delay ago.
             Err(RecvTimeoutError::Timeout) => {
                 stalled = true;
-                let lag = if input { STALL } else { TOLERANCE + STALL_FILL };
+                let lag = if input {
+                    STALL
+                } else {
+                    TOLERANCE + STALL_FILL.max(quantum)
+                };
                 let (pad, _, _) = timeline.place(monotonic_now().saturating_sub(lag), 0);
                 (pad, 0, 0, Vec::new())
             }
@@ -1360,14 +1370,14 @@ mod tests {
     }
 
     /// Worst `now - pts` of the packets out of a track that stalls after
-    /// its first buffer, once it is stalled (past 450 ms).
-    fn stalled_lag(input: bool) -> Duration {
+    /// its first buffer of `frames`, once it is stalled (past 450 ms).
+    fn stalled_lag(input: bool, frames: usize) -> Duration {
         let anchor = monotonic_now();
         let (chunk_tx, chunk_rx) = mpsc::channel();
         chunk_tx
             .send(pw::Chunk {
                 start: anchor,
-                samples: vec![0.0; FRAME * 2],
+                samples: vec![0.0; frames * 2],
             })
             .unwrap();
         let stopper = std::thread::spawn(move || {
@@ -1389,12 +1399,18 @@ mod tests {
 
     #[test]
     fn a_stalled_playback_track_keeps_up_with_now() {
-        // Filled every 20 ms up to 5 ms ago: the mix and a live stream do
-        // not wait for it. Packets lag by a block, the fill and the encoder.
-        let lag = stalled_lag(false);
-        assert!(lag < Duration::from_millis(150), "{lag:?}");
+        // Filled every 20 ms up to 25 ms ago (a fill and the tolerance): the
+        // mix and a live stream do not wait for it. Packets lag by that, a
+        // block and the encoder.
+        let lag = stalled_lag(false, FRAME);
+        let margin = TOLERANCE + STALL_FILL;
+        assert!(lag >= margin && lag < Duration::from_millis(150), "{lag:?}");
+        // A larger quantum: a resume can come that early, so that far back.
+        let lag = stalled_lag(false, 2_048);
+        let margin = TOLERANCE + frames_to_duration(2_048);
+        assert!(lag >= margin && lag < Duration::from_millis(170), "{lag:?}");
         // An input's buffers are stamped in the past: it stays `STALL` back.
-        let lag = stalled_lag(true);
+        let lag = stalled_lag(true, FRAME);
         assert!(lag >= STALL, "{lag:?}");
         assert!(lag < STALL + Duration::from_millis(150), "{lag:?}");
     }
