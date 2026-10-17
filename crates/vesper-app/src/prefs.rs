@@ -164,7 +164,18 @@ impl Prefs {
                 continue;
             }
             match key.trim() {
-                "codec" => set(&mut self.codec, codec(value)),
+                // Files before HEVC became the default: AV1 was the default
+                // then, and a choice of it cannot be told apart, so it moves
+                // to HEVC (as good on games at about half the size, better on
+                // text). Other choices stay.
+                "codec" => set(
+                    &mut self.codec,
+                    codec(value).map(|c| match c {
+                        VideoCodec::Av1 => VideoCodec::Hevc,
+                        c => c,
+                    }),
+                ),
+                "video_codec" => set(&mut self.codec, codec(value)),
                 "quality" => set(&mut self.quality, quality(value)),
                 "fps" => set(&mut self.fps, choice(value, &FPS)),
                 "replay" => set(&mut self.replay_enabled, flag(value)),
@@ -313,7 +324,7 @@ impl Prefs {
             text += &format!("name={}\n", self.profile_name);
         }
         text += &format!(
-            "codec={codec}\nquality={quality}\nfps={}\nreplay={}\nreplay_seconds={}\n",
+            "video_codec={codec}\nquality={quality}\nfps={}\nreplay={}\nreplay_seconds={}\n",
             self.fps, self.replay_enabled, self.replay_seconds
         );
         // Marks the list as saved, even empty.
@@ -1215,6 +1226,22 @@ mod tests {
         let prefs = defaults().parse(" codec = hevc \r\nfps=30\r\n");
         assert_eq!(prefs.codec, VideoCodec::Hevc);
         assert_eq!(prefs.fps, 30);
+    }
+
+    #[test]
+    fn the_old_default_av1_moves_to_hevc_but_choices_stay() {
+        let codec = |text| defaults().parse(text).codec;
+        // Written before HEVC was the default: AV1 was the default then.
+        assert_eq!(codec("codec=av1\n"), VideoCodec::Hevc);
+        assert_eq!(codec("codec=h264\n"), VideoCodec::H264);
+        assert_eq!(codec("codec=hevc\n"), VideoCodec::Hevc);
+        // Written since: AV1 is a choice.
+        assert_eq!(codec("video_codec=av1\n"), VideoCodec::Av1);
+        let av1 = Prefs {
+            codec: VideoCodec::Av1,
+            ..defaults()
+        };
+        assert_eq!(codec(&av1.serialize_profile(DEFAULT)), VideoCodec::Av1);
     }
 
     #[test]

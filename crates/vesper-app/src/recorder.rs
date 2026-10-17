@@ -82,6 +82,37 @@ const FIRST_FRAME_TIMEOUT: Duration = if cfg!(test) {
 /// nothing records (a launcher, then the game in fullscreen).
 const RESIZE_AFTER: Duration = Duration::from_secs(1);
 
+/// Share of the GPU encoder's time ([`Encoder::vcn_load`]) above which the
+/// user is told frames may be dropped. Quality is never lowered for it.
+const VCN_OVERLOAD: f64 = 0.9;
+
+/// Recording and own-encode stream together above this share of the GPU
+/// encoder's time: the stream opens at the faster quality level (in CBR,
+/// measured as good as the slower one).
+const VCN_STREAM_FAST: f64 = 0.85;
+
+/// What the user can do when the GPU encoder cannot keep up with a
+/// recording in `codec`. `stream`: the codec of a stream that, with the
+/// recording, is too much.
+fn overload_notice(codec: Codec, stream: Option<Codec>) -> String {
+    let what = if stream.is_some() {
+        tr!(
+            "The GPU encoder cannot keep up with both the recording and the stream: frames may be dropped."
+        )
+    } else {
+        tr!("The GPU encoder cannot keep up with this size and frame rate: frames may be dropped.")
+    };
+    // AV1 has no faster level: an HEVC stream takes far less of the encoder.
+    let advice = if stream == Some(Codec::Av1) {
+        tr!("Choose HEVC for the stream, or a lower frame rate or size.")
+    } else if codec == Codec::Hevc {
+        tr!("Choose a lower frame rate or size.")
+    } else {
+        tr!("Choose HEVC, or a lower frame rate or size.")
+    };
+    format!("{what} {advice}")
+}
+
 /// First wait before the scene compositor is tried again after a failure;
 /// doubled on each failure in a row, up to [`RETRY_MAX`].
 const RETRY_FIRST: Duration = if cfg!(test) {
@@ -1262,8 +1293,9 @@ impl Video {
             extradata: enc.extradata().to_vec(),
         };
         log!(
-            "encoding {width}x{height} at quality {}, max {bitrate} bit/s",
-            settings.quality
+            "encoding {width}x{height} at quality {}, max {bitrate} bit/s, GPU encoder load {:?}",
+            settings.quality,
+            enc.vcn_load()
         );
         // The grid starts now, not at the frame's own pts: opening the encoder
         // takes a while, and a producer clock off by seconds must not stall
@@ -1278,6 +1310,13 @@ impl Video {
     }
 }
 
+impl Video {
+    /// The encode takes more of the GPU encoder than it can give reliably.
+    fn overloaded(&self) -> bool {
+        self.enc.vcn_load().is_some_and(|l| l > VCN_OVERLOAD)
+    }
+}
+
 /// The video of a live stream.
 enum StreamVideo {
     /// The recording's packets.
@@ -1285,7 +1324,7 @@ enum StreamVideo {
     /// The stream's own encoder, being opened on a helper thread (opening
     /// takes tens of milliseconds: never on the tick).
     Opening(std::sync::mpsc::Receiver<Result<Encoder, String>>),
-    Own(Encoder),
+    Own(Box<Encoder>),
 }
 
 /// A live stream, from the pipeline thread's side.
@@ -1335,10 +1374,24 @@ impl Streaming {
         let video = if shared {
             StreamVideo::Shared
         } else {
-            let source = v
+            let mut source = v
                 .enc
                 .scaled_source()
                 .map_err(|e| tr!("Could not open the stream encoder: {}", e))?;
+            // The GPU encoder serves both: the recording keeps its quality,
+            // the stream takes the faster level when both are a lot.
+            let rec = v.enc.vcn_load().unwrap_or(0.0);
+            let load = |s: &vesper_encode::ScaledSource| {
+                s.vcn_load(codec, width, height, fps).map(|l| rec + l)
+            };
+            if load(&source).is_some_and(|l| l > VCN_STREAM_FAST) {
+                source.prefer_speed();
+            }
+            let load = load(&source);
+            log!("live: GPU encoder load with the recording {load:?}");
+            if load.is_some_and(|l| l > VCN_OVERLOAD) {
+                on_event(Event::Notice(overload_notice(settings.codec, Some(codec))));
+            }
             let (tx, rx) = std::sync::mpsc::channel();
             let rate = RateControl::ConstantBitrate(s.bitrate);
             std::thread::Builder::new()
@@ -1438,7 +1491,7 @@ impl Streaming {
                 fps: self.fps,
                 extradata: enc.extradata().to_vec(),
             };
-            self.video = StreamVideo::Own(enc);
+            self.video = StreamVideo::Own(Box::new(enc));
             self.connect(track, sources)?;
         }
         let Some(sink) = &self.sink else {
@@ -1673,6 +1726,9 @@ fn pump(
             on_event(Event::AudioStarted);
             match Video::open(settings, width, height) {
                 Ok(v) => {
+                    if v.overloaded() {
+                        on_event(Event::Notice(overload_notice(settings.codec, None)));
+                    }
                     stage.set_canvas(width, height);
                     video = Some(v);
                 }
@@ -1818,8 +1874,13 @@ fn pump(
             && streaming.is_none()
         {
             new_size = None;
+            let was_overloaded = video.as_ref().is_some_and(Video::overloaded);
             match Video::open(settings, f.width, f.height) {
                 Ok(v) => {
+                    // Told once, not on every resize of a game.
+                    if v.overloaded() && !was_overloaded {
+                        on_event(Event::Notice(overload_notice(settings.codec, None)));
+                    }
                     stage.set_canvas(f.width, f.height);
                     video = Some(v);
                 }

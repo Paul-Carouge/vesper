@@ -995,7 +995,7 @@ export component AppWindow inherits Window {
     in-out property <bool> audio-mix: true;
 
     // ---- Output settings ----------------------------------------------
-    in-out property <VideoCodec> codec: VideoCodec.av1;
+    in-out property <VideoCodec> codec: VideoCodec.hevc;
     in-out property <QualityPreset> quality: QualityPreset.balanced;
     /// One of 30, 60, 120, 144.
     in-out property <int> fps: 60;
@@ -1074,7 +1074,7 @@ export component AppWindow inherits Window {
     in-out property <int> live-fps: 60;
     // Mbit/s.
     in-out property <float> live-bitrate: 6;
-    in-out property <VideoCodec> live-codec: VideoCodec.h264;
+    in-out property <VideoCodec> live-codec: VideoCodec.av1;
     // Where the stream key is kept ("" when there is none).
     in property <string> live-key-state;
     // The key typed in the field: "Saving…", "Saved", "Not saved: <why>", or "".
@@ -2568,8 +2568,8 @@ export component AppWindow inherits Window {
                     SettingGroup {
                         label: @tr("CODEC");
                         hint: root.codec == VideoCodec.av1
-                            ? @tr("Smallest files at a given quality. Needs a recent player.")
-                            : root.codec == VideoCodec.hevc ? @tr("Efficient and widely supported by hardware.") : @tr("Plays everywhere, larger files.");
+                            ? @tr("Small files, but heavier on the GPU encoder. Needs a recent player.")
+                            : root.codec == VideoCodec.hevc ? @tr("Recommended: sharp games and text in small files.") : @tr("Plays everywhere, larger files.");
                         codec-picker := Segmented {
                             label: @tr("Codec");
                             enabled: !root.active;

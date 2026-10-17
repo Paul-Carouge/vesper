@@ -191,6 +191,14 @@ impl Muxer {
             };
             (*par).width = video.width as c_int;
             (*par).height = video.height as c_int;
+            // Matroska's Colour element, the same as the bitstream's VUI
+            // written by vesper-encode: BT.709 limited range, sRGB transfer
+            // (screen content), chroma sited left like the VA-VPP output.
+            (*par).color_range = ff::AVColorRange::AVCOL_RANGE_MPEG;
+            (*par).color_space = ff::AVColorSpace::AVCOL_SPC_BT709;
+            (*par).color_primaries = ff::AVColorPrimaries::AVCOL_PRI_BT709;
+            (*par).color_trc = ff::AVColorTransferCharacteristic::AVCOL_TRC_IEC61966_2_1;
+            (*par).chroma_location = ff::AVChromaLocation::AVCHROMA_LOC_LEFT;
             (*st).avg_frame_rate = ff::AVRational {
                 num: video.fps as c_int,
                 den: 1,

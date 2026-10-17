@@ -108,16 +108,58 @@ fn va(status: c_int, what: &str) -> Result<(), Error> {
 /// VMAF, but HEVC/H.264 then encode only ~550 Mpx/s, so faster pixel rates
 /// use balanced + VBAQ (19 = 0b10011). AV1 runs at the same speed with any
 /// level. Other drivers (Intel: 1-7) read the level differently: `None`
-/// keeps FFmpeg's default.
-fn quality_level(vendor: &str, codec: Codec, px_rate: u64) -> Option<c_int> {
+/// keeps FFmpeg's default. `fast`: balanced + VBAQ at any pixel rate (in
+/// CBR, measured as good as 21 for H.264, HEVC and AV1 on VCN 5).
+fn quality_level(vendor: &str, codec: Codec, px_rate: u64, fast: bool) -> Option<c_int> {
     if !vendor.contains("radeonsi") {
         return None;
     }
-    Some(if codec == Codec::Av1 || px_rate <= 300_000_000 {
-        21
-    } else {
-        19
-    })
+    Some(
+        if codec == Codec::Av1 || (px_rate <= 300_000_000 && !fast) {
+            21
+        } else {
+            19
+        },
+    )
+}
+
+/// Share of the GPU encoder's time (1.0: all of it) an encode of
+/// `width`x`height` at `fps` takes, at the quality level [`quality_level`]
+/// picks; `None` off radeonsi (no measurements). The VCN is one engine
+/// shared in time by every encode: loads add up, and above 1.0 frames are
+/// dropped. Throughput measured unpaced on VCN 5 (RX 9070 XT), the slowest
+/// of the runs: AV1 650 Mpx/s at any level; HEVC 590 (level 21) / 1690
+/// (19); H.264 620 / 940.
+pub fn vcn_load(
+    vendor: &str,
+    codec: Codec,
+    width: u32,
+    height: u32,
+    fps: u32,
+    fast: bool,
+) -> Option<f64> {
+    let px_rate = u64::from(width) * u64::from(height) * u64::from(fps);
+    let level = quality_level(vendor, codec, px_rate, fast)?;
+    let mpx_per_s = match (codec, level) {
+        (Codec::Av1, _) => 650.0,
+        (Codec::Hevc, 21) => 590.0,
+        (Codec::Hevc, _) => 1690.0,
+        (Codec::H264, 21) => 620.0,
+        (Codec::H264, _) => 940.0,
+    };
+    Some(px_rate as f64 / 1e6 / mpx_per_s)
+}
+
+/// The VA driver's vendor string ("" if unknown).
+unsafe fn vendor<'a>(display: *mut c_void) -> &'a str {
+    unsafe {
+        let vendor = vaQueryVendorString(display);
+        if vendor.is_null() {
+            ""
+        } else {
+            CStr::from_ptr(vendor).to_str().unwrap_or("")
+        }
+    }
 }
 
 /// What to open instead when `rate` fails: drivers without QVBR get VBR at
@@ -189,6 +231,15 @@ impl Drop for Frame {
     }
 }
 
+/// Owned reference to a frames context (`AVBufferRef`).
+struct Frames(*mut ff::AVBufferRef);
+
+impl Drop for Frames {
+    fn drop(&mut self) {
+        unsafe { ff::av_buffer_unref(&mut self.0) };
+    }
+}
+
 /// Borrows a raw fd as a `File` without taking ownership.
 fn borrow_file(fd: RawFd) -> ManuallyDrop<File> {
     ManuallyDrop::new(unsafe { File::from_raw_fd(fd) })
@@ -224,6 +275,9 @@ pub struct Encoder {
     cleared: Vec<u32>,
     /// Small black RGB surface the bars are painted from.
     black: Frame,
+    /// RGB surfaces a picture more than twice the size of `fit` is scaled
+    /// through first ([`scale_steps`]), largest first.
+    steps: Vec<Frames>,
     /// VA-VPP config and context of the letterbox.
     vpp: (u32, u32),
     packet: *mut ff::AVPacket,
@@ -238,6 +292,10 @@ pub struct Encoder {
     /// Scaled encoders ([`Encoder::new_scaled`]): the frames context of the
     /// source pictures their graph was built for.
     scaled_from: *mut u8,
+    /// The faster quality level ([`ScaledSource::prefer_speed`]).
+    fast: bool,
+    /// [`vcn_load`] of the open encoder.
+    load: Option<f64>,
 }
 
 // SAFETY: the FFmpeg/VA objects are owned by this struct and only used through
@@ -273,6 +331,7 @@ impl Encoder {
             canvas: ptr::null_mut(),
             cleared: Vec::new(),
             black: Frame::new()?,
+            steps: Vec::new(),
             vpp: (VA_INVALID_ID, VA_INVALID_ID),
             packet: ptr::null_mut(),
             imports: HashMap::new(),
@@ -280,6 +339,8 @@ impl Encoder {
             started: false,
             force_key: false,
             scaled_from: ptr::null_mut(),
+            fast: false,
+            load: None,
         };
         // On error, `e` is dropped and frees whatever was created so far.
         unsafe {
@@ -328,6 +389,7 @@ impl Encoder {
                 display: self.display,
                 width: self.width,
                 height: self.height,
+                fast: false,
             };
             source.frames = not_null(
                 ff::av_buffer_ref(ff::av_buffersink_get_hw_frames_ctx(self.sink)),
@@ -346,6 +408,7 @@ pub struct ScaledSource {
     display: *mut c_void,
     width: u32,
     height: u32,
+    fast: bool,
 }
 
 // SAFETY: reference-counted FFmpeg buffers (thread-safe counts) and a VA
@@ -362,6 +425,20 @@ impl Drop for ScaledSource {
 }
 
 impl ScaledSource {
+    /// Opens the encoder at the faster quality level (HEVC and H.264; AV1
+    /// runs at one speed), e.g. so a stream leaves the GPU encoder time for
+    /// the recording.
+    pub fn prefer_speed(&mut self) {
+        self.fast = true;
+    }
+
+    /// [`vcn_load`] of the encoder [`ScaledSource::open`] would open with
+    /// these settings (see [`ScaledSource::prefer_speed`]).
+    pub fn vcn_load(&self, codec: Codec, width: u32, height: u32, fps: u32) -> Option<f64> {
+        let vendor = unsafe { vendor(self.display) };
+        vcn_load(vendor, codec, width, height, fps, self.fast)
+    }
+
     /// Opens the scaled encoder; it then takes the source encoder's
     /// pictures through [`Encoder::encode_scaled`].
     pub fn open(
@@ -391,6 +468,7 @@ impl ScaledSource {
             canvas: ptr::null_mut(),
             cleared: Vec::new(),
             black: Frame::new()?,
+            steps: Vec::new(),
             vpp: (VA_INVALID_ID, VA_INVALID_ID),
             packet: ptr::null_mut(),
             imports: HashMap::new(),
@@ -398,6 +476,8 @@ impl ScaledSource {
             started: false,
             force_key: false,
             scaled_from: ptr::null_mut(),
+            fast: self.fast,
+            load: None,
         };
         // On error, `e` is dropped and frees whatever was created so far.
         unsafe {
@@ -423,26 +503,26 @@ impl Encoder {
                 };
                 tracing::warn!("{rate:?} failed ({err}), falling back to {fb:?}");
                 ff::avcodec_free_context(&mut self.enc);
-                self.open_encoder(codec, fps, fb)?;
+                // VBR sets no quality level: unknown load.
+                return self.open_encoder(codec, fps, fb);
             }
+            let vendor = vendor(self.display);
+            self.load = vcn_load(vendor, codec, self.width, self.height, fps, self.fast);
         }
         Ok(())
     }
 
     /// Builds `buffer` (`width`x`height` NV12 VA surfaces of `frames`) ->
-    /// `scale_vaapi` -> `buffersink` for a scaled encoder. On error the
-    /// previous graph stays.
+    /// `scale_vaapi` (one per [`scale_steps`] step, then the encoder's size)
+    /// -> `buffersink` for a scaled encoder. On error the previous graph stays.
     unsafe fn build_scaled_graph(
         &mut self,
         frames: *mut ff::AVBufferRef,
         width: u32,
         height: u32,
     ) -> Result<(), Error> {
-        let args = std::ffi::CString::new(format!(
-            "w={}:h={}:format=nv12:out_color_matrix=bt709:out_range=tv",
-            self.width, self.height
-        ))
-        .expect("no NUL");
+        let mut sizes = scale_steps((width, height), (self.width, self.height));
+        sizes.push((self.width, self.height));
         unsafe {
             if frames.is_null() {
                 return Err(Error("the source encoder has no frames context".into()));
@@ -450,10 +530,19 @@ impl Encoder {
             let mut graph = not_null(ff::avfilter_graph_alloc(), "avfilter_graph_alloc")?;
             let built = (|| {
                 let src = buffer_source(graph, frames, width, height, true)?;
-                let vpp = create_filter(graph, c"scale_vaapi", c"scale", args.as_ptr())?;
+                let mut prev = src;
+                for (i, (w, h)) in sizes.iter().enumerate() {
+                    let args = std::ffi::CString::new(format!(
+                        "w={w}:h={h}:format=nv12:out_color_matrix=bt709:out_range=tv"
+                    ))
+                    .expect("no NUL");
+                    let label = std::ffi::CString::new(format!("scale{i}")).expect("no NUL");
+                    let vpp = create_filter(graph, c"scale_vaapi", &label, args.as_ptr())?;
+                    check(ff::avfilter_link(prev, 0, vpp, 0), "link")?;
+                    prev = vpp;
+                }
                 let sink = create_filter(graph, c"buffersink", c"out", ptr::null())?;
-                check(ff::avfilter_link(src, 0, vpp, 0), "link")?;
-                check(ff::avfilter_link(vpp, 0, sink, 0), "link")?;
+                check(ff::avfilter_link(prev, 0, sink, 0), "link")?;
                 check(
                     ff::avfilter_graph_config(graph, ptr::null_mut()),
                     "configure graph",
@@ -502,21 +591,28 @@ impl Encoder {
             (*fc).height = height as c_int;
             let mut graph = ptr::null_mut();
             let native = (width, height) == (self.width, self.height);
+            let fitted = (!native).then(|| fit(width, height, self.width, self.height));
             let built = check(ff::av_hwframe_ctx_init(frames), "init VA frames").and_then(|_| {
-                if native {
-                    self.build_graph(&mut graph, frames)
-                } else {
-                    self.open_letterbox()?;
-                    self.build_graph(&mut graph, self.canvas)
-                }
+                let Some(r) = fitted else {
+                    let (src, sink) = self.build_graph(&mut graph, frames)?;
+                    return Ok((src, sink, Vec::new()));
+                };
+                self.open_letterbox()?;
+                let (src, sink) = self.build_graph(&mut graph, self.canvas)?;
+                let steps = scale_steps((width, height), (r.width.into(), r.height.into()))
+                    .into_iter()
+                    .map(|(w, h)| rgb_frames(self.device, w, h).map(Frames))
+                    .collect::<Result<_, _>>()?;
+                Ok((src, sink, steps))
             });
             match built {
-                Ok((src, sink)) => {
+                Ok((src, sink, steps)) => {
                     ff::avfilter_graph_free(&mut self.graph);
                     ff::av_buffer_unref(&mut self.import_frames);
                     (self.graph, self.src, self.sink, self.import_frames) =
                         (graph, src, sink, frames);
-                    self.fit = (!native).then(|| fit(width, height, self.width, self.height));
+                    self.fit = fitted;
+                    self.steps = steps;
                     self.cleared.clear();
                     Ok(())
                 }
@@ -683,11 +779,36 @@ impl Encoder {
                 self.blit(black, dst, ptr::null())?;
                 self.cleared.push(dst);
             }
-            if let Err(e) = self.blit((*picture).data[3] as usize as u32, dst, &fit) {
-                // The job may be running: wait for it before the producer's
-                // buffer is released (radeonsi fences the target, not the source).
-                vaSyncSurface(self.display, dst);
-                return Err(e);
+            // The jobs may be running: wait for them before the producer's
+            // buffer is released (radeonsi fences the target, not the source).
+            let mut targets = Vec::with_capacity(self.steps.len() + 1);
+            let failed = |targets: &[u32], e| {
+                for &t in targets {
+                    vaSyncSurface(self.display, t);
+                }
+                Err(e)
+            };
+            let mut src = (*picture).data[3] as usize as u32;
+            let mut held = Vec::with_capacity(self.steps.len());
+            for step in &self.steps {
+                let s = match Frame::new() {
+                    Ok(s) => s,
+                    Err(e) => return failed(&targets, e),
+                };
+                if let Err(e) = check(ff::av_hwframe_get_buffer(step.0, s.0, 0), "step surface") {
+                    return failed(&targets, e);
+                }
+                let t = (*s.0).data[3] as usize as u32;
+                targets.push(t);
+                if let Err(e) = self.blit(src, t, ptr::null()) {
+                    return failed(&targets, e);
+                }
+                src = t;
+                held.push(s);
+            }
+            targets.push(dst);
+            if let Err(e) = self.blit(src, dst, &fit) {
+                return failed(&targets, e);
             }
             Ok(canvas)
         }
@@ -761,14 +882,9 @@ impl Encoder {
                 rate,
                 RateControl::Quality { .. } | RateControl::ConstantBitrate(_)
             ) {
-                let vendor = vaQueryVendorString(self.display);
-                let vendor = if vendor.is_null() {
-                    ""
-                } else {
-                    CStr::from_ptr(vendor).to_str().unwrap_or("")
-                };
                 let px_rate = u64::from(self.width) * u64::from(self.height) * u64::from(fps);
-                if let Some(level) = quality_level(vendor, codec, px_rate) {
+                if let Some(level) = quality_level(vendor(self.display), codec, px_rate, self.fast)
+                {
                     enc.compression_level = level;
                 }
             }
@@ -787,6 +903,11 @@ impl Encoder {
             )?;
         }
         Ok(())
+    }
+
+    /// Share of the GPU encoder's time this encode takes (see [`vcn_load`]).
+    pub fn vcn_load(&self) -> Option<f64> {
+        self.load
     }
 
     /// Codec-level header (FFmpeg `extradata`) a muxer needs to declare the
@@ -1065,6 +1186,25 @@ impl Encoder {
     }
 }
 
+/// Intermediate sizes of a VA-VPP downscale from `src` to `dst`, largest
+/// first, without `dst`. radeonsi's VPP scales with a 2-tap bilinear filter
+/// (`mode=hq` changes nothing): exact at 2:1 (a box filter), but beyond it
+/// skips pixels (4K to 720p measured at VMAF 66-71 against an area
+/// downscale). So a larger ratio first goes to a power-of-two multiple of
+/// `dst` (at most 2:1) and then halves exactly: 4K to 720p via 1440p
+/// measured at VMAF 94 (text) / 99.8 (game); halving first (via 1080p) only
+/// reached 86 / 95.
+fn scale_steps(src: (u32, u32), dst: (u32, u32)) -> Vec<(u32, u32)> {
+    let mut steps = Vec::new();
+    let (mut w, mut h) = (dst.0.max(1), dst.1.max(1));
+    while src.0 > 2 * w || src.1 > 2 * h {
+        (w, h) = ((2 * w).min(src.0), (2 * h).min(src.1));
+        steps.push((w, h));
+    }
+    steps.reverse();
+    steps
+}
+
 /// Where a `width`x`height` picture goes on a `w`x`h` canvas: as large as
 /// fits with its aspect ratio, even-sized, centred.
 fn fit(width: u32, height: u32, w: u32, h: u32) -> VaRect {
@@ -1182,6 +1322,7 @@ impl Drop for Encoder {
             ff::av_packet_free(&mut self.packet);
             ff::av_buffer_unref(&mut self.import_frames);
             ff::av_frame_unref(self.black.0);
+            self.steps.clear();
             ff::av_buffer_unref(&mut self.canvas);
             if self.vpp.1 != VA_INVALID_ID {
                 vaDestroyContext(self.display, self.vpp.1);
@@ -1213,12 +1354,52 @@ mod tests {
     }
 
     #[test]
+    fn large_downscales_end_with_exact_halvings() {
+        assert_eq!(scale_steps((3840, 2160), (1280, 720)), [(2560, 1440)]);
+        assert_eq!(
+            scale_steps((3840, 2160), (640, 360)),
+            [(2560, 1440), (1280, 720)]
+        );
+        assert!(scale_steps((3840, 2160), (1920, 1080)).is_empty());
+        assert!(scale_steps((2560, 1440), (1920, 1080)).is_empty());
+        assert!(scale_steps((2560, 1440), (1280, 720)).is_empty());
+        assert!(scale_steps((1280, 720), (1920, 1080)).is_empty());
+        // Ultrawide in a 16:9 box: the narrow axis never goes past the source.
+        assert_eq!(scale_steps((5120, 1440), (1280, 360)), [(2560, 720)]);
+        assert_eq!(scale_steps((3000, 100), (1000, 90)), [(2000, 100)]);
+    }
+
+    #[test]
     fn quality_level_only_on_radeonsi() {
         let amd = "Mesa Gallium driver 26.2.4 for AMD Radeon RX 9070 XT (radeonsi, gfx1201)";
-        assert_eq!(quality_level(amd, Codec::Hevc, 2560 * 1440 * 60), Some(21));
-        assert_eq!(quality_level(amd, Codec::Hevc, 3840 * 2160 * 60), Some(19));
-        assert_eq!(quality_level(amd, Codec::Av1, 3840 * 2160 * 60), Some(21));
-        assert_eq!(quality_level("Intel iHD driver", Codec::Hevc, 1), None);
+        let q = |codec, px, fast| quality_level(amd, codec, px, fast);
+        assert_eq!(q(Codec::Hevc, 2560 * 1440 * 60, false), Some(21));
+        assert_eq!(q(Codec::Hevc, 3840 * 2160 * 60, false), Some(19));
+        assert_eq!(q(Codec::Av1, 3840 * 2160 * 60, false), Some(21));
+        assert_eq!(q(Codec::H264, 1920 * 1080 * 60, true), Some(19));
+        assert_eq!(q(Codec::Av1, 1920 * 1080 * 60, true), Some(21));
+        assert_eq!(
+            quality_level("Intel iHD driver", Codec::Hevc, 1, false),
+            None
+        );
+    }
+
+    #[test]
+    fn vcn_load_follows_the_measured_throughput() {
+        let amd = "Mesa Gallium driver 26.2.4 for AMD Radeon RX 9070 XT (radeonsi, gfx1201)";
+        let load = |codec, w, h, fps, fast| vcn_load(amd, codec, w, h, fps, fast).unwrap();
+        // AV1 4K60: 498 of 650 Mpx/s; 4K120 is more than the VCN can do.
+        assert!((load(Codec::Av1, 3840, 2160, 60, false) - 0.766).abs() < 0.001);
+        assert!(load(Codec::Av1, 3840, 2160, 120, false) > 1.5);
+        // HEVC 4K144 goes to the faster level on its own.
+        assert!(load(Codec::Hevc, 3840, 2160, 144, false) < 0.75);
+        // A 1080p60 H.264 stream: 20% of the VCN, 13% at the faster level.
+        assert!((load(Codec::H264, 1920, 1080, 60, false) - 0.201).abs() < 0.001);
+        assert!((load(Codec::H264, 1920, 1080, 60, true) - 0.132).abs() < 0.001);
+        assert_eq!(
+            vcn_load("Intel iHD driver", Codec::Hevc, 1920, 1080, 60, false),
+            None
+        );
     }
 
     #[test]

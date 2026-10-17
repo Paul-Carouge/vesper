@@ -267,6 +267,42 @@ fn scaled_encoder_encodes_the_source_pictures_at_its_own_size() {
     }
 }
 
+/// A stream at a quarter of the recording's size goes through an
+/// intermediate scaling step (4:1: two exact halvings).
+#[test]
+fn scaled_encoder_downscales_beyond_two_to_one_in_steps() {
+    if !vesper_core::test_gpu() {
+        return;
+    }
+    let (w, h) = (1920, 1080);
+    let mut enc = Encoder::new(Codec::Hevc, w, h, 30, RateControl::ConstantQp(30)).unwrap();
+    let mut live = enc
+        .new_scaled(
+            Codec::Hevc,
+            480,
+            270,
+            30,
+            RateControl::ConstantBitrate(500_000),
+        )
+        .unwrap();
+    let producer = unsafe { Producer::new(w, h) };
+    let ms = |t: u64| Duration::from_millis(1_000 + t * 33);
+    let mut packets = Vec::new();
+    for t in 0..4 {
+        let frame = unsafe { producer.frame(t as usize % POOL, t as u32, 0, ms(t)) };
+        enc.encode(frame).unwrap();
+        packets.extend(live.encode_scaled(&enc, ms(t)).unwrap());
+    }
+    packets.extend(live.flush().unwrap());
+    let frames = unsafe { decode_luma(live.extradata(), &packets) };
+    assert_eq!(frames.len(), 4);
+    for f in &frames {
+        assert_eq!((f.w, f.h), (480, 270));
+        let mean = f.y.iter().map(|&v| f64::from(v)).sum::<f64>() / f.y.len() as f64;
+        assert!(mean > 30.0, "the pattern, not black: {mean}");
+    }
+}
+
 struct Luma {
     w: usize,
     h: usize,

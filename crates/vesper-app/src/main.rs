@@ -1084,12 +1084,14 @@ fn update_replay_memory(ui: &AppWindow) {
 /// Constant-quality target of each preset, on the encoder's QP scale (AV1:
 /// 0-255). Measured on VCN 5 at 1440p and 4K 60 fps against the old VBR
 /// presets: Balanced HEVC needs 22-32% fewer bits on fast motion for the same
-/// VMAF, and 50-80% fewer on desktop content. The AV1 values match HEVC's
-/// quality on fast motion.
+/// VMAF, and 50-80% fewer on desktop content. Balanced HEVC (the default) at
+/// 27 keeps the worst frames at VMAF >= 95.7 even on full-screen grain
+/// (games 99.1, text 98.7, dark gradients at the 8-bit floor). The AV1
+/// values match HEVC's quality on fast motion, at up to 1.8x the bitrate.
 fn quality(codec: VideoCodec, quality: QualityPreset) -> u32 {
     match (codec == VideoCodec::Av1, quality) {
         (false, QualityPreset::Performance) => 32,
-        (false, QualityPreset::Balanced) => 28,
+        (false, QualityPreset::Balanced) => 27,
         (false, QualityPreset::Quality) => 25,
         (true, QualityPreset::Performance) => 130,
         (true, QualityPreset::Balanced) => 105,
