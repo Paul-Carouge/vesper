@@ -262,13 +262,19 @@ mod tests {
         }
     }
 
+    /// The `ext` files under `dir`, subfolders included (e.g. `src/recorder/`).
     fn sources(dir: &str, ext: &str) -> Vec<(String, String)> {
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(dir);
-        let mut files: Vec<_> = std::fs::read_dir(&dir)
-            .unwrap()
-            .map(|e| e.unwrap().path())
-            .filter(|p| p.extension().is_some_and(|e| e == ext))
-            .collect();
+        let mut dirs = vec![Path::new(env!("CARGO_MANIFEST_DIR")).join(dir)];
+        let mut files = Vec::new();
+        while let Some(dir) = dirs.pop() {
+            for p in std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().path()) {
+                if p.is_dir() {
+                    dirs.push(p);
+                } else if p.extension().is_some_and(|e| e == ext) {
+                    files.push(p);
+                }
+            }
+        }
         files.sort();
         files
             .into_iter()
