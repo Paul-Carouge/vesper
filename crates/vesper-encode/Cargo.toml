@@ -2,6 +2,11 @@
 name = "vesper-encode"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+
+[lib]
+# No doc-tests: skips an empty rustdoc run per `cargo test`.
+doctest = false
 
 [dependencies]
 vesper-core.workspace = true

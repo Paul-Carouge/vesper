@@ -2,6 +2,11 @@
 name = "vesper-dsp"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+
+[lib]
+# No doc-tests: skips an empty rustdoc run per `cargo test`.
+doctest = false
 
 [dependencies]
 # Pure-Rust RNNoise port (BSD-3-Clause). Without default features it skips

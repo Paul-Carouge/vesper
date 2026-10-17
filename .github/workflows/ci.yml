@@ -25,15 +25,36 @@ jobs:
     container: archlinux:latest
     timeout-minutes: 30
     steps:
+      # rustup, not Arch's rust: the toolchain is the one rust-toolchain.toml
+      # pins, as on the dev machine. dbus and python-*: scripts/secret_tests.sh.
       - name: Install system dependencies
         run: >-
           pacman -Syu --noconfirm --needed
-          git rust clang pkgconf ffmpeg libva pipewire fontconfig freetype2 libxkbcommon
+          git rustup clang pkgconf ffmpeg libva pipewire fontconfig freetype2 libxkbcommon
+          dbus python-dbus python-gobject
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install the pinned toolchain
+        run: rustup toolchain install && rustc -vV
+      # rust-cache keys on rustc's version and commit only, but cargo's
+      # fingerprints hash all of `rustc -vV` (LLVM version included): a
+      # rebuild of the same version would keep the key and stale every artifact.
+      - name: Toolchain fingerprint
+        id: toolchain
+        run: echo "key=$(rustc -vV | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
+          key: ${{ steps.toolchain.outputs.key }}
           # PRs restore master's cache but don't each store a ~1 GB copy.
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
+      # Examples are left out: clippy above already checks them.
+      - run: cargo test --workspace --lib --bins --tests
+      - name: Keyring tests (fake Secret Service, private bus)
+        run: bash scripts/secret_tests.sh
+      # 32-bit games: the i686 layer and GL interposer, with code generation
+      # (an rlib, so no lib32 link) so the x86 `naked_asm!` is assembled too.
+      - name: Build the i686 layer and GL interposer
+        run: |
+          cargo rustc --target i686-unknown-linux-gnu -p vesper-vklayer --lib --crate-type rlib -- -D warnings
+          cargo rustc --target i686-unknown-linux-gnu -p vesper-glcapture --lib --crate-type rlib -- -D warnings

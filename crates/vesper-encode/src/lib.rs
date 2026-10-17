@@ -1197,7 +1197,6 @@ impl Drop for Encoder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
     use vesper_core::{DmaBufPlane, ReleaseGuard};
 
     #[test]
@@ -1235,8 +1234,7 @@ mod tests {
 
     #[test]
     fn rejects_a_bad_dmabuf_and_releases_it() {
-        if !Path::new("/dev/dri/renderD128").exists() {
-            eprintln!("no GPU, skipping");
+        if !vesper_core::test_gpu() {
             return;
         }
         let mut enc = Encoder::new(Codec::Hevc, 640, 360, 30, RateControl::ConstantQp(30)).unwrap();

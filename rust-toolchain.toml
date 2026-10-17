@@ -1,0 +1,8 @@
+# Same compiler locally and in CI, so a new lint can't pass here and fail
+# there. Raise it on purpose (with `rust-version` in Cargo.toml) in its own PR.
+[toolchain]
+channel = "1.98.1"
+components = ["clippy", "rustfmt"]
+# 32-bit games: the i686 layer and GL interposer (install.sh, CI check).
+targets = ["i686-unknown-linux-gnu"]
+profile = "minimal"

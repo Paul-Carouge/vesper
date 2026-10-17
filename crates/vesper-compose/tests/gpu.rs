@@ -4,7 +4,6 @@
 #[path = "../../vesper-encode/tests/common/mod.rs"]
 mod common;
 
-use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -18,11 +17,7 @@ use vesper_core::{Codec, ReleaseGuard, VideoFrame};
 use vesper_encode::{Encoder, RateControl};
 
 fn gpu() -> bool {
-    let ok = Path::new("/dev/dri/renderD128").exists();
-    if !ok {
-        eprintln!("no GPU, skipping");
-    }
-    ok
+    vesper_core::test_gpu()
 }
 
 fn full(source: Source, fit: Fit, opacity: f32) -> Draw {

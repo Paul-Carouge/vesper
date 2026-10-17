@@ -13,7 +13,6 @@
 
 mod common;
 
-use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -198,11 +197,7 @@ fn sizes() -> Vec<(usize, usize)> {
 }
 
 fn has_gpu() -> bool {
-    let yes = Path::new("/dev/dri/renderD128").exists();
-    if !yes {
-        eprintln!("no GPU, skipping");
-    }
-    yes
+    vesper_core::test_gpu()
 }
 
 #[test]

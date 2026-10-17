@@ -1,6 +1,5 @@
 mod common;
 
-use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -11,8 +10,7 @@ use vesper_encode::{Encoder, RateControl};
 
 #[test]
 fn encodes_frames_releases_each_once_and_keeps_pts() {
-    if !Path::new("/dev/dri/renderD128").exists() {
-        eprintln!("no GPU, skipping");
+    if !vesper_core::test_gpu() {
         return;
     }
     const FRAMES: u32 = 8;
@@ -45,8 +43,7 @@ fn encodes_frames_releases_each_once_and_keeps_pts() {
 
 #[test]
 fn repeat_reencodes_last_picture_with_new_pts() {
-    if !Path::new("/dev/dri/renderD128").exists() {
-        eprintln!("no GPU, skipping");
+    if !vesper_core::test_gpu() {
         return;
     }
     let (w, h) = (640, 360);
@@ -79,8 +76,7 @@ fn repeat_reencodes_last_picture_with_new_pts() {
 
 #[test]
 fn force_keyframe_makes_only_the_next_picture_a_keyframe() {
-    if !Path::new("/dev/dri/renderD128").exists() {
-        eprintln!("no GPU, skipping");
+    if !vesper_core::test_gpu() {
         return;
     }
     let (w, h) = (640, 360);
@@ -117,8 +113,7 @@ fn force_keyframe_makes_only_the_next_picture_a_keyframe() {
 
 #[test]
 fn scales_frames_of_other_sizes_to_the_encoder_size() {
-    if !Path::new("/dev/dri/renderD128").exists() {
-        eprintln!("no GPU, skipping");
+    if !vesper_core::test_gpu() {
         return;
     }
     let (w, h) = (640, 360);
@@ -185,8 +180,7 @@ fn scales_frames_of_other_sizes_to_the_encoder_size() {
 /// hand out buffer 0: each is imported, never the other's stale picture.
 #[test]
 fn another_producer_with_the_same_buffer_id_is_imported_anew() {
-    if !Path::new("/dev/dri/renderD128").exists() {
-        eprintln!("no GPU, skipping");
+    if !vesper_core::test_gpu() {
         return;
     }
     let (w, h) = (640, 360);
@@ -216,8 +210,7 @@ fn another_producer_with_the_same_buffer_id_is_imported_anew() {
 /// rebuilt its graph for another input size.
 #[test]
 fn scaled_encoder_encodes_the_source_pictures_at_its_own_size() {
-    if !Path::new("/dev/dri/renderD128").exists() {
-        eprintln!("no GPU, skipping");
+    if !vesper_core::test_gpu() {
         return;
     }
     let (w, h) = (640, 360);
@@ -332,8 +325,7 @@ unsafe fn decode_luma(extradata: &[u8], packets: &[vesper_core::EncodedPacket]) 
 
 #[test]
 fn quality_rate_control_trades_size_for_quality() {
-    if !Path::new("/dev/dri/renderD128").exists() {
-        eprintln!("no GPU, skipping");
+    if !vesper_core::test_gpu() {
         return;
     }
     // radeonsi's H.264 QVBR ignores the quality value at 640x360 (measured

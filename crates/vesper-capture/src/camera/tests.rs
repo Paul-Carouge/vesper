@@ -1,7 +1,6 @@
 use std::ffi::c_int;
 use std::io::Seek;
 use std::os::fd::AsRawFd;
-use std::path::Path;
 use std::process::Command;
 use std::ptr;
 
@@ -271,8 +270,7 @@ unsafe fn read_back(frame: &VideoFrame) -> Vec<u8> {
 
 #[test]
 fn gpu_decodes_mjpeg_to_an_exported_rgb_frame() {
-    if !Path::new("/dev/dri/renderD128").exists() {
-        eprintln!("no GPU, skipping");
+    if !vesper_core::test_gpu() {
         return;
     }
     let mut dec = decode::Decoder::gpu().expect("VAAPI on renderD128");
@@ -327,8 +325,7 @@ fn gpu_decodes_mjpeg_to_an_exported_rgb_frame() {
 
 #[test]
 fn gpu_surfaces_keep_their_buffer_id_and_return_on_release() {
-    if !Path::new("/dev/dri/renderD128").exists() {
-        eprintln!("no GPU, skipping");
+    if !vesper_core::test_gpu() {
         return;
     }
     let Some(jpeg) = jpeg(RGB, 640, 480, "yuvj422p") else {
