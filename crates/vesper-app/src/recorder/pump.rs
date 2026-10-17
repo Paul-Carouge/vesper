@@ -172,11 +172,7 @@ pub(super) fn pump(
             // Audio starts with the first frame: before it, the ring and a
             // recording would drop its packets anyway. Before the encoder
             // opens, so the tracks cover the first video tick.
-            start_audio(sources, sinks, on_event);
-            reset_ring_audio(sources, sinks);
-            let except = lock(sources).exclusions.as_ref().map(|e| e.apps());
-            on_event(Event::DesktopExcept(except.unwrap_or_default()));
-            on_event(Event::AudioStarted);
+            start_audio_and_tell(sources, sinks, on_event);
             match Video::open(settings, width, height) {
                 Ok(v) => {
                     if v.overloaded() {
@@ -195,16 +191,7 @@ pub(super) fn pump(
         // Requests are read under the control lock, so none lands on an
         // ended pipeline unseen.
         // The live thread ended on its own (the server refused the stream).
-        if let Some(s) = streaming.take_if(|s| s.ended()) {
-            let retry = s.h264_retry();
-            let handle = s.stop(sources, None, false);
-            let mut c = lock(control);
-            c.saves.extend(handle);
-            if let Some((request, notice)) = retry {
-                log!("live: codec rejected, trying H.264");
-                queue_retry(&mut c, request, notice, on_event);
-            }
-        }
+        reap_ended_stream(&mut streaming, control, sources, on_event);
         let (record, stop, replay, save, go_live, scene) = {
             // Only this thread sets `rec`; never take `sinks` under
             // `control`: the UI would wait on muxer writes.
@@ -297,11 +284,7 @@ pub(super) fn pump(
         if changed && video.is_some() && lock(sinks).rec.is_none() {
             log!("audio tracks changed: restarting the audio");
             stop_audio(sources);
-            start_audio(sources, sinks, on_event);
-            reset_ring_audio(sources, sinks);
-            let except = lock(sources).exclusions.as_ref().map(|e| e.apps());
-            on_event(Event::DesktopExcept(except.unwrap_or_default()));
-            on_event(Event::AudioStarted);
+            start_audio_and_tell(sources, sinks, on_event);
         }
         let streams = lock(sources).streams();
         {
@@ -361,34 +344,10 @@ pub(super) fn pump(
             k += 1;
         }
         let pts = v.start + frame_offset(k, fps);
-        if let Some(folder) = record {
-            let audio = lock(sources).file_tracks();
-            match create_file(&folder, "Vesper", pts, &v.track, &audio) {
-                Ok((mut mux, path)) => {
-                    log!("recording to {}", path.display());
-                    v.enc.force_keyframe();
-                    let mut s = lock(sinks);
-                    // Desktop audio is stamped ahead of real time (playback
-                    // delay): its first packets already wait in the ring.
-                    for (i, track) in s.ring.iter().flat_map(|r| r.audio.iter().enumerate()) {
-                        for p in track.iter().filter(|p| p.pts + AUDIO_MARGIN >= pts) {
-                            if let Err(e) = mux.write_audio(i, p) {
-                                log!("audio: {e}");
-                            }
-                        }
-                    }
-                    s.rec = Some(Recording {
-                        mux,
-                        path,
-                        start: pts,
-                        stop_at: None,
-                    });
-                    drop(s);
-                    (rec_skipped, stats_sent) = (skipped, false);
-                    on_event(Event::Started);
-                }
-                Err(e) => on_event(Event::Finished(Err(e))),
-            }
+        if let Some(folder) = record
+            && start_recording(&folder, v, pts, sinks, sources, on_event)
+        {
+            (rec_skipped, stats_sent) = (skipped, false);
         }
         if stop && let Some(r) = lock(sinks).rec.as_mut() {
             r.stop_at.get_or_insert(pts);
@@ -505,6 +464,99 @@ pub(super) fn pump(
         }
     }
 
+    wind_down(
+        &mut video,
+        error,
+        &mut streaming,
+        control,
+        sinks,
+        sources,
+        on_event,
+    )
+}
+
+/// Starts the audio (see [`start_audio`]) and tells the UI.
+fn start_audio_and_tell(sources: &AudioSources, sinks: &SharedSinks, on_event: &OnEvent) {
+    start_audio(sources, sinks, on_event);
+    reset_ring_audio(sources, sinks);
+    let except = lock(sources).exclusions.as_ref().map(|e| e.apps());
+    on_event(Event::DesktopExcept(except.unwrap_or_default()));
+    on_event(Event::AudioStarted);
+}
+
+/// Stops a stream whose live thread ended on its own, and queues its H.264
+/// retry when the server rejected the codec.
+fn reap_ended_stream(
+    streaming: &mut Option<Streaming>,
+    control: &Mutex<Control>,
+    sources: &AudioSources,
+    on_event: &OnEvent,
+) {
+    if let Some(s) = streaming.take_if(|s| s.ended()) {
+        let retry = s.h264_retry();
+        let handle = s.stop(sources, None, false);
+        let mut c = lock(control);
+        c.saves.extend(handle);
+        if let Some((request, notice)) = retry {
+            log!("live: codec rejected, trying H.264");
+            queue_retry(&mut c, request, notice, on_event);
+        }
+    }
+}
+
+/// Opens a recording in `folder` starting at `pts`, with the ring's audio
+/// from there on. Returns whether it started.
+fn start_recording(
+    folder: &Path,
+    v: &mut Video,
+    pts: Duration,
+    sinks: &SharedSinks,
+    sources: &AudioSources,
+    on_event: &OnEvent,
+) -> bool {
+    let audio = lock(sources).file_tracks();
+    match create_file(folder, "Vesper", pts, &v.track, &audio) {
+        Ok((mut mux, path)) => {
+            log!("recording to {}", path.display());
+            v.enc.force_keyframe();
+            let mut s = lock(sinks);
+            // Desktop audio is stamped ahead of real time (playback
+            // delay): its first packets already wait in the ring.
+            for (i, track) in s.ring.iter().flat_map(|r| r.audio.iter().enumerate()) {
+                for p in track.iter().filter(|p| p.pts + AUDIO_MARGIN >= pts) {
+                    if let Err(e) = mux.write_audio(i, p) {
+                        log!("audio: {e}");
+                    }
+                }
+            }
+            s.rec = Some(Recording {
+                mux,
+                path,
+                start: pts,
+                stop_at: None,
+            });
+            drop(s);
+            on_event(Event::Started);
+            true
+        }
+        Err(e) => {
+            on_event(Event::Finished(Err(e)));
+            false
+        }
+    }
+}
+
+/// After the last tick: ends the stream, flushes the encoder into the sinks,
+/// and gives the pipeline's result.
+fn wind_down(
+    video: &mut Option<Video>,
+    mut error: Option<String>,
+    streaming: &mut Option<Streaming>,
+    control: &Mutex<Control>,
+    sinks: &SharedSinks,
+    sources: &AudioSources,
+    on_event: &OnEvent,
+) -> Result<(), String> {
     // Error breaks too: later requests must start a new pipeline.
     lock(control).ended = true;
     if let Some(s) = streaming.take() {
@@ -515,7 +567,7 @@ pub(super) fn pump(
         // Requested, never started: the UI waits for its end.
         on_event(Event::Stream(StreamState::Ended(None)));
     }
-    if let Some(v) = &mut video {
+    if let Some(v) = video {
         match v.enc.flush() {
             Ok(packets) => {
                 let ended = lock(sinks).write_video(packets);
