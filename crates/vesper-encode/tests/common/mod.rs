@@ -10,6 +10,16 @@ use ffmpeg_next::ffi as ff;
 use vesper_core::{DmaBufPlane, ReleaseGuard, VideoFrame};
 use vesper_encode::RENDER_NODE;
 
+/// Gray level of [`Producer::noise`] at `x`, `y`: white noise.
+#[allow(dead_code)]
+pub fn noise(x: u32, y: u32) -> u8 {
+    let mut h = x.wrapping_mul(0x9E37_79B1) ^ y.wrapping_mul(0x85EB_CA77);
+    h ^= h >> 15;
+    h = h.wrapping_mul(0x2C1B_3C6D);
+    h ^= h >> 12;
+    (h >> 24) as u8
+}
+
 /// Number of surfaces in the producer pool.
 pub const POOL: usize = 4;
 
@@ -83,6 +93,24 @@ impl Producer {
 
     /// Draws frame `t` into surface `id` and wraps it as a `VideoFrame`.
     pub unsafe fn frame(&self, id: usize, t: u32, generation: u32, pts: Duration) -> VideoFrame {
+        unsafe { self.draw(id, t, generation, pts, false) }
+    }
+
+    /// Like [`Producer::frame`], but gray [`noise`]: what a downscale that
+    /// skips pixels gets most wrong.
+    #[allow(dead_code)]
+    pub unsafe fn noise(&self, id: usize, t: u32, pts: Duration) -> VideoFrame {
+        unsafe { self.draw(id, t, 0, pts, true) }
+    }
+
+    unsafe fn draw(
+        &self,
+        id: usize,
+        t: u32,
+        generation: u32,
+        pts: Duration,
+        noise: bool,
+    ) -> VideoFrame {
         let (w, h) = (self.w, self.h);
         unsafe {
             let up = &*self.upload;
@@ -99,7 +127,9 @@ impl Producer {
                 {
                     let x = x as u32;
                     let in_box = (bx..bx + 256).contains(&x) && (by..by + 256).contains(&y);
-                    let v = if in_box {
+                    let v = if noise {
+                        [self::noise(x, y); 4]
+                    } else if in_box {
                         [255, 255, 255, 0]
                     } else {
                         [

@@ -64,6 +64,9 @@ pub struct Prefs {
     pub profile_name: String,
     /// Canvas and scenes; in the profile's file.
     pub scenes: Scenes,
+    /// The codec was AV1 from a file of before HEVC became the default, and
+    /// is now HEVC. Never saved.
+    pub codec_migrated: bool,
 }
 
 impl Prefs {
@@ -87,6 +90,7 @@ impl Prefs {
             profile: ui.get_profile_slug().into(),
             profile_name: ui.get_profile_name().into(),
             scenes: crate::scene_ui::from_ui(ui),
+            codec_migrated: false,
         }
     }
 
@@ -164,7 +168,25 @@ impl Prefs {
                 continue;
             }
             match key.trim() {
-                "codec" => set(&mut self.codec, codec(value)),
+                // Files before HEVC became the default: AV1 was the default
+                // then, and a choice of it cannot be told apart, so it moves
+                // to HEVC (as good on games at about half the size, better on
+                // text). Other choices stay.
+                "codec" => {
+                    let old = codec(value);
+                    self.codec_migrated = old == Some(VideoCodec::Av1);
+                    set(
+                        &mut self.codec,
+                        old.map(|c| match c {
+                            VideoCodec::Av1 => VideoCodec::Hevc,
+                            c => c,
+                        }),
+                    );
+                }
+                "video_codec" => {
+                    self.codec_migrated = false;
+                    set(&mut self.codec, codec(value));
+                }
                 "quality" => set(&mut self.quality, quality(value)),
                 "fps" => set(&mut self.fps, choice(value, &FPS)),
                 "replay" => set(&mut self.replay_enabled, flag(value)),
@@ -313,7 +335,7 @@ impl Prefs {
             text += &format!("name={}\n", self.profile_name);
         }
         text += &format!(
-            "codec={codec}\nquality={quality}\nfps={}\nreplay={}\nreplay_seconds={}\n",
+            "video_codec={codec}\nquality={quality}\nfps={}\nreplay={}\nreplay_seconds={}\n",
             self.fps, self.replay_enabled, self.replay_seconds
         );
         // Marks the list as saved, even empty.
@@ -845,6 +867,7 @@ mod tests {
             profile: String::new(),
             profile_name: String::new(),
             scenes: Scenes::default(),
+            codec_migrated: false,
         }
     }
 
@@ -942,6 +965,7 @@ mod tests {
                     ],
                 }],
             },
+            codec_migrated: false,
         }
     }
 
@@ -1104,7 +1128,12 @@ mod tests {
         // Saved again, the tracks are written and the old keys are gone.
         let text = prefs.serialize(DEFAULT);
         assert!(!text.contains("desktop_muted") && !text.contains("mic_muted"));
-        assert_eq!(defaults().parse(&text), prefs);
+        // Saved as `video_codec`: no longer a migration.
+        let saved = Prefs {
+            codec_migrated: false,
+            ..prefs
+        };
+        assert_eq!(defaults().parse(&text), saved);
         // The old keys no longer apply once tracks are saved.
         assert!(!defaults().parse(&format!("{text}mic_muted=true\n")).tracks[1].muted);
     }
@@ -1215,6 +1244,25 @@ mod tests {
         let prefs = defaults().parse(" codec = hevc \r\nfps=30\r\n");
         assert_eq!(prefs.codec, VideoCodec::Hevc);
         assert_eq!(prefs.fps, 30);
+    }
+
+    #[test]
+    fn the_old_default_av1_moves_to_hevc_but_choices_stay() {
+        let codec = |text| defaults().parse(text).codec;
+        // Written before HEVC was the default: AV1 was the default then.
+        assert_eq!(codec("codec=av1\n"), VideoCodec::Hevc);
+        assert!(defaults().parse("codec=av1\n").codec_migrated);
+        assert!(!defaults().parse("codec=h264\n").codec_migrated);
+        assert!(!defaults().parse("video_codec=av1\n").codec_migrated);
+        assert_eq!(codec("codec=h264\n"), VideoCodec::H264);
+        assert_eq!(codec("codec=hevc\n"), VideoCodec::Hevc);
+        // Written since: AV1 is a choice.
+        assert_eq!(codec("video_codec=av1\n"), VideoCodec::Av1);
+        let av1 = Prefs {
+            codec: VideoCodec::Av1,
+            ..defaults()
+        };
+        assert_eq!(codec(&av1.serialize_profile(DEFAULT)), VideoCodec::Av1);
     }
 
     #[test]

@@ -162,6 +162,15 @@ msgstr "Changer l’image"
 msgid "Choose"
 msgstr "Choisir"
 
+msgid "Choose HEVC, or a lower frame rate or size."
+msgstr "Choisissez HEVC, ou une fréquence d’images ou une taille plus basse."
+
+msgid "Choose HEVC for the stream, or a lower frame rate or size."
+msgstr "Choisissez HEVC pour le stream, ou une fréquence d’images ou une taille plus basse."
+
+msgid "Choose a lower frame rate or size."
+msgstr "Choisissez une fréquence d’images ou une taille plus basse."
+
 msgid "Choose an image"
 msgstr "Choisir une image"
 
@@ -341,9 +350,6 @@ msgstr "Modifier"
 
 msgid "Edit the scenes"
 msgstr "Modifier les scènes"
-
-msgid "Efficient and widely supported by hardware."
-msgstr "Efficace et largement pris en charge par le matériel."
 
 msgid "Elapsed time"
 msgstr "Temps écoulé"
@@ -593,6 +599,27 @@ msgstr "S’applique à la fin de l’enregistrement."
 
 msgid "Desktop audio does not record this app a second time."
 msgstr "Le son du bureau n’enregistre pas cette application une deuxième fois."
+
+msgid "Recommended: sharp games and text in small files."
+msgstr "Recommandé : jeux et texte nets dans des fichiers légers."
+
+msgid "Recordings now use HEVC: the same quality, with game recordings about a third smaller. AV1 is still available in Settings."
+msgstr "Les enregistrements utilisent maintenant HEVC : même qualité, et des enregistrements de jeux environ un tiers plus légers. L’AV1 reste disponible dans les paramètres."
+
+msgid "SRT streams cannot carry AV1: choose H.264 or HEVC for this server"
+msgstr "Un stream SRT ne peut pas transporter l’AV1 : choisissez H.264 ou HEVC pour ce serveur"
+
+msgid "Small files, but heavier on the GPU encoder. Needs a recent player."
+msgstr "Petits fichiers, mais plus lourd pour l’encodeur du GPU. Demande un lecteur récent."
+
+msgid "The GPU encoder cannot keep up with both the recording and the stream: frames may be dropped."
+msgstr "L’encodeur du GPU ne suit pas l’enregistrement et le stream à la fois : des images peuvent être perdues."
+
+msgid "The GPU encoder cannot keep up with this size and frame rate: frames may be dropped."
+msgstr "L’encodeur du GPU ne suit pas à cette taille et cette fréquence d’images : des images peuvent être perdues."
+
+msgid "The server refused {}: trying H.264"
+msgstr "Le serveur a refusé {} : essai en H.264"
 
 msgid "{} left out of desktop audio"
 msgstr "{} retiré du son du bureau"
@@ -1040,9 +1067,6 @@ msgstr "Silence"
 
 msgid "Size"
 msgstr "Taille"
-
-msgid "Smallest files at a given quality. Needs a recent player."
-msgstr "Les plus petits fichiers à qualité égale. Demande un lecteur récent."
 
 msgid "Soft and even, kept under your voice and out of its way."
 msgstr "Douce et régulière, gardée sous votre voix sans la gêner."

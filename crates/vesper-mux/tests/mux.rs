@@ -81,6 +81,20 @@ fn muxes_hevc_and_opus_readable_by_libavformat() {
             audio += 1;
         }
     }
+    // The container itself says BT.709 limited / sRGB (not only the VUI):
+    // Matroska Colour (0x55B0) with MatrixCoefficients (0x55B1) = 1,
+    // Range (0x55B9) = 1 (broadcast), TransferCharacteristics (0x55BA) = 13.
+    let bytes = std::fs::read(&path).unwrap();
+    for element in [
+        [0x55, 0xB1, 0x81, 1],
+        [0x55, 0xB9, 0x81, 1],
+        [0x55, 0xBA, 0x81, 13],
+    ] {
+        assert!(
+            bytes.windows(4).any(|w| w == element),
+            "Colour element {element:02x?} missing"
+        );
+    }
     std::fs::remove_file(&path).unwrap();
     assert_eq!(video_pts.len(), FRAMES as usize);
     // Rebased to `start`, in milliseconds.

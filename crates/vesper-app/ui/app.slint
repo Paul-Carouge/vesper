@@ -1002,7 +1002,7 @@ export component AppWindow inherits Window {
     in-out property <bool> audio-mix: true;
 
     // ---- Output settings ----------------------------------------------
-    in-out property <VideoCodec> codec: VideoCodec.av1;
+    in-out property <VideoCodec> codec: VideoCodec.hevc;
     in-out property <QualityPreset> quality: QualityPreset.balanced;
     /// One of 30, 60, 120, 144.
     in-out property <int> fps: 60;
@@ -2581,8 +2581,8 @@ export component AppWindow inherits Window {
                     SettingGroup {
                         label: @tr("CODEC");
                         hint: root.codec == VideoCodec.av1
-                            ? @tr("Smallest files at a given quality. Needs a recent player.")
-                            : root.codec == VideoCodec.hevc ? @tr("Efficient and widely supported by hardware.") : @tr("Plays everywhere, larger files.");
+                            ? @tr("Small files, but heavier on the GPU encoder. Needs a recent player.")
+                            : root.codec == VideoCodec.hevc ? @tr("Recommended: sharp games and text in small files.") : @tr("Plays everywhere, larger files.");
                         codec-picker := Segmented {
                             label: @tr("Codec");
                             enabled: !root.active;
@@ -2702,6 +2702,9 @@ export component AppWindow inherits Window {
                                     // A key being typed belongs to the service it was typed for.
                                     live-key-field.commit();
                                     root.live-service = i == 0 ? LiveService.twitch : i == 1 ? LiveService.youtube : LiveService.custom;
+                                    // Each service's best codec it surely takes: AV1 on YouTube,
+                                    // H.264 on custom servers (no Enhanced RTMP, MPEG-TS over SRT).
+                                    root.live-codec = i == 1 ? VideoCodec.av1 : VideoCodec.h264;
                                     root.live-settings-changed();
                                 }
                             }

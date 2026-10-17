@@ -82,6 +82,37 @@ const FIRST_FRAME_TIMEOUT: Duration = if cfg!(test) {
 /// nothing records (a launcher, then the game in fullscreen).
 const RESIZE_AFTER: Duration = Duration::from_secs(1);
 
+/// Share of the GPU encoder's time ([`Encoder::vcn_load`]) above which the
+/// user is told frames may be dropped. Quality is never lowered for it.
+const VCN_OVERLOAD: f64 = 0.9;
+
+/// Recording and own-encode stream together above this share of the GPU
+/// encoder's time: the stream opens at the faster quality level (in CBR,
+/// measured as good as the slower one).
+const VCN_STREAM_FAST: f64 = 0.85;
+
+/// What the user can do when the GPU encoder cannot keep up with a
+/// recording in `codec`. `stream`: the codec of a stream that, with the
+/// recording, is too much.
+fn overload_notice(codec: Codec, stream: Option<Codec>) -> String {
+    let what = if stream.is_some() {
+        tr!(
+            "The GPU encoder cannot keep up with both the recording and the stream: frames may be dropped."
+        )
+    } else {
+        tr!("The GPU encoder cannot keep up with this size and frame rate: frames may be dropped.")
+    };
+    // AV1 has no faster level: an HEVC stream takes far less of the encoder.
+    let advice = if stream == Some(Codec::Av1) {
+        tr!("Choose HEVC for the stream, or a lower frame rate or size.")
+    } else if codec == Codec::Hevc {
+        tr!("Choose a lower frame rate or size.")
+    } else {
+        tr!("Choose HEVC, or a lower frame rate or size.")
+    };
+    format!("{what} {advice}")
+}
+
 /// First wait before the scene compositor is tried again after a failure;
 /// doubled on each failure in a row, up to [`RETRY_MAX`].
 const RETRY_FIRST: Duration = if cfg!(test) {
@@ -527,6 +558,16 @@ struct Control {
 }
 
 pub(crate) type OnEvent = Arc<dyn Fn(Event) + Send + Sync>;
+
+/// Queues the H.264 retry of a stream whose codec the server rejected,
+/// unless the user stopped it (the stop then sends its one `Ended`) or
+/// started another one meanwhile.
+fn queue_retry(c: &mut Control, request: StreamRequest, notice: String, on_event: &OnEvent) {
+    if !c.stop_stream && c.stream.is_none() {
+        on_event(Event::Notice(notice));
+        c.stream = Some(request);
+    }
+}
 
 pub struct Pipeline {
     control: Arc<Mutex<Control>>,
@@ -1262,8 +1303,9 @@ impl Video {
             extradata: enc.extradata().to_vec(),
         };
         log!(
-            "encoding {width}x{height} at quality {}, max {bitrate} bit/s",
-            settings.quality
+            "encoding {width}x{height} at quality {}, max {bitrate} bit/s, GPU encoder load {:?}",
+            settings.quality,
+            enc.vcn_load()
         );
         // The grid starts now, not at the frame's own pts: opening the encoder
         // takes a while, and a producer clock off by seconds must not stall
@@ -1278,6 +1320,13 @@ impl Video {
     }
 }
 
+impl Video {
+    /// The encode takes more of the GPU encoder than it can give reliably.
+    fn overloaded(&self) -> bool {
+        self.enc.vcn_load().is_some_and(|l| l > VCN_OVERLOAD)
+    }
+}
+
 /// The video of a live stream.
 enum StreamVideo {
     /// The recording's packets.
@@ -1285,7 +1334,7 @@ enum StreamVideo {
     /// The stream's own encoder, being opened on a helper thread (opening
     /// takes tens of milliseconds: never on the tick).
     Opening(std::sync::mpsc::Receiver<Result<Encoder, String>>),
-    Own(Encoder),
+    Own(Box<Encoder>),
 }
 
 /// A live stream, from the pipeline thread's side.
@@ -1293,6 +1342,8 @@ struct Streaming {
     /// `None` until the stream's encoder is open: its header is needed.
     sink: Option<LiveSink>,
     video: StreamVideo,
+    /// What it started with, to start again in H.264 (see `h264_retry`).
+    request: StreamRequest,
     url: String,
     codec: Codec,
     width: u32,
@@ -1335,10 +1386,24 @@ impl Streaming {
         let video = if shared {
             StreamVideo::Shared
         } else {
-            let source = v
+            let mut source = v
                 .enc
                 .scaled_source()
                 .map_err(|e| tr!("Could not open the stream encoder: {}", e))?;
+            // The GPU encoder serves both: the recording keeps its quality,
+            // the stream takes the faster level when both are a lot.
+            let rec = v.enc.vcn_load();
+            let load = |s: &vesper_encode::ScaledSource| {
+                Some(rec? + s.vcn_load(codec, width, height, fps)?)
+            };
+            if load(&source).is_some_and(|l| l > VCN_STREAM_FAST) {
+                source.prefer_speed();
+            }
+            let load = load(&source);
+            log!("live: GPU encoder load with the recording {load:?}");
+            if load.is_some_and(|l| l > VCN_OVERLOAD) {
+                on_event(Event::Notice(overload_notice(settings.codec, Some(codec))));
+            }
             let (tx, rx) = std::sync::mpsc::channel();
             let rate = RateControl::ConstantBitrate(s.bitrate);
             std::thread::Builder::new()
@@ -1373,6 +1438,7 @@ impl Streaming {
         let mut streaming = Self {
             sink: None,
             video,
+            request: request.clone(),
             url,
             codec,
             width,
@@ -1413,6 +1479,23 @@ impl Streaming {
         self.sink.as_ref().is_some_and(LiveSink::ended)
     }
 
+    /// The same stream in H.264, when the server rejected this one's codec
+    /// (a server without Enhanced RTMP), with what to tell the user.
+    fn h264_retry(&self) -> Option<(StreamRequest, String)> {
+        if !self.sink.as_ref().is_some_and(LiveSink::codec_rejected) {
+            return None;
+        }
+        let mut request = self.request.clone();
+        request.settings.codec = Codec::H264;
+        let name = if self.codec == Codec::Av1 {
+            "AV1"
+        } else {
+            "HEVC"
+        };
+        let notice = tr!("The server refused {}: trying H.264", name);
+        Some((request, notice))
+    }
+
     /// Sends this tick's picture. `packets`: what the recording encoder
     /// made of it; `new_picture`: it encoded a new picture (not a repeat).
     fn tick(
@@ -1438,7 +1521,7 @@ impl Streaming {
                 fps: self.fps,
                 extradata: enc.extradata().to_vec(),
             };
-            self.video = StreamVideo::Own(enc);
+            self.video = StreamVideo::Own(Box::new(enc));
             self.connect(track, sources)?;
         }
         let Some(sink) = &self.sink else {
@@ -1673,6 +1756,9 @@ fn pump(
             on_event(Event::AudioStarted);
             match Video::open(settings, width, height) {
                 Ok(v) => {
+                    if v.overloaded() {
+                        on_event(Event::Notice(overload_notice(settings.codec, None)));
+                    }
                     stage.set_canvas(width, height);
                     video = Some(v);
                 }
@@ -1686,9 +1772,15 @@ fn pump(
         // Requests are read under the control lock, so none lands on an
         // ended pipeline unseen.
         // The live thread ended on its own (the server refused the stream).
-        if streaming.as_ref().is_some_and(Streaming::ended) {
-            let handle = streaming.take().and_then(|s| s.stop(sources, None, false));
-            lock(control).saves.extend(handle);
+        if let Some(s) = streaming.take_if(|s| s.ended()) {
+            let retry = s.h264_retry();
+            let handle = s.stop(sources, None, false);
+            let mut c = lock(control);
+            c.saves.extend(handle);
+            if let Some((request, notice)) = retry {
+                log!("live: codec rejected, trying H.264");
+                queue_retry(&mut c, request, notice, on_event);
+            }
         }
         let (record, stop, replay, save, go_live, scene) = {
             // Only this thread sets `rec`; never take `sinks` under
@@ -1818,8 +1910,13 @@ fn pump(
             && streaming.is_none()
         {
             new_size = None;
+            let was_overloaded = video.as_ref().is_some_and(Video::overloaded);
             match Video::open(settings, f.width, f.height) {
                 Ok(v) => {
+                    // Told once, not on every resize of a game.
+                    if v.overloaded() && !was_overloaded {
+                        on_event(Event::Notice(overload_notice(settings.codec, None)));
+                    }
                     stage.set_canvas(f.width, f.height);
                     video = Some(v);
                 }
@@ -2894,6 +2991,44 @@ mod gpu_tests;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_stop_during_the_h264_retry_wins() {
+        use crate::stream::{Service, StreamSettings};
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let s = seen.clone();
+        let on_event: OnEvent = Arc::new(move |e| lock(&s).push(format!("{e:?}")));
+        let request = || StreamRequest {
+            settings: StreamSettings {
+                service: Service::Custom,
+                ..StreamSettings::default()
+            },
+            key: None,
+        };
+        // Stopped meanwhile: no retry, and nothing sent here (the stop
+        // sends the one `Ended`).
+        let mut c = Control {
+            stop_stream: true,
+            ..Control::default()
+        };
+        queue_retry(&mut c, request(), "n".into(), &on_event);
+        assert!(c.stream.is_none() && lock(&seen).is_empty());
+        // Another stream asked for meanwhile: it stays.
+        let mut c = Control {
+            stream: Some(StreamRequest {
+                key: crate::stream::StreamKey::new("other"),
+                ..request()
+            }),
+            ..Control::default()
+        };
+        queue_retry(&mut c, request(), "n".into(), &on_event);
+        assert!(c.stream.as_ref().unwrap().key.is_some() && lock(&seen).is_empty());
+        // Otherwise: retried, with the notice.
+        let mut c = Control::default();
+        queue_retry(&mut c, request(), "n".into(), &on_event);
+        assert!(c.stream.is_some());
+        assert_eq!(lock(&seen).len(), 1);
+    }
+
     use super::*;
 
     #[test]
