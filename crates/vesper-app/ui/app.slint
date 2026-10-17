@@ -1074,7 +1074,7 @@ export component AppWindow inherits Window {
     in-out property <int> live-fps: 60;
     // Mbit/s.
     in-out property <float> live-bitrate: 6;
-    in-out property <VideoCodec> live-codec: VideoCodec.av1;
+    in-out property <VideoCodec> live-codec: VideoCodec.h264;
     // Where the stream key is kept ("" when there is none).
     in property <string> live-key-state;
     // The key typed in the field: "Saving…", "Saved", "Not saved: <why>", or "".
@@ -2689,6 +2689,9 @@ export component AppWindow inherits Window {
                                     // A key being typed belongs to the service it was typed for.
                                     live-key-field.commit();
                                     root.live-service = i == 0 ? LiveService.twitch : i == 1 ? LiveService.youtube : LiveService.custom;
+                                    // Each service's best codec it surely takes: AV1 on YouTube,
+                                    // H.264 on custom servers (no Enhanced RTMP, MPEG-TS over SRT).
+                                    root.live-codec = i == 1 ? VideoCodec.av1 : VideoCodec.h264;
                                     root.live-settings-changed();
                                 }
                             }

@@ -267,39 +267,68 @@ fn scaled_encoder_encodes_the_source_pictures_at_its_own_size() {
     }
 }
 
-/// A stream at a quarter of the recording's size goes through an
-/// intermediate scaling step (4:1: two exact halvings).
+/// Mean absolute luma error of `f` against an area (box) downscale of the
+/// [`common::noise`] pattern by `k`, `margin` px inside the edges.
+fn noise_error(f: &Luma, k: u32, margin: usize) -> f64 {
+    let mut sum = 0.0;
+    let mut n = 0.0;
+    for y in margin..f.h - margin {
+        for x in margin..f.w - margin {
+            let (x0, y0) = (x as u32 * k, y as u32 * k);
+            let gray = (0..k * k)
+                .map(|i| f64::from(common::noise(x0 + i % k, y0 + i / k)))
+                .sum::<f64>()
+                / f64::from(k * k);
+            // BT.709 limited range: gray g is luma 16 + g * 219 / 255.
+            let want = 16.0 + gray * 219.0 / 255.0;
+            sum += (f64::from(f.y[y * f.w + x]) - want).abs();
+            n += 1.0;
+        }
+    }
+    sum / n
+}
+
+/// Fine detail scaled 3:1 must stay close to an area downscale: one
+/// bilinear VA-VPP pass skips pixels there (aliasing), the intermediate
+/// steps filter them. Checked on a scaled (stream) encoder and on a
+/// letterboxed source three times the encoder's size. Measured: 4.3 with
+/// the steps, 50.9 in one pass.
 #[test]
-fn scaled_encoder_downscales_beyond_two_to_one_in_steps() {
+fn downscales_beyond_two_to_one_do_not_alias() {
     if !vesper_core::test_gpu() {
         return;
     }
     let (w, h) = (1920, 1080);
-    let mut enc = Encoder::new(Codec::Hevc, w, h, 30, RateControl::ConstantQp(30)).unwrap();
-    let mut live = enc
-        .new_scaled(
-            Codec::Hevc,
-            480,
-            270,
-            30,
-            RateControl::ConstantBitrate(500_000),
-        )
-        .unwrap();
-    let producer = unsafe { Producer::new(w, h) };
     let ms = |t: u64| Duration::from_millis(1_000 + t * 33);
-    let mut packets = Vec::new();
-    for t in 0..4 {
-        let frame = unsafe { producer.frame(t as usize % POOL, t as u32, 0, ms(t)) };
+    let producer = unsafe { Producer::new(w, h) };
+
+    let mut enc = Encoder::new(Codec::Hevc, w, h, 30, RateControl::ConstantQp(4)).unwrap();
+    let mut live = enc
+        .new_scaled(Codec::Hevc, 640, 360, 30, RateControl::ConstantQp(4))
+        .unwrap();
+    let mut boxed = Encoder::new(Codec::Hevc, 640, 360, 30, RateControl::ConstantQp(4)).unwrap();
+    let (mut scaled, mut letterboxed) = (Vec::new(), Vec::new());
+    for t in 0..2 {
+        let frame = unsafe { producer.noise(t as usize % POOL, t as u32, ms(t)) };
         enc.encode(frame).unwrap();
-        packets.extend(live.encode_scaled(&enc, ms(t)).unwrap());
+        scaled.extend(live.encode_scaled(&enc, ms(t)).unwrap());
+        let frame = unsafe { producer.noise(t as usize % POOL, t as u32, ms(t)) };
+        letterboxed.extend(boxed.encode(frame).unwrap());
     }
-    packets.extend(live.flush().unwrap());
-    let frames = unsafe { decode_luma(live.extradata(), &packets) };
-    assert_eq!(frames.len(), 4);
-    for f in &frames {
-        assert_eq!((f.w, f.h), (480, 270));
-        let mean = f.y.iter().map(|&v| f64::from(v)).sum::<f64>() / f.y.len() as f64;
-        assert!(mean > 30.0, "the pattern, not black: {mean}");
+    scaled.extend(live.flush().unwrap());
+    letterboxed.extend(boxed.flush().unwrap());
+    for (what, extradata, packets) in [
+        ("scaled", live.extradata(), &scaled),
+        ("letterboxed", boxed.extradata(), &letterboxed),
+    ] {
+        let frames = unsafe { decode_luma(extradata, packets) };
+        assert_eq!(frames.len(), 2, "{what}");
+        for f in &frames {
+            // Same aspect ratio: no bars, the picture fills the frame.
+            assert_eq!((f.w, f.h), (640, 360), "{what}");
+            let err = noise_error(f, 3, 8);
+            assert!(err < 10.0, "{what}: aliasing, mean luma error {err:.2}");
+        }
     }
 }
 

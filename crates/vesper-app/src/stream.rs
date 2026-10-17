@@ -85,10 +85,9 @@ impl Default for StreamSettings {
             height: Some(1080),
             fps: 60,
             bitrate: 6_000_000,
-            // YouTube and custom servers (Twitch takes H.264 only): at 8
-            // Mbit/s 1440p60, +13 VMAF on games over H.264; AV1's CBR keeps
-            // to the bitrate better than HEVC's.
-            codec: Codec::Av1,
+            // Custom servers: what every one takes. Choosing YouTube in the
+            // UI switches to AV1 (see `app.slint`).
+            codec: Codec::H264,
         }
     }
 }
@@ -156,7 +155,17 @@ impl StreamRequest {
         match self.settings.service {
             Service::Twitch => Ok(format!("{TWITCH}/{}", need_key()?)),
             Service::YouTube => Ok(format!("{YOUTUBE}/{}", need_key()?)),
-            Service::Custom => custom_url(self.settings.custom_url.trim(), key),
+            Service::Custom => {
+                let url = custom_url(self.settings.custom_url.trim(), key)?;
+                // FFmpeg's MPEG-TS writes AV1 as private data no player reads.
+                if url.starts_with("srt://") && self.settings.codec() == Codec::Av1 {
+                    return Err(tr!(
+                        "SRT streams cannot carry AV1: choose H.264 or HEVC for this server"
+                    )
+                    .into());
+                }
+                Ok(url)
+            }
         }
     }
 }
@@ -325,6 +334,9 @@ struct Queue {
     error: Option<String>,
     /// The writer thread is done.
     ended: bool,
+    /// The server rejected the stream's first connection in a codec other
+    /// than H.264: maybe it lacks Enhanced RTMP, the pipeline tries H.264.
+    codec_rejected: bool,
 }
 
 struct Shared {
@@ -360,8 +372,14 @@ impl LiveSink {
             .spawn(move || {
                 let error = run(&s, &url, &video, audio.as_ref(), &on_event)
                     .or_else(|| lock(&s.queue).error.take());
-                lock(&s.queue).ended = true;
-                on_event(Event::Stream(StreamState::Ended(error)));
+                let mut q = lock(&s.queue);
+                q.ended = true;
+                // Not over: the pipeline starts it again in H.264.
+                let retry = q.codec_rejected;
+                drop(q);
+                if !retry {
+                    on_event(Event::Stream(StreamState::Ended(error)));
+                }
             })?;
         Ok(Self {
             shared,
@@ -415,6 +433,12 @@ impl LiveSink {
     /// The thread ended on its own (the server refused the stream).
     pub fn ended(&self) -> bool {
         lock(&self.shared.queue).ended
+    }
+
+    /// It ended because the server rejected its codec (not H.264) on the
+    /// first connection; no `Ended` was sent.
+    pub fn codec_rejected(&self) -> bool {
+        lock(&self.shared.queue).codec_rejected
     }
 
     /// Ends the stream; `Ended` follows once it is closed (within seconds).
@@ -529,6 +553,13 @@ fn run(
             Err(e) if e.kind() == LiveErrorKind::Aborted => return None,
             Err(e) => {
                 log!("live: {e}");
+                if e.kind() == LiveErrorKind::Rejected
+                    && on_air.is_none()
+                    && video.codec != Codec::H264
+                {
+                    lock(&s.queue).codec_rejected = true;
+                    return None;
+                }
                 let text = describe(e.kind(), host, on_air.is_some());
                 // A wrong key or URL will not fix itself: only retry what
                 // may. An unknown host that never worked gets 3 tries.
@@ -675,6 +706,65 @@ pub fn live_audio(aac: &Aac) -> LiveAudio {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A server that takes the connection and hangs up (as one without
+    /// Enhanced RTMP rejecting AV1): AV1 ends for an H.264 retry, without
+    /// `Ended`; H.264 ends with the key message.
+    #[test]
+    fn a_codec_rejected_at_first_is_left_to_an_h264_retry() {
+        for (codec, retry) in [
+            (Codec::Av1, true),
+            (Codec::Hevc, true),
+            (Codec::H264, false),
+        ] {
+            let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = server.local_addr().unwrap().port();
+            std::thread::spawn(move || {
+                for c in server.incoming() {
+                    drop(c);
+                }
+            });
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let seen = events.clone();
+            let video = VideoTrack {
+                codec,
+                width: 64,
+                height: 64,
+                fps: 30,
+                extradata: Vec::new(),
+            };
+            let sink = LiveSink::start(
+                format!("rtmp://127.0.0.1:{port}/app/key"),
+                video,
+                None,
+                Arc::new(move |e| lock(&seen).push(format!("{e:?}"))),
+            )
+            .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while !sink.ended() {
+                assert!(Instant::now() < deadline, "{codec:?}: still running");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert_eq!(sink.codec_rejected(), retry, "{codec:?}");
+            if let Some(t) = sink.stop() {
+                t.join().unwrap();
+            }
+            let ended = lock(&events).iter().any(|e| e.contains("Ended"));
+            assert_eq!(ended, !retry, "{codec:?}: {:?}", lock(&events));
+        }
+    }
+
+    #[test]
+    fn srt_refuses_av1() {
+        let mut r = request(Service::Custom, "srt://h:9000", "k");
+        r.settings.codec = Codec::Av1;
+        assert!(r.url().is_err());
+        r.settings.codec = Codec::Hevc;
+        assert!(r.url().is_ok());
+        let mut r = request(Service::Custom, "rtmp://h/app", "k");
+        r.settings.codec = Codec::Av1;
+        assert!(r.url().is_ok());
+    }
 
     fn request(service: Service, url: &str, key: &str) -> StreamRequest {
         StreamRequest {

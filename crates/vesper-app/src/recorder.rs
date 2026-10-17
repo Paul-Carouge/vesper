@@ -1332,6 +1332,8 @@ struct Streaming {
     /// `None` until the stream's encoder is open: its header is needed.
     sink: Option<LiveSink>,
     video: StreamVideo,
+    /// What it started with, to start again in H.264 (see `h264_retry`).
+    request: StreamRequest,
     url: String,
     codec: Codec,
     width: u32,
@@ -1380,9 +1382,9 @@ impl Streaming {
                 .map_err(|e| tr!("Could not open the stream encoder: {}", e))?;
             // The GPU encoder serves both: the recording keeps its quality,
             // the stream takes the faster level when both are a lot.
-            let rec = v.enc.vcn_load().unwrap_or(0.0);
+            let rec = v.enc.vcn_load();
             let load = |s: &vesper_encode::ScaledSource| {
-                s.vcn_load(codec, width, height, fps).map(|l| rec + l)
+                Some(rec? + s.vcn_load(codec, width, height, fps)?)
             };
             if load(&source).is_some_and(|l| l > VCN_STREAM_FAST) {
                 source.prefer_speed();
@@ -1426,6 +1428,7 @@ impl Streaming {
         let mut streaming = Self {
             sink: None,
             video,
+            request: request.clone(),
             url,
             codec,
             width,
@@ -1464,6 +1467,23 @@ impl Streaming {
     /// The live thread ended on its own (the server refused the stream).
     fn ended(&self) -> bool {
         self.sink.as_ref().is_some_and(LiveSink::ended)
+    }
+
+    /// The same stream in H.264, when the server rejected this one's codec
+    /// (a server without Enhanced RTMP), with what to tell the user.
+    fn h264_retry(&self) -> Option<(StreamRequest, String)> {
+        if !self.sink.as_ref().is_some_and(LiveSink::codec_rejected) {
+            return None;
+        }
+        let mut request = self.request.clone();
+        request.settings.codec = Codec::H264;
+        let name = if self.codec == Codec::Av1 {
+            "AV1"
+        } else {
+            "HEVC"
+        };
+        let notice = tr!("The server does not accept {}: streaming in H.264", name);
+        Some((request, notice))
     }
 
     /// Sends this tick's picture. `packets`: what the recording encoder
@@ -1742,9 +1762,21 @@ fn pump(
         // Requests are read under the control lock, so none lands on an
         // ended pipeline unseen.
         // The live thread ended on its own (the server refused the stream).
-        if streaming.as_ref().is_some_and(Streaming::ended) {
-            let handle = streaming.take().and_then(|s| s.stop(sources, None, false));
-            lock(control).saves.extend(handle);
+        if let Some(s) = streaming.take_if(|s| s.ended()) {
+            let retry = s.h264_retry();
+            let handle = s.stop(sources, None, false);
+            let mut c = lock(control);
+            c.saves.extend(handle);
+            if let Some((request, notice)) = retry {
+                log!("live: codec rejected, again in H.264");
+                // Unless stopped meanwhile (that `Ended` was never sent).
+                if c.stop_stream {
+                    on_event(Event::Stream(StreamState::Ended(None)));
+                } else {
+                    on_event(Event::Notice(notice));
+                    c.stream = Some(request);
+                }
+            }
         }
         let (record, stop, replay, save, go_live, scene) = {
             // Only this thread sets `rec`; never take `sinks` under

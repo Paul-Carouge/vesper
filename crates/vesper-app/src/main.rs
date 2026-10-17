@@ -202,7 +202,18 @@ fn main() -> Result<(), slint::PlatformError> {
     audio::show_tracks(&ui, &prefs::default_tracks());
     // Also the settings of a new profile.
     let defaults = Prefs::from_ui(&ui);
-    Prefs::load(defaults.clone()).apply(&ui);
+    let prefs = Prefs::load(defaults.clone());
+    prefs.apply(&ui);
+    if prefs.codec_migrated {
+        // Saved at once (as `video_codec`): told only once.
+        Prefs::from_ui(&ui).save();
+        flash_notice(
+            &ui,
+            tr!(
+                "Recordings now use HEVC: the same quality, with game recordings about a third smaller. AV1 is still available in Settings."
+            ),
+        );
+    }
     // The entry may have been removed elsewhere (e.g. System Settings).
     ui.set_autostart(autostart::enabled());
     show_output_folder(&ui);

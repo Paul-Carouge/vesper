@@ -277,6 +277,10 @@ impl Live {
                 "width, height and fps must be non-zero",
             ));
         }
+        // FFmpeg's MPEG-TS muxer writes AV1 as private data no player reads.
+        if url.starts_with("srt://") && video.codec == Codec::Av1 {
+            return Err(LiveError::new(Other, "MPEG-TS (SRT) cannot carry AV1"));
+        }
         let curl =
             CString::new(url).map_err(|_| LiveError::new(Other, "the URL contains a NUL byte"))?;
         let format = if url.starts_with("srt://") {

@@ -138,6 +138,11 @@ pub fn vcn_load(
     fps: u32,
     fast: bool,
 ) -> Option<f64> {
+    // shortcut: throughput measured on VCN 5 (RDNA4, gfx12, one VCN
+    // instance) only; other GPUs get no estimate, measure them to add theirs.
+    if !vendor.contains("gfx12") {
+        return None;
+    }
     let px_rate = u64::from(width) * u64::from(height) * u64::from(fps);
     let level = quality_level(vendor, codec, px_rate, fast)?;
     let mpx_per_s = match (codec, level) {
@@ -849,6 +854,8 @@ impl Encoder {
             enc.colorspace = ff::AVColorSpace::AVCOL_SPC_BT709;
             enc.color_primaries = ff::AVColorPrimaries::AVCOL_PRI_BT709;
             enc.color_trc = ff::AVColorTransferCharacteristic::AVCOL_TRC_IEC61966_2_1;
+            // VA-VPP sites chroma left, as the MKV's Colour element says.
+            enc.chroma_sample_location = ff::AVChromaLocation::AVCHROMA_LOC_LEFT;
             enc.hw_frames_ctx = not_null(
                 ff::av_buffer_ref(ff::av_buffersink_get_hw_frames_ctx(self.sink)),
                 "sink frames",
@@ -1400,6 +1407,8 @@ mod tests {
             vcn_load("Intel iHD driver", Codec::Hevc, 1920, 1080, 60, false),
             None
         );
+        let rdna3 = "Mesa Gallium driver 26.2.4 for AMD Radeon RX 7900 XTX (radeonsi, gfx1100)";
+        assert_eq!(vcn_load(rdna3, Codec::Hevc, 1920, 1080, 60, false), None);
     }
 
     #[test]
