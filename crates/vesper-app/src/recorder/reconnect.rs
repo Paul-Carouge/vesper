@@ -21,12 +21,24 @@ pub(super) type Starter =
     Arc<dyn Fn(&Cancel, Arc<Mailbox>) -> vesper_capture::Result<Started> + Send + Sync>;
 
 /// The portal capture, started with the restore token (no picker when the
-/// portal can restore the source) at most `max_fps`.
+/// portal can restore the source) at most `max_fps`. A token the portal
+/// refuses is dropped for the picker, once.
 pub(super) fn portal(max_fps: u32) -> Starter {
     Arc::new(move |cancel, slot| {
-        let capture = Capture::start(load_restore_token().as_deref(), cancel, max_fps, {
-            move |event| slot.park(event.map_err(|e| e.to_string()))
-        })?;
+        let start = |token: Option<&str>| {
+            let slot = slot.clone();
+            Capture::start(token, cancel, max_fps, move |event| {
+                slot.park(event.map_err(|e| e.to_string()))
+            })
+        };
+        let token = load_restore_token();
+        let capture = match start(token.as_deref()) {
+            Err(e) if token.is_some() && vesper_capture::is_refused(&e) => {
+                log!("could not restore the source ({e}): asking again");
+                start(None)
+            }
+            result => result,
+        }?;
         // The portal hands out a new token on every start.
         if let Some(token) = capture.restore_token()
             && let Err(e) = save_restore_token(token)
@@ -40,12 +52,17 @@ pub(super) fn portal(max_fps: u32) -> Starter {
     })
 }
 
-/// What [`Portal::poll`] found.
+/// What [`Portal::tick`] saw.
+#[derive(Debug)]
 pub(super) enum Change {
     /// The capture streams again.
     Found(SourceInfo),
+    /// The capture ended: a restart is on its way.
+    Lost,
     /// The user closed the picker the portal showed again: stop.
     Refused,
+    /// The restart itself failed (its thread panicked): stop with this.
+    Failed(String),
 }
 
 /// The pipeline's portal capture, restarted in the background when lost.
@@ -91,7 +108,7 @@ impl Portal {
 
     /// The capture ended on its own: restart it in the background, one
     /// request at a time, after 1, 2, 4… s (at most 30 s).
-    pub(super) fn lost(&mut self) -> std::io::Result<()> {
+    fn lost(&mut self) -> std::io::Result<()> {
         if self.retry.is_some() {
             return Ok(());
         }
@@ -146,13 +163,29 @@ impl Portal {
         Ok(())
     }
 
-    /// The outcome of a restart, once there is one. Cheap: called every tick.
-    pub(super) fn poll(&mut self) -> Option<Change> {
+    /// Called every tick, `ended` when the capture's end was parked: the
+    /// outcome of a restart first (the capture it brings may be the one that
+    /// ended), then the end. Cheap while the capture streams.
+    pub(super) fn tick(&mut self, ended: bool) -> std::io::Result<[Option<Change>; 2]> {
+        let found = self.poll();
+        let lost = if ended {
+            self.lost()?;
+            Some(Change::Lost)
+        } else {
+            None
+        };
+        Ok([found, lost])
+    }
+
+    /// The outcome of a restart, once there is one.
+    fn poll(&mut self) -> Option<Change> {
         let outcome = match self.retry.as_ref()?.rx.try_recv() {
             Ok(outcome) => outcome,
             Err(TryRecvError::Empty) => return None,
-            // The restart thread panicked: give up.
-            Err(TryRecvError::Disconnected) => (Err(()), RETRY_FIRST),
+            Err(TryRecvError::Disconnected) => {
+                self.retry = None;
+                return Some(Change::Failed("the capture restart crashed".into()));
+            }
         };
         if let Some(r) = self.retry.take() {
             let _ = r.thread.join();
@@ -174,10 +207,9 @@ impl Drop for Portal {
     fn drop(&mut self) {
         *lock(&self.stop.0) = true;
         self.stop.1.notify_all();
+        // Not joined: a portal that never answers must not hang the quit.
+        // The thread only holds the mailbox and drops what it gets.
         self.cancel.cancel();
-        if let Some(r) = self.retry.take() {
-            let _ = r.thread.join();
-        }
     }
 }
 
@@ -334,5 +366,43 @@ mod tests {
         let t = std::time::Instant::now();
         drop(p);
         assert!(t.elapsed() < Duration::from_millis(500));
+    }
+
+    /// A restarted capture that ends before the pipeline saw it come back
+    /// (its end parked with the restart's outcome) is restarted again,
+    /// never kept as a dead source.
+    #[test]
+    fn a_capture_dying_as_it_comes_back_is_restarted_again() {
+        let starts = Arc::new(AtomicUsize::new(0));
+        let n = starts.clone();
+        let start: Starter = Arc::new(move |_, slot| {
+            if n.fetch_add(1, Ordering::SeqCst) == 1 {
+                slot.park(Err("stream closed".into()));
+            }
+            Ok(Started {
+                info: SourceInfo::default(),
+                _guard: Box::new(()),
+            })
+        });
+        let slot = Arc::new(Mailbox::default());
+        let mut p = Portal::start(start, slot.clone()).unwrap();
+        let first = p.tick(true).unwrap();
+        assert!(matches!(first, [None, Some(Change::Lost)]), "{first:?}");
+        let t = std::time::Instant::now();
+        let changes = loop {
+            slot.wait(Some(Duration::from_secs(3)));
+            let (_, ended) = slot.take();
+            let c = p.tick(ended.is_some()).unwrap();
+            if c.iter().any(Option::is_some) {
+                break c;
+            }
+            assert!(t.elapsed() < Duration::from_secs(3), "never came back");
+        };
+        assert!(
+            matches!(changes, [Some(Change::Found(_)), Some(Change::Lost)]),
+            "{changes:?}"
+        );
+        assert!(p.retry.is_some(), "restarting again");
+        assert!(p.source().is_none());
     }
 }

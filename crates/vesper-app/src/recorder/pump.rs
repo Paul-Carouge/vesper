@@ -161,34 +161,46 @@ pub(super) fn pump(
             ),
         }
         let (frame, ended) = slot.take();
-        if let Some(e) = ended {
-            // A lost portal capture comes back in the background; the
-            // last picture repeats meanwhile.
-            let Some(p) = portal.as_mut() else {
-                error = Some(tr!("Capture ended: {}", e));
-                break;
-            };
-            log!("capture lost: {e}");
-            if let Err(e) = p.lost() {
+        // A lost portal capture comes back in the background; the last
+        // picture repeats meanwhile.
+        let changes = match (portal.as_mut(), &ended) {
+            (Some(p), _) => p.tick(ended.is_some()).map_err(|e| e.to_string()),
+            (None, Some(e)) => Err(e.clone()),
+            (None, None) => Ok([None, None]),
+        };
+        let changes = match changes {
+            Ok(c) => c,
+            Err(e) => {
                 error = Some(tr!("Capture ended: {}", e));
                 break;
             }
-            on_event(Event::Notice(tr!("Source lost: reconnecting…").into()));
-        }
-        if let Some(change) = portal.as_mut().and_then(|p| p.poll()) {
+        };
+        let mut stopped = false;
+        for change in changes.into_iter().flatten() {
             match change {
                 Change::Found(source) => {
                     on_event(Event::Notice(tr!("Source back").into()));
                     on_event(Event::Source(crate::outputs::describe(&source)));
+                }
+                Change::Lost => {
+                    log!("capture lost: {}", ended.as_deref().unwrap_or_default());
+                    on_event(Event::Notice(tr!("Source lost: reconnecting…").into()));
                 }
                 // The file is kept: a clean stop, not a failure.
                 Change::Refused => {
                     on_event(Event::Notice(
                         tr!("The source was not picked again: capture stopped").into(),
                     ));
-                    break;
+                    stopped = true;
+                }
+                Change::Failed(e) => {
+                    error = Some(tr!("Capture ended: {}", e));
+                    stopped = true;
                 }
             }
+        }
+        if stopped {
+            break;
         }
         // The canvas: a fixed one, else the first frame's size. A fixed
         // canvas with a scene that does not show the capture (e.g. "Be
