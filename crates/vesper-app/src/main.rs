@@ -218,7 +218,7 @@ fn main() -> Result<(), slint::PlatformError> {
     scene_ui::wire(&ui, &recording, &games);
     profiles::wire(&ui, &recording, &games, defaults);
     if prefs::SAVING_OFF.load(Ordering::Relaxed) {
-        flash_notice(
+        flash_error(
             &ui,
             tr!("Could not read the settings: changes are not saved"),
         );
@@ -233,17 +233,21 @@ fn main() -> Result<(), slint::PlatformError> {
         && !game_down
         && let Err(e) = start_pipeline(&ui, &recording, &games, None, None)
     {
-        flash_notice(&ui, &e);
+        flash_error(&ui, &e);
     }
 
     // Refreshes game mode, and restarts a game capture server that failed
-    // or could not start, backing off 1, 2, 4... up to 30 s.
-    let games_tick = slint::Timer::default();
+    // or could not start, backing off 1, 2, 4... up to 30 s. Runs in game
+    // mode only (see `set_source_mode`).
     let weak = ui.as_weak();
     let (g, rec) = (games.clone(), recording.clone());
     let (mut failures, mut retry_at) = (0u32, Instant::now());
-    games_tick.start(slint::TimerMode::Repeated, GAMES_TICK, move || {
+    let games_tick = move || {
         let Some(ui) = weak.upgrade() else { return };
+        // Back in game mode (the tick was stopped meanwhile): a fresh start.
+        if GAMES_TICK_FRESH.with(|f| f.replace(false)) {
+            (failures, retry_at) = (0, Instant::now());
+        }
         if ui.get_source_kind() != SourceKind::Game {
             failures = 0;
             return;
@@ -297,7 +301,7 @@ fn main() -> Result<(), slint::PlatformError> {
                         && ui.get_replay_enabled()
                         && let Err(e) = start_pipeline(&ui, &rec, &g, None, None)
                     {
-                        flash_notice(&ui, &e);
+                        flash_error(&ui, &e);
                     }
                     return;
                 }
@@ -309,9 +313,11 @@ fn main() -> Result<(), slint::PlatformError> {
             },
         }
         if failures == 3 {
-            flash_notice(&ui, tr!("Game capture stopped"));
+            flash_error(&ui, tr!("Game capture stopped"));
         }
-    });
+    };
+    GAMES_TICK_TIMER.with(|t| t.start(slint::TimerMode::Repeated, GAMES_TICK, games_tick));
+    set_games_tick(ui.get_source_kind() == SourceKind::Game);
 
     let _meters = audio::start_meters(&ui, &recording);
 
@@ -393,7 +399,7 @@ fn wire_callbacks(ui: &AppWindow, recording: &Shared, games: &Games) {
             return;
         }
         if ui.get_output_folder().is_empty() {
-            flash_notice(&ui, tr!("Choose an output folder first"));
+            flash_error(&ui, tr!("Choose an output folder first"));
             return;
         }
         // Game mode without a layer game records the game's window.
@@ -407,7 +413,7 @@ fn wire_callbacks(ui: &AppWindow, recording: &Shared, games: &Games) {
             .is_some_and(|p| p.record(folder.clone()));
         if !joined && let Err(e) = start_pipeline(&ui, &rec, &g, Some(folder), None) {
             ui.set_rec_state(RecState::Idle);
-            flash_notice(&ui, &e);
+            flash_error(&ui, &e);
         }
     });
 
@@ -431,14 +437,14 @@ fn wire_callbacks(ui: &AppWindow, recording: &Shared, games: &Games) {
         let Some(ui) = weak.upgrade() else { return };
         log!("save-replay: last {} s", ui.get_replay_seconds());
         if ui.get_output_folder().is_empty() {
-            flash_notice(&ui, tr!("Choose an output folder first"));
+            flash_error(&ui, tr!("Choose an output folder first"));
             return;
         }
         let folder = PathBuf::from(ui.get_output_folder().as_str());
         let saving =
             ui.get_replay_enabled() && rec.borrow().as_ref().is_some_and(|p| p.save_replay(folder));
         if !saving {
-            flash_notice(&ui, tr!("The replay buffer is not running"));
+            flash_error(&ui, tr!("The replay buffer is not running"));
         }
     });
 
@@ -493,7 +499,7 @@ fn wire_callbacks(ui: &AppWindow, recording: &Shared, games: &Games) {
                 Ok(None) => {}
                 Err(e) => {
                     log!("folder picker: {e}");
-                    flash_notice(&ui, tr!("Could not open the folder picker"));
+                    flash_error(&ui, tr!("Could not open the folder picker"));
                 }
             });
         });
@@ -507,6 +513,12 @@ fn wire_callbacks(ui: &AppWindow, recording: &Shared, games: &Games) {
     ui.on_play_notice_file(|| {
         if let Some(file) = notice_file() {
             desktop::open(&file);
+        }
+    });
+    let weak = ui.as_weak();
+    ui.on_dismiss_notice(move || {
+        if let Some(ui) = weak.upgrade() {
+            dismiss_notice(&ui);
         }
     });
 
@@ -547,7 +559,7 @@ fn apply_replay(ui: &AppWindow, rec: &Shared, games: &Games) {
         && let Err(e) = start_pipeline(ui, rec, games, None, None)
     {
         ui.set_replay_enabled(false);
-        flash_notice(ui, &e);
+        flash_error(ui, &e);
     }
 }
 
@@ -565,7 +577,7 @@ fn start_replay(ui: &AppWindow, rec: &Shared, games: &Games) {
         // The start error is shown; the games tick starts the replay
         // buffer once game capture runs.
     } else if let Err(e) = start_pipeline(ui, rec, games, None, None) {
-        flash_notice(ui, &e);
+        flash_error(ui, &e);
     }
 }
 
@@ -713,7 +725,7 @@ fn wire_background(ui: &AppWindow, tray: Option<&Tray>) {
             Ok(()) => ui.set_autostart(on),
             Err(e) => {
                 log!("autostart entry: {e}");
-                flash_notice(&ui, &tr!("Could not change autostart: {}", e));
+                flash_error(&ui, &tr!("Could not change autostart: {}", e));
             }
         }
     });
@@ -785,7 +797,7 @@ fn wire_game_callbacks(ui: &AppWindow, games: &Games) {
             Ok(()) => flash_notice(&ui, tr!("Game capture removed")),
             Err(e) => {
                 log!("game capture layer: {e}");
-                flash_notice(&ui, &tr!("Could not change game capture: {}", e));
+                flash_error(&ui, &tr!("Could not change game capture: {}", e));
             }
         }
         show_layer_state(&ui);
@@ -810,19 +822,40 @@ fn show_layer_state(ui: &AppWindow) {
     ui.set_game_layer_outdated(outdated);
 }
 
+thread_local! {
+    /// Game mode's tick (see `main`), stopped outside game mode.
+    static GAMES_TICK_TIMER: slint::Timer = slint::Timer::default();
+    /// Set when the tick starts again: it forgets the last failures.
+    static GAMES_TICK_FRESH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs the games tick in game mode only: no wakeups otherwise. Does nothing
+/// before `main` starts it.
+fn set_games_tick(on: bool) {
+    GAMES_TICK_TIMER.with(|t| match (on, t.running()) {
+        (true, false) => {
+            GAMES_TICK_FRESH.with(|f| f.set(true));
+            t.restart();
+        }
+        (false, true) => t.stop(),
+        _ => {}
+    });
+}
+
 /// Switches between the portal source and game capture. The game capture
 /// server only runs in game mode; if it cannot start, game mode stays with
 /// the error shown, and the games tick retries.
 fn set_source_mode(ui: &AppWindow, games: &Games, game: bool) {
     game::clear(ui);
     *games.borrow_mut() = None;
+    set_games_tick(game);
     if game {
         ui.set_source_kind(SourceKind::Game);
         match GameSource::start() {
             Ok(source) => *games.borrow_mut() = Some(source),
             Err(e) => {
                 log!("{e}");
-                flash_notice(ui, &e);
+                flash_error(ui, &e);
             }
         }
         return;
@@ -1021,7 +1054,8 @@ fn on_recorder_event(ui: &AppWindow, generation: u64, event: Event) {
             log!("audio track {name:?}: {reason}");
             flash_notice(ui, &tr!("{}: reconnecting…", name));
         }
-        Event::AudioMissing(text) | Event::Notice(text) => flash_notice(ui, &text),
+        Event::AudioMissing(text) => flash_error(ui, &text),
+        Event::Notice(text) => flash_notice(ui, &text),
         Event::Camera(on) => {
             log!("webcam {}", if on { "on" } else { "off" });
             ui.global::<SceneStore>().set_camera_on(on);
@@ -1060,7 +1094,7 @@ fn on_recorder_event(ui: &AppWindow, generation: u64, event: Event) {
             ui.set_elapsed_seconds(0);
             ui.set_replay_enabled(false);
             live::reset(ui);
-            flash_notice(ui, &e);
+            flash_error(ui, &e);
         }
     }
 }
@@ -1192,11 +1226,55 @@ fn flash_notice(ui: &AppWindow, text: &str) {
     show_notice(ui, text, None);
 }
 
-/// Shows a notice, with Open and Play buttons for `file`, then hides it.
+/// Shows an error until the user dismisses it (or a newer notice replaces
+/// it), and as a notification while the window is hidden in the tray.
+fn flash_error(ui: &AppWindow, text: &str) {
+    let text = &friendly(text);
+    if !ui.window().is_visible() {
+        desktop::notify("Vesper".into(), text.into(), None);
+    }
+    show_error(ui, text);
+}
+
+/// Shows an error notice, without a timer.
+fn show_error(ui: &AppWindow, text: &str) {
+    // An older notice's timer leaves it.
+    NOTICE_GENERATION.fetch_add(1, Ordering::Relaxed);
+    ui.set_notice(text.into());
+    ui.set_notice_has_file(false);
+    ui.set_notice_error(true);
+}
+
+thread_local! {
+    /// The last plain notice that came while an error was shown: it shows
+    /// once the error is closed.
+    static NOTICE_AFTER_ERROR: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+/// Hides the notice (its close button), then shows one that waited.
+fn dismiss_notice(ui: &AppWindow) {
+    NOTICE_GENERATION.fetch_add(1, Ordering::Relaxed);
+    ui.set_notice("".into());
+    ui.set_notice_has_file(false);
+    ui.set_notice_error(false);
+    if let Some(text) = NOTICE_AFTER_ERROR.with(|n| n.borrow_mut().take()) {
+        show_notice(ui, &text, None);
+    }
+}
+
+/// Shows a notice, with Open and Play buttons for `file`, then hides it. A
+/// plain notice waits while an error is shown: it would hide it for good.
 fn show_notice(ui: &AppWindow, text: &str, file: Option<PathBuf>) {
+    if file.is_none() && ui.get_notice_error() && !ui.get_notice().is_empty() {
+        NOTICE_AFTER_ERROR.with(|n| *n.borrow_mut() = Some(text.to_owned()));
+        return;
+    }
+    // A saved file replaces the error: what waited is old news.
+    NOTICE_AFTER_ERROR.with(|n| n.borrow_mut().take());
     let generation = NOTICE_GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
     ui.set_notice(text.into());
     ui.set_notice_has_file(file.is_some());
+    ui.set_notice_error(false);
     let time = if file.is_some() {
         FILE_NOTICE_TIME
     } else {
@@ -1249,8 +1327,8 @@ fn announce_failure(ui: &AppWindow, title: &str, error: &str) {
     if !window_focused(ui) {
         desktop::notify(title.to_owned(), error.to_owned(), None);
     }
-    // Not `flash_notice`: it would send a second, untitled notification.
-    show_notice(ui, error, None);
+    // Not `flash_error`: it would send a second, untitled notification.
+    show_error(ui, error);
 }
 
 /// Shows the output folder's name, and its parent with the home folder as `~`.
@@ -1293,6 +1371,26 @@ fn default_output_folder() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_games_tick_runs_in_game_mode_only() {
+        // Before `main` starts it, switching modes leaves it stopped.
+        set_games_tick(true);
+        assert!(!GAMES_TICK_TIMER.with(slint::Timer::running));
+        GAMES_TICK_TIMER.with(|t| t.start(slint::TimerMode::Repeated, GAMES_TICK, || {}));
+        set_games_tick(false);
+        assert!(!GAMES_TICK_TIMER.with(slint::Timer::running));
+        set_games_tick(false);
+        assert!(!GAMES_TICK_TIMER.with(slint::Timer::running));
+        GAMES_TICK_FRESH.with(|f| f.set(false));
+        set_games_tick(true);
+        assert!(GAMES_TICK_TIMER.with(slint::Timer::running));
+        // Started again: its next tick forgets the old failures.
+        assert!(GAMES_TICK_FRESH.with(|f| f.replace(false)));
+        set_games_tick(true);
+        assert!(GAMES_TICK_TIMER.with(slint::Timer::running));
+        assert!(!GAMES_TICK_FRESH.with(std::cell::Cell::get));
+    }
 
     #[test]
     fn version_matches_the_arch_pkgver() {

@@ -26,7 +26,9 @@ use vesper_dsp::FilterSpec;
 
 use crate::prefs::Prefs;
 use crate::recorder::Track;
-use crate::{AppWindow, Games, LiveState, ProfileEntry, RecState, Shared, flash_notice};
+use crate::{
+    AppWindow, Games, LiveState, ProfileEntry, RecState, Shared, flash_error, flash_notice,
+};
 
 /// The profile settings of a version without profiles become.
 const DEFAULT_SLUG: &str = "default";
@@ -297,7 +299,7 @@ fn plan(old: &Prefs, new: &Prefs) -> Plan {
 /// Nor while saving is off (the settings could not be read).
 fn locked(ui: &AppWindow) -> bool {
     if crate::prefs::SAVING_OFF.load(std::sync::atomic::Ordering::Relaxed) {
-        flash_notice(
+        flash_error(
             ui,
             tr!("Settings could not be read: profiles are unavailable"),
         );
@@ -493,7 +495,7 @@ pub fn wire(ui: &AppWindow, rec: &Shared, games: &Games, defaults: Prefs) {
             }
             Err(e) => {
                 log!("could not delete profile {}: {e}", gone.profile);
-                flash_notice(&ui, &tr!("Could not delete {}", gone.profile_name));
+                flash_error(&ui, &tr!("Could not delete {}", gone.profile_name));
             }
         }
         show_list(&ui, &d);
@@ -503,7 +505,7 @@ pub fn wire(ui: &AppWindow, rec: &Shared, games: &Games, defaults: Prefs) {
 /// A profile that cannot be read is not switched to.
 fn refused(ui: &AppWindow, e: &std::io::Error) {
     log!("{e}");
-    flash_notice(ui, tr!("Could not read that profile"));
+    flash_error(ui, tr!("Could not read that profile"));
 }
 
 /// Deletes `gone`'s file from `dir`. Then its plugin instances whose

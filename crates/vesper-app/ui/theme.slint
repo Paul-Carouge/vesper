@@ -15,6 +15,9 @@ export global Theme {
     out property <color> surface-pressed: dark ? #2E2F39 : #E1E1E7;
     out property <color> border: dark ? #24252D : #E4E4EA;
     out property <color> border-strong: dark ? #34353F : #D0D0D8;
+    // Edges of the controls one types in or picks from (fields, selectors,
+    // a switch's off track): at least 3:1 on `surface` and `surface-raised`.
+    out property <color> control-border: dark ? #6A6C76 : #898B95;
     out property <color> scrim: dark ? #000000a0 : #16171c50;
 
     // Text (AA on `surface` and `window-bg` in both schemes)
@@ -31,6 +34,9 @@ export global Theme {
     // Recording state (semantic, never decorative)
     out property <color> rec: dark ? #FF5C52 : #D23A30;
     out property <color> rec-soft: dark ? #FF5C5226 : #D23A301a;
+    // Red text on `rec-soft` (the REC pill, 11px bold): 4.5:1 at least
+    // (light: 4.6:1 on the tinted window background, where `rec` is 3.75:1).
+    out property <color> rec-text: dark ? #FF5C52 : #B92F26;
     out property <color> warn: dark ? #F2B84B : #9A6200;
 
     // Meter
@@ -90,6 +96,8 @@ export global Icons {
     out property <string> replay: "M4.5 12 A7.5 7.5 0 1 0 6.7 6.7 M5.5 3.5 L5.5 7.5 L9.5 7.5";
     out property <string> gamepad: "M7.5 7 L16.5 7 A5 5 0 0 1 21.5 12 L21.5 13.5 A3.5 3.5 0 0 1 15.5 16 L14.5 15 L9.5 15 L8.5 16 A3.5 3.5 0 0 1 2.5 13.5 L2.5 12 A5 5 0 0 1 7.5 7 Z M7.5 9.5 L7.5 12.5 M6 11 L9 11 M15.5 10.5 L15.6 10.5 M17.5 12 L17.6 12";
     out property <string> check: "M5 12.5 L10 17 L19 7.5";
+    out property <string> alert: "M12 3.5 A8.5 8.5 0 1 1 12 20.5 A8.5 8.5 0 1 1 12 3.5 Z M12 7.5 L12 12.5 M12 16 L12 16.1";
+    out property <string> info: "M12 3.5 A8.5 8.5 0 1 1 12 20.5 A8.5 8.5 0 1 1 12 3.5 Z M12 11 L12 16.5 M12 7.9 L12 8";
     out property <string> save: "M12 4 L12 14.5 M7.5 10 L12 14.5 L16.5 10 M5 19.5 L19 19.5";
     out property <string> chevron-up: "M6.5 14.5 L12 9 L17.5 14.5";
     out property <string> chevron-down: "M6.5 9.5 L12 15 L17.5 9.5";

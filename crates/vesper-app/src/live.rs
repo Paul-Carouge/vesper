@@ -12,7 +12,7 @@ use slint::ComponentHandle;
 use crate::prefs::Prefs;
 use crate::secret::{self, Store};
 use crate::stream::{Service, StreamKey, StreamRequest, StreamSettings, StreamState};
-use crate::{AppWindow, Games, LiveService, LiveState, Shared, flash_notice};
+use crate::{AppWindow, Games, LiveService, LiveState, Shared, flash_error, flash_notice};
 
 /// The stream settings of the UI.
 pub fn settings(ui: &AppWindow) -> StreamSettings {
@@ -71,7 +71,7 @@ fn no_server() -> &'static str {
 /// Saves `key` for the selected service, then says `done`.
 fn store_key(ui: &AppWindow, key: StreamKey, done: &'static str) {
     let Some(id) = secret::key_id(&settings(ui)) else {
-        flash_notice(ui, no_server());
+        flash_error(ui, no_server());
         return;
     };
     save_key(ui, id, key, Some(done));
@@ -103,7 +103,7 @@ fn save_key(ui: &AppWindow, id: String, key: StreamKey, done: Option<&'static st
                     if shown {
                         show_save(ui, &e, true);
                     }
-                    flash_notice(ui, &e);
+                    flash_error(ui, &e);
                 }
             }
         },
@@ -280,7 +280,7 @@ fn no_key(request: &StreamRequest, other: Option<&str>) -> Option<String> {
 /// Says where the key of an older version went: it was saved for the
 /// service selected back then, which may not be the one it belongs to.
 fn say_moved(ui: &AppWindow, id: &str) {
-    flash_notice(
+    flash_error(
         ui,
         &tr!(
             "Your previous stream key is now saved for {}: paste it again if it is another service's",
@@ -331,7 +331,7 @@ pub fn wire(ui: &AppWindow, recording: &Shared, games: &Games) {
             key: StreamKey::new("check"),
         };
         if let Err(e) = check.url() {
-            flash_notice(&ui, &e);
+            flash_error(&ui, &e);
             return;
         }
         log!("go-live: {settings:?}");
@@ -371,7 +371,7 @@ pub fn wire(ui: &AppWindow, recording: &Shared, games: &Games) {
             if let Err(e) = request.url() {
                 ui.set_live_state(LiveState::Off);
                 let e = no_key(&request, other).unwrap_or(e);
-                flash_notice(ui, &e);
+                flash_error(ui, &e);
                 return;
             }
             let joined = rec
@@ -380,7 +380,7 @@ pub fn wire(ui: &AppWindow, recording: &Shared, games: &Games) {
                 .is_some_and(|p| p.start_stream(request.clone()));
             if !joined && let Err(e) = crate::start_pipeline(ui, &rec, &g, None, Some(request)) {
                 ui.set_live_state(LiveState::Off);
-                flash_notice(ui, &e);
+                flash_error(ui, &e);
             }
         });
     });

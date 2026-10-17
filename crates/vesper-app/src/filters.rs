@@ -113,8 +113,20 @@ fn plugin_id(kind: &str) -> Option<u32> {
     }
 }
 
+thread_local! {
+    /// Refreshes the plugin rows (loaded, bypassed, back). Runs only while
+    /// a plugin row exists: no wakeups for an app that has none.
+    static PLUGIN_TIMER: slint::Timer = slint::Timer::default();
+}
+
 /// A plugin's row: its parameters as 0-100 % sliders.
 fn plugin_row(enabled: bool, id: u32) -> FilterRow {
+    // Its row must follow the plugin. Does nothing before `wire` starts it.
+    PLUGIN_TIMER.with(|t| {
+        if !t.running() {
+            t.restart();
+        }
+    });
     let view = vesper_vst::global()
         .and_then(|r| r.instance(id).ok())
         .map(|i| i.view());
@@ -319,10 +331,12 @@ fn scan_plugins(ui: &AppWindow) {
 }
 
 /// Refreshes plugin rows whose plugin changed (loaded, bypassed, back).
-fn refresh_plugins(ui: &AppWindow, seen: &mut HashMap<u32, u64>) {
+/// False when there is no plugin row left to follow.
+fn refresh_plugins(ui: &AppWindow, seen: &mut HashMap<u32, u64>) -> bool {
     let Some(registry) = vesper_vst::global() else {
-        return;
+        return false;
     };
+    let mut any = false;
     for track in ui.get_tracks().iter() {
         let Some(model) = track.filters.as_any().downcast_ref::<VecModel<FilterRow>>() else {
             continue;
@@ -331,6 +345,7 @@ fn refresh_plugins(ui: &AppWindow, seen: &mut HashMap<u32, u64>) {
             let Some(id) = plugin_id(&r.kind) else {
                 continue;
             };
+            any = true;
             let Ok(instance) = registry.instance(id) else {
                 continue;
             };
@@ -340,6 +355,7 @@ fn refresh_plugins(ui: &AppWindow, seen: &mut HashMap<u32, u64>) {
             }
         }
     }
+    any
 }
 
 pub fn wire(ui: &AppWindow, rec: &Shared) {
@@ -352,14 +368,17 @@ pub fn wire(ui: &AppWindow, rec: &Shared) {
     });
     let weak = ui.as_weak();
     let seen = RefCell::new(HashMap::new());
-    let plugin_timer = slint::Timer::default();
-    plugin_timer.start(slint::TimerMode::Repeated, PLUGIN_TICK, move || {
-        if let Some(ui) = weak.upgrade() {
-            refresh_plugins(&ui, &mut seen.borrow_mut());
-        }
+    PLUGIN_TIMER.with(|t| {
+        t.start(slint::TimerMode::Repeated, PLUGIN_TICK, move || {
+            let any = weak
+                .upgrade()
+                .is_some_and(|ui| refresh_plugins(&ui, &mut seen.borrow_mut()));
+            // A new plugin row starts it again.
+            if !any {
+                PLUGIN_TIMER.with(slint::Timer::stop);
+            }
+        })
     });
-    // Ticks as long as the app runs.
-    std::mem::forget(plugin_timer);
 
     let (weak, r) = (ui.as_weak(), rec.clone());
     ui.on_filter_toggled(move |i, j, on| {
@@ -602,6 +621,24 @@ mod tests {
                 assert_ne!(p.label, "Value", "{}", f.spec.name());
             }
         }
+    }
+
+    #[test]
+    fn a_plugin_row_wakes_the_plugin_timer() {
+        PLUGIN_TIMER.with(|t| {
+            t.start(slint::TimerMode::Repeated, PLUGIN_TICK, || {});
+            t.stop();
+        });
+        let _ = rows(&[TrackFilter {
+            enabled: true,
+            spec: FilterSpec::Gain { db: 1.0 },
+        }]);
+        assert!(!PLUGIN_TIMER.with(slint::Timer::running));
+        let _ = rows(&[TrackFilter {
+            enabled: true,
+            spec: FilterSpec::Vst3 { id: 7 },
+        }]);
+        assert!(PLUGIN_TIMER.with(slint::Timer::running));
     }
 
     #[test]
