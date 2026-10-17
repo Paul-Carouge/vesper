@@ -5,11 +5,11 @@
 //! until it changes.
 
 use std::io::Read;
+use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
-use std::sync::mpsc;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use tracing::warn;
@@ -168,7 +168,11 @@ pub fn scan(host: &HostCommand, dirs: &[PathBuf], cache: &Path) -> Vec<PluginInf
 /// Runs `host --scan path`: its stdout lines, or why it failed.
 fn scan_one(host: &HostCommand, path: &Path) -> Result<Vec<String>, String> {
     let mut cmd = host.command();
-    cmd.arg("--scan").arg(path).stdout(Stdio::piped());
+    // Its own process group, so helpers the plugin starts go with it.
+    cmd.arg("--scan")
+        .arg(path)
+        .stdout(Stdio::piped())
+        .process_group(0);
     // SAFETY: an async-signal-safe syscall between fork and exec.
     unsafe {
         cmd.pre_exec(|| {
@@ -176,47 +180,67 @@ fn scan_one(host: &HostCommand, path: &Path) -> Result<Vec<String>, String> {
             Ok(())
         });
     }
-    let mut child = cmd
+    let child = cmd
         .spawn()
         .map_err(|e| format!("cannot start {:?}: {e}", host.program))?;
-    let mut stdout = child.stdout.take().expect("piped");
-    let (tx, rx) = mpsc::channel();
-    // Detached: a helper the plugin started may keep the pipe open.
-    std::thread::spawn(move || {
-        let mut out = Vec::new();
-        let _ = stdout.read_to_end(&mut out);
-        let _ = tx.send(out);
-    });
-    let status = wait_timeout(&mut child, SCAN_TIMEOUT);
-    match status {
-        Some(s) if s.success() => {
-            let out = rx
-                .recv_timeout(Duration::from_secs(1))
-                .map_err(|_| "output not closed".to_owned())?;
-            Ok(String::from_utf8_lossy(&out)
-                .lines()
-                .map(str::to_owned)
-                .collect())
-        }
-        Some(s) => Err(format!("scan failed ({s})")),
-        None => Err("scan timed out".into()),
-    }
+    collect(child, SCAN_TIMEOUT)
 }
 
-/// Waits for `child` at most `timeout`, then kills it (None).
-fn wait_timeout(child: &mut Child, timeout: Duration) -> Option<std::process::ExitStatus> {
+/// Reads the stdout of `child` (a process group leader) until it closes,
+/// at most `MAX_OUTPUT` bytes and `timeout`, then kills what is left of
+/// its group and reaps it. A helper that keeps the pipe open gets a second
+/// after the scan exits.
+fn collect(mut child: Child, timeout: Duration) -> Result<Vec<String>, String> {
+    const MAX_OUTPUT: usize = 1 << 20;
+    let mut stdout = child.stdout.take().expect("piped");
+    let pid = child.id() as libc::pid_t;
     let until = Instant::now() + timeout;
-    loop {
-        if let Ok(Some(status)) = child.try_wait() {
-            return Some(status);
+    let (mut out, mut buf) = (Vec::new(), [0u8; 16 << 10]);
+    let mut exited: Option<Instant> = None;
+    let result = loop {
+        // Not reaped yet (WNOWAIT): the group id stays ours to signal.
+        if exited.is_none() {
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            let flags = libc::WEXITED | libc::WNOHANG | libc::WNOWAIT;
+            if unsafe { libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, flags) } == 0
+                && unsafe { info.si_pid() } == pid
+            {
+                exited = Some(Instant::now());
+            }
+        }
+        if exited.is_some_and(|t| t.elapsed() >= Duration::from_secs(1)) {
+            break Err("output not closed".to_owned());
         }
         if Instant::now() >= until {
-            let _ = child.kill();
-            let _ = child.wait();
-            return None;
+            break Err("scan timed out".to_owned());
         }
-        std::thread::sleep(Duration::from_millis(20));
+        let mut pfd = libc::pollfd {
+            fd: stdout.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        if unsafe { libc::poll(&mut pfd, 1, 20) } <= 0 {
+            continue;
+        }
+        match stdout.read(&mut buf) {
+            Ok(0) => break Ok(()),
+            Ok(n) if out.len() + n > MAX_OUTPUT => break Err("too much output".to_owned()),
+            Ok(n) => out.extend_from_slice(&buf[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => break Err(format!("reading its output: {e}")),
+        }
+    };
+    unsafe { libc::kill(-pid, libc::SIGKILL) };
+    drop(stdout);
+    let status = child.wait().map_err(|e| e.to_string())?;
+    result?;
+    if !status.success() {
+        return Err(format!("scan failed ({status})"));
     }
+    Ok(String::from_utf8_lossy(&out)
+        .lines()
+        .map(str::to_owned)
+        .collect())
 }
 
 #[cfg(test)]
@@ -242,6 +266,57 @@ mod tests {
         assert!(!synth.is_effect());
         assert!(PluginInfo::parse(&p.path, "").is_none());
         assert!(PluginInfo::parse(&p.path, "zz\tname").is_none());
+    }
+
+    fn run(script: &str, timeout: Duration) -> (Result<Vec<String>, String>, Duration) {
+        let child = std::process::Command::new("sh")
+            .args(["-c", script])
+            .stdout(Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let t = Instant::now();
+        (collect(child, timeout), t.elapsed())
+    }
+
+    #[test]
+    fn scan_output_is_bounded_and_nothing_outlives_it() {
+        let ten = Duration::from_secs(10);
+        assert_eq!(run("echo a; echo b", ten).0.unwrap(), ["a", "b"]);
+        assert_eq!(
+            run("echo a; exit 3", ten).0.unwrap_err(),
+            "scan failed (exit status: 3)"
+        );
+        // Endless output: cut at 1 MiB.
+        let (r, t) = run("yes", ten);
+        assert_eq!(r.unwrap_err(), "too much output");
+        assert!(t < Duration::from_secs(5), "{t:?}");
+        // A helper keeps the pipe open: given a second, then killed.
+        let pidfile = std::env::temp_dir().join(format!("vesper-scan-{}", std::process::id()));
+        let script = format!("sleep 30 & echo $! > {}; echo x", pidfile.display());
+        let (r, t) = run(&script, ten);
+        assert_eq!(r.unwrap_err(), "output not closed");
+        assert!(t < Duration::from_secs(3), "{t:?}");
+        let helper: i32 = std::fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        std::fs::remove_file(&pidfile).unwrap();
+        // Killed (a zombie until its reaper collects it).
+        let dead = || {
+            let stat = std::fs::read_to_string(format!("/proc/{helper}/stat"));
+            stat.map_or(true, |s| s.contains(") Z"))
+        };
+        let until = Instant::now() + Duration::from_secs(2);
+        while !dead() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(dead(), "helper {helper} survived");
+        // A hung scan is killed at the timeout.
+        let (r, t) = run("sleep 30", Duration::from_millis(300));
+        assert_eq!(r.unwrap_err(), "scan timed out");
+        assert!(t < Duration::from_secs(2), "{t:?}");
     }
 
     #[test]
