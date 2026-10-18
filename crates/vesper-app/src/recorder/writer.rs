@@ -32,6 +32,8 @@ struct State {
     error: Option<String>,
     /// The file is created and `Event::Started` sent.
     started: bool,
+    /// The file, once created: named in an error even if the writer panics.
+    path: Option<PathBuf>,
 }
 
 impl Queue {
@@ -183,9 +185,15 @@ impl Recording {
     pub(super) fn finish(mut self, error: Option<String>) -> Result<PathBuf, String> {
         self.close(error);
         let writer = self.writer.take().expect("joined once");
-        writer
-            .join()
-            .unwrap_or_else(|_| Err(tr!("The recording stopped on an internal error").into()))
+        writer.join().unwrap_or_else(|_| {
+            // Dropping the muxer still finalized the file, if there is one.
+            let e = tr!("The recording stopped on an internal error");
+            Err(match &lock(&self.queue.state).path {
+                // Kept in English: matched by `friendly()`.
+                Some(path) => format!("{e} (saved up to there: {})", path.display()),
+                None => e.into(),
+            })
+        })
     }
 }
 
@@ -215,9 +223,17 @@ fn write(
         }
     };
     log!("recording to {}", path.display());
-    on_event(Event::Started);
-    // After `Started`: the pipeline's `Stats` follow it.
-    lock(&q.state).started = true;
+    {
+        let mut s = lock(&q.state);
+        s.path = Some(path.clone());
+        // Stopped while the file was being created (a slow disk): the UI is
+        // already stopping, `Started` would show it recording again. Sent
+        // under the lock so no stop slips in between; `Stats` follow it.
+        if !s.closed && s.stop_at.is_none() {
+            on_event(Event::Started);
+            s.started = true;
+        }
+    }
     for (i, p) in lead {
         if let Err(e) = mux.write_audio(*i, p) {
             log!("audio: {e}");
@@ -378,8 +394,10 @@ mod tests {
         for k in 2..50 {
             rec.push(1, opus_packet(1000 + k * 20));
         }
-        let path = rec.finish(None).unwrap();
+        // Before closing: a recording closed while its file is being created
+        // never says `Started`.
         assert_eq!(rx.recv().unwrap(), "Started");
+        let path = rec.finish(None).unwrap();
         let mut input = ffmpeg_next::format::input(&path).unwrap();
         let pts: Vec<_> = input.packets().filter_map(|(_, p)| p.pts()).collect();
         std::fs::remove_dir_all(&folder).unwrap();
