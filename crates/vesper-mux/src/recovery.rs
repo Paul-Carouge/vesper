@@ -689,7 +689,12 @@ fn remux(src: &Path, dst: &Path, busy: &dyn Fn() -> bool) -> Result<Option<Strin
             continue;
         }
         if packet.dts().is_none() {
-            packet.set_dts(packet.pts()); // no B-frames (vesper-core contract)
+            // Matroska stores no dts: libavformat guesses it from the pts
+            // and the H.264 reorder delay, all but the first packet's,
+            // which is the file's lowest pts (a keyframe) and decoded first.
+            // After damage the demuxer may resync mid-GOP and guess a dts
+            // going back: those packets are refused (a Partial outcome).
+            packet.set_dts(packet.pts());
         }
         let tb = output.stream(index).map(|s| s.time_base());
         packet.rescale_ts(time_bases[index], tb.unwrap_or(time_bases[index]));

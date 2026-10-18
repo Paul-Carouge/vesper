@@ -38,6 +38,30 @@ pub fn opus_packet(pts: Duration) -> EncodedPacket {
     EncodedPacket {
         data: Arc::from(&[(31 << 3) | 0b100][..]),
         pts,
+        dts: pts,
         keyframe: true,
     }
+}
+
+/// `frames` pictures of 640x360 at 30 fps encoded in H.264 by the GPU,
+/// first at `start`: B-frames, packets in decode order, a keyframe every
+/// 60. Returns the codec header and the packets. GPU only.
+pub fn h264_b_frames(start: Duration, frames: u32) -> (Vec<u8>, Vec<EncodedPacket>) {
+    use producer::{POOL, Producer};
+    use vesper_core::Codec;
+    use vesper_encode::{Encoder, RateControl};
+    let producer = unsafe { Producer::new(640, 360) };
+    let mut enc = Encoder::new(Codec::H264, 640, 360, 30, RateControl::ConstantQp(30)).unwrap();
+    let mut packets = Vec::new();
+    for t in 0..frames {
+        let pts = start + Duration::from_nanos(u64::from(t) * 1_000_000_000 / 30);
+        let frame = unsafe { producer.frame(t as usize % POOL, t, 0, pts) };
+        packets.extend(enc.encode(frame).unwrap());
+    }
+    packets.extend(enc.flush().unwrap());
+    assert!(
+        packets.windows(2).any(|w| w[1].pts < w[0].pts),
+        "the encoder made B-frames"
+    );
+    (enc.extradata().to_vec(), packets)
 }

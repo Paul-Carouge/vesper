@@ -39,6 +39,71 @@ fn encodes_frames_releases_each_once_and_keeps_pts() {
     assert!(packets[0].keyframe);
     let got: Vec<Duration> = packets.iter().map(|p| p.pts).collect();
     assert_eq!(got, sent, "pts preserved, in order");
+    assert!(
+        packets.iter().all(|p| p.dts == p.pts),
+        "HEVC has no B-frames"
+    );
+}
+
+/// H.264 has B-frames: packets come in decode order with a rising dts
+/// never after pts, every picture once, and closed GOPs (nothing after a
+/// keyframe in decode order is shown before it), forced keyframes included.
+#[test]
+fn h264_b_frames_come_in_decode_order_with_a_rising_dts() {
+    if !vesper_core::test_gpu() {
+        return;
+    }
+    let (w, h) = (640, 360);
+    let producer = unsafe { Producer::new(w, h) };
+    let mut enc = Encoder::new(Codec::H264, w, h, 30, RateControl::ConstantQp(30)).unwrap();
+    let ms = |t: u64| Duration::from_millis(1_000 + t * 33);
+    let mut packets = Vec::new();
+    // Frames given before the first packet came out: the reorder delay.
+    let mut delay = None;
+    for t in 0..150u32 {
+        if t == 75 {
+            enc.force_keyframe();
+        }
+        let frame = unsafe { producer.frame(t as usize % POOL, t, 0, ms(t.into())) };
+        packets.extend(enc.encode(frame).unwrap());
+        if !packets.is_empty() {
+            delay.get_or_insert(t);
+        }
+    }
+    packets.extend(enc.flush().unwrap());
+    eprintln!("first packet after {delay:?} more frames");
+    assert!(delay.is_some_and(|d| d as i32 <= vesper_encode::H264_B_FRAMES + 1));
+
+    let mut pts: Vec<Duration> = packets.iter().map(|p| p.pts).collect();
+    assert!(
+        pts.windows(2).any(|w| w[1] < w[0]),
+        "B-frames: some pts go back"
+    );
+    pts.sort();
+    assert_eq!(
+        pts,
+        (0..150).map(ms).collect::<Vec<_>>(),
+        "every picture once"
+    );
+    assert!(packets.windows(2).all(|w| w[0].dts < w[1].dts), "dts rises");
+    assert!(
+        packets.iter().all(|p| p.dts <= p.pts),
+        "dts never after pts"
+    );
+    let keys: Vec<Duration> = packets
+        .iter()
+        .filter(|p| p.keyframe)
+        .map(|p| p.pts)
+        .collect();
+    // The natural GOP of 2 s (60) restarts at the forced one.
+    assert_eq!(keys, [ms(0), ms(60), ms(75), ms(135)]);
+    for (i, k) in packets.iter().enumerate().filter(|(_, p)| p.keyframe) {
+        assert!(
+            packets[i..].iter().all(|p| p.pts >= k.pts),
+            "closed GOP at {:?}",
+            k.pts
+        );
+    }
 }
 
 #[test]

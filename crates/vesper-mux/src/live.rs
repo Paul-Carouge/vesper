@@ -196,11 +196,11 @@ pub struct Live {
     packet: *mut ff::AVPacket,
     /// Boxed: libavformat keeps a pointer to it.
     interrupt: Box<Interrupt>,
-    /// Pts of the first video packet (a keyframe): time 0 of the stream.
+    /// Dts of the first video packet (a keyframe): time 0 of the stream.
     start: Option<Duration>,
     frame_ns: i64,
-    /// Last written pts per stream, in its time base.
-    last_pts: [i64; 2],
+    /// Last written dts per stream, in its time base.
+    last_dts: [i64; 2],
     has_audio: bool,
     /// Bytes handed to the network so far.
     written: u64,
@@ -328,7 +328,7 @@ impl Live {
             }),
             start: None,
             frame_ns: 1_000_000_000 / i64::from(video.fps),
-            last_pts: [i64::MIN; 2],
+            last_dts: [i64::MIN; 2],
             has_audio: audio.is_some(),
             written: 0,
         };
@@ -525,14 +525,15 @@ impl Live {
         self.written
     }
 
-    /// Writes a video packet. The first one must be a keyframe: its pts is
-    /// the stream's time 0. Out-of-order packets are dropped.
+    /// Writes a video packet, in decode order. The first one must be a
+    /// keyframe: its dts is the stream's time 0 (no timestamp goes below
+    /// it, B-frames or not). Packets whose dts goes back are dropped.
     pub fn write_video(&mut self, packet: &EncodedPacket) -> Result<(), LiveError> {
         if self.start.is_none() {
             if !packet.keyframe {
                 return Ok(());
             }
-            self.start = Some(packet.pts);
+            self.start = Some(packet.dts);
         }
         self.write(0, packet, self.frame_ns)
     }
@@ -554,23 +555,26 @@ impl Live {
         duration_ns: i64,
     ) -> Result<(), LiveError> {
         let start = self.start.unwrap_or_default();
-        let pts_ns = i64::try_from(packet.pts.saturating_sub(start).as_nanos())
-            .map_err(|_| LiveError::new(LiveErrorKind::Other, "pts overflow"))?;
+        let rebase = |t: Duration| {
+            i64::try_from(t.saturating_sub(start).as_nanos())
+                .map_err(|_| LiveError::new(LiveErrorKind::Other, "timestamp overflow"))
+        };
+        let (pts_ns, dts_ns) = (rebase(packet.pts)?, rebase(packet.dts)?);
         let size = c_int::try_from(packet.data.len())
             .map_err(|_| LiveError::new(LiveErrorKind::Other, "packet too large"))?;
         unsafe {
             let tb = (**(*self.ctx).streams.add(stream)).time_base;
-            let pts = ff::av_rescale_q(pts_ns, NANOS, tb);
-            if pts <= self.last_pts[stream] {
+            let dts = ff::av_rescale_q(dts_ns, NANOS, tb);
+            if dts <= self.last_dts[stream] {
                 return Ok(());
             }
-            self.last_pts[stream] = pts;
+            self.last_dts[stream] = dts;
             let p = &mut *self.packet;
             p.data = packet.data.as_ptr() as *mut u8;
             p.size = size;
             p.stream_index = stream as c_int;
-            p.pts = pts;
-            p.dts = pts; // no B-frames (vesper-core contract)
+            p.pts = ff::av_rescale_q(pts_ns, NANOS, tb);
+            p.dts = dts;
             p.duration = ff::av_rescale_q(duration_ns, NANOS, tb);
             p.flags = if packet.keyframe {
                 ff::AV_PKT_FLAG_KEY

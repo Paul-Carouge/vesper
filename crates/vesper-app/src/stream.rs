@@ -399,8 +399,9 @@ impl LiveSink {
         }
         (q.want_key, q.congested) = (false, false);
         q.video.push_back((p, Instant::now()));
-        // Saturating: pts may go back (an encoder restart), never panic on it.
-        let span = (q.video.back().unwrap().0.pts).saturating_sub(q.video.front().unwrap().0.pts);
+        // By dts (pts go back between B-frames). Saturating: dts may go
+        // back too (an encoder restart), never panic on it.
+        let span = (q.video.back().unwrap().0.dts).saturating_sub(q.video.front().unwrap().0.dts);
         if span > MAX_QUEUE {
             // Congested: drop what waits rather than fall further behind,
             // and resume on the next keyframe.
@@ -486,11 +487,12 @@ impl Drop for LiveSink {
     }
 }
 
-/// The next packet to send, in pts order across both queues: `(is_video,
-/// packet)`. A packet alone waits [`INTERLEAVE_WAIT`] for the other kind.
+/// The next packet to send, in dts order across both queues (video comes
+/// in decode order; audio has dts == pts): `(is_video, packet)`. A packet
+/// alone waits [`INTERLEAVE_WAIT`] for the other kind.
 fn next_packet(q: &mut Queue, has_audio: bool, now: Instant) -> Option<(bool, EncodedPacket)> {
-    let video = q.video.front().map(|(p, t)| (p.pts, *t));
-    let audio = q.audio.front().map(|(p, t)| (p.pts, *t));
+    let video = q.video.front().map(|(p, t)| (p.dts, *t));
+    let audio = q.audio.front().map(|(p, t)| (p.dts, *t));
     let take_video = match (video, audio) {
         (None, None) => return None,
         (Some((v, _)), Some((a, _))) => v <= a,
@@ -884,6 +886,7 @@ mod tests {
         EncodedPacket {
             data: Arc::from(&[0u8; 4][..]),
             pts: Duration::from_millis(ms),
+            dts: Duration::from_millis(ms),
             keyframe,
         }
     }
@@ -948,15 +951,20 @@ mod tests {
     }
 
     #[test]
-    fn packets_leave_in_pts_order_and_a_lone_kind_waits_briefly() {
+    fn packets_leave_in_dts_order_and_a_lone_kind_waits_briefly() {
         let mut q = Queue::default();
         let t0 = Instant::now();
-        q.video.push_back((packet(100, true), t0));
+        // A B-frame anchor: shown at 133, decoded at 100.
+        let anchor = EncodedPacket {
+            dts: Duration::from_millis(100),
+            ..packet(133, true)
+        };
+        q.video.push_back((anchor, t0));
         q.video.push_back((packet(116, false), t0));
         q.audio.push_back((packet(90, true), t0));
         q.audio.push_back((packet(111, true), t0));
         let order: Vec<_> = std::iter::from_fn(|| next_packet(&mut q, true, t0))
-            .map(|(v, p)| (v, p.pts.as_millis()))
+            .map(|(v, p)| (v, p.dts.as_millis()))
             .collect();
         assert_eq!(order, [(false, 90), (true, 100), (false, 111)]);
         // Video alone waits for audio, then goes.

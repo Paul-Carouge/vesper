@@ -26,6 +26,10 @@ use std::time::Duration;
 use ffmpeg_next::ffi as ff;
 use vesper_core::{Codec, EncodedPacket};
 
+// The integration tests' helpers, shared with the unit tests, name the crate.
+#[cfg(test)]
+extern crate self as vesper_mux;
+
 mod live;
 mod recovery;
 pub use live::{Live, LiveAudio, LiveError, LiveErrorKind, redact};
@@ -117,8 +121,8 @@ pub struct Muxer {
     pre_skip: Vec<Duration>,
     /// Video is dropped until the first keyframe so the file starts decodable.
     got_keyframe: bool,
-    /// Last written pts per stream, in its time base.
-    last_pts: Vec<i64>,
+    /// Last written dts per stream, in its time base.
+    last_dts: Vec<i64>,
     /// The output file, opened again to notice it being deleted: writes to
     /// an unlinked file succeed, and `finish` would claim it was saved.
     /// shortcut: on NFS a file deleted while open is "silly-renamed"
@@ -170,7 +174,7 @@ impl Muxer {
                 })
                 .collect(),
             got_keyframe: false,
-            last_pts: vec![i64::MIN; 1 + audio.len()],
+            last_dts: vec![i64::MIN; 1 + audio.len()],
             file: None,
             guard: None,
         };
@@ -277,8 +281,9 @@ impl Muxer {
         Ok(st)
     }
 
-    /// Writes one video packet. Packets before `start`, and before the first
-    /// keyframe at or after it, are dropped.
+    /// Writes one video packet, in decode order. Packets presented before
+    /// `start`, and before the first keyframe at or after it, are dropped
+    /// (GOPs are closed: nothing after a keyframe is presented before it).
     pub fn write_video(&mut self, packet: &EncodedPacket) -> Result<(), Error> {
         if packet.pts < self.start || !(self.got_keyframe || packet.keyframe) {
             return Ok(());
@@ -306,9 +311,13 @@ impl Muxer {
         packet: &EncodedPacket,
         duration_ns: i64,
     ) -> Result<(), Error> {
-        // Signed: an Opus packet may start up to its pre-skip before `start`.
-        let pts_ns = i64::try_from(packet.pts.as_nanos() as i128 - self.start.as_nanos() as i128)
-            .map_err(|_| Error("pts overflow".into()))?;
+        // Signed: an Opus packet may start up to its pre-skip before `start`,
+        // and the first keyframe's dts its B-frame delay before it.
+        let rebase = |t: Duration| {
+            i64::try_from(t.as_nanos() as i128 - self.start.as_nanos() as i128)
+                .map_err(|_| Error("timestamp overflow".into()))
+        };
+        let (pts_ns, dts_ns) = (rebase(packet.pts)?, rebase(packet.dts)?);
         let size =
             c_int::try_from(packet.data.len()).map_err(|_| Error("packet too large".into()))?;
         unsafe {
@@ -318,15 +327,15 @@ impl Muxer {
             p.data = packet.data.as_ptr() as *mut u8;
             p.size = size;
             p.stream_index = stream as c_int;
-            let pts = ff::av_rescale_q(pts_ns, NANOS, tb);
-            // libavformat rejects a timestamp going backwards (e.g. after a
+            let dts = ff::av_rescale_q(dts_ns, NANOS, tb);
+            // libavformat rejects a dts going backwards (e.g. after a
             // capture renegotiation): drop that packet, keep the recording.
-            if pts < self.last_pts[stream] {
+            if dts < self.last_dts[stream] {
                 return Ok(());
             }
-            self.last_pts[stream] = pts;
-            p.pts = pts;
-            p.dts = p.pts; // no B-frames (vesper-core contract)
+            self.last_dts[stream] = dts;
+            p.pts = ff::av_rescale_q(pts_ns, NANOS, tb);
+            p.dts = dts;
             p.duration = ff::av_rescale_q(duration_ns, NANOS, tb);
             p.flags = if packet.keyframe {
                 ff::AV_PKT_FLAG_KEY
@@ -423,6 +432,7 @@ mod tests {
             let packet = EncodedPacket {
                 data: std::sync::Arc::from(&[(31 << 3) | 0b100][..]),
                 pts: start,
+                dts: start,
                 keyframe: true,
             };
             mux.write_audio(i, &packet).unwrap();

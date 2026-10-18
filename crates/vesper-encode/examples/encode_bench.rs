@@ -79,7 +79,7 @@ fn bench(producer: &Producer, codec: Codec, (w, h): (u32, u32), frames: u32) -> 
     assert_eq!(packets.len(), frames as usize, "one packet per frame");
     assert!(
         packets.windows(2).all(|w| w[0].pts < w[1].pts),
-        "packets in pts order (no B-frames)"
+        "packets in pts order (no B-frames in HEVC and AV1)"
     );
     assert!(packets[0].keyframe);
 

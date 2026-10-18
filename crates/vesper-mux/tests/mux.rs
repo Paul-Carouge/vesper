@@ -3,7 +3,7 @@ mod common;
 use std::time::Duration;
 
 use common::producer::{POOL, Producer};
-use common::{OPUS_FRAME, opus_packet, opus_track};
+use common::{OPUS_FRAME, h264_b_frames, opus_packet, opus_track};
 use ffmpeg_next::codec::Id;
 use ffmpeg_next::media::Type;
 use vesper_core::Codec;
@@ -101,4 +101,70 @@ fn muxes_hevc_and_opus_readable_by_libavformat() {
     assert_eq!(video_pts[0], 0);
     assert_eq!(video_pts[1], 33);
     assert_eq!(audio, audio_sent, "audio before start dropped, rest kept");
+}
+
+/// H.264 with B-frames: the packets go in decode order with audio
+/// interleaved by dts, and every frame decodes back in presentation order.
+#[test]
+fn h264_b_frames_mux_and_decode_in_order() {
+    if !vesper_core::test_gpu() {
+        return;
+    }
+    const FRAMES: u32 = 90;
+    let start = Duration::from_secs(1_000);
+    let (extradata, packets) = h264_b_frames(start, FRAMES);
+    // The first keyframe's dts is before `start`: kept, rebased below 0.
+    assert!(packets[0].keyframe && packets[0].dts < start);
+    let path = std::env::temp_dir().join(format!("vesper-mux-bframes-{}.mkv", std::process::id()));
+    let video = VideoTrack {
+        codec: Codec::H264,
+        width: 640,
+        height: 360,
+        fps: 30,
+        extradata,
+    };
+    let mut mux = Muxer::create(&path, start, video, &[opus_track()]).unwrap();
+    let mut audio_pts = start;
+    for p in &packets {
+        while audio_pts <= p.dts {
+            mux.write_audio(0, &opus_packet(audio_pts)).unwrap();
+            audio_pts += OPUS_FRAME;
+        }
+        mux.write_video(p).unwrap();
+    }
+    mux.finish().unwrap();
+
+    let mut input = ffmpeg_next::format::input(&path).unwrap();
+    let stream = input.streams().best(Type::Video).unwrap();
+    let index = stream.index();
+    let mut decoder = ffmpeg_next::codec::Context::from_parameters(stream.parameters())
+        .unwrap()
+        .decoder()
+        .video()
+        .unwrap();
+    let mut frame = ffmpeg_next::frame::Video::empty();
+    // Matroska stores no dts: what the encoder gave is checked in vesper-encode.
+    let (mut shown, mut read) = (Vec::new(), 0);
+    for (s, packet) in input.packets() {
+        if s.index() != index {
+            continue;
+        }
+        if read == 0 {
+            assert!(packet.is_key(), "starts on a keyframe");
+        }
+        read += 1;
+        decoder.send_packet(&packet).unwrap();
+        while decoder.receive_frame(&mut frame).is_ok() {
+            shown.push(frame.pts().unwrap());
+        }
+    }
+    decoder.send_eof().unwrap();
+    while decoder.receive_frame(&mut frame).is_ok() {
+        shown.push(frame.pts().unwrap());
+    }
+    std::fs::remove_file(&path).unwrap();
+    assert_eq!(read, FRAMES);
+    assert_eq!(shown.len(), FRAMES as usize, "every frame decodes");
+    assert_eq!(shown[0], 0, "presentation starts at `start`");
+    assert!(shown.windows(2).all(|w| w[0] < w[1]), "shown in pts order");
 }

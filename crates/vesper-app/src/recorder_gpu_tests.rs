@@ -1654,3 +1654,46 @@ fn a_capture_that_never_comes_back_still_ends_in_a_finished_file() {
     assert!(n as f64 > wall * 28.0, "{n} packets in {wall:.2} s");
     std::fs::remove_dir_all(out).unwrap();
 }
+
+/// A replay saved mid-GOP from H.264 with B-frames: it starts on the IDR the
+/// ring was cut at (in decode order), and every frame it holds decodes.
+#[test]
+fn a_replay_of_h264_b_frames_saved_mid_gop_decodes_whole() {
+    if !vesper_core::test_gpu() {
+        return;
+    }
+    let producer = unsafe { Producer::new(W, H) };
+    let mut enc =
+        vesper_encode::Encoder::new(Codec::H264, W, H, 30, RateControl::ConstantQp(30)).unwrap();
+    let mut ring = Ring::new(Duration::from_secs(3), 0);
+    let start = Duration::from_secs(1_000);
+    // 6.7 s at 30 fps, a keyframe every 2 s: the newest GOP is a third done.
+    for t in 0..200u32 {
+        let pts = start + frame_offset(t.into(), 30);
+        let frame = unsafe { producer.frame(t as usize % POOL, t, 0, pts) };
+        for p in enc.encode(frame).unwrap() {
+            ring.push_video(p);
+        }
+    }
+    assert!(ring.video[0].keyframe);
+    assert_eq!(ring.video[0].pts, start + Duration::from_secs(2));
+    assert!(ring.video.iter().any(|p| p.dts != p.pts), "B-frames");
+    let track = VideoTrack {
+        codec: Codec::H264,
+        width: W,
+        height: H,
+        fps: 30,
+        extradata: enc.extradata().to_vec(),
+    };
+    let out = dir("replay-bframes");
+    let path = write_replay(&out, &track, &[], ring.snapshot()).unwrap();
+    let (n, first_key, _) = inspect(&path);
+    assert_eq!(n, ring.video.len());
+    assert!(first_key);
+    assert_eq!(
+        decode_all(&path).len(),
+        ring.video.len(),
+        "every frame decodes"
+    );
+    std::fs::remove_dir_all(out).unwrap();
+}

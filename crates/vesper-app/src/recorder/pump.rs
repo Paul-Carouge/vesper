@@ -92,8 +92,14 @@ impl Video {
             extradata: enc.extradata().to_vec(),
         };
         log!(
-            "encoding {width}x{height} at quality {}, max {bitrate} bit/s, GPU encoder load {:?}",
+            "encoding {width}x{height} {:?} at quality {}{}, max {bitrate} bit/s, GPU encoder load {:?}",
+            settings.codec,
             settings.quality,
+            if settings.codec == Codec::H264 {
+                " (one step finer: B-frames)"
+            } else {
+                ""
+            },
             enc.vcn_load()
         );
         // The grid starts now, not at the frame's own pts: opening the encoder

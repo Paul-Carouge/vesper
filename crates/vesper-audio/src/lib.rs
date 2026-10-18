@@ -821,11 +821,11 @@ impl<F: FnMut(EncodedPacket)> Encoder<F> {
             // samples early (negative pts), so decoded audio lands on `anchor`.
             let pts_ns = packet.pts().unwrap_or(0) as i128 * 1_000_000_000 / SAMPLE_RATE as i128;
             let pts = self.anchor.as_nanos() as i128 + pts_ns;
-            (self.on_packet)(EncodedPacket {
-                data: Arc::from(packet.data().unwrap_or_default()),
-                pts: Duration::from_nanos(pts.max(0) as u64),
-                keyframe: true,
-            });
+            (self.on_packet)(EncodedPacket::new(
+                Arc::from(packet.data().unwrap_or_default()),
+                Duration::from_nanos(pts.max(0) as u64),
+                true,
+            ));
         }
     }
 

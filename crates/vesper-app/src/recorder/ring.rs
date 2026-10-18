@@ -3,7 +3,9 @@
 use super::*;
 
 /// The replay buffer: the last `span` of encoded packets, starting at a video
-/// keyframe. Memory is about (`span` + one GOP) times the bitrate.
+/// keyframe. Memory is about (`span` + one GOP) times the bitrate. Video is
+/// in decode order (H.264 B-frames: pts go back, dts rises), so it is cut
+/// and timed by dts; GOPs are closed, so a cut at a keyframe decodes.
 pub(super) struct Ring {
     pub(super) span: Duration,
     pub(super) video: VecDeque<EncodedPacket>,
@@ -25,7 +27,7 @@ impl Ring {
         if self
             .video
             .back()
-            .is_some_and(|last| p.pts.saturating_sub(last.pts) > self.span)
+            .is_some_and(|last| p.dts.saturating_sub(last.dts) > self.span)
         {
             *self = Ring::new(self.span, self.audio.len());
         }
@@ -33,11 +35,11 @@ impl Ring {
         if self.video.is_empty() && !p.keyframe {
             return;
         }
-        let cutoff = p.pts.saturating_sub(self.span);
+        let cutoff = p.dts.saturating_sub(self.span);
         self.video.push_back(p);
         // Drop the oldest GOP while the next one still starts by the cutoff.
         while let Some(next) = self.video.iter().skip(1).position(|p| p.keyframe)
-            && self.video[next + 1].pts <= cutoff
+            && self.video[next + 1].dts <= cutoff
         {
             self.video.drain(..=next);
         }
@@ -68,13 +70,14 @@ impl Ring {
 
 pub(super) type Snapshot = (VecDeque<EncodedPacket>, Vec<VecDeque<EncodedPacket>>);
 
-/// All packets as `(stream, packet)`, video being stream 0, in pts order.
+/// All packets as `(stream, packet)`, video being stream 0, in dts order
+/// (stable: video keeps its decode order).
 pub(super) fn interleave((video, audio): Snapshot) -> Vec<(usize, EncodedPacket)> {
     let mut all: Vec<_> = video.into_iter().map(|p| (0, p)).collect();
     for (i, track) in audio.into_iter().enumerate() {
         all.extend(track.into_iter().map(|p| (1 + i, p)));
     }
-    all.sort_by_key(|(_, p)| p.pts);
+    all.sort_by_key(|(_, p)| p.dts);
     all
 }
 
