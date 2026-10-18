@@ -30,28 +30,50 @@ fn settings(route: &GameFrames) -> Settings {
 
 /// Feeds the route ~30 frames per second of the current `size` pattern until
 /// `live` is false; `paused` skips frames (the game froze or is loading).
+/// Sends on `drawn` each time a frame is ready.
 fn feeder(
     route: GameFrames,
     live: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
     size: Arc<Mutex<(u32, u32)>>,
     counts: Arc<(AtomicUsize, AtomicUsize)>,
+    drawn: mpsc::Sender<()>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         // Producers are not Send: created here, one per size.
         let mut producers: Vec<((u32, u32), Producer)> = Vec::new();
         let mut t = 0u32;
+        // The next frame, drawn ahead (slow in a debug build on a busy
+        // machine) and kept while no pipeline is attached: one that just
+        // attached gets it at once, well within its 100 ms first-frame wait.
+        let mut next: Option<((u32, u32), VideoFrame)> = None;
+        let mut attached = false;
         while live.load(Ordering::Relaxed) {
-            std::thread::sleep(Duration::from_millis(33));
-            if paused.load(Ordering::Relaxed) {
+            let want = *lock(&size);
+            if next.as_ref().is_none_or(|(s, _)| *s != want) {
+                if !producers.iter().any(|(s, _)| *s == want) {
+                    producers.push((want, unsafe { Producer::new(want.0, want.1) }));
+                }
+                let producer = &producers.iter().find(|(s, _)| *s == want).unwrap().1;
+                let frame = unsafe { producer.frame(t as usize % POOL, t, 0, Duration::ZERO) };
+                next = Some((want, frame));
+                let _ = drawn.send(());
+            }
+            let wait = Instant::now();
+            loop {
+                let now = route.fps().is_some();
+                let fresh = now && !attached;
+                attached = now;
+                if fresh || wait.elapsed() >= Duration::from_millis(33) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            if paused.load(Ordering::Relaxed) || !attached {
                 continue;
             }
-            let want = *lock(&size);
-            if !producers.iter().any(|(s, _)| *s == want) {
-                producers.push((want, unsafe { Producer::new(want.0, want.1) }));
-            }
-            let producer = &producers.iter().find(|(s, _)| *s == want).unwrap().1;
-            let mut frame = unsafe { producer.frame(t as usize % POOL, t, 0, monotonic_now()) };
+            let (_, mut frame) = next.take().unwrap();
+            frame.pts = monotonic_now();
             let c = counts.clone();
             c.0.fetch_add(1, Ordering::SeqCst);
             let release = std::mem::replace(&mut frame.release, ReleaseGuard::new(|| {}));
@@ -85,13 +107,20 @@ impl Rig {
         let paused = Arc::new(AtomicBool::new(false));
         let size = Arc::new(Mutex::new((W, H)));
         let counts = Arc::new((AtomicUsize::new(0), AtomicUsize::new(0)));
+        let (drawn, first) = mpsc::channel();
         let feeder = feeder(
             route.clone(),
             live.clone(),
             paused.clone(),
             size.clone(),
             counts.clone(),
+            drawn,
         );
+        // The first frame waits for the feeder's VA producer (slow on a busy
+        // machine): ready before a pipeline's first-frame wait starts.
+        first
+            .recv_timeout(Duration::from_secs(20))
+            .expect("no game frame");
         Some(Self {
             route,
             live,
@@ -424,9 +453,10 @@ fn video_size(path: &Path) -> (u32, u32) {
     (w as u32, h as u32)
 }
 
-/// 8-bit 4:2:0 planes of a decoded frame.
+/// 8-bit 4:2:0 planes of a decoded frame, and its pts in seconds.
 struct Yuv {
     w: usize,
+    pts: f64,
     planes: [Vec<u8>; 3],
 }
 
@@ -450,6 +480,7 @@ fn decode_all(path: &Path) -> Vec<Yuv> {
         .best(ffmpeg_next::media::Type::Video)
         .unwrap();
     let index = stream.index();
+    let tb = f64::from(stream.time_base());
     let ctx = codec::context::Context::from_parameters(stream.parameters()).unwrap();
     let mut dec = ctx.decoder().video().unwrap();
     let mut out = Vec::new();
@@ -467,6 +498,7 @@ fn decode_all(path: &Path) -> Vec<Yuv> {
             };
             out.push(Yuv {
                 w,
+                pts: f.timestamp().or(f.pts()).unwrap_or(0) as f64 * tb,
                 planes: [
                     plane(0, w, h),
                     plane(1, w / 2, h / 2),
@@ -1412,11 +1444,13 @@ use super::reconnect::Started;
 
 /// A fake portal capture: streams the test pattern into the mailbox until
 /// dropped, or until `kill` (the stream closes, like a monitor turned off).
-/// Restarts fail while `down`.
+/// Restarts fail while `down`. `streams` holds the pts of the frames each
+/// started capture delivered: when the picture really stopped and resumed.
 struct FakePortal {
     kill: Arc<AtomicBool>,
     down: Arc<AtomicBool>,
     starts: Arc<AtomicUsize>,
+    streams: Arc<Mutex<Vec<Vec<Duration>>>>,
 }
 
 impl FakePortal {
@@ -1425,19 +1459,26 @@ impl FakePortal {
             kill: Arc::default(),
             down: Arc::default(),
             starts: Arc::default(),
+            streams: Arc::default(),
         }
     }
 
     fn starter(&self) -> Starter {
         let (kill, down, starts) = (self.kill.clone(), self.down.clone(), self.starts.clone());
+        let streams = self.streams.clone();
         Arc::new(move |_, slot| {
             starts.fetch_add(1, Ordering::SeqCst);
             if down.load(Ordering::SeqCst) {
                 return Err("portal gone".into());
             }
             kill.store(false, Ordering::SeqCst);
+            let stream = {
+                let mut s = lock(&streams);
+                s.push(Vec::new());
+                s.len() - 1
+            };
             let live = Arc::new(AtomicBool::new(true));
-            let (l, kill) = (live.clone(), kill.clone());
+            let (l, kill, log) = (live.clone(), kill.clone(), streams.clone());
             let thread = std::thread::spawn(move || {
                 // Not Send: made here.
                 let producer = unsafe { Producer::new(W, H) };
@@ -1447,12 +1488,22 @@ impl FakePortal {
                         slot.park(Err("stream closed".into()));
                         return;
                     }
-                    let frame = unsafe { producer.frame(t as usize % POOL, t, 0, monotonic_now()) };
+                    let pts = monotonic_now();
+                    let frame = unsafe { producer.frame(t as usize % POOL, t, 0, pts) };
+                    lock(&log)[stream].push(pts);
                     slot.park(Ok(frame));
                     t += 1;
                     std::thread::sleep(Duration::from_millis(33));
                 }
             });
+            // Started once streaming, like the portal: the producer's VA
+            // setup, slow on a busy machine, is not the pipeline's 100 ms
+            // first-frame wait.
+            let ready = Instant::now();
+            while lock(&streams)[stream].is_empty() {
+                assert!(ready.elapsed() < Duration::from_secs(20), "no frame");
+                std::thread::sleep(Duration::from_millis(5));
+            }
             Ok(Started {
                 info: vesper_capture::SourceInfo::default(),
                 _guard: Box::new(Stream(live, Some(thread))),
@@ -1501,32 +1552,28 @@ fn finished(rx: &Receiver<Event>) -> Option<PathBuf> {
     }
 }
 
-/// Video packet sizes of a file, in order.
-fn packet_sizes(path: &Path) -> Vec<usize> {
-    let mut input = ffmpeg_next::format::input(path).unwrap();
-    input
-        .packets()
-        .filter(|(s, _)| s.index() == 0)
-        .map(|(_, p)| p.size())
-        .collect()
+/// Mean luma difference of two decoded frames, on a sparse grid.
+fn luma_diff(a: &Yuv, b: &Yuv) -> f64 {
+    let (y0, y1) = (&a.planes[0], &b.planes[0]);
+    let grid = (0..y0.len()).step_by(7);
+    let n = grid.len() as f64;
+    grid.map(|i| f64::from(y0[i].abs_diff(y1[i]))).sum::<f64>() / n
 }
 
-/// The longest run of packets far smaller than the moving picture's first
-/// ones (a frozen picture; a lone keyframe in it does not end it), and
-/// where it ends.
-fn longest_freeze(sizes: &[usize]) -> (usize, usize) {
-    let mut first = sizes[..20].to_vec();
-    first.sort_unstable();
-    let small = |i: usize| sizes.get(i).is_some_and(|&s| s < first[10] / 4);
-    let (mut best, mut end, mut run) = (0, 0, 0);
-    for i in 0..sizes.len() {
-        let frozen = small(i) || (run > 0 && small(i + 1));
-        run = if frozen { run + 1 } else { 0 };
-        if run > best {
-            (best, end) = (run, i + 1);
+/// The longest stretch of a video showing one still picture (the test
+/// pattern moves every frame, so only repeats look alike): pts of its first
+/// frame, pts of the first frame that differs, and that frame's index.
+fn longest_still(frames: &[Yuv]) -> (f64, f64, usize) {
+    let (mut best, mut start) = ((0.0, 0.0, 0), 0);
+    for i in 1..frames.len() {
+        if luma_diff(&frames[i - 1], &frames[i]) > 2.0 {
+            if frames[i].pts - frames[start].pts > best.1 - best.0 {
+                best = (frames[start].pts, frames[i].pts, i);
+            }
+            start = i;
         }
     }
-    (best, end)
+    best
 }
 
 /// The screen capture closes mid-recording (KWin restarted, monitor off),
@@ -1590,14 +1637,27 @@ fn a_lost_screen_capture_freezes_then_resumes_in_one_file() {
         "file {last:.2} s, wall {wall:.2} s"
     );
     assert!(n as f64 > wall * 28.0, "{n} packets in {wall:.2} s");
-    let sizes = packet_sizes(&path);
-    let (frozen, end) = longest_freeze(&sizes);
-    let want = gap.as_secs_f64() * 30.0;
+    // The picture froze on the last frame before the loss until the first
+    // one after it, for as long as the fake capture really delivered none
+    // (the restart's own latency included), then moved again.
+    let outage = {
+        let streams = lock(&fake.streams);
+        assert_eq!(streams.len(), 2, "one capture, one restart");
+        (streams[1][0] - *streams[0].last().unwrap()).as_secs_f64()
+    };
+    // Retried after 1 s (refused), then 2 s later.
+    assert!(outage >= 2.95, "capture out for {outage:.2} s");
+    let frames = decode_all(&path);
+    let (from, to, end) = longest_still(&frames);
     assert!(
-        (frozen as f64) > want * 0.8 && (frozen as f64) < want * 1.2 + 10.0,
-        "frozen for {frozen} packets, lost for {gap:?}"
+        (to - from - outage).abs() < 0.2,
+        "still from {from:.2} s to {to:.2} s, capture out for {outage:.2} s"
     );
-    assert!(sizes.len() - end > 20, "moving again after the freeze");
+    let moving = frames[end..]
+        .windows(2)
+        .filter(|w| luma_diff(&w[0], &w[1]) > 2.0)
+        .count();
+    assert!(moving > 20, "{moving} new pictures after the freeze");
     // The replay buffer holds the seconds before the loss too.
     let (rn, rkey, _) = inspect(&saved);
     assert!(
