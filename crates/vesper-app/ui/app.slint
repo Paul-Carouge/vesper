@@ -946,6 +946,8 @@ component SettingGroup inherits VerticalLayout {
 export component AppWindow inherits Window {
     // ---- Source -------------------------------------------------------
     in property <SourceKind> source-kind: SourceKind.none;
+    // The portal picker is open (Choose/Change).
+    in property <bool> source-picking;
     /// Human-readable source, e.g. "DP-1" or "Firefox".
     in property <string> source-name;
     /// Extra detail shown under the source name, e.g. "2560 × 1440".
@@ -1820,10 +1822,13 @@ export component AppWindow inherits Window {
                             if !root.game || (!root.game-layer-installed && root.source-name == ""): VerticalLayout {
                                 alignment: center;
                                 Button {
-                                    text: root.game ? @tr("Set up") : root.source-kind == SourceKind.none ? @tr("Choose") : @tr("Change");
+                                    text: root.game ? @tr("Set up") : root.source-picking ? @tr("Choosing…") : root.source-kind == SourceKind.none ? @tr("Choose") : @tr("Change");
                                     kind: root.game || root.source-kind == SourceKind.none ? "primary" : "secondary";
-                                    enabled: !root.active && !root.settings-open;
-                                    accessible-label: root.game ? @tr("Open the game capture settings") : @tr("Choose source");
+                                    // While recording, a click says why the source stays;
+                                    // while the picker is open, a click closes it.
+                                    enabled: !root.settings-open
+                                        && root.rec-state != RecState.starting && root.rec-state != RecState.stopping;
+                                    accessible-label: root.game ? @tr("Open the game capture settings") : root.source-picking ? @tr("Close the screen picker") : @tr("Choose source");
                                     clicked => {
                                         if (root.game) {
                                             root.open-game-settings();

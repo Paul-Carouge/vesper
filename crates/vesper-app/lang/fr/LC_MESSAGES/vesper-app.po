@@ -1251,9 +1251,6 @@ msgstr "Le dossier de sortie n’est pas un dossier"
 msgid "The output folder is read-only"
 msgstr "Le dossier de sortie est en lecture seule"
 
-msgid "The picker opens when you record"
-msgstr "Le sélecteur s’ouvre quand vous enregistrez"
-
 msgid "The recording file was deleted while recording"
 msgstr "Le fichier a été supprimé pendant l’enregistrement"
 
@@ -1525,3 +1522,24 @@ msgstr "Source retrouvée"
 
 msgid "The source was not picked again: capture stopped"
 msgstr "La source n’a pas été choisie de nouveau : capture arrêtée"
+
+msgid "Stop the recording to change the source"
+msgstr "Arrêtez l’enregistrement pour changer de source"
+
+msgid "Could not open the screen picker"
+msgstr "Impossible d’ouvrir le sélecteur d’écran"
+
+msgid "Could not change the source"
+msgstr "Impossible de changer de source"
+
+msgid "Choosing…"
+msgstr "Choix en cours…"
+
+msgid "Choose a source first"
+msgstr "Choisissez d’abord une source"
+
+msgid "The screen picker is already open"
+msgstr "Le sélecteur d’écran est déjà ouvert"
+
+msgid "Close the screen picker"
+msgstr "Fermer le sélecteur d’écran"

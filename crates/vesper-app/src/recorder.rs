@@ -677,21 +677,11 @@ pub fn load_restore_token() -> Option<String> {
         .filter(|t| !t.is_empty())
 }
 
-fn save_restore_token(token: &str) -> std::io::Result<()> {
+pub fn save_restore_token(token: &str) -> std::io::Result<()> {
     let path = token_path().ok_or(std::io::ErrorKind::NotFound)?;
     // Private (0600, the token lets anyone running as this user record the
     // source) and atomic: a crash mid-write must not leave an empty token.
     crate::prefs::write_file(&path, token.as_bytes(), true)
-}
-
-/// Forgets the source so the next recording opens the portal picker.
-pub fn clear_restore_token() {
-    if let Some(path) = token_path()
-        && let Err(e) = std::fs::remove_file(path)
-        && e.kind() != std::io::ErrorKind::NotFound
-    {
-        log!("could not clear the restore token: {e}");
-    }
 }
 
 /// vesper-encode's GPU test-pattern producer: synthetic game frames for the

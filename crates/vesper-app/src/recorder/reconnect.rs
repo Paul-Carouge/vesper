@@ -25,6 +25,7 @@ pub(super) type Starter =
 /// refuses is dropped for the picker, once.
 pub(super) fn portal(max_fps: u32) -> Starter {
     Arc::new(move |cancel, slot| {
+        crate::shortcuts::portal_ready();
         let start = |token: Option<&str>| {
             let slot = slot.clone();
             Capture::start(token, cancel, max_fps, move |event| {
@@ -33,14 +34,23 @@ pub(super) fn portal(max_fps: u32) -> Starter {
         };
         let token = load_restore_token();
         let capture = match start(token.as_deref()) {
-            Err(e) if token.is_some() && vesper_capture::is_refused(&e) => {
+            // Another picker is open (Change): never a second one.
+            Err(e)
+                if token.is_some()
+                    && vesper_capture::is_refused(&e)
+                    && !vesper_capture::picker_open() =>
+            {
                 log!("could not restore the source ({e}): asking again");
                 start(None)
             }
             result => result,
         }?;
-        // The portal hands out a new token on every start.
-        if let Some(token) = capture.restore_token()
+        // The portal hands out a new token on every start. An abandoned
+        // restart, or one that ends after a source was picked meanwhile,
+        // must not replace that source.
+        if !cancel.is_cancelled()
+            && load_restore_token() == token
+            && let Some(token) = capture.restore_token()
             && let Err(e) = save_restore_token(token)
         {
             log!("could not save the restore token: {e}");
