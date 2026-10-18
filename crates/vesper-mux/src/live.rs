@@ -12,7 +12,7 @@
 //! Never raise FFmpeg's log level above `AV_LOG_VERBOSE` without a callback
 //! that filters it: the RTMP debug logs print the play path, the stream key.
 
-use std::ffi::{CString, c_int, c_void};
+use std::ffi::{CStr, CString, c_int, c_void};
 use std::fmt;
 use std::ptr;
 use std::sync::Arc;
@@ -29,6 +29,13 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Name resolution gives up after this long (it cannot be interrupted).
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long `finish` waits at most for an SRT receiver to get the tail.
+const SRT_DRAIN: Duration = Duration::from_secs(3);
+
+/// No SRT acknowledgement for this long while draining: the peer is gone.
+/// Closing then takes libsrt about 1 s more.
+const SRT_STALL: Duration = Duration::from_secs(1);
 
 /// The protocols a stream may open, nested ones included.
 const PROTOCOLS: &std::ffi::CStr = c"rtmp,rtmps,tls,tcp,srt";
@@ -594,7 +601,8 @@ impl Live {
         Ok(())
     }
 
-    /// Ends the stream cleanly (a short wait at most) and disconnects.
+    /// Ends the stream cleanly and disconnects. Over SRT, first waits for
+    /// the receiver to get the tail (its latency, 3 s at most).
     pub fn finish(mut self) {
         self.close();
     }
@@ -607,12 +615,114 @@ impl Live {
             if !(*self.ctx).pb.is_null() {
                 self.interrupt.arm(Duration::from_secs(2));
                 ff::av_write_trailer(self.ctx);
+                self.drain_srt();
                 ff::avio_closep(&mut (*self.ctx).pb);
             }
             ff::avformat_free_context(self.ctx);
             self.ctx = ptr::null_mut();
         }
     }
+
+    /// Keeps an SRT connection open until the receiver has the stream's
+    /// tail: libsrt holds each packet for the negotiated latency before
+    /// handing it on, and drops what it still holds when the sender closes.
+    /// Waits for every packet to be acknowledged, then for that latency;
+    /// gives up past [`SRT_DRAIN`], on a stop, once the link is down, or
+    /// when nothing was acknowledged for [`SRT_STALL`] (the peer is gone).
+    fn drain_srt(&self) {
+        // SAFETY: `pb` is open; the libsrt calls get that socket and valid
+        // out pointers.
+        unsafe {
+            let Some(fd) = srt_socket((*self.ctx).pb) else {
+                return;
+            };
+            let (Some(state), Some(flag)) = (
+                symbol::<srt::GetState>(c"srt_getsockstate"),
+                symbol::<srt::GetFlag>(c"srt_getsockflag"),
+            ) else {
+                return;
+            };
+            let get = |opt| {
+                let (mut value, mut len): (c_int, c_int) = (0, 4);
+                (flag(fd, opt, (&raw mut value).cast(), &mut len) == 0).then_some(value)
+            };
+            let Some(latency) = get(srt::PEERLATENCY) else {
+                return;
+            };
+            // Scheduling and clock drift on top of the latency.
+            let latency = Duration::from_millis(latency.max(0) as u64 + 50);
+            let start = Instant::now();
+            let deadline = start + SRT_DRAIN;
+            // Packets not yet acknowledged, and when that count last fell.
+            let mut unacked = (c_int::MAX, start);
+            let mut received = None;
+            while Instant::now() < deadline
+                && !self.interrupt.abort.load(Ordering::Relaxed)
+                && state(fd) == srt::CONNECTED
+            {
+                let now = Instant::now();
+                match received {
+                    Some(at) if now >= at => return,
+                    Some(_) => {}
+                    None => match get(srt::SNDDATA) {
+                        Some(0) => received = Some(now + latency),
+                        Some(n) if n < unacked.0 => unacked = (n, now),
+                        _ if now - unacked.1 > SRT_STALL => return,
+                        _ => {}
+                    },
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+}
+
+/// The libsrt socket under `pb`, if it is one. AVOptions children lead
+/// from the AVIOContext to its URLContext, then to the protocol's context;
+/// FFmpeg's `libsrt.c` starts that one with its class, then the socket.
+unsafe fn srt_socket(pb: *mut ff::AVIOContext) -> Option<c_int> {
+    #[repr(C)]
+    struct SrtContext {
+        class: *const ff::AVClass,
+        fd: c_int,
+    }
+    unsafe {
+        let url = ff::av_opt_child_next(pb.cast(), ptr::null_mut());
+        if url.is_null() {
+            return None;
+        }
+        let ctx = ff::av_opt_child_next(url, ptr::null_mut()) as *const SrtContext;
+        let libsrt = !ctx.is_null()
+            && !(*ctx).class.is_null()
+            && CStr::from_ptr((*(*ctx).class).class_name) == c"libsrt";
+        libsrt.then(|| (*ctx).fd)
+    }
+}
+
+/// A function `name` of the libraries loaded in the process: libsrt is
+/// there once libavformat opened an SRT socket, and is not linked directly
+/// so that an FFmpeg built without it still links. `T` must be the
+/// function's pointer type.
+unsafe fn symbol<T: Copy>(name: &CStr) -> Option<T> {
+    let f = unsafe { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr()) };
+    // SAFETY: the caller's `T` is a function pointer, the size of `f`.
+    (!f.is_null()).then(|| unsafe { std::mem::transmute_copy(&f) })
+}
+
+/// The bits of libsrt's `srt.h` that [`Live::drain_srt`] uses.
+mod srt {
+    use std::ffi::{c_int, c_void};
+
+    /// `SRTS_CONNECTED`.
+    pub const CONNECTED: c_int = 5;
+    /// `SRTO_SNDDATA`: packets sent but not yet acknowledged.
+    pub const SNDDATA: c_int = 19;
+    /// `SRTO_PEERLATENCY`: the receiver's latency (ms), once connected.
+    pub const PEERLATENCY: c_int = 44;
+    /// `srt_getsockstate`.
+    pub type GetState = unsafe extern "C" fn(c_int) -> c_int;
+    /// `srt_getsockflag`.
+    pub type GetFlag = unsafe extern "C" fn(c_int, c_int, *mut c_void, *mut c_int) -> c_int;
 }
 
 impl Drop for Live {
