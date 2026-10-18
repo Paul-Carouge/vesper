@@ -130,11 +130,11 @@ impl Aac {
         let mut packet = ffmpeg::Packet::empty();
         while self.encoder.receive_packet(&mut packet).is_ok() {
             let pts = base + samples_ns(packet.pts().unwrap_or(0));
-            out(EncodedPacket {
-                data: Arc::from(packet.data().unwrap_or_default()),
-                pts: Duration::from_nanos(pts.max(0) as u64),
-                keyframe: true,
-            });
+            out(EncodedPacket::new(
+                Arc::from(packet.data().unwrap_or_default()),
+                Duration::from_nanos(pts.max(0) as u64),
+                true,
+            ));
         }
     }
 }

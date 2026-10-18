@@ -20,6 +20,21 @@ use std::time::Duration;
 use ffmpeg_next::ffi as ff;
 use vesper_core::{Codec, EncodedPacket, VideoFrame};
 
+/// B-frames between H.264 anchors (HEVC and AV1 have none on VCN). Measured
+/// on VCN 5 at 1080p60, VMAF mean / 1% worst frames against IPPP: at
+/// 6 Mbit/s CBR (Twitch) scrolling text 97.9 / 97.0 -> 99.0 / 97.8 (2) ->
+/// 99.1 / 98.3 (3), game footage 94.0 / 89.4 -> 94.0 / 89.3 -> 94.3 / 90.0.
+/// Each one delays the packets by a frame (3: 50 ms at 60 fps); the GPU
+/// encoder's throughput does not change.
+pub const H264_B_FRAMES: c_int = 3;
+
+/// What [`RateControl::Quality`] lowers H.264's quality value by: radeonsi
+/// gives B-frames a coarser QP, so at the same value B-frame footage lost
+/// ~1 VMAF. One step lower keeps or beats the IPPP picture with fewer bits:
+/// text 97.6 / 96.9 at 5.2 Mbit/s -> 98.8 / 98.3 at 2.1, game footage
+/// 89.2 / 85.7 at 1.7 -> 89.4 / 86.2 at 1.5 (Balanced, 1080p60).
+const H264_QUALITY_STEP: u32 = 1;
+
 /// The discrete GPU. `renderD129` is the iGPU on the target machine.
 pub const RENDER_NODE: &CStr = c"/dev/dri/renderD128";
 
@@ -185,6 +200,7 @@ pub enum RateControl {
     ConstantQp(u32),
     /// Constant quality capped at `max_bitrate` bits per second (VAAPI QVBR).
     /// `quality` is on the QP scale of [`RateControl::ConstantQp`]; lower is better.
+    /// H.264 encodes one step finer (see [`H264_B_FRAMES`]) for the same picture.
     Quality { quality: u32, max_bitrate: u64 },
     /// Constant bitrate in bits per second with a one-second buffer (VBV),
     /// what streaming services ask for.
@@ -846,8 +862,15 @@ impl Encoder {
             };
             enc.pix_fmt = ff::AVPixelFormat::AV_PIX_FMT_VAAPI;
             enc.gop_size = (fps * 2) as c_int;
-            // No B-frames: decode order == presentation order (vesper-core contract).
-            enc.max_b_frames = 0;
+            // VCN encodes B-frames in H.264 only (HEVC and AV1 stay IPPP).
+            // Closed GOPs: every keyframe is an IDR a file or stream can
+            // start at, with no frame before it referencing it.
+            if codec == Codec::H264 {
+                enc.max_b_frames = H264_B_FRAMES;
+                enc.flags |= ff::AV_CODEC_FLAG_CLOSED_GOP as c_int;
+            } else {
+                enc.max_b_frames = 0;
+            }
             // Parameter sets go to `extradata` for containers (see `extradata()`).
             enc.flags |= ff::AV_CODEC_FLAG_GLOBAL_HEADER as c_int;
             enc.color_range = ff::AVColorRange::AVCOL_RANGE_MPEG;
@@ -873,6 +896,11 @@ impl Encoder {
                     quality,
                     max_bitrate,
                 } => {
+                    let quality = if codec == Codec::H264 {
+                        quality.saturating_sub(H264_QUALITY_STEP).max(1)
+                    } else {
+                        quality
+                    };
                     enc.global_quality = quality as c_int;
                     enc.bit_rate = max_bitrate as i64;
                     enc.rc_max_rate = max_bitrate as i64;
@@ -1177,6 +1205,10 @@ impl Encoder {
             unsafe {
                 let p = &*self.packet;
                 debug_assert!(p.pts >= 0, "negative packet pts {}", p.pts);
+                // FFmpeg's vaapi takes dts from earlier pts, shifted back by
+                // the reorder delay: on CLOCK_MONOTONIC never below 0.
+                debug_assert!(p.dts >= 0, "negative packet dts {}", p.dts);
+                debug_assert!(p.dts <= p.pts, "dts {} after pts {}", p.dts, p.pts);
                 let data = if p.data.is_null() {
                     &[][..]
                 } else {
@@ -1185,6 +1217,7 @@ impl Encoder {
                 out.push(EncodedPacket {
                     data: Arc::from(data),
                     pts: Duration::from_nanos(p.pts.max(0) as u64),
+                    dts: Duration::from_nanos(p.dts.max(0) as u64),
                     keyframe: p.flags & ff::AV_PKT_FLAG_KEY != 0,
                 });
                 ff::av_packet_unref(self.packet);

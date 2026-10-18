@@ -56,6 +56,7 @@ fn record(path: &Path, secs: u64, finish: bool) {
                 let p = EncodedPacket {
                     data: frame.clone(),
                     pts: start + Duration::from_nanos(k * 1_000_000_000 / 30),
+                    dts: start + Duration::from_nanos(k * 1_000_000_000 / 30),
                     keyframe: k % 30 == 0,
                 };
                 mux.write_video(&p).unwrap();
@@ -65,6 +66,7 @@ fn record(path: &Path, secs: u64, finish: bool) {
             let p = EncodedPacket {
                 data: silence.clone(),
                 pts,
+                dts: pts,
                 keyframe: true,
             };
             mux.write_audio(t, &p).unwrap();
@@ -169,6 +171,54 @@ fn a_killed_recording_is_remuxed_in_place_with_cues_and_duration() {
     assert!(before.0[0].len() > 100, "{}", before.0[0].len());
     assert!(before.1.contains("AVCOL_RANGE_MPEG"), "{}", before.1);
     assert_eq!(names(&dir), ["Vesper 1.mkv", "markers"], "no copy left");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[path = "../../tests/common/mod.rs"]
+mod common;
+
+/// A killed H.264 recording with B-frames (pts out of order in the file)
+/// is recovered whole: no packet refused, every frame and its pts kept.
+#[test]
+fn a_killed_recording_with_b_frames_is_recovered_whole() {
+    if !vesper_core::test_gpu() {
+        return;
+    }
+    let dir = scratch("bframes");
+    let mkv = dir.join("b.mkv");
+    let start = Duration::from_secs(1_000);
+    let (extradata, video) = common::h264_b_frames(start, 150);
+    let track = VideoTrack {
+        codec: Codec::H264,
+        width: 640,
+        height: 360,
+        fps: 30,
+        extradata,
+    };
+    let mut mux = Muxer::create(&mkv, start, track, &[opus("Mix")]).unwrap();
+    let mut audio = start;
+    for p in &video {
+        while audio <= p.dts {
+            mux.write_audio(0, &common::opus_packet(audio)).unwrap();
+            audio += common::OPUS_FRAME;
+        }
+        mux.write_video(p).unwrap();
+    }
+    // What a kill leaves.
+    std::mem::forget(mux);
+    let before = packets(&mkv);
+    assert!(
+        before.0[0].windows(2).any(|w| w[1] < w[0]),
+        "B-frames in the file"
+    );
+    marker(&dir, "1-0", &dead(), &mkv);
+
+    let out = recover_all(&dir);
+
+    assert!(matches!(out[0].1, Outcome::Recovered), "{:?}", out[0].1);
+    assert_eq!(packets(&mkv), before, "every packet kept, in order");
+    // A cluster (1 s) may be lost by the kill: the rest is there.
+    assert!(before.0[0].len() >= 120, "{}", before.0[0].len());
     std::fs::remove_dir_all(&dir).unwrap();
 }
 

@@ -809,6 +809,7 @@ mod tests {
         EncodedPacket {
             data: Arc::from(&[0u8][..]),
             pts: Duration::from_millis(ms),
+            dts: Duration::from_millis(ms),
             keyframe,
         }
     }
@@ -976,11 +977,60 @@ mod tests {
         );
     }
 
+    /// Video in decode order as H.264 with 2 B-frames makes it, 100 ms
+    /// frames, an IDR every second: I0 P3 B1 B2 P6 B4 B5 ... (frame numbers
+    /// are pts), dts one frame per packet, 200 ms before the pts of I0.
+    fn b_frames(end_ms: u64) -> Vec<EncodedPacket> {
+        let mut order = Vec::new();
+        for gop in (0..=end_ms / 100).step_by(10) {
+            // Closed GOP: 0 ... 9, ending on a P (9 = 3 * 3).
+            order.push(gop);
+            for anchor in [3, 6, 9] {
+                order.extend([gop + anchor, gop + anchor - 2, gop + anchor - 1]);
+            }
+        }
+        order
+            .into_iter()
+            .enumerate()
+            .map(|(i, f)| EncodedPacket {
+                data: Arc::from(&[0u8][..]),
+                pts: Duration::from_millis(10_000 + f * 100),
+                dts: Duration::from_millis(10_000 - 200 + i as u64 * 100),
+                keyframe: f % 10 == 0,
+            })
+            .collect()
+    }
+
     #[test]
-    fn ring_snapshot_is_in_pts_order() {
+    fn ring_of_b_frames_is_cut_and_interleaved_by_dts() {
+        let mut ring = Ring::new(Duration::from_secs(2), 1);
+        let video = b_frames(4950);
+        for p in &video {
+            ring.push_audio(0, packet(p.dts.as_millis() as u64 + 50, false));
+            ring.push_video(p.clone());
+        }
+        // Newest dts 14_750, cutoff 12_750: the IDR at pts 12_000 (dts 11_800).
+        assert!(ring.video[0].keyframe);
+        assert_eq!(ring.video[0].pts, Duration::from_millis(12_000));
+        let snap = interleave(ring.snapshot());
+        assert!(snap.windows(2).all(|w| w[0].1.dts <= w[1].1.dts));
+        let order: Vec<_> = snap
+            .iter()
+            .filter(|(s, _)| *s == 0)
+            .map(|(_, p)| p.pts)
+            .collect();
+        let pushed: Vec<_> = video[video.len() - order.len()..]
+            .iter()
+            .map(|p| p.pts)
+            .collect();
+        assert_eq!(order, pushed, "video keeps its decode order");
+    }
+
+    #[test]
+    fn ring_snapshot_is_in_dts_order() {
         let ring = filled(3, 4000);
         let snap = interleave(ring.snapshot());
-        assert!(snap.windows(2).all(|w| w[0].1.pts <= w[1].1.pts));
+        assert!(snap.windows(2).all(|w| w[0].1.dts <= w[1].1.dts));
         assert_eq!(
             snap.iter().filter(|(s, _)| *s == 0).count(),
             ring.video.len()

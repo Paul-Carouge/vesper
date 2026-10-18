@@ -113,15 +113,32 @@ pub enum Codec {
 
 /// One compressed access unit produced by an encoder.
 ///
-/// Encoders emit no B-frames, so decode order equals presentation order and
-/// no separate dts is needed.
+/// Packets come in decode order. H.264 uses B-frames, so its pts can go back
+/// from one packet to the next while `dts` always rises; HEVC, AV1 and audio
+/// have none (`dts == pts`). Consumers order, cut and interleave by `dts`.
 #[derive(Debug, Clone)]
 pub struct EncodedPacket {
     /// Shared so the replay buffer and the muxer can hold it without copying.
     pub data: Arc<[u8]>,
     /// `CLOCK_MONOTONIC` presentation time, copied from the source frame.
     pub pts: Duration,
+    /// Decode time on the same clock: rises strictly in emission order and
+    /// is never after `pts`. A keyframe's `dts` is up to the B-frame reorder
+    /// delay before its `pts`.
+    pub dts: Duration,
     pub keyframe: bool,
+}
+
+impl EncodedPacket {
+    /// A packet decoded when it is presented (no B-frames).
+    pub fn new(data: Arc<[u8]>, pts: Duration, keyframe: bool) -> Self {
+        Self {
+            data,
+            pts,
+            dts: pts,
+            keyframe,
+        }
+    }
 }
 
 #[cfg(test)]

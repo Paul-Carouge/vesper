@@ -28,21 +28,7 @@ fn av1_over_rtmp_reads_back_as_av1() {
     )
     .unwrap();
     let path = std::env::temp_dir().join(format!("vesper-live-test-{}.mkv", std::process::id()));
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
-    let url = format!("rtmp://127.0.0.1:{port}/app/key");
-    let Ok(mut server) = std::process::Command::new("ffmpeg")
-        .args([
-            "-v", "error", "-y", "-listen", "1", "-i", &url, "-c", "copy",
-        ])
-        .arg(&path)
-        .stdin(std::process::Stdio::null())
-        .spawn()
-    else {
-        eprintln!("no ffmpeg, skipping");
+    let Some((mut server, url)) = serve(&path) else {
         return;
     };
     let video = VideoTrack {
@@ -52,20 +38,7 @@ fn av1_over_rtmp_reads_back_as_av1() {
         fps: 30,
         extradata: enc.extradata().to_vec(),
     };
-    // Until the server listens.
-    let mut tries = 0;
-    let mut live = loop {
-        let abort = Arc::new(AtomicBool::new(false));
-        match Live::connect(&url, &video, None, abort, Duration::from_secs(5)) {
-            Ok(live) => break live,
-            Err(e) if tries < 50 => {
-                tries += 1;
-                eprintln!("{e}");
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            Err(e) => panic!("{e}"),
-        }
-    };
+    let mut live = connect(&url, &video);
     let mut packets = Vec::new();
     for t in 0..10u32 {
         let pts = Duration::from_millis(1_000 + u64::from(t) * 33);
@@ -107,6 +80,90 @@ fn av1_over_rtmp_reads_back_as_av1() {
     }
     std::fs::remove_file(&path).unwrap();
     assert_eq!(decoded, packets.len());
+}
+
+/// A local `ffmpeg -listen` RTMP server copying what it gets into `path`
+/// (its format from the extension), and its URL. `None` without ffmpeg.
+fn serve(path: &std::path::Path) -> Option<(std::process::Child, String)> {
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let url = format!("rtmp://127.0.0.1:{port}/app/key");
+    let Ok(server) = std::process::Command::new("ffmpeg")
+        .args([
+            "-v", "error", "-y", "-listen", "1", "-i", &url, "-c", "copy",
+        ])
+        .arg(path)
+        .stdin(std::process::Stdio::null())
+        .spawn()
+    else {
+        eprintln!("no ffmpeg, skipping");
+        return None;
+    };
+    Some((server, url))
+}
+
+/// Connects to `url`, retrying until the server listens.
+fn connect(url: &str, video: &VideoTrack) -> Live {
+    let mut tries = 0;
+    loop {
+        let abort = Arc::new(AtomicBool::new(false));
+        match Live::connect(url, video, None, abort, Duration::from_secs(5)) {
+            Ok(live) => return live,
+            Err(e) if tries < 50 => {
+                tries += 1;
+                eprintln!("{e}");
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(e) => panic!("{e}"),
+        }
+    }
+}
+
+/// H.264 with B-frames over RTMP (FLV): the server gets every packet with
+/// a rising dts from 0 and pts never before dts, starting on a keyframe.
+#[test]
+fn h264_b_frames_over_rtmp_keep_dts_and_pts() {
+    if !vesper_core::test_gpu() {
+        return;
+    }
+    let path = std::env::temp_dir().join(format!("vesper-live-bf-{}.flv", std::process::id()));
+    let Some((mut server, url)) = serve(&path) else {
+        return;
+    };
+    let (extradata, packets) = common::h264_b_frames(Duration::from_secs(1_000), 90);
+    let video = VideoTrack {
+        codec: Codec::H264,
+        width: 640,
+        height: 360,
+        fps: 30,
+        extradata,
+    };
+    let mut live = connect(&url, &video);
+    for p in &packets {
+        live.write_video(p).unwrap();
+    }
+    live.finish();
+    assert!(server.wait().unwrap().success(), "the server failed");
+
+    let mut input = ffmpeg_next::format::input(&path).unwrap();
+    let got: Vec<_> = input
+        .packets()
+        .map(|(_, p)| (p.dts().unwrap(), p.pts().unwrap(), p.is_key()))
+        .collect();
+    std::fs::remove_file(&path).unwrap();
+    assert_eq!(got.len(), packets.len());
+    assert!(got[0].2 && got[0].0 == 0, "starts on a keyframe at dts 0");
+    assert!(got.windows(2).all(|w| w[0].0 < w[1].0), "dts rises");
+    assert!(got.iter().all(|&(dts, pts, _)| pts >= dts));
+    // FLV keeps milliseconds: the same times as sent, from the first dts.
+    let ms = |t: Duration| (t - packets[0].dts).as_secs_f64() * 1000.0;
+    for ((dts, pts, _), p) in got.iter().zip(&packets) {
+        assert!((*dts as f64 - ms(p.dts)).abs() <= 1.0);
+        assert!((*pts as f64 - ms(p.pts)).abs() <= 1.0);
+    }
 }
 
 /// FFmpeg's MPEG-TS (SRT) writes AV1 as private data no player reads:

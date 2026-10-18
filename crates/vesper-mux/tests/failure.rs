@@ -44,6 +44,7 @@ fn video_packet(start: Duration, i: u64, size: usize) -> EncodedPacket {
     EncodedPacket {
         data: Arc::from(vec![(i % 251) as u8; size]),
         pts: start + Duration::from_millis(i * 33),
+        dts: start + Duration::from_millis(i * 33),
         keyframe: i.is_multiple_of(30),
     }
 }
@@ -174,6 +175,7 @@ fn odd_packets_never_panic() {
     let mk = |pts: Duration, keyframe, len| EncodedPacket {
         data: Arc::from(vec![7u8; len]),
         pts,
+        dts: pts,
         keyframe,
     };
     // Empty payload, absurd timestamps, going backwards, no keyframe first.
