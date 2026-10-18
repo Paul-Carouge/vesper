@@ -391,17 +391,13 @@ pub(super) fn pump(
         {
             (rec_skipped, stats_sent) = (skipped, false);
         }
-        if stop && let Some(r) = lock(sinks).rec.as_mut() {
-            r.stop_at.get_or_insert(pts);
-        }
-        // Only a video packet ends a recording: with no picture yet (a fixed
-        // canvas waiting for a compositor that never came), end it here.
-        if stop && !stage.pictured {
-            let rec = lock(sinks).rec.take();
-            if let Some(r) = rec {
-                on_event(Event::Finished(
-                    r.finish(Some(tr!("No picture was recorded").into())),
-                ));
+        if stop && let Some(r) = lock(sinks).rec.as_ref() {
+            r.stop_at(pts);
+            // Only a video packet ends a recording: with no picture yet (a
+            // fixed canvas waiting for a compositor that never came), end it
+            // here.
+            if !stage.pictured {
+                r.close(Some(tr!("No picture was recorded").into()));
             }
         }
         if let Some(request) = go_live {
@@ -465,9 +461,11 @@ pub(super) fn pump(
                 .and_then(|s| s.stop(sources, Some(e), false));
             lock(control).saves.extend(handle);
         }
-        let ended = lock(sinks).write_video(packets);
-        if let Some((r, e)) = ended {
-            on_event(Event::Finished(r.finish(e)));
+        lock(sinks).write_video(packets);
+        // The writer ended the file (stopped, failed, disk too slow).
+        let ended = lock(sinks).rec.take_if(|r| r.ended());
+        if let Some(r) = ended {
+            on_event(Event::Finished(r.finish(None)));
         }
 
         deadline = v.start + frame_offset(k + 1, fps);
@@ -484,7 +482,11 @@ pub(super) fn pump(
 
         window.1 += 1;
         let span = now.saturating_sub(window.0);
-        let rec_start = lock(sinks).rec.as_ref().map(|r| r.start);
+        // Only between `Started` and the stop: the UI counts from `Started`.
+        let rec_start = lock(sinks)
+            .rec
+            .as_ref()
+            .and_then(|r| r.running().then_some(r.start));
         if let Some(start) = rec_start
             && (!stats_sent || span >= STATS_PERIOD)
         {
@@ -547,7 +549,8 @@ fn reap_ended_stream(
 }
 
 /// Opens a recording in `folder` starting at `pts`, with the ring's audio
-/// from there on. Returns whether it started.
+/// from there on. Returns whether its writer started (`Event::Started`
+/// follows once the file is created).
 fn start_recording(
     folder: &Path,
     v: &mut Video,
@@ -557,31 +560,28 @@ fn start_recording(
     on_event: &OnEvent,
 ) -> bool {
     let audio = lock(sources).file_tracks();
-    match create_file(folder, "Vesper", pts, &v.track, &audio) {
-        Ok((mut mux, path)) => {
-            log!("recording to {}", path.display());
-            v.enc.force_keyframe();
-            let mut s = lock(sinks);
-            // Desktop audio is stamped ahead of real time (playback
-            // delay): its first packets already wait in the ring.
-            for (i, track) in s.ring.iter().flat_map(|r| r.audio.iter().enumerate()) {
-                for p in track.iter().filter(|p| p.pts + AUDIO_MARGIN >= pts) {
-                    if let Err(e) = mux.write_audio(i, p) {
-                        log!("audio: {e}");
-                    }
-                }
-            }
-            s.rec = Some(Recording {
-                mux,
-                path,
-                start: pts,
-                stop_at: None,
-            });
+    let mut s = lock(sinks);
+    // Desktop audio is stamped ahead of real time (playback delay): its
+    // first packets already wait in the ring.
+    let lead = s
+        .ring
+        .iter()
+        .flat_map(|r| r.audio.iter().enumerate())
+        .flat_map(|(i, track)| {
+            let after = track.iter().filter(|p| p.pts + AUDIO_MARGIN >= pts);
+            after.map(move |p| (i, p.clone()))
+        })
+        .collect();
+    let track = v.track.clone();
+    match Recording::start(folder.into(), pts, track, audio, lead, on_event.clone()) {
+        Ok(r) => {
+            s.rec = Some(r);
             drop(s);
-            on_event(Event::Started);
+            v.enc.force_keyframe();
             true
         }
         Err(e) => {
+            drop(s);
             on_event(Event::Finished(Err(e)));
             false
         }
@@ -611,12 +611,8 @@ fn wind_down(
     }
     if let Some(v) = video {
         match v.enc.flush() {
-            Ok(packets) => {
-                let ended = lock(sinks).write_video(packets);
-                if let Some((r, e)) = ended {
-                    on_event(Event::Finished(r.finish(e)));
-                }
-            }
+            // The recording is finished by `run`.
+            Ok(packets) => lock(sinks).write_video(packets),
             Err(e) => {
                 error.get_or_insert(e.to_string());
             }

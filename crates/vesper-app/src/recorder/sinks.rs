@@ -1,4 +1,5 @@
-//! Where frames and packets go: the capture mailbox and the recording file.
+//! Where frames and packets go: the capture mailbox, the recording's queue
+//! and the replay buffer.
 
 use super::*;
 
@@ -65,30 +66,6 @@ impl Mailbox {
     }
 }
 
-/// An open recording.
-pub(super) struct Recording {
-    pub(super) mux: Muxer,
-    pub(super) path: PathBuf,
-    /// Pts of its first (forced key) frame.
-    pub(super) start: Duration,
-    /// Set by a stop request: packets from this pts on end the file.
-    pub(super) stop_at: Option<Duration>,
-}
-
-impl Recording {
-    pub(super) fn finish(self, error: Option<String>) -> Result<PathBuf, String> {
-        let finished = self.mux.finish();
-        if finished.as_ref().is_err_and(vesper_mux::Error::is_deleted) {
-            return Err(tr!("The recording file was deleted while recording").into());
-        }
-        match error.or(finished.err().map(|e| e.to_string())) {
-            None => Ok(self.path),
-            // Kept in English: matched by `friendly()`.
-            Some(e) => Err(format!("{e} (saved up to there: {})", self.path.display())),
-        }
-    }
-}
-
 /// Consumers of the encoded packets, shared with the audio threads.
 #[derive(Default)]
 pub(super) struct Sinks {
@@ -98,28 +75,18 @@ pub(super) struct Sinks {
 
 pub(super) type SharedSinks = Arc<Mutex<Sinks>>;
 
-/// A recording that ended, with its error if any, to finish outside the lock.
-pub(super) type Ended = (Recording, Option<String>);
-
 impl Sinks {
-    pub(super) fn write_video(&mut self, packets: Vec<EncodedPacket>) -> Option<Ended> {
-        let mut ended = None;
+    /// Only memory work under the lock: the recording's writer thread does
+    /// the disk's.
+    pub(super) fn write_video(&mut self, packets: Vec<EncodedPacket>) {
         for p in packets {
-            if let Some(r) = &mut self.rec {
-                let result = if r.stop_at.is_some_and(|t| p.pts >= t) {
-                    Err(None)
-                } else {
-                    r.mux.write_video(&p).map_err(|e| Some(e.to_string()))
-                };
-                if let Err(e) = result {
-                    ended = self.rec.take().map(|r| (r, e));
-                }
+            if let Some(r) = &self.rec {
+                r.push(0, p.clone());
             }
             if let Some(ring) = &mut self.ring {
                 ring.push_video(p);
             }
         }
-        ended
     }
 }
 

@@ -1224,6 +1224,9 @@ msgstr "La capture y est ajustée."
 msgid "The disk is full"
 msgstr "Le disque est plein"
 
+msgid "The disk is too slow, recording stopped"
+msgstr "Disque trop lent, enregistrement arrêté"
+
 msgid "The key in the URL was moved to the stream key"
 msgstr "La clé présente dans l’URL a été déplacée vers la clé de stream"
 
@@ -1256,6 +1259,9 @@ msgstr "Le sélecteur s’ouvre quand vous enregistrez"
 
 msgid "The recording file was deleted while recording"
 msgstr "Le fichier a été supprimé pendant l’enregistrement"
+
+msgid "The recording stopped on an internal error"
+msgstr "L’enregistrement s’est arrêté sur une erreur interne"
 
 msgid "The replay buffer is empty"
 msgstr "Le tampon de replay est vide"

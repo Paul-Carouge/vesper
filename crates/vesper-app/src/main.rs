@@ -1209,6 +1209,8 @@ fn friendly(error: &str) -> String {
     let has = |s: &str| error.contains(s);
     let text = if has("No space left on device") || has("File too large") {
         tr!("The disk is full")
+    } else if has("Disk too slow") {
+        tr!("The disk is too slow, recording stopped")
     } else if has("Read-only file system") {
         tr!("The output folder is read-only")
     } else if has("Could not create") && has("Permission denied") {
@@ -1518,6 +1520,10 @@ mod tests {
             (
                 "write packet: No space left on device (saved up to there: /v/a.mkv)",
                 "The disk is full: a.mkv saved up to there",
+            ),
+            (
+                "Disk too slow: recording stopped (saved up to there: /v/a.mkv)",
+                "The disk is too slow, recording stopped: a.mkv saved up to there",
             ),
             (
                 "Could not create /v/a.mkv: open output file: Read-only file system",
