@@ -174,15 +174,12 @@ fn b_frames_reach_the_server(ext: &str, srt: bool, ms_per_tick: f64) {
     for p in &packets {
         live.write_video(p).unwrap();
         if srt {
-            // Paced like a stream: a burst then a close can beat the
-            // listener to the data.
+            // Paced like a stream: SRT's live mode drops what waits in its
+            // send queue past the latency, as a loaded burst can.
             std::thread::sleep(Duration::from_millis(10));
         }
     }
-    if srt {
-        // SRT delivers within its latency (120 ms): closing at once drops the tail.
-        std::thread::sleep(Duration::from_millis(500));
-    }
+    // At once: `finish` must wait for the tail to arrive.
     live.finish();
     assert!(server.wait().unwrap().success(), "the server failed");
 
@@ -205,6 +202,42 @@ fn b_frames_reach_the_server(ext: &str, srt: bool, ms_per_tick: f64) {
         assert!(((dts - first) as f64 * ms_per_tick - ms(p.dts)).abs() <= 1.0);
         assert!(((pts - first) as f64 * ms_per_tick - ms(p.pts)).abs() <= 1.0);
     }
+}
+
+/// `finish` waits for an SRT receiver to get the tail, but not for one
+/// that is gone: it gives up within 3 s.
+#[test]
+fn finish_gives_up_on_a_dead_srt_peer() {
+    if !vesper_core::test_gpu() {
+        return;
+    }
+    let path = std::env::temp_dir().join(format!("vesper-live-dead-{}.ts", std::process::id()));
+    let Some((mut server, url)) = serve(&path, true) else {
+        return;
+    };
+    let (extradata, packets) = common::h264_b_frames(Duration::from_secs(1_000), 90);
+    let video = VideoTrack {
+        codec: Codec::H264,
+        width: 640,
+        height: 360,
+        fps: 30,
+        extradata,
+    };
+    let mut live = connect(&url, &video);
+    let (first, rest) = packets.split_at(30);
+    for p in first {
+        live.write_video(p).unwrap();
+    }
+    server.kill().unwrap();
+    server.wait().unwrap();
+    // UDP: writes to a dead peer still succeed, and stay unacknowledged.
+    for p in rest {
+        live.write_video(p).unwrap();
+    }
+    let t = std::time::Instant::now();
+    live.finish();
+    let _ = std::fs::remove_file(&path);
+    assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
 }
 
 /// FFmpeg's MPEG-TS (SRT) writes AV1 as private data no player reads:
