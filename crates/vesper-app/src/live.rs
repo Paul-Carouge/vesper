@@ -324,6 +324,7 @@ pub fn wire(ui: &AppWindow, recording: &Shared, games: &Games) {
         }
         // Without a source, going live would open a second picker.
         if ui.get_source_picking() && ui.get_source_kind() == crate::SourceKind::None {
+            flash_notice(&ui, tr!("Choose a source first"));
             return;
         }
         // A key still being typed is saved first: the read below follows it.

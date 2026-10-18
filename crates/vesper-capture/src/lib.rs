@@ -9,7 +9,7 @@ mod format;
 mod pw;
 
 use std::os::fd::OwnedFd;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Poll, Waker};
 use std::thread::JoinHandle;
@@ -95,8 +95,10 @@ impl Capture {
         max_fps: u32,
         on_frame: impl FnMut(Result<VideoFrame>) + Send + 'static,
     ) -> Result<Self> {
+        let shown = restore_token.is_none().then(PickerShown::new);
         let (session, node_id, fd, restore_token, source) =
             block_on(open_portal(sources, restore_token, cancel))?;
+        drop(shown);
         let (control, rx) = ::pipewire::channel::channel();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let tx = control.clone();
@@ -151,9 +153,36 @@ impl Drop for Capture {
 /// Blocks until the user picks; `cancel` closes the picker.
 pub fn pick(cancel: &Cancel) -> Result<(Option<String>, SourceInfo)> {
     let sources = SourceType::Monitor | SourceType::Window;
+    let shown = PickerShown::new();
     let (session, _, _, restore_token, source) = block_on(open_portal(sources, None, cancel))?;
+    drop(shown);
     close(session);
     Ok((restore_token, source))
+}
+
+/// How many portal requests without a restore token (the picker shows) are
+/// under way.
+static PICKERS: AtomicUsize = AtomicUsize::new(0);
+
+/// Whether a picker of this process is open: a second one would stack on it.
+pub fn picker_open() -> bool {
+    PICKERS.load(Ordering::SeqCst) > 0
+}
+
+/// Counts a request in [`PICKERS`] while it lives.
+struct PickerShown;
+
+impl PickerShown {
+    fn new() -> Self {
+        PICKERS.fetch_add(1, Ordering::SeqCst);
+        Self
+    }
+}
+
+impl Drop for PickerShown {
+    fn drop(&mut self) {
+        PICKERS.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// Closes a screencast session. A hung portal must not hold up the caller
@@ -359,6 +388,17 @@ async fn open_portal(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_picker_counts_as_open_while_its_request_lives() {
+        assert!(!picker_open());
+        let first = PickerShown::new();
+        let second = PickerShown::new();
+        drop(first);
+        assert!(picker_open());
+        drop(second);
+        assert!(!picker_open());
+    }
 
     #[test]
     fn request_paths_come_from_the_options_token() {

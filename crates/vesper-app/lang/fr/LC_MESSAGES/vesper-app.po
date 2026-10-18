@@ -1534,3 +1534,12 @@ msgstr "Impossible de changer de source"
 
 msgid "Choosing…"
 msgstr "Choix en cours…"
+
+msgid "Choose a source first"
+msgstr "Choisissez d’abord une source"
+
+msgid "The screen picker is already open"
+msgstr "Le sélecteur d’écran est déjà ouvert"
+
+msgid "Close the screen picker"
+msgstr "Fermer le sélecteur d’écran"

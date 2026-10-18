@@ -351,6 +351,7 @@ fn main() -> Result<(), slint::PlatformError> {
     // Hiding the window does not end the loop: only Quit, Ctrl+Q, or closing
     // the window without a tray does.
     let result = slint::run_event_loop_until_quit();
+    cancel_pick();
     // Changes still waiting for a delayed save (volume, filters, scenes).
     Prefs::from_ui(&ui).save();
     // A stream key typed but not saved yet, and saves still under way.
@@ -403,34 +404,53 @@ fn wire_callbacks(ui: &AppWindow, recording: &Shared, games: &Games) {
     let g = games.clone();
     ui.on_pick_source(move || {
         let Some(ui) = weak.upgrade() else { return };
+        // A second click closes a picker that seems stuck.
+        if ui.get_source_picking() {
+            log!("pick-source: closing the picker");
+            cancel_pick();
+            return;
+        }
         if let Some(why) = source_locked(ui.get_rec_state(), ui.get_live_state()) {
             flash_notice(&ui, why);
             return;
         }
-        if ui.get_source_picking() {
+        if vesper_capture::picker_open() {
+            flash_notice(&ui, tr!("The screen picker is already open"));
             return;
         }
         log!("pick-source");
-        ui.set_source_picking(true);
+        static PICKS: AtomicU64 = AtomicU64::new(0);
+        let id = PICKS.fetch_add(1, Ordering::Relaxed);
+        let cancel = vesper_capture::Cancel::default();
         // The answer comes on the UI thread, where the pipeline lives.
-        PICKING_FOR.with(|p| *p.borrow_mut() = Some((rec.clone(), g.clone())));
+        PICK.with(|p| {
+            *p.borrow_mut() = Some(Picking {
+                id,
+                rec: rec.clone(),
+                games: g.clone(),
+                cancel: cancel.clone(),
+            })
+        });
+        ui.set_source_picking(true);
         let weak = weak.clone();
-        let picked = move |result| {
-            let _ = weak.upgrade_in_event_loop(move |ui| {
-                if let Some((rec, g)) = PICKING_FOR.with(|p| p.borrow_mut().take()) {
-                    on_source_picked(&ui, &rec, &g, result);
-                }
-            });
-        };
         let spawned = std::thread::Builder::new()
             .name("vesper-pick".into())
             .spawn(move || {
+                // Also on a panic: the button must not stay on "Choosing…".
+                let _done = PickDone(weak.clone(), id);
                 shortcuts::portal_ready();
-                picked(vesper_capture::pick(&vesper_capture::Cancel::default()));
+                let result = vesper_capture::pick(&cancel);
+                // Closed by a second click or quitting: as if cancelled.
+                let closed = cancel.is_cancelled();
+                let _ = weak.upgrade_in_event_loop(move |ui| {
+                    if let Some(p) = take_pick(id) {
+                        on_source_picked(&ui, &p.rec, &p.games, result, closed);
+                    }
+                });
             });
         if let Err(e) = spawned {
             log!("could not start the picker: {e}");
-            PICKING_FOR.with(|p| p.borrow_mut().take());
+            take_pick(id);
             ui.set_source_picking(false);
         }
     });
@@ -440,10 +460,12 @@ fn wire_callbacks(ui: &AppWindow, recording: &Shared, games: &Games) {
     let g = games.clone();
     ui.on_start_recording(move || {
         let Some(ui) = weak.upgrade() else { return };
+        if ui.get_rec_state() != RecState::Idle {
+            return;
+        }
         // Without a source, it would open a second picker.
-        if ui.get_rec_state() != RecState::Idle
-            || (ui.get_source_picking() && ui.get_source_kind() == SourceKind::None)
-        {
+        if ui.get_source_picking() && ui.get_source_kind() == SourceKind::None {
+            flash_notice(&ui, tr!("Choose a source first"));
             return;
         }
         if ui.get_output_folder().is_empty() {
@@ -585,6 +607,10 @@ fn wire_callbacks(ui: &AppWindow, recording: &Shared, games: &Games) {
             flash_notice(&ui, tr!("End the stream to change the source"));
             return;
         }
+        if ui.get_source_picking() {
+            flash_notice(&ui, tr!("The screen picker is already open"));
+            return;
+        }
         log!("source-mode-changed: game={game}");
         if let Some(p) = rec.borrow_mut().take() {
             p.set_replay(None);
@@ -595,9 +621,52 @@ fn wire_callbacks(ui: &AppWindow, recording: &Shared, games: &Games) {
     });
 }
 
+/// A pick in progress: what it applies to, and how to close its picker.
+struct Picking {
+    id: u64,
+    rec: Shared,
+    games: Games,
+    cancel: vesper_capture::Cancel,
+}
+
 thread_local! {
-    /// The pipeline and game source a pick in progress applies to.
-    static PICKING_FOR: RefCell<Option<(Shared, Games)>> = const { RefCell::new(None) };
+    static PICK: RefCell<Option<Picking>> = const { RefCell::new(None) };
+}
+
+/// The pick `id`, if it is still the one in progress.
+fn take_pick(id: u64) -> Option<Picking> {
+    PICK.with(|p| {
+        let mut p = p.borrow_mut();
+        if p.as_ref().is_some_and(|p| p.id == id) {
+            p.take()
+        } else {
+            None
+        }
+    })
+}
+
+/// Closes the picker of the pick in progress, if any (its answer follows).
+fn cancel_pick() {
+    PICK.with(|p| {
+        if let Some(p) = p.borrow().as_ref() {
+            p.cancel.cancel();
+        }
+    });
+}
+
+/// Dropped when a pick thread ends: a pick that sent no answer (it
+/// panicked) ends too.
+struct PickDone(slint::Weak<AppWindow>, u64);
+
+impl Drop for PickDone {
+    fn drop(&mut self) {
+        let id = self.1;
+        let _ = self.0.upgrade_in_event_loop(move |ui| {
+            if take_pick(id).is_some() {
+                ui.set_source_picking(false);
+            }
+        });
+    }
 }
 
 /// Why the source cannot change now, if it cannot: a recording or a stream
@@ -619,11 +688,12 @@ fn on_source_picked(
     rec: &Shared,
     games: &Games,
     result: vesper_capture::Result<(Option<String>, vesper_capture::SourceInfo)>,
+    closed: bool,
 ) {
     ui.set_source_picking(false);
     let (token, info) = match result {
         Ok(picked) => picked,
-        Err(e) if vesper_capture::is_cancelled(&e) => {
+        Err(e) if closed || vesper_capture::is_cancelled(&e) => {
             log!("picker closed: source kept");
             return;
         }
