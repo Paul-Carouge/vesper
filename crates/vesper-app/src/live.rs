@@ -322,6 +322,10 @@ pub fn wire(ui: &AppWindow, recording: &Shared, games: &Games) {
             }
             return;
         }
+        // Without a source, going live would open a second picker.
+        if ui.get_source_picking() && ui.get_source_kind() == crate::SourceKind::None {
+            return;
+        }
         // A key still being typed is saved first: the read below follows it.
         save_draft(&ui);
         let settings = settings(&ui);

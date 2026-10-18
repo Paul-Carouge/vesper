@@ -6,7 +6,7 @@
 //!   `saved` shows the saved-file notice and `notify` sends the desktop
 //!   notification, both for `VESPER_DEMO_FILE`.
 //!   Looks without a capture or a game, for screenshots: `screen-look`,
-//!   `game-look`, `game-window-look`, `consent-look`, `starting-look`, `stopping-look`, `layer-installed`, `layer-missing`,
+//!   `game-look`, `game-window-look`, `consent-look`, `starting-look`, `stopping-look`, `picking-look` (the picker is open), `layer-installed`, `layer-missing`,
 //!   `replay-on`, `replay-off`, `filters-look`, `ducking-look`, `live-look`, `live-dropping-look`,
 //!   `live-reconnecting-look`, `live-key-look`; `scroll-end` scrolls the settings
 //!   to the end, `scroll:<px>` that far.
@@ -447,6 +447,7 @@ fn look(ui: &AppWindow, step: &str) -> bool {
             ui.set_game_layer_available(false);
         }
         "starting-look" => ui.set_rec_state(crate::RecState::Starting),
+        "picking-look" => ui.set_source_picking(true),
         "stopping-look" => {
             ui.set_measured_fps(59.9);
             ui.set_rec_state(crate::RecState::Stopping);

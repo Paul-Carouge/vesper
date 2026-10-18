@@ -140,23 +140,37 @@ impl Drop for Capture {
         {
             warn!("pipewire thread panicked");
         }
-        // A hung portal must not hold up the caller (finishing a file,
-        // quitting): the session closes on its own thread, waited on a while.
-        let Some(session) = self.session.take() else {
-            return;
-        };
-        let (done_tx, done) = std::sync::mpsc::channel();
-        let closing = std::thread::Builder::new()
-            .name("vesper-portal-close".into())
-            .spawn(move || {
-                if let Err(e) = block_on(session.close()) {
-                    warn!("closing the screencast session failed: {e}");
-                }
-                let _ = done_tx.send(());
-            });
-        if closing.is_ok() && done.recv_timeout(CLOSE_TIMEOUT).is_err() {
-            warn!("the portal did not close the screencast session in time");
+        if let Some(session) = self.session.take() {
+            close(session);
         }
+    }
+}
+
+/// Opens the picker only, offering monitors and windows: the picked source
+/// and a token that restores it without the picker. No stream starts.
+/// Blocks until the user picks; `cancel` closes the picker.
+pub fn pick(cancel: &Cancel) -> Result<(Option<String>, SourceInfo)> {
+    let sources = SourceType::Monitor | SourceType::Window;
+    let (session, _, _, restore_token, source) = block_on(open_portal(sources, None, cancel))?;
+    close(session);
+    Ok((restore_token, source))
+}
+
+/// Closes a screencast session. A hung portal must not hold up the caller
+/// (finishing a file, quitting): it closes on its own thread, waited on a
+/// while.
+fn close(session: Session<Screencast>) {
+    let (done_tx, done) = std::sync::mpsc::channel();
+    let closing = std::thread::Builder::new()
+        .name("vesper-portal-close".into())
+        .spawn(move || {
+            if let Err(e) = block_on(session.close()) {
+                warn!("closing the screencast session failed: {e}");
+            }
+            let _ = done_tx.send(());
+        });
+    if closing.is_ok() && done.recv_timeout(CLOSE_TIMEOUT).is_err() {
+        warn!("the portal did not close the screencast session in time");
     }
 }
 
@@ -212,6 +226,11 @@ impl Cancel {
         if let Some(waker) = waker {
             waker.wake();
         }
+    }
+
+    /// Whether [`Cancel::cancel`] was called.
+    pub fn is_cancelled(&self) -> bool {
+        self.0.done.load(Ordering::SeqCst)
     }
 
     /// Ready once [`Cancel::cancel`] was called.

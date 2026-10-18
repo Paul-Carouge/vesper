@@ -7,6 +7,7 @@
 //! again. Without the portal, it logs once and ends: the in-window shortcuts
 //! keep working.
 
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use ashpd::desktop::global_shortcuts::{GlobalShortcuts, NewShortcut, Shortcut};
@@ -22,6 +23,20 @@ pub const APP_ID: &str = "io.github.PaulCarouge.Vesper";
 /// portal restarts: the portal process keeps it per connection.
 pub async fn register_app_id() -> ashpd::Result<()> {
     ashpd::register_host_app(APP_ID.parse()?).await
+}
+
+/// Registers `APP_ID` on the first call; later calls wait for it. Every
+/// portal user calls it first (on its own thread: the portal may take
+/// seconds to start), so none goes before the registration.
+pub fn portal_ready() {
+    static REGISTERED: OnceLock<()> = OnceLock::new();
+    REGISTERED.get_or_init(|| {
+        if let Err(e) = block_on(register_app_id()) {
+            log!(
+                "could not register the app id with the portal (is {APP_ID}.desktop installed? see README): {e}"
+            );
+        }
+    });
 }
 
 /// What a global shortcut does.
@@ -99,7 +114,10 @@ pub fn spawn(
 ) {
     let spawned = std::thread::Builder::new()
         .name("vesper-shortcuts".into())
-        .spawn(move || block_on(run(&on_bound, &on_activated)));
+        .spawn(move || {
+            portal_ready();
+            block_on(run(&on_bound, &on_activated));
+        });
     if let Err(e) = spawned {
         log!("global shortcuts: could not start the thread: {e}");
     }

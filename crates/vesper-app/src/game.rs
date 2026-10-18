@@ -112,6 +112,7 @@ fn open_window(key: String, frames: GameFrames, fps: u32, cancel: Cancel) -> Rec
                     }
                 }
             };
+            crate::shortcuts::portal_ready();
             // Twice the recording rate, as for a portal source.
             let max_fps = fps.saturating_mul(2);
             let token = fallback::load_token(&key);

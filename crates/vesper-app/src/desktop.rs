@@ -65,6 +65,7 @@ pub fn pick_folder(
     done: impl FnOnce(Result<Option<PathBuf>, String>) + Send + 'static,
 ) {
     spawn("vesper-folder", move || {
+        crate::shortcuts::portal_ready();
         done(block_on(choose_folder(&current)).map_err(|e| e.to_string()));
     });
 }
@@ -92,6 +93,7 @@ pub fn pick_image(
     done: impl FnOnce(Result<Option<PathBuf>, String>) + Send + 'static,
 ) {
     spawn("vesper-image", move || {
+        crate::shortcuts::portal_ready();
         done(block_on(choose_image(current.as_deref())).map_err(|e| e.to_string()));
     });
 }
@@ -129,6 +131,7 @@ pub fn notify(title: String, body: String, file: Option<PathBuf>) {
         listen_for_actions();
     }
     spawn("vesper-notify", move || {
+        crate::shortcuts::portal_ready();
         let mut notification = Notification::new(&title)
             .body(body.as_str())
             .priority(Priority::Normal);
@@ -157,6 +160,7 @@ fn listen_for_actions() {
         return;
     }
     spawn("vesper-notify-actions", || {
+        crate::shortcuts::portal_ready();
         let listened = block_on(async {
             let proxy = NotificationProxy::new().await?;
             let mut actions = proxy.receive_action_invoked().await?;

@@ -136,12 +136,6 @@ fn main() -> Result<(), slint::PlatformError> {
     filters::install_plugins();
     // Started with the session: stay in the tray (when there is one).
     let background = std::env::args().skip(1).any(|a| a == "--background");
-    if let Err(e) = futures_lite::future::block_on(shortcuts::register_app_id()) {
-        log!(
-            "could not register the app id with the portal (is {}.desktop installed? see README): {e}",
-            shortcuts::APP_ID
-        );
-    }
     // Every recording, dev ones included, leaves a marker until it is finished.
     if let Some(dir) = recording_markers() {
         vesper_mux::set_marker_dir(dir);
@@ -187,6 +181,14 @@ fn main() -> Result<(), slint::PlatformError> {
             return Ok(());
         }
     };
+    // The portal may take seconds to start (D-Bus activation at login): the
+    // window does not wait for it, its users do (see `portal_ready`).
+    if let Err(e) = std::thread::Builder::new()
+        .name("vesper-app-id".into())
+        .spawn(shortcuts::portal_ready)
+    {
+        log!("could not start registering the app id: {e}");
+    }
     // The only instance: a marker left by an earlier one is stale.
     recover_recordings(&ui);
 
@@ -394,17 +396,43 @@ fn ends_on_game_closed(rec: RecState, live: LiveState) -> (bool, bool, bool) {
 /// when the picker is cancelled or the pipeline fails to start; the UI ignores
 /// record intents while it is `starting` or `stopping`.
 fn wire_callbacks(ui: &AppWindow, recording: &Shared, games: &Games) {
+    // Opens the picker at once; the current source and its replay buffer
+    // keep running until another one is picked.
     let weak = ui.as_weak();
+    let rec = recording.clone();
+    let g = games.clone();
     ui.on_pick_source(move || {
         let Some(ui) = weak.upgrade() else { return };
-        // The portal has no "pick only" call: forget the source so the next
-        // recording opens the picker.
-        recorder::clear_restore_token();
-        prefs::clear_source();
-        ui.set_source_kind(SourceKind::None);
-        ui.set_source_name("".into());
-        ui.set_source_detail("".into());
-        flash_notice(&ui, tr!("The picker opens when you record"));
+        if let Some(why) = source_locked(ui.get_rec_state(), ui.get_live_state()) {
+            flash_notice(&ui, why);
+            return;
+        }
+        if ui.get_source_picking() {
+            return;
+        }
+        log!("pick-source");
+        ui.set_source_picking(true);
+        // The answer comes on the UI thread, where the pipeline lives.
+        PICKING_FOR.with(|p| *p.borrow_mut() = Some((rec.clone(), g.clone())));
+        let weak = weak.clone();
+        let picked = move |result| {
+            let _ = weak.upgrade_in_event_loop(move |ui| {
+                if let Some((rec, g)) = PICKING_FOR.with(|p| p.borrow_mut().take()) {
+                    on_source_picked(&ui, &rec, &g, result);
+                }
+            });
+        };
+        let spawned = std::thread::Builder::new()
+            .name("vesper-pick".into())
+            .spawn(move || {
+                shortcuts::portal_ready();
+                picked(vesper_capture::pick(&vesper_capture::Cancel::default()));
+            });
+        if let Err(e) = spawned {
+            log!("could not start the picker: {e}");
+            PICKING_FOR.with(|p| p.borrow_mut().take());
+            ui.set_source_picking(false);
+        }
     });
 
     let weak = ui.as_weak();
@@ -412,7 +440,10 @@ fn wire_callbacks(ui: &AppWindow, recording: &Shared, games: &Games) {
     let g = games.clone();
     ui.on_start_recording(move || {
         let Some(ui) = weak.upgrade() else { return };
-        if ui.get_rec_state() != RecState::Idle {
+        // Without a source, it would open a second picker.
+        if ui.get_rec_state() != RecState::Idle
+            || (ui.get_source_picking() && ui.get_source_kind() == SourceKind::None)
+        {
             return;
         }
         if ui.get_output_folder().is_empty() {
@@ -562,6 +593,75 @@ fn wire_callbacks(ui: &AppWindow, recording: &Shared, games: &Games) {
         Prefs::from_ui(&ui).save();
         start_replay(&ui, &rec, &g);
     });
+}
+
+thread_local! {
+    /// The pipeline and game source a pick in progress applies to.
+    static PICKING_FOR: RefCell<Option<(Shared, Games)>> = const { RefCell::new(None) };
+}
+
+/// Why the source cannot change now, if it cannot: a recording or a stream
+/// runs on it.
+fn source_locked(rec: RecState, live: LiveState) -> Option<&'static str> {
+    if rec != RecState::Idle {
+        Some(tr!("Stop the recording to change the source"))
+    } else if live != LiveState::Off {
+        Some(tr!("End the stream to change the source"))
+    } else {
+        None
+    }
+}
+
+/// The picker closed. A picked source replaces the current one, and its
+/// replay buffer the current one's; otherwise the current source stays.
+fn on_source_picked(
+    ui: &AppWindow,
+    rec: &Shared,
+    games: &Games,
+    result: vesper_capture::Result<(Option<String>, vesper_capture::SourceInfo)>,
+) {
+    ui.set_source_picking(false);
+    let (token, info) = match result {
+        Ok(picked) => picked,
+        Err(e) if vesper_capture::is_cancelled(&e) => {
+            log!("picker closed: source kept");
+            return;
+        }
+        Err(e) => {
+            log!("picker: {e}");
+            flash_error(ui, tr!("Could not open the screen picker"));
+            return;
+        }
+    };
+    // Started meanwhile (a shortcut, the tray): they keep their source.
+    if let Some(why) = source_locked(ui.get_rec_state(), ui.get_live_state()) {
+        flash_notice(ui, why);
+        return;
+    }
+    if ui.get_source_kind() == SourceKind::Game {
+        log!("picked a source in game mode: ignored");
+        return;
+    }
+    // Without a token the next start would show the picker again.
+    let Some(token) = token else {
+        log!("the portal gave no restore token: source kept");
+        flash_error(ui, tr!("Could not change the source"));
+        return;
+    };
+    if let Err(e) = recorder::save_restore_token(&token) {
+        log!("could not save the restore token: {e}");
+        flash_error(ui, tr!("Could not change the source"));
+        return;
+    }
+    let label = outputs::describe(&info);
+    log!("source picked: {label:?}");
+    show_source(ui, &label);
+    prefs::save_source(&label);
+    // The replay buffer moves to the new source.
+    if let Some(p) = rec.borrow_mut().take() {
+        p.set_replay(None);
+    }
+    start_replay(ui, rec, games);
 }
 
 /// Hands the replay switch and length to the pipeline, or starts one for
@@ -1542,6 +1642,22 @@ mod tests {
             ("No game to record yet", "No game to record yet"),
         ] {
             assert_eq!(friendly(raw), text);
+        }
+    }
+
+    #[test]
+    fn the_source_changes_only_when_nothing_runs_on_it() {
+        assert_eq!(source_locked(RecState::Idle, LiveState::Off), None);
+        for rec in [RecState::Starting, RecState::Recording, RecState::Stopping] {
+            assert!(source_locked(rec, LiveState::Off).is_some(), "{rec:?}");
+        }
+        for live in [
+            LiveState::Connecting,
+            LiveState::Live,
+            LiveState::Reconnecting,
+            LiveState::Ending,
+        ] {
+            assert!(source_locked(RecState::Idle, live).is_some(), "{live:?}");
         }
     }
 

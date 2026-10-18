@@ -758,15 +758,6 @@ pub fn save_source(label: &SourceLabel) {
     }
 }
 
-pub fn clear_source() {
-    if let Some(path) = source_path()
-        && let Err(e) = std::fs::remove_file(&path)
-        && e.kind() != std::io::ErrorKind::NotFound
-    {
-        log!("could not remove {}: {e}", path.display());
-    }
-}
-
 /// Most of the settings file read; the rest is ignored. Real files are a few
 /// KB: this only bounds a corrupt or hostile one.
 const MAX_SETTINGS_SIZE: u64 = 1 << 20;
