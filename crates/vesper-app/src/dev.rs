@@ -24,6 +24,8 @@
 //!   demo settled, then quits. Nothing outside the window is captured.
 //! - `VESPER_DEMO_DELAY=<ms>` runs `VESPER_DEMO` that long after launch
 //!   (default 300), e.g. once a game asks for consent (`allow`, `ignore`).
+//! - Logs `first frame at <unix seconds>` when the window first draws
+//!   (`scripts/robustness/r2_startup.sh` reads it).
 //! - `vesper --record <seconds>` records without the UI, from the saved
 //!   source or `VESPER_RESTORE_TOKEN`, with `default_settings()`.
 //! - `vesper --record-game <seconds>` records the game capture the same way,
@@ -221,6 +223,19 @@ pub fn replay(buffer: u64, wait: u64, settings: Settings) {
 }
 
 pub fn apply(ui: &AppWindow) {
+    let mut drawn = false;
+    let notified = ui.window().set_rendering_notifier(move |state, _| {
+        if !drawn && matches!(state, slint::RenderingState::AfterRendering) {
+            drawn = true;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default();
+            log!("first frame at {:.3}", now.as_secs_f64());
+        }
+    });
+    if let Err(e) = notified {
+        log!("no first frame time: {e}");
+    }
     if let Ok(size) = std::env::var("VESPER_WINDOW_SIZE")
         && let Some((w, h)) = size.split_once('x')
         && let (Ok(w), Ok(h)) = (w.parse::<f32>(), h.parse::<f32>())
