@@ -18,6 +18,9 @@
 //! - Audio threads (`vesper-audio`, two per track): Opus packets of each
 //!   audio track, and of the mix of them all, go to the same sinks, behind a
 //!   mutex. The mix is encoded on whichever track thread completes a block.
+//! - Writer thread (`writer`), one per recording: creates and writes the
+//!   file from a bounded queue. The sinks only queue packets (shared data),
+//!   so a slow disk never stalls the pipeline, the stream or the audio.
 //! - Replay threads: each saved replay is muxed on its own thread from a
 //!   snapshot of the ring (shared packet data, no copy).
 //! - Overlay thread (`overlay`), while the active scene is more than the
@@ -67,6 +70,7 @@ mod ring;
 mod sinks;
 mod stage;
 mod streaming;
+mod writer;
 
 pub use audio::*;
 use clock::*;
@@ -76,6 +80,7 @@ use ring::*;
 use sinks::*;
 pub(crate) use stage::*;
 use streaming::*;
+use writer::*;
 
 /// How often `Event::Stats` is sent.
 const STATS_PERIOD: Duration = Duration::from_millis(500);

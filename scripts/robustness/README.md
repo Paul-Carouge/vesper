@@ -53,3 +53,12 @@ Examples:
     scripts/robustness/r2 perf r2_perf.sh CASE=stream-own
     TMO=4000 scripts/robustness/r2 long r2_long.sh LONG_SECS=3600
     scripts/robustness/r2_faults_all.sh serverdead pwrestart
+
+## Round 3
+
+| Scenario | What it measures |
+| --- | --- |
+| `r3_slowdisk.sh` | A slow disk while recording and streaming: `probe/slowdisk.c` (built in the lab, `LD_PRELOAD`) stalls every write to the `.mkv` for `SLOW_MS` (800) every `SLOW_EVERY_S` (5; 0: once) from `SLOW_AFTER_S` (12). Prints frames dropped, audio buffers dropped, the largest gap of the recording and of the received stream, and how the recording ended |
+
+    TMO=150 scripts/robustness/r2 slow r3_slowdisk.sh SLOW_MS=1500
+    TMO=150 scripts/robustness/r2 slow r3_slowdisk.sh SLOW_MS=20000 SLOW_EVERY_S=0 SECS=50

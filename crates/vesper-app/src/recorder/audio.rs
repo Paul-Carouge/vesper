@@ -201,10 +201,9 @@ pub(super) type AudioSources = Arc<Mutex<Audio>>;
 /// Writes an audio packet of file stream `index` (the video aside) to the sinks.
 pub(super) fn write_audio(sinks: &SharedSinks, index: usize, packet: EncodedPacket) {
     let mut s = lock(sinks);
-    if let Some(r) = s.rec.as_mut()
-        && let Err(e) = r.mux.write_audio(index, &packet)
-    {
-        log!("audio track {index}: {e}");
+    // Queued: an audio thread never waits on the disk.
+    if let Some(r) = &s.rec {
+        r.push(index + 1, packet.clone());
     }
     if let Some(ring) = s.ring.as_mut() {
         ring.push_audio(index, packet);

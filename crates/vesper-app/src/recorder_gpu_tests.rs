@@ -112,6 +112,19 @@ impl Drop for Rig {
     }
 }
 
+/// Waits for `Started`, skipping notices (e.g. the GPU encoder load warning,
+/// sent before it). False: no encoder here.
+fn started(rx: &Receiver<Event>) -> bool {
+    loop {
+        match event(rx) {
+            Some(Event::Started) => return true,
+            Some(Event::Notice(_)) => {}
+            None => return false,
+            Some(other) => panic!("before Started: {other:?}"),
+        }
+    }
+}
+
 /// Next event that is not stats, source or audio news. `None`: no encoder here.
 fn event(rx: &Receiver<Event>) -> Option<Event> {
     loop {
@@ -120,6 +133,9 @@ fn event(rx: &Receiver<Event>) -> Option<Event> {
                 Event::Stats { .. }
                 | Event::Source(_)
                 | Event::AudioStarted
+                | Event::AudioSignal
+                | Event::AudioTrack(..)
+                | Event::AudioMissing(_)
                 | Event::DesktopExcept(_),
             ) => {}
             Ok(Event::Stopped(Some(e))) if e.contains("Could not open the encoder") => {
@@ -181,10 +197,8 @@ fn rapid_start_stop_cycles_leave_valid_files() {
             p.record(out.clone()),
             "cycle {i}: pipeline refused a recording"
         );
-        match event(&rx) {
-            Some(Event::Started) => {}
-            None => return,
-            Some(other) => panic!("cycle {i}: {other:?}"),
+        if !started(&rx) {
+            return;
         }
         std::thread::sleep(Duration::from_millis(hold_ms));
         p.stop_recording();
@@ -217,7 +231,7 @@ fn saving_replays_while_recording_then_quitting_loses_nothing() {
         move |e| drop(tx.send(e)),
     )
     .unwrap();
-    if !matches!(event(&rx), Some(Event::Started)) {
+    if !started(&rx) {
         return;
     }
     std::thread::sleep(Duration::from_secs(2));
@@ -265,7 +279,7 @@ fn a_game_pause_and_resize_keep_the_recording_continuous() {
         move |e| drop(tx.send(e)),
     )
     .unwrap();
-    if !matches!(event(&rx), Some(Event::Started)) {
+    if !started(&rx) {
         return;
     }
     let started = Instant::now();
@@ -369,7 +383,7 @@ fn a_recording_keeps_repeating_while_the_game_is_gone() {
         move |e| drop(tx.send(e)),
     )
     .unwrap();
-    if !matches!(event(&rx), Some(Event::Started)) {
+    if !started(&rx) {
         return;
     }
     let started = Instant::now();
@@ -536,11 +550,7 @@ fn record_with(settings: Settings, out: &Path) -> Option<(Pipeline, Receiver<Eve
         drop(tx.send(e))
     })
     .unwrap();
-    match event(&rx) {
-        Some(Event::Started) => Some((p, rx)),
-        None => None,
-        Some(other) => panic!("{other:?}"),
-    }
+    started(&rx).then_some((p, rx))
 }
 
 /// Stops the recording, returns its file.
@@ -1539,7 +1549,7 @@ fn a_lost_screen_capture_freezes_then_resumes_in_one_file() {
         move |e| drop(tx.send(e)),
     )
     .unwrap();
-    if !matches!(event(&rx), Some(Event::Started)) {
+    if !started(&rx) {
         return;
     }
     let started = Instant::now();
@@ -1617,7 +1627,7 @@ fn a_capture_that_never_comes_back_still_ends_in_a_finished_file() {
         move |e| drop(tx.send(e)),
     )
     .unwrap();
-    if !matches!(event(&rx), Some(Event::Started)) {
+    if !started(&rx) {
         return;
     }
     let started = Instant::now();
