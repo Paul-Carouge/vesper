@@ -416,6 +416,12 @@ impl LiveSink {
         self.shared.wake.notify_one();
     }
 
+    /// Set to end the stream at once, even once stopped (quitting must not
+    /// wait for the stopped stream's tail on a slow network).
+    pub fn abort_flag(&self) -> Arc<AtomicBool> {
+        self.shared.abort.clone()
+    }
+
     /// Where the stream's audio goes, for its [`AudioTap`].
     pub fn audio_in(&self) -> AudioIn {
         AudioIn(self.shared.clone())
@@ -621,7 +627,10 @@ fn send(
                 ..Queue::default()
             };
             drop(q);
-            flush(&mut live, &mut tail, &s.abort);
+            if !flush(&mut live, &mut tail, &s.abort) {
+                // Dead connection: no trailer nor SRT drain, even on drop.
+                s.abort.store(true, Ordering::Relaxed);
+            }
             break None;
         }
         let now = Instant::now();
@@ -659,17 +668,18 @@ fn send(
         q.video.clear();
         q.audio.clear();
     }
-    if result.is_none() {
+    if result.is_none() && !s.abort.load(Ordering::Relaxed) {
         live.finish();
     }
     result
 }
 
 /// Sends what `tail` holds in dts order, for [`FLUSH_TIMEOUT`] at most;
-/// stops on an abort or a write error (the connection is gone).
+/// stops on an abort or a write error (the connection is gone: `false`).
 // shortcut: the deadline is checked between writes, so one stalled write may
-// block up to `Live`'s write timeout; give `Live` a per-call timeout if that bites.
-fn flush(live: &mut Live, tail: &mut Queue, abort: &AtomicBool) {
+// block up to `Live`'s write timeout (an abort, as at quit, still ends it at
+// once); give `Live` a per-call timeout if that bites.
+fn flush(live: &mut Live, tail: &mut Queue, abort: &AtomicBool) -> bool {
     let deadline = Instant::now() + FLUSH_TIMEOUT;
     // Without waiting for the other kind: nothing more will come.
     let far = deadline + INTERLEAVE_WAIT;
@@ -679,7 +689,7 @@ fn flush(live: &mut Live, tail: &mut Queue, abort: &AtomicBool) {
                 "live: {} packets left unsent at the stop",
                 tail.video.len() + tail.audio.len() + 1
             );
-            return;
+            return true;
         }
         let written = if is_video {
             live.write_video(&packet)
@@ -688,9 +698,10 @@ fn flush(live: &mut Live, tail: &mut Queue, abort: &AtomicBool) {
         };
         if let Err(e) = written {
             log!("live: the stream's tail was not sent: {e}");
-            return;
+            return false;
         }
     }
+    true
 }
 
 /// The audio side of a [`LiveSink`].

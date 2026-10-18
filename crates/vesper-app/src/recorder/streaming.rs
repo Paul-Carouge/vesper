@@ -254,24 +254,27 @@ impl Streaming {
     }
 
     /// Ends the stream (with `error` if it failed here) and its audio;
-    /// returns the live thread to join. `abort`: do not wait for a slow
-    /// network (the pipeline is ending).
+    /// returns the live thread to join and its abort flag (see
+    /// [`Control::keep_live`]). `abort`: do not wait for a slow network (the
+    /// pipeline is ending).
     pub(super) fn stop(
         self,
         sources: &AudioSources,
         error: Option<String>,
         abort: bool,
-    ) -> Option<JoinHandle<()>> {
+    ) -> Option<(JoinHandle<()>, Arc<AtomicBool>)> {
         lock(sources).set_stream_tap(None);
-        match (self.sink, error) {
+        let Some(sink) = self.sink else {
             // Never connected: the UI still waits for the end.
-            (None, error) => {
-                (self.on_event)(Event::Stream(StreamState::Ended(error)));
-                None
-            }
-            (Some(sink), _) if abort => sink.abort(),
-            (Some(sink), Some(e)) => sink.fail(e),
-            (Some(sink), None) => sink.stop(),
-        }
+            (self.on_event)(Event::Stream(StreamState::Ended(error)));
+            return None;
+        };
+        let flag = sink.abort_flag();
+        let thread = match error {
+            _ if abort => sink.abort(),
+            Some(e) => sink.fail(e),
+            None => sink.stop(),
+        };
+        thread.map(|t| (t, flag))
     }
 }

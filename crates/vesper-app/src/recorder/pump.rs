@@ -322,7 +322,7 @@ pub(super) fn pump(
         }
         if let Some(s) = stopping.take() {
             let handle = s.stop(sources, None, false);
-            lock(control).saves.extend(handle);
+            lock(control).keep_live(handle);
         }
         // New tracks: restart the audio, and its part of the replay buffer
         // (the old tracks' packets do not match the new files' streams).
@@ -465,7 +465,7 @@ pub(super) fn pump(
             let handle = streaming
                 .take()
                 .and_then(|s| s.stop(sources, Some(e), false));
-            lock(control).saves.extend(handle);
+            lock(control).keep_live(handle);
         }
         lock(sinks).write_video(packets);
         // The writer ended the file (stopped, failed, disk too slow).
@@ -546,7 +546,7 @@ fn reap_ended_stream(
         let retry = s.h264_retry();
         let handle = s.stop(sources, None, false);
         let mut c = lock(control);
-        c.saves.extend(handle);
+        c.keep_live(handle);
         if let Some((request, notice)) = retry {
             log!("live: codec rejected, trying H.264");
             queue_retry(&mut c, request, notice, on_event);
@@ -610,7 +610,7 @@ fn wind_down(
     if let Some(s) = streaming.take() {
         // Quitting or failed: do not wait for a slow network.
         let handle = s.stop(sources, None, true);
-        lock(control).saves.extend(handle);
+        lock(control).keep_live(handle);
     } else if lock(control).stream.take().is_some() {
         // Requested, never started: the UI waits for its end.
         on_event(Event::Stream(StreamState::Ended(None)));
