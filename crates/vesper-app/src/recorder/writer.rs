@@ -4,7 +4,7 @@
 
 use super::*;
 
-/// Most a recording queues for its writer, in bytes and in pts span: a
+/// Most a recording queues for its writer, in bytes and in dts span: a
 /// disk this far behind is not catching up, the recording stops there.
 const QUEUE_BYTES: usize = 256 << 20;
 const QUEUE_SPAN: Duration = Duration::from_secs(10);
@@ -24,7 +24,10 @@ struct Queue {
 struct State {
     packets: VecDeque<(usize, EncodedPacket)>,
     bytes: usize,
-    /// The first video packet from this pts on closes the queue.
+    /// The first video packet decoded from this time on (dts) closes the
+    /// queue: every picture shown before it is written (B-frames before
+    /// it in display come before it in decode order), plus at most the one
+    /// anchor after it they reference.
     stop_at: Option<Duration>,
     /// No more packets: the writer drains the queue, then finishes.
     closed: bool,
@@ -55,13 +58,14 @@ impl Queue {
         }
         // The stop: nothing from this packet on is written, and nothing more
         // queued, so a slow disk draining the queue cannot overflow it.
-        if stream == 0 && s.stop_at.is_some_and(|t| p.pts >= t) {
+        if stream == 0 && s.stop_at.is_some_and(|t| p.dts >= t) {
             s.closed = true;
             drop(s);
             self.wake.notify_one();
             return;
         }
-        let span = s.packets.front().map(|(_, f)| p.pts.saturating_sub(f.pts));
+        // By dts: video pts go back between B-frames.
+        let span = s.packets.front().map(|(_, f)| p.dts.saturating_sub(f.dts));
         if s.bytes + p.data.len() > self.max_bytes || span.is_some_and(|d| d > self.max_span) {
             log!(
                 "recording: disk too slow ({} MB, {:?} queued), stopping",
@@ -160,7 +164,8 @@ impl Recording {
         self.queue.push(stream, p);
     }
 
-    /// Ends the file before the first video packet from `pts` on.
+    /// Ends the file before the first video packet decoded from `pts` on:
+    /// it holds every picture shown before `pts`.
     pub(super) fn stop_at(&self, pts: Duration) {
         lock(&self.queue.state).stop_at.get_or_insert(pts);
     }
@@ -272,11 +277,7 @@ mod tests {
     use super::*;
 
     fn packet(ms: u64, len: usize) -> EncodedPacket {
-        EncodedPacket {
-            data: Arc::from(vec![0u8; len]),
-            pts: Duration::from_millis(ms),
-            keyframe: true,
-        }
+        EncodedPacket::new(Arc::from(vec![0u8; len]), Duration::from_millis(ms), true)
     }
 
     fn drain(q: &Queue) -> Vec<(usize, u64)> {
@@ -337,6 +338,36 @@ mod tests {
         assert_eq!(q.end(), None);
     }
 
+    /// H.264 with B-frames, stopped at every frame time S of a GOP: the
+    /// file gets a decode-order prefix (decodable: nothing written refers
+    /// to a dropped packet), every picture shown before S, and at most one
+    /// after it (the anchor the last B-frames refer to).
+    #[test]
+    fn a_stop_in_b_frames_keeps_every_picture_before_it() {
+        let video = crate::recorder::tests::b_frames(2950);
+        for stop in (10_000..13_000).step_by(100) {
+            let q = Queue::new(usize::MAX, QUEUE_SPAN);
+            lock(&q.state).stop_at = Some(Duration::from_millis(stop));
+            for p in &video {
+                q.push(0, p.clone());
+            }
+            q.close(None);
+            let written: Vec<u64> = drain(&q).into_iter().map(|(_, pts)| pts).collect();
+            let pushed: Vec<u64> = video.iter().map(|p| p.pts.as_millis() as u64).collect();
+            assert_eq!(written, pushed[..written.len()], "a prefix, stop {stop}");
+            let before = pushed.iter().filter(|&&t| t < stop).count();
+            assert_eq!(
+                written.iter().filter(|&&t| t < stop).count(),
+                before,
+                "every picture before {stop}"
+            );
+            assert!(
+                written.iter().filter(|&&t| t >= stop).count() <= 1,
+                "stop {stop}"
+            );
+        }
+    }
+
     #[test]
     fn a_waiting_writer_wakes_for_video_and_for_the_close() {
         let q = Arc::new(Queue::new(1000, QUEUE_SPAN));
@@ -382,10 +413,12 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let on_event: OnEvent = Arc::new(move |e| drop(tx.send(format!("{e:?}"))));
         // One Opus frame per packet (a CELT 20 ms TOC byte).
-        let opus_packet = |ms| EncodedPacket {
-            data: Arc::from(&[(31 << 3) | 0b100][..]),
-            pts: Duration::from_millis(ms),
-            keyframe: true,
+        let opus_packet = |ms| {
+            EncodedPacket::new(
+                Arc::from(&[(31 << 3) | 0b100][..]),
+                Duration::from_millis(ms),
+                true,
+            )
         };
         let lead = vec![(0, opus_packet(1000)), (0, opus_packet(1020))];
         let start = Duration::from_secs(1);

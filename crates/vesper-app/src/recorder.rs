@@ -979,8 +979,9 @@ mod tests {
 
     /// Video in decode order as H.264 with 2 B-frames makes it, 100 ms
     /// frames, an IDR every second: I0 P3 B1 B2 P6 B4 B5 ... (frame numbers
-    /// are pts), dts one frame per packet, 200 ms before the pts of I0.
-    fn b_frames(end_ms: u64) -> Vec<EncodedPacket> {
+    /// are pts), dts as FFmpeg's vaapi sets it: the i-th presentation time,
+    /// a frame (100 ms) early.
+    pub(super) fn b_frames(end_ms: u64) -> Vec<EncodedPacket> {
         let mut order = Vec::new();
         for gop in (0..=end_ms / 100).step_by(10) {
             // Closed GOP: 0 ... 9, ending on a P (9 = 3 * 3).
@@ -995,7 +996,7 @@ mod tests {
             .map(|(i, f)| EncodedPacket {
                 data: Arc::from(&[0u8][..]),
                 pts: Duration::from_millis(10_000 + f * 100),
-                dts: Duration::from_millis(10_000 - 200 + i as u64 * 100),
+                dts: Duration::from_millis(10_000 - 100 + i as u64 * 100),
                 keyframe: f % 10 == 0,
             })
             .collect()
@@ -1009,7 +1010,7 @@ mod tests {
             ring.push_audio(0, packet(p.dts.as_millis() as u64 + 50, false));
             ring.push_video(p.clone());
         }
-        // Newest dts 14_750, cutoff 12_750: the IDR at pts 12_000 (dts 11_800).
+        // Newest dts 14_800, cutoff 12_800: the IDR at pts 12_000 (dts 11_900).
         assert!(ring.video[0].keyframe);
         assert_eq!(ring.video[0].pts, Duration::from_millis(12_000));
         let snap = interleave(ring.snapshot());
