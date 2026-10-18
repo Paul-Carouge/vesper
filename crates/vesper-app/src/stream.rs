@@ -33,6 +33,9 @@ const MAX_AUDIO_QUEUE: Duration = Duration::from_secs(3);
 /// before it is sent anyway (no audio, or a stalled one).
 const INTERLEAVE_WAIT: Duration = Duration::from_millis(300);
 
+/// What was queued at a stop is sent for this long at most, then dropped.
+const FLUSH_TIMEOUT: Duration = Duration::from_secs(1);
+
 /// Connecting gives up after this long.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -413,6 +416,12 @@ impl LiveSink {
         self.shared.wake.notify_one();
     }
 
+    /// Set to end the stream at once, even once stopped (quitting must not
+    /// wait for the stopped stream's tail on a slow network).
+    pub fn abort_flag(&self) -> Arc<AtomicBool> {
+        self.shared.abort.clone()
+    }
+
     /// Where the stream's audio goes, for its [`AudioTap`].
     pub fn audio_in(&self) -> AudioIn {
         AudioIn(self.shared.clone())
@@ -442,7 +451,8 @@ impl LiveSink {
         lock(&self.shared.queue).codec_rejected
     }
 
-    /// Ends the stream; `Ended` follows once it is closed (within seconds).
+    /// Ends the stream after sending what was queued (for [`FLUSH_TIMEOUT`]
+    /// at most); `Ended` follows once it is closed (within seconds).
     /// Returns its thread, to join before the process exits.
     pub fn stop(self) -> Option<JoinHandle<()>> {
         self.end(None)
@@ -610,6 +620,17 @@ fn send(
     let result = loop {
         let mut q = lock(&s.queue);
         if q.stop {
+            // The last frames and their audio, queued before the stop.
+            let mut tail = Queue {
+                video: std::mem::take(&mut q.video),
+                audio: std::mem::take(&mut q.audio),
+                ..Queue::default()
+            };
+            drop(q);
+            if !flush(&mut live, &mut tail, &s.abort) {
+                // Dead connection: no trailer nor SRT drain, even on drop.
+                s.abort.store(true, Ordering::Relaxed);
+            }
             break None;
         }
         let now = Instant::now();
@@ -647,10 +668,40 @@ fn send(
         q.video.clear();
         q.audio.clear();
     }
-    if result.is_none() {
+    if result.is_none() && !s.abort.load(Ordering::Relaxed) {
         live.finish();
     }
     result
+}
+
+/// Sends what `tail` holds in dts order, for [`FLUSH_TIMEOUT`] at most;
+/// stops on an abort or a write error (the connection is gone: `false`).
+// shortcut: the deadline is checked between writes, so one stalled write may
+// block up to `Live`'s write timeout (an abort, as at quit, still ends it at
+// once); give `Live` a per-call timeout if that bites.
+fn flush(live: &mut Live, tail: &mut Queue, abort: &AtomicBool) -> bool {
+    let deadline = Instant::now() + FLUSH_TIMEOUT;
+    // Without waiting for the other kind: nothing more will come.
+    let far = deadline + INTERLEAVE_WAIT;
+    while let Some((is_video, packet)) = next_packet(tail, true, far) {
+        if abort.load(Ordering::Relaxed) || Instant::now() >= deadline {
+            log!(
+                "live: {} packets left unsent at the stop",
+                tail.video.len() + tail.audio.len() + 1
+            );
+            return true;
+        }
+        let written = if is_video {
+            live.write_video(&packet)
+        } else {
+            live.write_audio(&packet)
+        };
+        if let Err(e) = written {
+            log!("live: the stream's tail was not sent: {e}");
+            return false;
+        }
+    }
+    true
 }
 
 /// The audio side of a [`LiveSink`].
@@ -973,6 +1024,144 @@ mod tests {
         // Without audio, video never waits.
         q.video.push_back((packet(132, false), t0));
         assert!(next_packet(&mut q, false, t0).is_some());
+    }
+
+    /// A local `ffmpeg -listen` RTMP server listing each packet it gets
+    /// (framecrc on its stdout), and a sink connected to it with
+    /// `video` / `audio` packets queued, then a stop (`abort`: an abort)
+    /// before any is sent. `None` without ffmpeg.
+    fn stopped_stream(
+        video: u64,
+        audio: u64,
+        abort: bool,
+    ) -> Option<(std::process::Child, LiveSink)> {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let url = format!("rtmp://127.0.0.1:{port}/app/key");
+        let Ok(server) = std::process::Command::new("ffmpeg")
+            .args(["-v", "quiet", "-listen", "1", "-i", &url])
+            .args(["-c", "copy", "-f", "framecrc", "-"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+        else {
+            eprintln!("no ffmpeg, skipping");
+            return None;
+        };
+        let track = VideoTrack {
+            codec: Codec::H264,
+            width: 64,
+            height: 64,
+            fps: 30,
+            // avcC: baseline 3.0, one SPS and one PPS.
+            extradata: vec![
+                1, 0x42, 0, 0x1e, 0xff, 0xe1, 0, 4, 0x67, 0x42, 0, 0x1e, 1, 0, 4, 0x68, 0xce, 0x3c,
+                0x80,
+            ],
+        };
+        let aac = LiveAudio {
+            sample_rate: SAMPLE_RATE,
+            channels: u32::from(CHANNELS),
+            // AAC LC, 48 kHz, stereo.
+            extradata: vec![0x11, 0x90],
+        };
+        let mut sink = None;
+        // The server may not listen yet: retry.
+        for _ in 0..50 {
+            let s = LiveSink::start(
+                url.clone(),
+                track.clone(),
+                Some(aac.clone()),
+                Arc::new(|_| {}),
+            )
+            .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !s.wants_keyframe() && !s.ended() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            if s.wants_keyframe() {
+                sink = Some(s);
+                break;
+            }
+            if let Some(t) = s.abort() {
+                t.join().unwrap();
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let sink = sink.expect("the server never took the stream");
+        // Under one lock: the stop comes before anything is sent.
+        let shared = sink.shared.clone();
+        let mut q = lock(&shared.queue);
+        q.want_key = false;
+        let t0 = Instant::now();
+        for n in 0..video {
+            let key = n % 30 == 0;
+            // An Annex B slice NAL: IDR or not.
+            let nal: &[u8] = if key {
+                &[0, 0, 0, 1, 0x65, 0x88, 0x84, 0]
+            } else {
+                &[0, 0, 0, 1, 0x41, 0x9a, 0, 0]
+            };
+            let p = EncodedPacket {
+                data: Arc::from(nal),
+                ..packet(1_000 + n * 33, key)
+            };
+            q.video.push_back((p, t0));
+        }
+        for n in 0..audio {
+            let p = packet(1_000 + n * 1024 * 1000 / 48_000, true);
+            q.audio.push_back((p, t0));
+        }
+        q.stop = true;
+        shared.abort.store(abort, Ordering::Relaxed);
+        drop(q);
+        Some((server, sink))
+    }
+
+    /// Packets per stream index in a framecrc listing.
+    fn received(server: std::process::Child) -> [usize; 2] {
+        let out = server.wait_with_output().unwrap();
+        let mut n = [0; 2];
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            match line.split(',').next() {
+                Some("0") => n[0] += 1,
+                Some("1") => n[1] += 1,
+                _ => {}
+            }
+        }
+        n
+    }
+
+    /// Every packet queued at a stop reaches the server, then the stream ends.
+    #[test]
+    fn a_stop_sends_what_was_queued() {
+        let Some((server, sink)) = stopped_stream(30, 45, false) else {
+            return;
+        };
+        let t = Instant::now();
+        sink.stop().unwrap().join().unwrap();
+        assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
+        assert_eq!(received(server), [30, 45]);
+    }
+
+    /// An abort drops the queue and returns at once.
+    #[test]
+    fn an_abort_does_not_wait() {
+        let Some((mut server, sink)) = stopped_stream(30, 45, true) else {
+            return;
+        };
+        let t = Instant::now();
+        sink.abort().unwrap().join().unwrap();
+        assert!(
+            t.elapsed() < Duration::from_millis(500),
+            "{:?}",
+            t.elapsed()
+        );
+        let _ = server.kill();
+        let _ = server.wait();
     }
 
     #[test]

@@ -382,6 +382,21 @@ struct Control {
     ended: bool,
     /// Replays being written and live streams ending, joined by `Pipeline::join`.
     saves: Vec<JoinHandle<()>>,
+    /// Abort flags of the stopped streams still sending their tail: quitting
+    /// sets them, never waiting on a slow network.
+    live_aborts: Vec<Arc<AtomicBool>>,
+}
+
+impl Control {
+    /// Keeps a stopped stream's thread for `Pipeline::join`, and its abort flag.
+    fn keep_live(&mut self, ending: Option<(JoinHandle<()>, Arc<AtomicBool>)>) {
+        if let Some((thread, abort)) = ending {
+            self.saves.push(thread);
+            // An ended stream's thread let go of its flag.
+            self.live_aborts.retain(|a| Arc::strong_count(a) > 1);
+            self.live_aborts.push(abort);
+        }
+    }
 }
 
 pub(crate) type OnEvent = Arc<dyn Fn(Event) + Send + Sync>;
@@ -660,7 +675,12 @@ impl Pipeline {
     pub fn join(self) {
         self.request(|c| c.quit = true);
         let _ = self.thread.join();
-        let saves = std::mem::take(&mut lock(&self.control).saves);
+        let mut c = lock(&self.control);
+        for abort in std::mem::take(&mut c.live_aborts) {
+            abort.store(true, Ordering::Relaxed);
+        }
+        let saves = std::mem::take(&mut c.saves);
+        drop(c);
         for save in saves {
             let _ = save.join();
         }
