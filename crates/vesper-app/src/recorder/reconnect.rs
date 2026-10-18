@@ -93,6 +93,12 @@ pub(super) struct Portal {
 struct Retry {
     rx: Receiver<(Result<Started, ()>, Duration)>,
     thread: JoinHandle<()>,
+    /// Set once a start was tried: an end parked after it is the new
+    /// capture's (the old one was closed before).
+    tried: Arc<AtomicBool>,
+    /// An end was parked after a start was tried: the capture the retry
+    /// brings may already be dead.
+    ended: bool,
 }
 
 impl Portal {
@@ -138,6 +144,8 @@ impl Portal {
             self.stop.clone(),
         );
         let (tx, rx) = std::sync::mpsc::channel();
+        let tried = Arc::new(AtomicBool::new(false));
+        let tried_now = tried.clone();
         let thread = std::thread::Builder::new()
             .name("vesper-reconnect".into())
             .spawn(move || {
@@ -151,6 +159,7 @@ impl Portal {
                     !*s.unwrap_or_else(PoisonError::into_inner).0
                 };
                 let attempt = || {
+                    tried_now.store(true, Ordering::SeqCst);
                     start(&cancel, slot.clone()).map_err(|e| {
                         log!("capture restart failed: {e}");
                         if vesper_capture::is_cancelled(&e) {
@@ -169,6 +178,8 @@ impl Portal {
         self.retry = Some(Retry {
             rx,
             thread: thread?,
+            tried,
+            ended: false,
         });
         Ok(())
     }
@@ -177,7 +188,14 @@ impl Portal {
     /// outcome of a restart first (the capture it brings may be the one that
     /// ended), then the end. Cheap while the capture streams.
     pub(super) fn tick(&mut self, ended: bool) -> std::io::Result<[Option<Change>; 2]> {
+        // The restarted capture can end before its outcome reaches us: that
+        // end, taken while the restart was still pending, must not be lost.
+        if ended && let Some(r) = self.retry.as_mut() {
+            r.ended |= r.tried.load(Ordering::SeqCst);
+        }
+        let ended_early = self.retry.as_ref().is_some_and(|r| r.ended);
         let found = self.poll();
+        let ended = ended || (ended_early && matches!(found, Some(Change::Found(_))));
         let lost = if ended {
             self.lost()?;
             Some(Change::Lost)
@@ -399,11 +417,13 @@ mod tests {
         let first = p.tick(true).unwrap();
         assert!(matches!(first, [None, Some(Change::Lost)]), "{first:?}");
         let t = std::time::Instant::now();
+        // Its end may be taken before or with the restart's outcome: either
+        // way the tick that brings it back also loses it.
         let changes = loop {
             slot.wait(Some(Duration::from_secs(3)));
             let (_, ended) = slot.take();
             let c = p.tick(ended.is_some()).unwrap();
-            if c.iter().any(Option::is_some) {
+            if matches!(c[0], Some(Change::Found(_))) {
                 break c;
             }
             assert!(t.elapsed() < Duration::from_secs(3), "never came back");
