@@ -236,9 +236,15 @@ impl DuckCaption {
         }
     }
 
-    /// Back to the state as it is, without the past (the window was away).
+    /// Back to the state as it is, without the past (the window was away,
+    /// the track list changed): the gain at once, and no voice, which may
+    /// have spoken long ago.
     pub fn reset(&mut self, state: DuckState) {
         *self = Self::default();
+        let state = DuckState {
+            voiced: false,
+            ..state
+        };
         self.feed(state, GAIN_SMOOTH);
     }
 
@@ -528,7 +534,8 @@ mod tests {
     fn reset_shows_the_state_at_once() {
         let mut c = DuckCaption::default();
         c.feed(duck(0.0, 0.0, true), TICK);
-        c.reset(duck(0.0, -12.0, false));
+        // A voice told while away is not shown on return.
+        c.reset(duck(0.0, -12.0, true));
         assert_eq!(
             c.shown(),
             TrackDuck {
@@ -537,5 +544,19 @@ mod tests {
                 db: -12
             }
         );
+    }
+
+    #[test]
+    fn a_new_caption_reset_to_its_track_does_not_count_up() {
+        // A track list changed: the music at -8 dB shows -8 dB on the
+        // first tick, then stays, instead of -1, -2... from 0 dB.
+        let mut c = DuckCaption::default();
+        c.reset(duck(0.0, -8.0, false));
+        assert_eq!(c.shown().db, -8);
+        assert!(c.rested());
+        for _ in 0..30 {
+            c.feed(duck(0.0, -8.0, false), TICK);
+            assert_eq!(c.shown().db, -8);
+        }
     }
 }

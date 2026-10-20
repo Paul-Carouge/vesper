@@ -804,6 +804,7 @@ pub fn start_meters(ui: &AppWindow, rec: &Shared) -> Rc<slint::Timer> {
     tick.start(slint::TimerMode::Repeated, METER_TICK, move || {
         let Some(ui) = weak.upgrade() else { return };
         let mut meters = m.borrow_mut();
+        let mut reshaped = false;
         let tracks = ui.get_tracks();
         let same = sources.len() == tracks.row_count()
             && tracks
@@ -818,6 +819,8 @@ pub fn start_meters(ui: &AppWindow, rec: &Shared) -> Rc<slint::Timer> {
                 .collect();
             model.set_vec(meters.iter().map(MeterState::shown).collect::<Vec<_>>());
             captions = vec![DuckCaption::default(); meters.len()];
+            // Each caption starts at its track's state, not from 0 dB.
+            reshaped = true;
             ducked.set_vec(vec![TrackDuck::default(); meters.len()]);
         }
         // The real time since the last tick (timers slip under load), at
@@ -844,7 +847,7 @@ pub fn start_meters(ui: &AppWindow, rec: &Shared) -> Rc<slint::Timer> {
             let duck = rec
                 .as_ref()
                 .map_or_else(Default::default, |r| r.take_duck_state(i));
-            if stale {
+            if stale || reshaped {
                 captions[i].reset(duck);
             } else {
                 captions[i].feed(duck, dt);
