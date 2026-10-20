@@ -8,7 +8,9 @@
 //! lookahead, and each of its blocks asks the key about the hold before
 //! its end and the lookahead after it ([`VoiceKey::ducks`]). The voice
 //! tells its block in the same step as the ducked track gets its input
-//! (the best case of the app's threads), or `late` after it.
+//! (the best case of the app's threads), or `late` after it. A
+//! [`VoiceMeter`] measures the voice after its chain and tells its loudness
+//! through the key, as `Encoder::encode_block` does.
 //!
 //! The duck's timing is read off a probe: a [`Ducker`] (duck only, the same
 //! depth) on a constant 1.0, so its output is its gain, sample by sample.
@@ -345,10 +347,8 @@ fn simulate_with(
     let mut det = VoiceDetector::new(CH);
     let mut probe = Ducker::new(CH);
     let mut duck = Ducker::new(CH);
-    let probe_set = DuckSettings {
-        duck_db: depth,
-        music_lufs: None,
-    };
+    let probe_set = duck_only(depth);
+    let mut meter = VoiceMeter::new(CH);
     let blocks = mic.len() / BLK;
     let mut sim = Sim {
         speaking: Vec::with_capacity(blocks),
@@ -386,6 +386,12 @@ fn simulate_with(
             if let Some(c) = &mut chain {
                 c.process(&mut v);
             }
+            // As `Encoder::encode_block`: the voice as recorded is measured.
+            let at = at as u64;
+            if let Some(lufs) = meter.process(&v, |a, b| key.speaking(at + a as u64, at + b as u64))
+            {
+                key.set_loudness(lufs);
+            }
         }
         // The ducked track's block, its audio held back by the lookahead.
         let Some(at) = step
@@ -398,13 +404,13 @@ fn simulate_with(
         let speaking = key.ducks(at as u64, BLK, lookahead);
         sim.speaking.push(speaking);
         p.fill(1.0);
-        probe.process(&mut p, probe_set, speaking);
+        probe.process(&mut p, probe_set, speaking, None);
         sim.gain
             .extend(p.as_chunks::<CH>().0.iter().map(|f| lin_to_db(f[0])));
         for (i, f) in m.as_chunks_mut::<CH>().0.iter_mut().enumerate() {
             f.fill(music.map_or(0.0, |x| x[at + i]));
         }
-        duck.process(&mut m, settings, speaking);
+        duck.process(&mut m, settings, speaking, key.loudness());
         sim.out.extend(m.as_chunks::<CH>().0.iter().map(|f| f[0]));
         sim.level.push(duck.level);
         sim.comp.push(duck.comp);
@@ -505,14 +511,14 @@ fn ducked_away(sim: &Sim, speech: &Speech) -> f32 {
 fn duck_only(db: f32) -> DuckSettings {
     DuckSettings {
         duck_db: db,
-        music_lufs: None,
+        ..DuckSettings::default()
     }
 }
 
 fn music(lufs: f32) -> DuckSettings {
     DuckSettings {
-        duck_db: 0.0,
         music_lufs: Some(lufs),
+        ..DuckSettings::default()
     }
 }
 
@@ -674,6 +680,60 @@ fn talk(db: f32, total_ms: usize) -> Speech {
     let n = x.len();
     add(&mut x, &room(n, -65.0, 31), 0);
     Speech { x, active }
+}
+
+/// The settings of the app's `Level` (0 Low, 1 Medium, 2 High) for a
+/// ducked track, or a background music one.
+fn level_settings(music_mode: bool, level: usize) -> DuckSettings {
+    if music_mode {
+        DuckSettings::at_levels(None, Some(level))
+    } else {
+        DuckSettings::at_levels(Some(level), None)
+    }
+}
+
+/// Both clips twice, 1 s apart, from 2 s in, at `db`, over a -65 dB room:
+/// about 21 s of talk in 26 s.
+fn long_talk(db: f32) -> Speech {
+    let mut x = vec![0.0; 2_000 * MS];
+    let mut active = Vec::new();
+    for name in ["1272-128104-0001", "1272-135031-0004"].repeat(2) {
+        let c = clip(name, db, 0, 1_000);
+        let off = x.len();
+        active.extend(c.active.iter().map(|&(s, e)| (s + off, e + off)));
+        x.extend(c.x);
+    }
+    x.resize(26_000 * MS, 0.0);
+    active.retain(|&(s, _)| s < x.len());
+    let n = x.len();
+    add(&mut x, &room(n, -65.0, 31), 0);
+    Speech { x, active }
+}
+
+/// `voice` speaks over `song` with `settings`. Returns (voice LUFS, track
+/// LUFS during the voice, LU gap), from 10 s in: the voice's loudness and
+/// the leveler are measured by then.
+fn gap_by_mic(voice: &Speech, song: &[f32], settings: DuckSettings) -> (f32, f32, f32) {
+    let sim = simulate(&voice.x, false, Some(&song[..voice.x.len()]), settings);
+    let ranges: Vec<_> = voice
+        .active
+        .iter()
+        .copied()
+        .filter(|&(a, _)| a > 10_000 * MS)
+        .collect();
+    let v = loudness(&voice.x, &ranges);
+    // The music where the voice speaks and the duck is down (60 ms into
+    // the voice's run): how deep it goes, not its attack and release (other
+    // matters).
+    let down =
+        |k: usize| k >= 3 && k < sim.speaking.len() && sim.speaking[k - 3..=k].iter().all(|&s| s);
+    let ducked: Vec<_> = ranges
+        .iter()
+        .flat_map(|&(a, b)| (a / BLK..b.div_ceil(BLK)).map(|k| (k * BLK, (k + 1) * BLK)))
+        .filter(|&(a, _)| down(a / BLK))
+        .collect();
+    let m = loudness(&sim.out, &ducked);
+    (v, m, v - m)
 }
 
 /// Time until the leveler is within 1 dB of where it ends (its mean over
@@ -984,7 +1044,9 @@ fn ducking_report() {
         );
     }
 
-    println!("\n### Voice over music: LU gap (voice minus music, while the voice speaks)\n");
+    println!(
+        "\n### Voice over music: LU gap (voice minus music, while the voice speaks; absolute music levels, the fallback until the voice is measured)\n"
+    );
     println!(
         "| Voice (dBFS RMS) | song in (LUFS) | music level | voice (LUFS) | music under voice (LUFS) | gap (LU) |"
     );
@@ -1001,6 +1063,34 @@ fn ducking_report() {
         let s = song(16.0, lufs, false, 15);
         let (v, m, gap) = lu_gap(&voice, &s, target);
         println!("| {vdb:.0} | {lufs:.0} | {target:.0} | {v:.1} | {m:.1} | {gap:.1} |");
+    }
+
+    println!(
+        "\n### Voice over the track: LU gap by mic level (while the voice speaks, from 10 s in)\n"
+    );
+    println!(
+        "| Mode, level | song in (LUFS) | gap at -20 dBFS | gap at -26 dBFS | gap at -32 dBFS | spread (LU) |"
+    );
+    println!("|---|---|---|---|---|---|");
+    for (mode, song_lufs) in [("duck", -14.0), ("music", -10.0)] {
+        for (name, level) in [("Low", 0), ("Medium", 1), ("High", 2)] {
+            let set = level_settings(mode == "music", level);
+            let s = song(30.0, song_lufs, false, 15);
+            let gaps: Vec<f32> = [-20.0, -26.0, -32.0]
+                .iter()
+                .map(|&vdb| gap_by_mic(&long_talk(vdb), &s, set).2)
+                .collect();
+            let (lo, hi) = gaps
+                .iter()
+                .fold((f32::MAX, f32::MIN), |(a, b), &v| (a.min(v), b.max(v)));
+            println!(
+                "| {mode}, {name} | {song_lufs:.0} | {:.1} | {:.1} | {:.1} | {:.1} |",
+                gaps[0],
+                gaps[1],
+                gaps[2],
+                hi - lo
+            );
+        }
     }
 
     println!("\n### Presence dip (music mode)\n");
@@ -1062,16 +1152,30 @@ fn ducking_report() {
         std::hint::black_box(v.process(b));
     });
     let mut d = Ducker::new(CH);
-    let idle = time(&mut |b, _| d.process(b, duck_only(12.0), false));
+    let idle = time(&mut |b, _| d.process(b, duck_only(12.0), false, None));
     let mut d = Ducker::new(CH);
-    let ducking = time(&mut |b, i| d.process(b, duck_only(12.0), i % 100 < 50));
+    let ducking = time(&mut |b, i| d.process(b, duck_only(12.0), i % 100 < 50, None));
     let mut d = Ducker::new(CH);
-    let bg = time(&mut |b, i| d.process(b, music(-26.0), i % 100 < 50));
+    let bg = time(&mut |b, i| d.process(b, music(-26.0), i % 100 < 50, None));
     println!("| Stage | ns per block |\n|---|---|");
     println!("| VoiceDetector | {det:.0} |");
     println!("| Ducker, idle | {idle:.0} |");
     println!("| Ducker, ducking 12 dB | {ducking:.0} |");
     println!("| Ducker, background music | {bg:.0} |");
+    // With the voice measured: the duck measures the track all along.
+    let duck_m = DuckSettings::at_levels(Some(1), None);
+    let mut d = Ducker::new(CH);
+    let adaptive = time(&mut |b, i| d.process(b, duck_m, i % 100 < 50, Some(-20.0)));
+    let music_m = DuckSettings::at_levels(None, Some(1));
+    let mut d = Ducker::new(CH);
+    let bg_rel = time(&mut |b, i| d.process(b, music_m, i % 100 < 50, Some(-20.0)));
+    let mut m = VoiceMeter::new(CH);
+    let meter = time(&mut |b, _| {
+        std::hint::black_box(m.process(b, |a, _| a % 960 == 0));
+    });
+    println!("| Ducker, adaptive duck (voice measured) | {adaptive:.0} |");
+    println!("| Ducker, background music under the voice | {bg_rel:.0} |");
+    println!("| VoiceMeter | {meter:.0} |");
 }
 
 // Quick checks, so later changes do not regress.
@@ -1223,4 +1327,63 @@ fn noise_right_after_speech_does_not_hold_the_voice() {
         let held = ms((last + 1) * BLK).max(0.0) - ms(s.offset());
         assert!(held < 600.0, "noise at {db}: voice held {held} ms");
     }
+}
+
+#[test]
+fn the_voice_over_music_gap_does_not_depend_on_the_mic_level() {
+    // Medium: 12 LU ducking, 14 LU in music mode (8 under, ducked 6 more).
+    // Before the voice was measured: 8.4 / 2.4 / -3.6 and 14.6 / 8.6 / 2.6
+    // LU at -20 / -26 / -32 dBFS. Now within 0.6 LU of the target.
+    let cases = [
+        (false, -14.0, -20.0, 12.0),
+        (false, -14.0, -32.0, 12.0),
+        (true, -10.0, -20.0, 14.0),
+        (true, -10.0, -32.0, 14.0),
+    ];
+    std::thread::scope(|s| {
+        for (music_mode, song_lufs, vdb, want) in cases {
+            s.spawn(move || {
+                let x = song(26.0, song_lufs, false, 15);
+                let (_, _, gap) = gap_by_mic(&long_talk(vdb), &x, level_settings(music_mode, 1));
+                assert!(
+                    (gap - want).abs() <= 1.5,
+                    "music {music_mode}, voice {vdb} dBFS: gap {gap} LU, want {want}"
+                );
+            });
+        }
+    });
+}
+
+/// Song `a` then song `b` (LUFS), 15 s each, in music mode at -26 LUFS:
+/// the leveler's convergence after the change (ms, final gain), and how
+/// far and how long (ms) the music goes over target + 3 LU after it.
+fn song_change(a: f32, b: f32) -> (f32, f32, f32, f32) {
+    let mut x = song(15.0, a, false, 12);
+    x.extend(song(15.0, b, false, 13));
+    let sim = simulate(&vec![0.0; x.len()], false, Some(&x), music(-26.0));
+    let (conv, gain) = convergence(&sim.level, 750);
+    let (top, over) = overshoot(&sim.out, 15_000 * MS, -26.0);
+    (conv, gain, top, over)
+}
+
+#[test]
+fn a_song_change_is_leveled_in_both_directions() {
+    // Before: 1.9 s over target + 3 LU, and 11.8 s to converge 9 LU under.
+    let (_, _, top, over) = song_change(-40.0, -8.0);
+    assert!(over <= 600.0, "{over} ms over target + 3 LU, peak {top}");
+    let (conv, gain, _, _) = song_change(-8.0, -40.0);
+    assert!(conv <= 9_000.0, "{conv} ms to converge");
+    assert!(gain >= 11.0, "raised {gain} dB only");
+}
+
+#[test]
+fn the_leveler_keeps_a_songs_dynamics() {
+    // Verse and chorus 8 dB apart: before, the leveler swung 8 dB.
+    let x = song(40.0, -14.0, true, 14);
+    let sim = simulate(&vec![0.0; x.len()], false, Some(&x), music(-26.0));
+    let l = &sim.level[500..];
+    let (lo, hi) = l
+        .iter()
+        .fold((f32::MAX, f32::MIN), |(a, b), &v| (a.min(v), b.max(v)));
+    assert!(hi - lo <= 3.0, "swings {} dB", hi - lo);
 }

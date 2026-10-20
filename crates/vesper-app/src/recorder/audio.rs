@@ -30,7 +30,8 @@ pub struct Track {
     pub leave_desktop: bool,
 }
 
-/// How much, for [`Ducking`]: the duck's depth, the music's loudness.
+/// How much, for [`Ducking`]: how far under the voice the duck puts the
+/// track, how loud the music is against the voice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Level {
     Low,
@@ -69,21 +70,14 @@ impl Ducking {
         }
     }
 
+    /// Relative to the voice once it is measured: the duck leaves the
+    /// track 8, 12 or 16 LU under it, the music sits 12, 8 or 4 LU under it
+    /// (see `DuckSettings::at_levels`).
     pub fn settings(&self) -> DuckSettings {
-        let duck_db = match self.duck_level {
-            Level::Low => 6.0,
-            Level::Medium => 12.0,
-            Level::High => 20.0,
-        };
-        let lufs = match self.music_level {
-            Level::Low => -30.0,
-            Level::Medium => -26.0,
-            Level::High => -22.0,
-        };
-        DuckSettings {
-            duck_db: if self.duck { duck_db } else { 0.0 },
-            music_lufs: self.music.then_some(lufs),
-        }
+        DuckSettings::at_levels(
+            self.duck.then_some(self.duck_level as usize),
+            self.music.then_some(self.music_level as usize),
+        )
     }
 }
 

@@ -1,6 +1,7 @@
 //! Real-time audio filters for Vesper's tracks: noise suppression (RNNoise),
 //! expander, compressor, de-esser, limiter, high-pass and gain; and voice
-//! ducking with a background music mode ([`VoiceDetector`], [`Ducker`]).
+//! ducking with a background music mode ([`VoiceDetector`], [`VoiceMeter`],
+//! [`Ducker`]).
 //!
 //! Every filter works on interleaved `f32` blocks at [`SAMPLE_RATE`], with a
 //! channel count fixed at construction. [`Filter::process`] never allocates,
@@ -36,7 +37,7 @@ use std::time::Instant;
 
 pub use duck::{
     DuckSettings, Ducker, LOOKAHEAD_FRAMES, MUSIC_DUCK_DB, VOICE_HOLD_FRAMES, VoiceDetector,
-    VoiceKey,
+    VoiceKey, VoiceMeter,
 };
 pub use live::{LiveChain, LiveControl, live};
 pub use spec::{FilterSpec, MAX_PARAMS, ParseError};

@@ -36,7 +36,12 @@
 //! block. A playback track's input runs ahead of a microphone's in real
 //! time by the output and input delays: past what the voice has told,
 //! nothing is known, so it eats into the lookahead (a Bluetooth headset
-//! takes all of it), but no track ever waits for another.
+//! takes all of it), but no track ever waits for another. The voice also
+//! measures its loudness as recorded (after its filters and volume, over
+//! its voiced windows) and tells it through the key: a duck then goes as
+//! deep as it takes for the track to sit its gap under the voice, and
+//! background music is leveled relative to the voice (see
+//! [`DuckSettings`]).
 
 mod aac;
 mod exclusions;
@@ -57,7 +62,7 @@ use ffmpeg::{ChannelLayout, codec, encoder, frame};
 use ffmpeg_next as ffmpeg;
 use tracing::{error, warn};
 use vesper_core::EncodedPacket;
-use vesper_dsp::{Ducker, LOOKAHEAD_FRAMES, VoiceDetector};
+use vesper_dsp::{Ducker, LOOKAHEAD_FRAMES, VoiceDetector, VoiceMeter};
 
 pub use aac::Aac;
 pub use exclusions::{Exclusions, Hold, OnExclusions};
@@ -137,6 +142,11 @@ pub fn db_to_gain(db: f32) -> f32 {
 struct Voice {
     key: Arc<VoiceKey>,
     detector: VoiceDetector,
+    /// This voice's own voiced windows (the shared key merges every
+    /// voice's), for `meter`.
+    own: Box<VoiceKey>,
+    /// Its loudness as recorded, told into `key`.
+    meter: VoiceMeter,
     ducker: Box<Ducker>,
     /// Was a voice at the last block (counted in `key`'s voices).
     speaks: bool,
@@ -153,6 +163,8 @@ impl Voice {
         Self {
             key,
             detector: VoiceDetector::new(ch),
+            own: Box::default(),
+            meter: VoiceMeter::new(ch),
             ducker: Box::new(Ducker::new(ch)),
             speaks: false,
             delay: vec![0.0; LOOKAHEAD_FRAMES * ch].into(),
@@ -293,6 +305,10 @@ struct Shared {
     duck_db: AtomicU32,
     /// `f32` bits of [`DuckSettings::music_lufs`], 0 for `None`.
     music_lufs: AtomicU32,
+    /// `f32` bits of [`DuckSettings::gap_lu`] and
+    /// [`DuckSettings::music_under_lu`].
+    gap_lu: AtomicU32,
+    music_under_lu: AtomicU32,
     /// `f32` bits of the duck's current reduction, dB.
     ducking: AtomicU32,
     /// A voice: it speaks into the [`VoiceKey`] instead of ducking.
@@ -307,13 +323,19 @@ impl Shared {
         );
         self.duck_db.store(duck.to_bits(), Ordering::Relaxed);
         self.music_lufs.store(music.to_bits(), Ordering::Relaxed);
+        let (gap, under) = (settings.gap_lu.max(0.0), settings.music_under_lu.max(0.0));
+        self.gap_lu.store(gap.to_bits(), Ordering::Relaxed);
+        self.music_under_lu
+            .store(under.to_bits(), Ordering::Relaxed);
     }
 
     fn ducking(&self) -> DuckSettings {
         let music = f32::from_bits(self.music_lufs.load(Ordering::Relaxed));
         DuckSettings {
             duck_db: f32::from_bits(self.duck_db.load(Ordering::Relaxed)),
+            gap_lu: f32::from_bits(self.gap_lu.load(Ordering::Relaxed)),
             music_lufs: (music < 0.0).then_some(music),
+            music_under_lu: f32::from_bits(self.music_under_lu.load(Ordering::Relaxed)),
         }
     }
 }
@@ -331,6 +353,8 @@ impl Default for Shared {
             wake: AtomicBool::new(false),
             duck_db: AtomicU32::new(0),
             music_lufs: AtomicU32::new(0),
+            gap_lu: AtomicU32::new(0),
+            music_under_lu: AtomicU32::new(0),
             ducking: AtomicU32::new(0),
             speaks: AtomicBool::new(false),
         }
@@ -725,6 +749,7 @@ impl<F: FnMut(EncodedPacket)> Encoder<F> {
         if speaks && !v.speaks {
             // A voice from now: it starts listening afresh.
             v.detector.reset();
+            v.meter.reset();
             v.key.add_voice();
         } else if !speaks && v.speaks {
             v.key.remove_voice();
@@ -740,15 +765,17 @@ impl<F: FnMut(EncodedPacket)> Encoder<F> {
         if self.shared.muted.load(Ordering::Relaxed) {
             v.detector.pause();
         } else {
-            let key = &v.key;
+            let (key, own) = (&v.key, &v.own);
             v.detector.process_windows(&self.block, |end, voiced| {
                 if voiced {
                     key.voiced(at + end as u64);
+                    own.voiced(at + end as u64);
                 }
             });
         }
         // Muted, it tells it does not speak.
         v.key.heard(at + FRAME as u64);
+        v.own.heard(at + FRAME as u64);
     }
 
     /// The lookahead of a track that ducks: delays the processed block in
@@ -831,7 +858,8 @@ impl<F: FnMut(EncodedPacket)> Encoder<F> {
                 let speaking = v.key.has_voice() && v.key.ducks(at, FRAME, ahead);
                 (self.shared.ducking(), speaking)
             };
-            v.ducker.process(&mut self.block, settings, speaking);
+            v.ducker
+                .process(&mut self.block, settings, speaking, v.key.loudness());
             let db = v.ducker.ducking_db();
             self.shared.ducking.store(db.to_bits(), Ordering::Relaxed);
         }
@@ -842,6 +870,19 @@ impl<F: FnMut(EncodedPacket)> Encoder<F> {
         };
         apply_gain(&mut self.block, self.gain, gain);
         self.gain = gain;
+        if let Some(v) = &mut self.voice
+            && speaks
+        {
+            // The voice as recorded: after its filters (their delay taken
+            // off, so its windows are where the detector marked them) and
+            // its volume.
+            let at = self.origin + self.sent as u64;
+            let own = &v.own;
+            let voiced = |a: usize, b: usize| own.speaking(at + a as u64, at + b as u64);
+            if let Some(lufs) = v.meter.process(&self.block, voiced) {
+                v.key.set_loudness(lufs);
+            }
+        }
         self.meter();
         if let Some(mix) = &self.mix {
             mix.push(&self.block, self.sent as u64);
@@ -1832,7 +1873,9 @@ mod tests {
 
     const DUCK_12: DuckSettings = DuckSettings {
         duck_db: 12.0,
+        gap_lu: 0.0,
         music_lufs: None,
+        music_under_lu: 0.0,
     };
 
     /// Block `k` of a `freq` sine (whole periods in 20 ms), stereo.
@@ -1922,6 +1965,23 @@ mod tests {
         // Back after the 600 ms release.
         let end = WORDS.end + 50;
         assert!(db(end).abs() < 0.1, "{}", db(end));
+    }
+
+    #[test]
+    fn the_voice_tells_its_loudness_as_recorded() {
+        // The same speech at volume 1 and 0.5: 6 dB apart, as recorded.
+        let loudness = |gain: f32| {
+            let key = Arc::new(VoiceKey::default());
+            let mut mic = voice_track(&key, Duration::ZERO, true, DuckSettings::default());
+            mic.shared.gain.store(gain.to_bits(), Ordering::Relaxed);
+            for k in 0..WORDS.end + 10 {
+                mic.push(&speech_block(k));
+            }
+            key.loudness().expect("measured")
+        };
+        let (full, half) = (loudness(1.0), loudness(0.5));
+        assert!((-40.0..-15.0).contains(&full), "{full}");
+        assert!((full - half - 6.02).abs() < 0.2, "{full} and {half} LUFS");
     }
 
     #[test]

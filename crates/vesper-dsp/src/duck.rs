@@ -1,16 +1,20 @@
 //! Voice ducking and background music.
 //!
-//! A voice track (a microphone) runs a [`VoiceDetector`] on what it records.
-//! Other tracks run a [`Ducker`]: it lowers them while the voice speaks, and
-//! in background music mode also levels them well under the voice (a slow
-//! short-term loudness leveler), tames their peaks (a gentle compressor) and
-//! dips the voice presence band (a broad bell around 2 kHz), so speech stays
-//! clear over them.
+//! A voice track (a microphone) runs a [`VoiceDetector`] on its raw input
+//! and a [`VoiceMeter`] on what it records (its loudness while it speaks).
+//! Other tracks run a [`Ducker`]: it lowers them while the voice speaks (as
+//! deep as it takes to leave them a set gap under the voice, once its
+//! loudness is known), and in background music mode also levels them under
+//! the voice (a slow loudness leveler that keeps a song's dynamics and
+//! catches up with a song change), tames their peaks (a gentle compressor)
+//! and dips the voice presence band (a broad bell around 2 kHz), so speech
+//! stays clear over them.
 //!
 //! The detector and the ducker meet through a [`VoiceKey`] (other threads):
 //! the voice marks its voiced 10 ms windows on the shared timeline, and a
 //! ducked track, its audio held back by [`LOOKAHEAD_FRAMES`], asks about
-//! its block and the lookahead after it. Every gain of the ducker (leveler, compressor,
+//! its block and the lookahead after it; the voice also tells its loudness
+//! there. Every gain of the ducker (leveler, compressor,
 //! duck) is summed in dB once per [`CHUNK`] frames, and the linear gain is
 //! interpolated across the chunk: no zipper noise, one `exp` per chunk.
 //! Nothing allocates, locks or makes a syscall after construction.
@@ -108,6 +112,9 @@ pub struct VoiceKey {
     heard: AtomicU64,
     /// Voice tracks listening.
     voices: AtomicU32,
+    /// `f32` bits of the voice's loudness as recorded (LUFS, see
+    /// [`VoiceMeter`]), 0 while none is measured.
+    loudness: AtomicU32,
 }
 
 impl VoiceKey {
@@ -117,8 +124,26 @@ impl VoiceKey {
     }
 
     /// A voice track stops listening (one that called [`Self::add_voice`]).
+    /// The last one takes its loudness away.
     pub fn remove_voice(&self) {
-        self.voices.fetch_sub(1, Ordering::Relaxed);
+        if self.voices.fetch_sub(1, Ordering::Relaxed) == 1 {
+            self.loudness.store(0, Ordering::Relaxed);
+        }
+    }
+
+    /// A voice measured its loudness, LUFS (see [`VoiceMeter`]). With
+    /// several voices the last one to tell wins: a voice tells only
+    /// after 200 ms more of its own speech, so it is the one speaking now,
+    /// the one the ducked tracks make room for. The loudest instead would
+    /// bury a quiet guest under music set for a loud host.
+    pub fn set_loudness(&self, lufs: f32) {
+        self.loudness.store(lufs.to_bits(), Ordering::Relaxed);
+    }
+
+    /// The voice's loudness, LUFS, once measured.
+    pub fn loudness(&self) -> Option<f32> {
+        let lufs = f32::from_bits(self.loudness.load(Ordering::Relaxed));
+        (lufs < 0.0).then_some(lufs)
     }
 
     /// Whether a voice track listens: tracks only duck under one then.
@@ -217,22 +242,55 @@ const DIP_Q: f64 = 0.7;
 const DIP_DB: f32 = -4.0;
 const DIP_GLIDE_MS: f32 = 100.0;
 
-/// Leveler: loudness blocks of 100 ms, 30 of them (3 s, short-term loudness).
+/// Most an adaptive duck lowers, dB.
+const MAX_DEPTH_DB: f32 = 36.0;
+/// How fast an adaptive duck's depth follows the music and the voice,
+/// dB/s: slower than the attack, so the duck never jumps.
+const DEPTH_RATE: f32 = 6.0;
+
+/// Loudness blocks of 100 ms. The track's short-term loudness (the music
+/// under the voice, for an adaptive duck) is over the last 3 s of them,
+/// the leveler's over the last 20 s (the sections of a song average out:
+/// it keeps the song's dynamics), gated at -10 LU under their mean as
+/// BS.1770 does (a pause or a quiet bridge does not pull it down).
 const BLOCK: usize = 4_800;
-const BLOCKS: usize = 30;
+const SHORT_BLOCKS: usize = 30;
+const BLOCKS: usize = 200;
+const RELATIVE_GATE: f32 = 0.1;
 /// Blocks quieter than this (LUFS) are left out: a pause is not leveled up.
 const GATE_LUFS: f32 = -50.0;
+/// Each of the last 300 ms this far over the leveler's loudness before
+/// them (the loud blocks would pull it up, through its gate): a louder
+/// song started, the leveler catches up at once. A song's own sections
+/// stay well within (8 LU apart, a chorus is about 2.5 over the mean), and
+/// a hit (a drum, a shot) is shorter.
+const LOUD_BLOCKS: usize = 3;
+const SONG_UP_LU: f32 = 6.0;
+/// Short-term loudness this far under the leveler's: a quieter song
+/// started, the leveler measures it alone and rises fast.
+const SONG_DOWN_LU: f32 = 10.0;
 /// Most the leveler lowers and raises, dB.
 const LEVEL_MIN_DB: f32 = -30.0;
-const LEVEL_MAX_DB: f32 = 6.0;
+const LEVEL_MAX_DB: f32 = 15.0;
 /// Leveler speed, dB/s: down fast (a loud song starts), up slowly.
 const LEVEL_DOWN: f32 = 10.0;
-/// Down speed once music mode turned on, after [`CATCH_UP_BLOCKS`] blocks
-/// measured, until the leveler reached its first target: a loud song is
-/// not left loud for seconds.
-const LEVEL_CATCH_UP: f32 = 100.0;
+/// Down speed once music mode turned on or a louder song started, after
+/// [`CATCH_UP_BLOCKS`] blocks measured, until the leveler reached its
+/// target: a loud song is not left loud for seconds.
+const LEVEL_CATCH_UP: f32 = 300.0;
 const CATCH_UP_BLOCKS: usize = 3;
 const LEVEL_UP: f32 = 2.0;
+/// Up speed once a quieter song started, until the leveler reached it.
+const LEVEL_RISE: f32 = 10.0;
+
+/// The voice's loudness: K-weighted power of its voiced 10 ms windows
+/// (above `VOICE_GATE_LUFS`) in blocks of 200 ms of speech, the last 50
+/// (10 s of speech), gated at -10 LU under their mean. Told after 1.6 s
+/// of speech.
+const VOICE_BLOCK: usize = 20;
+const VOICE_BLOCKS: usize = 50;
+const VOICE_MIN_BLOCKS: usize = 8;
+const VOICE_GATE_LUFS: f32 = -70.0;
 
 /// Compressor of background music: peaks this far over the target
 /// loudness (peak dBFS against LUFS, a usual crest factor) are compressed.
@@ -252,6 +310,136 @@ fn sum_sq(x: &[f32]) -> f32 {
         }
     }
     acc.iter().sum::<f32>() + rest.iter().map(|s| s * s).sum::<f32>()
+}
+
+/// K-weighted mean power (summed over the channels) at `lufs`.
+fn lufs_power(lufs: f32) -> f32 {
+    db_to_lin(lufs + 0.691).powi(2)
+}
+
+/// Loudness (LUFS) of mean powers `blocks` over the `gate` power, and if
+/// `relative` also within 10 LU of their mean (BS.1770's two gates);
+/// `None` when none is left.
+fn gated(blocks: impl Iterator<Item = f32> + Clone, gate: f32, relative: bool) -> Option<f32> {
+    let mean = |gate: f32| {
+        let (sum, n) = blocks
+            .clone()
+            .filter(|&p| p > gate)
+            .fold((0.0, 0), |(s, n), p| (s + p, n + 1));
+        (n > 0).then(|| sum / n as f32)
+    };
+    let mut m = mean(gate)?;
+    if relative {
+        m = mean(gate.max(m * RELATIVE_GATE))?;
+    }
+    Some(-0.691 + 10.0 * m.log10())
+}
+
+/// BS.1770 K-weighting, per channel.
+struct KWeight {
+    c: [Coefs; 2],
+    z: Vec<[State; 2]>,
+}
+
+impl KWeight {
+    fn new(ch: usize) -> Self {
+        Self {
+            c: Coefs::k_weighting(),
+            z: vec![[State::default(); 2]; ch],
+        }
+    }
+
+    /// K-weighted energy of `buf` (interleaved, whole frames): the sum of
+    /// its squares over frames and channels.
+    fn energy(&mut self, buf: &[f32]) -> f64 {
+        let [c0, c1] = self.c;
+        let mut e = 0.0;
+        for frame in buf.chunks_exact(self.z.len()) {
+            for (&s, z) in frame.iter().zip(&mut self.z) {
+                let x = z[0].run(&c0, f64::from(s));
+                let y = z[1].run(&c1, x);
+                e += y * y;
+            }
+        }
+        e
+    }
+
+    /// Keeps the filters away from denormals (after silence).
+    fn flush(&mut self) {
+        self.z.iter_mut().flatten().for_each(State::flush);
+    }
+}
+
+/// Measures a voice as recorded (after its filters and volume): its
+/// loudness over its voiced windows (see `VOICE_BLOCK`), the reference an
+/// adaptive duck and background music go under. Lock-free and
+/// allocation-free after construction; the voice track runs it on each
+/// block it records and tells the [`VoiceKey`].
+pub struct VoiceMeter {
+    kw: KWeight,
+    /// Mean powers of voiced windows in the current block, and how many.
+    power: f32,
+    windows: usize,
+    /// Mean power of the last [`VOICE_BLOCKS`] blocks, the next one, and
+    /// how many there are.
+    blocks: [f32; VOICE_BLOCKS],
+    next: usize,
+    count: usize,
+}
+
+impl VoiceMeter {
+    pub fn new(ch: usize) -> Self {
+        assert!(ch > 0, "no channel");
+        Self {
+            kw: KWeight::new(ch),
+            power: 0.0,
+            windows: 0,
+            blocks: [0.0; VOICE_BLOCKS],
+            next: 0,
+            count: 0,
+        }
+    }
+
+    /// Forgets the voice heard so far (a track that just became a voice).
+    pub fn reset(&mut self) {
+        (self.power, self.windows, self.next, self.count) = (0.0, 0, 0, 0);
+    }
+
+    /// Feeds `buf` (interleaved, whole frames), in windows of 10 ms from
+    /// its start; `voiced(from, to)` tells whether the voice spoke in
+    /// frames `from..to` of it. Returns the voice's loudness (LUFS) when
+    /// it measured more of it.
+    pub fn process(
+        &mut self,
+        buf: &[f32],
+        mut voiced: impl FnMut(usize, usize) -> bool,
+    ) -> Option<f32> {
+        let ch = self.kw.z.len();
+        let mut told = None;
+        for (i, w) in buf.chunks(WINDOW * ch).enumerate() {
+            let frames = w.len() / ch;
+            let p = (self.kw.energy(w) / frames as f64) as f32;
+            let from = i * WINDOW;
+            if p <= lufs_power(VOICE_GATE_LUFS) || !voiced(from, from + frames) {
+                continue;
+            }
+            self.power += p;
+            self.windows += 1;
+            if self.windows < VOICE_BLOCK {
+                continue;
+            }
+            self.blocks[self.next] = self.power / self.windows as f32;
+            self.next = (self.next + 1) % VOICE_BLOCKS;
+            self.count = (self.count + 1).min(VOICE_BLOCKS);
+            (self.power, self.windows) = (0.0, 0);
+            if self.count >= VOICE_MIN_BLOCKS {
+                let blocks = self.blocks[..self.count].iter().copied();
+                told = gated(blocks, 0.0, true).or(told);
+            }
+        }
+        self.kw.flush();
+        told
+    }
 }
 
 /// Tells when a voice track speaks, from its raw input (before its filters,
@@ -428,11 +616,41 @@ impl VoiceDetector {
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct DuckSettings {
     /// Lowered by this much (dB) while the voice speaks; 0: not lowered.
+    /// With `gap_lu`, only until the voice's loudness is known.
     pub duck_db: f32,
-    /// Background music, leveled to this short-term loudness (LUFS);
-    /// `None`: off. It also ducks, by [`MUSIC_DUCK_DB`] unless `duck_db`
-    /// is set.
+    /// While the voice speaks, lowered so it sits this far (LU) under the
+    /// voice (as loud as both are recorded), once the voice's loudness is
+    /// known; 0: by `duck_db` (or [`MUSIC_DUCK_DB`]) whatever the levels.
+    pub gap_lu: f32,
+    /// Background music, leveled to this short-term loudness (LUFS) until
+    /// the voice's loudness is known; `None`: off. It also ducks, by
+    /// [`MUSIC_DUCK_DB`] unless `duck_db` is set.
     pub music_lufs: Option<f32>,
+    /// Background music, leveled this far (LU) under the voice once its
+    /// loudness is known; 0: to `music_lufs` whatever the voice.
+    pub music_under_lu: f32,
+}
+
+impl DuckSettings {
+    /// A track lowered at level `duck` while the voice speaks, played as
+    /// background music at level `music`, or both (levels 0, 1, 2: low,
+    /// medium, high). The fixed depths and absolute loudness are the
+    /// fallbacks until the voice is measured; with the voice at -18 LUFS
+    /// (a mic at about -20 dBFS RMS) the music sits where they put it.
+    pub fn at_levels(duck: Option<usize>, music: Option<usize>) -> Self {
+        let under = music.map(|l| [12.0, 8.0, 4.0][l]);
+        Self {
+            duck_db: duck.map_or(0.0, |l| [6.0, 12.0, 20.0][l]),
+            // Music only: as far under as its level, plus its soft duck.
+            gap_lu: match (duck, under) {
+                (Some(l), _) => [8.0, 12.0, 16.0][l],
+                (None, Some(u)) => u + MUSIC_DUCK_DB,
+                (None, None) => 0.0,
+            },
+            music_lufs: music.map(|l| [-30.0, -26.0, -22.0][l]),
+            music_under_lu: under.unwrap_or(0.0),
+        }
+    }
 }
 
 /// Moves `x` towards `target` by at most `down` (when lower) or `up`.
@@ -464,25 +682,36 @@ pub struct Ducker {
     dip: Glide,
     dip_c: Coefs,
     dip_z: Vec<State>,
-    kw: [Coefs; 2],
-    kw_z: Vec<[State; 2]>,
+    kw: KWeight,
     /// K-weighted power of the current 100 ms block (summed over the
     /// channels), and its frames.
     power: f64,
     frames: usize,
-    /// Mean power of the last [`BLOCKS`] blocks.
+    /// Mean power of the last [`BLOCKS`] blocks, the next one, and how
+    /// many of them the leveler reads (since it started over).
     blocks: [f32; BLOCKS],
     next: usize,
-    /// Music mode in the last block: turned on, the leveler starts over.
-    music: bool,
-    /// Blocks measured since music mode turned on, while it catches up.
+    count: usize,
+    /// Measuring in the last block (music mode, or an adaptive duck):
+    /// turned on, the measurement starts over.
+    measuring: bool,
+    /// Short-term loudness (3 s) of the track, and the leveler's (20 s,
+    /// gated), LUFS.
+    short: Option<f32>,
+    long: Option<f32>,
+    /// Blocks measured since music mode turned on or a louder song
+    /// started, while it catches up.
     catch_up: Option<usize>,
+    /// A quieter song started: the leveler rises fast until it is there.
+    rising: bool,
     /// Gain the leveler goes to, dB.
     level_target: f32,
     /// Gains, dB: leveler, compressor, duck.
     level: f32,
     comp: f32,
     duck: f32,
+    /// Depth of the duck, dB (it glides when adaptive).
+    depth: f32,
     /// Linear gain at the end of the last chunk.
     gain: f32,
 }
@@ -495,18 +724,22 @@ impl Ducker {
             dip: Glide::new(0.0, DIP_GLIDE_MS, CHUNK),
             dip_c: Coefs::peaking(DIP_HZ, DIP_Q, 0.0),
             dip_z: vec![State::default(); ch],
-            kw: Coefs::k_weighting(),
-            kw_z: vec![[State::default(); 2]; ch],
+            kw: KWeight::new(ch),
             power: 0.0,
             frames: 0,
             blocks: [0.0; BLOCKS],
             next: 0,
-            music: false,
+            count: 0,
+            measuring: false,
+            short: None,
+            long: None,
             catch_up: None,
+            rising: false,
             level_target: 0.0,
             level: 0.0,
             comp: 0.0,
             duck: 0.0,
+            depth: 0.0,
             gain: 1.0,
         }
     }
@@ -527,50 +760,60 @@ impl Ducker {
     }
 
     /// Processes `buf` (interleaved, whole frames) with `settings`; the
-    /// voice speaks during it or not. Real-time safe.
-    pub fn process(&mut self, buf: &mut [f32], settings: DuckSettings, speaking: bool) {
-        let music = settings.music_lufs;
-        let depth = if settings.duck_db > 0.0 {
+    /// voice speaks during it or not, and its loudness is `voice` (LUFS,
+    /// see [`VoiceKey::loudness`]) once known. Real-time safe.
+    pub fn process(
+        &mut self,
+        buf: &mut [f32],
+        settings: DuckSettings,
+        speaking: bool,
+        voice: Option<f32>,
+    ) {
+        let fixed = if settings.duck_db > 0.0 {
             settings.duck_db
-        } else if music.is_some() {
+        } else if settings.music_lufs.is_some() {
             MUSIC_DUCK_DB
         } else {
             0.0
         };
-        if music.is_none() && !(speaking && depth > 0.0) && self.idle() {
-            self.music = false;
+        // The voice it goes under, and how far, once both are known.
+        let gap = voice
+            .filter(|_| fixed > 0.0 && settings.gap_lu > 0.0)
+            .map(|v| v - settings.gap_lu);
+        let target = settings.music_lufs.map(|lufs| match voice {
+            Some(v) if settings.music_under_lu > 0.0 => v - settings.music_under_lu,
+            _ => lufs,
+        });
+        let measuring = target.is_some() || gap.is_some();
+        if !measuring && !(speaking && fixed > 0.0) && self.idle() {
+            self.measuring = false;
             return;
         }
-        if music.is_some() && !self.music {
+        if measuring && !self.measuring {
             // A new measurement: the old one may be of other music.
-            (self.blocks, self.power, self.frames) = ([0.0; BLOCKS], 0.0, 0);
-            self.catch_up = Some(0);
+            (self.power, self.frames, self.count) = (0.0, 0, 0);
+            (self.short, self.long) = (None, None);
+            self.catch_up = target.map(|_| 0);
         }
-        self.music = music.is_some();
-        if music.is_none() {
-            (self.level_target, self.catch_up) = (0.0, None);
+        self.measuring = measuring;
+        if target.is_none() {
+            (self.level_target, self.catch_up, self.rising) = (0.0, None, false);
         }
-        self.dip.target = if music.is_some() { DIP_DB } else { 0.0 };
+        self.dip.target = if target.is_some() { DIP_DB } else { 0.0 };
         let per_chunk = CHUNK as f32 / FS;
-        let rate = depth.max(MIN_RATE_DEPTH);
-        let (attack, release) = (
-            rate / ATTACK_MS * 1e3 * per_chunk,
-            rate / RELEASE_MS * 1e3 * per_chunk,
-        );
         let (comp_attack, comp_release) = (
             coef(COMP_ATTACK_MS / CHUNK as f32),
             coef(COMP_RELEASE_MS / CHUNK as f32),
         );
-        let duck_target = if speaking { -depth } else { 0.0 };
         let ch = self.ch;
         for chunk in buf.chunks_mut(CHUNK * ch) {
             if !self.dip.settled() {
                 self.dip_c = Coefs::peaking(DIP_HZ, DIP_Q, self.dip.step());
             }
             let mut peak = 0f32;
-            // Measured before the dip: the leveler hears the music as it is.
-            if let Some(lufs) = music {
-                self.measure(chunk, lufs);
+            // Measured before the dip and every gain: the track as it is.
+            if measuring {
+                self.measure(chunk, target);
                 peak = chunk.iter().fold(0f32, |m, s| m.max(s.abs()));
             }
             if self.dip.cur != 0.0 {
@@ -581,10 +824,10 @@ impl Ducker {
                 }
             }
             // Out of music mode the leveler goes back fast.
-            let up = if music.is_some() {
-                LEVEL_UP
-            } else {
-                LEVEL_DOWN
+            let up = match target {
+                None => LEVEL_DOWN,
+                Some(_) if self.rising => LEVEL_RISE,
+                Some(_) => LEVEL_UP,
             };
             let down = match self.catch_up {
                 Some(n) if n >= CATCH_UP_BLOCKS => LEVEL_CATCH_UP,
@@ -601,7 +844,10 @@ impl Ducker {
             {
                 self.catch_up = None;
             }
-            let gc = match music {
+            if self.rising && self.level >= self.level_target {
+                self.rising = false;
+            }
+            let gc = match target {
                 Some(lufs) => curve(lin_to_db(peak) + self.level, lufs + COMP_ABOVE),
                 None => 0.0,
             };
@@ -614,14 +860,29 @@ impl Ducker {
             if self.comp > -1e-4 {
                 self.comp = 0.0;
             }
-            self.duck = slew(self.duck, duck_target, attack, release);
+            // Adaptive: as deep as it takes for the music (as leveled) to
+            // sit `gap_lu` under the voice, gliding there; until both are
+            // measured, and otherwise, the fixed depth.
+            match (gap, self.short) {
+                (Some(under), Some(short)) => {
+                    let want = (short + self.level - under).clamp(0.0, MAX_DEPTH_DB);
+                    let step = DEPTH_RATE * per_chunk;
+                    self.depth = slew(self.depth, want, step, step);
+                }
+                (Some(_), None) => {
+                    let step = DEPTH_RATE * per_chunk;
+                    self.depth = slew(self.depth, fixed, step, step);
+                }
+                (None, _) => self.depth = fixed,
+            }
+            let rate = self.depth.max(MIN_RATE_DEPTH) * 1e3 * per_chunk;
+            let duck_target = if speaking { -self.depth } else { 0.0 };
+            self.duck = slew(self.duck, duck_target, rate / ATTACK_MS, rate / RELEASE_MS);
             let to = db_to_lin(self.level + self.comp + self.duck);
             self.ramp(chunk, to);
         }
         self.dip_z.iter_mut().for_each(State::flush);
-        for z in &mut self.kw_z {
-            z.iter_mut().for_each(State::flush);
-        }
+        self.kw.flush();
     }
 
     /// Ramps the gain of `chunk` from the last chunk's to `to`.
@@ -642,36 +903,55 @@ impl Ducker {
         }
     }
 
-    /// Adds `chunk` to the loudness measurement; sets the leveler's target
-    /// at the end of each 100 ms block.
-    fn measure(&mut self, chunk: &[f32], lufs: f32) {
-        let [c0, c1] = self.kw;
-        for frame in chunk.chunks_exact(self.ch) {
-            for (&s, z) in frame.iter().zip(&mut self.kw_z) {
-                let x = z[0].run(&c0, f64::from(s));
-                let y = z[1].run(&c1, x);
-                self.power += y * y;
-            }
-        }
+    /// The last `n` blocks' mean powers (of those measured).
+    fn last(&self, n: usize) -> impl Iterator<Item = f32> + Clone {
+        let n = n.min(self.count);
+        (1..=n).map(move |i| self.blocks[(self.next + BLOCKS - i) % BLOCKS])
+    }
+
+    /// Adds `chunk` to the loudness measurement; at the end of each 100 ms
+    /// block, updates the loudness and, in music mode (to `target` LUFS),
+    /// the leveler's target.
+    fn measure(&mut self, chunk: &[f32], target: Option<f32>) {
+        self.power += self.kw.energy(chunk);
         self.frames += chunk.len() / self.ch;
         if self.frames < BLOCK {
             return;
         }
         self.blocks[self.next] = (self.power / self.frames as f64) as f32;
         self.next = (self.next + 1) % BLOCKS;
+        self.count = (self.count + 1).min(BLOCKS);
         (self.power, self.frames) = (0.0, 0);
         if let Some(n) = &mut self.catch_up {
             *n += 1;
         }
-        let gate = db_to_lin(GATE_LUFS + 0.691).powi(2);
-        let (sum, n) = self
-            .blocks
-            .iter()
-            .filter(|&&p| p > gate)
-            .fold((0.0, 0), |(s, n), p| (s + p, n + 1));
-        if n > 0 {
-            let loudness = -0.691 + 10.0 * (sum / n as f32).log10();
-            self.level_target = (lufs - loudness).clamp(LEVEL_MIN_DB, LEVEL_MAX_DB);
+        let gate = lufs_power(GATE_LUFS);
+        self.short = gated(self.last(SHORT_BLOCKS), gate, false);
+        if target.is_some()
+            && let Some(long) = self.long
+        {
+            let before = gated(self.last(BLOCKS).skip(LOUD_BLOCKS), gate, true);
+            let loud = before.map(|b| lufs_power(b + SONG_UP_LU));
+            if let Some(loud) = loud
+                && self.last(LOUD_BLOCKS).all(|p| p > loud)
+            {
+                // A louder song: measured alone, caught up with at once.
+                self.count = LOUD_BLOCKS;
+                self.catch_up = Some(CATCH_UP_BLOCKS);
+                self.rising = false;
+            } else if self.count >= SHORT_BLOCKS
+                && self.short.is_some_and(|s| s < long - SONG_DOWN_LU)
+            {
+                // A quieter one, for 3 s: measured alone (its blocks
+                // since the louder one), risen to fast.
+                let quiet = lufs_power(long - SONG_DOWN_LU);
+                self.count = self.last(SHORT_BLOCKS).take_while(|&p| p < quiet).count();
+                self.rising = true;
+            }
+        }
+        self.long = gated(self.last(BLOCKS), gate, true);
+        if let (Some(lufs), Some(long)) = (target, self.long) {
+            self.level_target = (lufs - long).clamp(LEVEL_MIN_DB, LEVEL_MAX_DB);
         }
     }
 }
@@ -817,7 +1097,7 @@ mod tests {
     fn duck(buf: &mut [f32], settings: DuckSettings, speaking: impl Fn(usize) -> bool) -> Ducker {
         let mut d = Ducker::new(CH);
         for (i, b) in buf.chunks_mut(BLK * CH).enumerate() {
-            d.process(b, settings, speaking(i));
+            d.process(b, settings, speaking(i), None);
         }
         d
     }
@@ -825,7 +1105,7 @@ mod tests {
     fn duck_only(db: f32) -> DuckSettings {
         DuckSettings {
             duck_db: db,
-            music_lufs: None,
+            ..DuckSettings::default()
         }
     }
 
@@ -870,7 +1150,7 @@ mod tests {
             } else {
                 duck_only(0.0)
             };
-            d.process(b, s, true);
+            d.process(b, s, true, None);
         }
         assert!(d.idle());
         assert_eq!(*buf.last().unwrap(), 1.0);
@@ -880,6 +1160,7 @@ mod tests {
         DuckSettings {
             duck_db: 0.0,
             music_lufs: Some(lufs),
+            ..DuckSettings::default()
         }
     }
 
@@ -910,7 +1191,7 @@ mod tests {
     }
 
     #[test]
-    fn leveler_brings_loud_music_to_the_target_and_raises_quiet_music_a_little() {
+    fn leveler_brings_loud_and_quiet_music_to_the_target() {
         // White noise music at about -6 LUFS, 12 s: leveled to the target
         // (measured before the dip, so the gain is target minus input).
         let input = noise(12 * 48_000 * CH, 0.5, 4);
@@ -919,8 +1200,14 @@ mod tests {
         let want = -26.0 - loudness(&input[9 * 48_000 * CH..]);
         assert!((d.level - want).abs() < 0.5, "{} dB, want {want}", d.level);
         assert_eq!(d.ducking_db(), 0.0);
-        // About -39 LUFS: raised by the most the leveler does.
-        let mut buf = noise(12 * 48_000 * CH, 0.01, 4);
+        // About -39 LUFS: raised to it too (2 dB/s).
+        let input = noise(12 * 48_000 * CH, 0.01, 4);
+        let mut buf = input.clone();
+        let d = duck(&mut buf, music(-26.0), |_| false);
+        let want = -26.0 - loudness(&input[9 * 48_000 * CH..]);
+        assert!((d.level - want).abs() < 0.5, "{} dB, want {want}", d.level);
+        // About -46 LUFS: raised by the most the leveler does.
+        let mut buf = noise(20 * 48_000 * CH, 0.004, 4);
         let d = duck(&mut buf, music(-26.0), |_| false);
         assert!((d.level - LEVEL_MAX_DB).abs() < 0.01, "{}", d.level);
     }
@@ -934,7 +1221,7 @@ mod tests {
         let mut d = Ducker::new(CH);
         let mut buf = input.clone();
         for b in buf[..30 * BLK * CH].chunks_mut(BLK * CH) {
-            d.process(b, music(-26.0), false);
+            d.process(b, music(-26.0), false, None);
         }
         assert!((d.level - want).abs() < 2.0, "{} dB, want {want}", d.level);
         assert!(d.catch_up.is_none());
@@ -942,24 +1229,25 @@ mod tests {
 
     #[test]
     fn music_peaks_are_compressed() {
-        // A quiet bed with a loud 100 ms hit every 3 s: the hits come out
-        // lower against the bed than they went in.
-        let input: Vec<f32> = noise(12 * 48_000 * CH, 1.0, 8)
+        // A bed with a hit 26 dB louder, 100 ms every 6 s (the bed within
+        // the leveler's relative gate): the hits come out lower against
+        // the bed than they went in.
+        let input: Vec<f32> = noise(14 * 48_000 * CH, 1.0, 8)
             .into_iter()
             .enumerate()
             .map(|(i, s)| {
-                s * if (i / CH) % 144_000 < 4_800 {
+                s * if (i / CH) % 288_000 < 4_800 {
                     1.0
                 } else {
-                    0.02
+                    0.05
                 }
             })
             .collect();
         let mut buf = input.clone();
         duck(&mut buf, music(-26.0), |_| false);
         let ratio = |b: &[f32]| {
-            let hit = &b[(9 * 48_000 + 960) * CH..(9 * 48_000 + 4_800) * CH];
-            let bed = &b[(10 * 48_000) * CH..(11 * 48_000) * CH];
+            let hit = &b[(12 * 48_000 + 960) * CH..(12 * 48_000 + 4_800) * CH];
+            let bed = &b[(13 * 48_000) * CH..(14 * 48_000) * CH];
             rms_db(hit) - rms_db(bed)
         };
         let (before, after) = (ratio(&input), ratio(&buf));
@@ -992,10 +1280,10 @@ mod tests {
     fn music_mode_glides_the_dip_in() {
         let mut d = Ducker::new(CH);
         let mut buf = vec![0.0; BLK * CH];
-        d.process(&mut buf, music(-26.0), false);
+        d.process(&mut buf, music(-26.0), false, None);
         assert!(d.dip.cur < 0.0 && d.dip.cur > DIP_DB);
         for _ in 0..100 {
-            d.process(&mut buf, music(-26.0), false);
+            d.process(&mut buf, music(-26.0), false, None);
         }
         assert_eq!(d.dip.cur, DIP_DB);
     }
@@ -1008,6 +1296,7 @@ mod tests {
                 DuckSettings {
                     duck_db: 18.0,
                     music_lufs: Some(-26.0),
+                    ..DuckSettings::default()
                 },
                 18.0,
             ),
@@ -1019,13 +1308,127 @@ mod tests {
     }
 
     #[test]
+    fn the_voice_meter_measures_only_the_voiced_windows() {
+        // 1 s on, 1 s off: voiced noise at about -20 LUFS, louder
+        // unvoiced noise between, digital silence in a voiced window.
+        let voiced_part = noise(48_000 * CH, 0.1, 6);
+        let want = loudness(&voiced_part);
+        let mut m = VoiceMeter::new(CH);
+        let loud = noise(48_000 * CH, 0.5, 7);
+        let mut told = Vec::new();
+        for sec in 0..8 {
+            let (buf, voiced) = if sec % 2 == 0 {
+                (&voiced_part, true)
+            } else {
+                (&loud, false)
+            };
+            for b in buf.chunks(BLK * CH) {
+                told.extend(m.process(b, |_, _| voiced));
+            }
+            // Voiced silence: under the gate, not counted.
+            assert_eq!(m.process(&[0.0; BLK * CH], |_, _| true), None);
+        }
+        // 1.6 s of voice before it tells, then every 200 ms of it.
+        assert_eq!(told.len(), 4 * 5 - (VOICE_MIN_BLOCKS - 1));
+        let last = *told.last().unwrap();
+        assert!((last - want).abs() < 0.3, "{last} LUFS, want {want}");
+        m.reset();
+        assert_eq!(m.process(&voiced_part[..BLK * CH], |_, _| true), None);
+    }
+
+    #[test]
+    fn the_key_holds_the_last_voice_loudness_while_a_voice_listens() {
+        let key = VoiceKey::default();
+        assert_eq!(key.loudness(), None);
+        key.add_voice();
+        key.add_voice();
+        key.set_loudness(-20.0);
+        key.set_loudness(-30.0);
+        assert_eq!(key.loudness(), Some(-30.0));
+        key.remove_voice();
+        assert_eq!(key.loudness(), Some(-30.0));
+        key.remove_voice();
+        assert_eq!(key.loudness(), None);
+    }
+
+    /// Runs a ducker over `buf` in 20 ms blocks, the voice speaking from
+    /// 4 s on at `voice` LUFS.
+    fn duck_under(buf: &mut [f32], settings: DuckSettings, voice: Option<f32>) -> Ducker {
+        let mut d = Ducker::new(CH);
+        for (i, b) in buf.chunks_mut(BLK * CH).enumerate() {
+            d.process(b, settings, i >= 200, voice);
+        }
+        d
+    }
+
+    #[test]
+    fn an_adaptive_duck_puts_the_track_its_gap_under_the_voice() {
+        // A -18.6 LUFS track: under a -20 LUFS voice by 12 LU, 13.4 dB
+        // down; under a -30 LUFS one, 23.4 dB down; the fixed 12 dB until the
+        // voice is measured.
+        let input = noise(8 * 48_000 * CH, 0.1, 4);
+        let track = loudness(&input);
+        let set = DuckSettings::at_levels(Some(1), None);
+        for (voice, want) in [
+            (Some(-20.0), track + 20.0 + 12.0),
+            (Some(-30.0), track + 30.0 + 12.0),
+            (None, 12.0),
+        ] {
+            let mut buf = input.clone();
+            let d = duck_under(&mut buf, set, voice);
+            let got = d.ducking_db();
+            assert!((got - want).abs() < 0.2, "{voice:?}: {got} dB, want {want}");
+        }
+        // As deep as it goes, no deeper.
+        let mut buf = input.clone();
+        let d = duck_under(&mut buf, set, Some(-60.0));
+        assert_eq!(d.ducking_db(), MAX_DEPTH_DB);
+        // It glides there: no step larger than the fixed duck's.
+        let mut buf = vec![1.0; 8 * 48_000 * CH];
+        let mut d = Ducker::new(CH);
+        for (i, b) in buf.chunks_mut(BLK * CH).enumerate() {
+            // Speaking all along; the voice is measured at 2 s.
+            let voice = (i >= 100).then_some(-40.0);
+            d.process(b, set, true, voice);
+        }
+        let step = buf
+            .chunks(CH)
+            .map(|f| f[0])
+            .collect::<Vec<_>>()
+            .windows(2)
+            .map(|w| (w[1] - w[0]).abs())
+            .fold(0.0, f32::max);
+        assert!(step < 2e-3, "{step}");
+    }
+
+    #[test]
+    fn background_music_is_leveled_under_the_voice() {
+        // Medium: 8 LU under the voice, absolute -26 LUFS until measured.
+        let input = noise(12 * 48_000 * CH, 0.1, 4);
+        let track = loudness(&input[9 * 48_000 * CH..]);
+        let set = DuckSettings::at_levels(None, Some(1));
+        for (voice, want) in [(Some(-16.0), -24.0), (Some(-30.0), -38.0), (None, -26.0)] {
+            let mut buf = input.clone();
+            let mut d = Ducker::new(CH);
+            for b in buf.chunks_mut(BLK * CH) {
+                d.process(b, set, false, voice);
+            }
+            let got = track + d.level;
+            assert!(
+                (got - want).abs() < 0.5,
+                "{voice:?}: {got} LUFS, want {want}"
+            );
+        }
+    }
+
+    #[test]
     fn no_nan_or_denormals_after_silence() {
         let mut buf = noise(48_000 * CH, 0.5, 1);
         buf.extend(vec![0.0; 10 * 48_000 * CH]);
         let d = duck(&mut buf, music(-26.0), |b| b % 7 < 3);
         assert!(buf.iter().all(|s| s.is_finite()));
         let tiny = |x: f64| x != 0.0 && x.abs() < 1e-30;
-        for z in d.dip_z.iter().chain(d.kw_z.iter().flatten()) {
+        for z in d.dip_z.iter().chain(d.kw.z.iter().flatten()) {
             let (a, b) = z.raw();
             assert!(!tiny(a) && !tiny(b));
         }
@@ -1162,15 +1565,15 @@ mod tests {
         });
         let mut d = Ducker::new(CH);
         time("ducker, idle", &mut |b, _| {
-            d.process(b, duck_only(12.0), false)
+            d.process(b, duck_only(12.0), false, None)
         });
         let mut d = Ducker::new(CH);
         time("ducker, ducking", &mut |b, i| {
-            d.process(b, duck_only(12.0), i % 100 < 50)
+            d.process(b, duck_only(12.0), i % 100 < 50, None)
         });
         let mut d = Ducker::new(CH);
         time("background music", &mut |b, i| {
-            d.process(b, music(-26.0), i % 100 < 50)
+            d.process(b, music(-26.0), i % 100 < 50, None)
         });
     }
 }
