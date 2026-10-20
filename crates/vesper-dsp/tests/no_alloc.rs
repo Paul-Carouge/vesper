@@ -4,7 +4,7 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
-use vesper_dsp::{Chain, FilterSpec, VoiceDetector};
+use vesper_dsp::{Chain, DuckSettings, Ducker, FilterSpec, VoiceDetector, VoiceMeter, Voices};
 
 thread_local! {
     static COUNTING: Cell<bool> = const { Cell::new(false) };
@@ -122,4 +122,35 @@ fn voice_detector_does_not_allocate() {
     .join()
     .unwrap();
     assert_eq!(calls, 0, "allocator calls in VoiceDetector");
+}
+
+#[test]
+fn voice_meter_and_ducker_do_not_allocate() {
+    let input: Vec<f32> = (0..48_000 * 2 * 6)
+        .map(|i| 0.3 * (i as f32 * 0.02).sin() * (i as f32 * 1e-4).sin())
+        .collect();
+    let mut meter = VoiceMeter::new(2);
+    let mut duck = Ducker::new(2);
+    let set = DuckSettings::at_levels(Some(1), Some(1));
+    let calls = std::thread::spawn(move || {
+        let mut buf = input.clone();
+        COUNTING.set(true);
+        let mut voice = None;
+        for (i, b) in buf.chunks_mut(960 * 2).enumerate() {
+            voice = meter
+                .process(b, |a, _| a % 960 == 0)
+                .map(Voices::one)
+                .or(voice);
+            let at = (i * 960) as u64;
+            duck.look_ahead(b, at, set, voice);
+            duck.process_at(b, at, set, i % 50 < 30, voice);
+        }
+        meter.reset();
+        COUNTING.set(false);
+        assert!(voice.is_some());
+        CALLS.get()
+    })
+    .join()
+    .unwrap();
+    assert_eq!(calls, 0, "allocator calls in VoiceMeter or Ducker");
 }
