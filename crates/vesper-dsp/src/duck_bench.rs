@@ -3,10 +3,12 @@
 //!
 //! The voice track and the ducked track run 20 ms blocks side by side. As in
 //! `vesper-audio`'s `Encoder::push`, the detector hears the voice's raw
-//! block (before its chain), and the voice key holds "speaking until" (end
-//! of the last voiced window plus [`VOICE_HOLD_FRAMES`]); a ducked block
-//! asks it at its own end. Here both are on one sample clock, the voice's
-//! block first (the best case of the app's two threads).
+//! block (before its chain) and marks its voiced windows in a [`VoiceKey`]
+//! at their timeline frames; the ducked track's audio is held back by the
+//! lookahead, and each of its blocks asks the key about the hold before
+//! its end and the lookahead after it ([`VoiceKey::ducks`]). The voice
+//! tells its block in the same step as the ducked track gets its input
+//! (the best case of the app's threads), or `late` after it.
 //!
 //! The duck's timing is read off a probe: a [`Ducker`] (duck only, the same
 //! depth) on a constant 1.0, so its output is its gain, sample by sample.
@@ -315,8 +317,23 @@ struct Sim {
 }
 
 /// Runs the voice `mic` (mono, through the voice chain first if `chain`)
-/// against `music` (mono; silence if None) with `settings`.
+/// against `music` (mono; silence if None) with `settings`, as the app
+/// does ([`LOOKAHEAD_FRAMES`], the voice told in time).
 fn simulate(mic: &[f32], chain: bool, music: Option<&[f32]>, settings: DuckSettings) -> Sim {
+    simulate_with(mic, chain, music, settings, LOOKAHEAD_FRAMES, 0)
+}
+
+/// [`simulate`] with a ducked track `lookahead` frames behind its input
+/// and a voice that tells its blocks `late` frames after the ducked track
+/// got them (both multiples of [`BLK`]).
+fn simulate_with(
+    mic: &[f32],
+    chain: bool,
+    music: Option<&[f32]>,
+    settings: DuckSettings,
+    lookahead: usize,
+    late: usize,
+) -> Sim {
     let depth = if settings.duck_db > 0.0 {
         settings.duck_db
     } else if settings.music_lufs.is_some() {
@@ -345,22 +362,40 @@ fn simulate(mic: &[f32], chain: bool, music: Option<&[f32]>, settings: DuckSetti
         vec![0.0; BLK * CH],
         vec![1.0; BLK * CH],
     );
-    let mut until = 0;
-    for b in 0..blocks {
-        let at = b * BLK;
-        for (i, f) in v.as_chunks_mut::<CH>().0.iter_mut().enumerate() {
-            f.fill(mic[at + i]);
+    let key = VoiceKey::default();
+    let (look, late) = (lookahead / BLK, late / BLK);
+    for step in 0..blocks + look.max(late) {
+        // The voice's block `late` steps late, as the app's mic runs
+        // behind a playback track by its capture and playback delays.
+        if let Some(at) = step
+            .checked_sub(late)
+            .filter(|&j| j < blocks)
+            .map(|j| j * BLK)
+        {
+            for (i, f) in v.as_chunks_mut::<CH>().0.iter_mut().enumerate() {
+                f.fill(mic[at + i]);
+            }
+            // As `Encoder::push`: the detector hears the raw input, then
+            // the chain runs (it does not change what the detector hears).
+            det.process_windows(&v, |end, voiced| {
+                if voiced {
+                    key.voiced((at + end) as u64);
+                }
+            });
+            key.heard((at + BLK) as u64);
+            if let Some(c) = &mut chain {
+                c.process(&mut v);
+            }
         }
-        // As `Encoder::push`: the detector hears the raw input, then the
-        // chain runs (it does not change what the detector hears).
-        let end = at + BLK;
-        if let Some(last) = det.process(&v) {
-            until = until.max(at + last + VOICE_HOLD_FRAMES);
-        }
-        if let Some(c) = &mut chain {
-            c.process(&mut v);
-        }
-        let speaking = end < until;
+        // The ducked track's block, its audio held back by the lookahead.
+        let Some(at) = step
+            .checked_sub(look)
+            .filter(|&k| k < blocks)
+            .map(|k| k * BLK)
+        else {
+            continue;
+        };
+        let speaking = key.ducks(at as u64, BLK, lookahead);
         sim.speaking.push(speaking);
         p.fill(1.0);
         probe.process(&mut p, probe_set, speaking);
@@ -377,9 +412,10 @@ fn simulate(mic: &[f32], chain: bool, music: Option<&[f32]>, settings: DuckSetti
     sim
 }
 
-/// Duck timing of one phrase, ms: onset to -3 dB, to full depth; offset
-/// to back over -3 dB, to over -0.5 dB. Err: "n/a" when already there at
-/// the onset / offset (ducked early, released early), or "never".
+/// Duck timing of one phrase, ms: onset to -3 dB, to full depth (negative:
+/// down before the onset); offset to back over -3 dB, to over -0.5 dB.
+/// Err: "n/a" when already there 500 ms before the onset or at the offset
+/// (ducked early, released early), or "never".
 struct Timing {
     to_3db: Result<f32, &'static str>,
     to_full: Result<f32, &'static str>,
@@ -389,17 +425,21 @@ struct Timing {
 
 fn timing(sim: &Sim, onset: usize, offset: usize, depth: f32) -> Timing {
     let g = &sim.gain;
-    let after = |from: usize, f: &dyn Fn(f32) -> bool| match g[from.min(g.len())..]
+    // From `lead` frames before `at`: negative when it was there early.
+    let from = |at: usize, lead: usize, f: &dyn Fn(f32) -> bool| match g[(at - lead).min(g.len())..]
         .iter()
         .position(|&x| f(x))
     {
         Some(0) => Err("n/a"),
-        Some(i) => Ok(ms(i)),
+        Some(i) => Ok(ms(i) - ms(lead)),
         None => Err("never"),
     };
+    let after = |at: usize, f: &dyn Fn(f32) -> bool| from(at, 0, f);
+    // A lookahead ducks before the onset, by less than this.
+    let lead = (500 * MS).min(onset);
     Timing {
-        to_3db: after(onset, &|x| x <= -3.0),
-        to_full: after(onset, &|x| x <= -(depth - 0.5)),
+        to_3db: from(onset, lead, &|x| x <= -3.0),
+        to_full: from(onset, lead, &|x| x <= -(depth - 0.5)),
         back_3db: after(offset, &|x| x > -3.0),
         back_full: after(offset, &|x| x > -0.5),
     }
@@ -768,6 +808,34 @@ fn ducking_report() {
     for (name, s, chain, depth) in &rows {
         println!("{}", timing_row(name, s, *chain, *depth));
     }
+    // What the lookahead buys, and what a voice told late (its capture
+    // delay plus the ducked track's playback delay, in the app) takes back.
+    println!(
+        "\n### Lookahead: onset to -3 dB / to full depth (ms), by how late the voice is told\n"
+    );
+    println!("| Scenario | lookahead (ms) | told in time | 20 ms late | 40 ms late |");
+    println!("|---|---|---|---|---|");
+    for i in [0, 3, 4, 8, 9, 10] {
+        let (name, s, chain, depth) = &rows[i];
+        for look_ms in [0, 40, 60, 80, 100, 120] {
+            let cells: Vec<String> = [0, 20, 40]
+                .iter()
+                .map(|late_ms| {
+                    let sim = simulate_with(
+                        &s.x,
+                        *chain,
+                        None,
+                        duck_only(*depth),
+                        look_ms * MS,
+                        late_ms * MS,
+                    );
+                    let t = timing(&sim, s.onset(), s.offset(), *depth);
+                    format!("{} / {}", opt(t.to_3db), opt(t.to_full))
+                })
+                .collect();
+            println!("| {name} | {look_ms} | {} |", cells.join(" | "));
+        }
+    }
     // Speech over a fan that is already there: the detector must have
     // learnt the floor; how much of the 6 s away from speech is ducked.
     println!("\n### Speech over steady noise: ducked away from speech\n");
@@ -1014,9 +1082,10 @@ fn a_spoken_phrase_ducks_fast_and_holds_through_its_gaps() {
     let sim = simulate(&s.x, false, None, duck_only(12.0));
     let t = timing(&sim, s.onset(), s.offset(), 12.0);
     // RNNoise needs the voiced part: each synthetic word opens with a 40 ms
-    // unvoiced onset, so 92 / 128 ms here (real speech: 42 ms, below).
-    assert!(t.to_3db.is_ok_and(|v| v <= 120.0), "{:?}", t.to_3db);
-    assert!(t.to_full.is_ok_and(|v| v <= 160.0), "{:?}", t.to_full);
+    // unvoiced onset, so the lookahead leaves -28 / 8 ms here (92 / 128
+    // without it; real speech: below).
+    assert!(t.to_3db.is_ok_and(|v| v <= 0.0), "{:?}", t.to_3db);
+    assert!(t.to_full.is_ok_and(|v| v <= 20.0), "{:?}", t.to_full);
     assert!(t.back_full.is_ok_and(|v| v <= 1_200.0), "{:?}", t.back_full);
     let (rise, _) = pumping(&sim, s.onset(), s.offset(), 12.0);
     // 0.0; a gap that lets the duck up would show as tenths of a dB.
@@ -1029,7 +1098,31 @@ fn real_speech_is_ducked_throughout() {
     let sim = simulate(&s.x, false, None, duck_only(12.0));
     assert!(recall(&sim, &s) >= 95.0, "{}", recall(&sim, &s));
     let t = timing(&sim, s.onset(), s.offset(), 12.0);
-    assert!(t.to_3db.is_ok_and(|v| v <= 60.0), "{:?}", t.to_3db);
+    // Down at full depth before the first syllable (-78 / -42 ms; 42 / 78
+    // without the lookahead), released as before (795 ms).
+    assert!(t.to_3db.is_ok_and(|v| v <= -40.0), "{:?}", t.to_3db);
+    assert!(t.to_full.is_ok_and(|v| v <= 0.0), "{:?}", t.to_full);
+    assert!(t.back_full.is_ok_and(|v| v <= 850.0), "{:?}", t.back_full);
+    let (rise, _) = pumping(&sim, s.onset(), s.offset(), 12.0);
+    assert!(rise < 0.25, "pumps {rise} dB");
+}
+
+#[test]
+fn real_speech_is_ducked_in_time_even_told_late() {
+    // The app's mic tells its blocks after a playback track got its own,
+    // by their capture and playback delays: 40 ms still leaves the duck
+    // at full depth by the first syllable (-2 ms).
+    let s = speech_with_floor(clip("1272-128104-0001", -26.0, 1_000, 2_000), -65.0);
+    let sim = simulate_with(
+        &s.x,
+        false,
+        None,
+        duck_only(12.0),
+        LOOKAHEAD_FRAMES,
+        40 * MS,
+    );
+    let t = timing(&sim, s.onset(), s.offset(), 12.0);
+    assert!(t.to_full.is_ok_and(|v| v <= 0.0), "{:?}", t.to_full);
 }
 
 #[test]

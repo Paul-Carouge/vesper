@@ -27,12 +27,16 @@
 //! thresholds; a muted voice does not listen at all, its detector keeps its
 //! state for the unmute); every other track ducks under it as
 //! its [`DuckSettings`] say, before its volume, so the duck is in the
-//! track's own file and in the mix alike. They meet lock-free on the time
-//! their blocks are processed, not on their pts: a playback track's pts run
-//! ahead of a microphone's by the output and input delays (a Bluetooth
-//! headset, an effects chain: easily more than the voice's hold), but both
-//! are processed as they come. The duck then starts as late as those
-//! delays, as any duck without lookahead would.
+//! track's own file and in the mix alike. They meet lock-free on the
+//! timeline: the voice marks its voiced windows at their timeline frames
+//! (its raw input sits there already: its capture delay is taken off when
+//! it is placed, and its filters come after), and a track that ducks holds
+//! its audio back by [`LOOKAHEAD_FRAMES`] (a processing latency, taken off
+//! its timeline like a plugin's) to read the voice that far past each
+//! block. A playback track's input runs ahead of a microphone's in real
+//! time by the output and input delays: past what the voice has told,
+//! nothing is known, so it eats into the lookahead (a Bluetooth headset
+//! takes all of it), but no track ever waits for another.
 
 mod aac;
 mod exclusions;
@@ -42,7 +46,7 @@ mod pw;
 mod ring;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -53,13 +57,13 @@ use ffmpeg::{ChannelLayout, codec, encoder, frame};
 use ffmpeg_next as ffmpeg;
 use tracing::{error, warn};
 use vesper_core::EncodedPacket;
-use vesper_dsp::{Ducker, VOICE_HOLD_FRAMES, VoiceDetector};
+use vesper_dsp::{Ducker, LOOKAHEAD_FRAMES, VoiceDetector};
 
 pub use aac::Aac;
 pub use exclusions::{Exclusions, Hold, OnExclusions};
 pub use mix::{Mix, MixInput};
 pub use nodes::{Node, NodeWatch};
-pub use vesper_dsp::DuckSettings;
+pub use vesper_dsp::{DuckSettings, VoiceKey};
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 pub type Result<T> = std::result::Result<T, Error>;
@@ -128,33 +132,19 @@ pub fn db_to_gain(db: f32) -> f32 {
     }
 }
 
-/// When the voice tracks speak, shared with the tracks that duck under them.
-#[derive(Debug, Default)]
-pub struct VoiceKey {
-    /// End of the latest speech plus its hold, ns on `CLOCK_MONOTONIC`.
-    until: AtomicU64,
-}
-
-impl VoiceKey {
-    /// A voice speaks until `t` at least (several voices: the latest wins).
-    fn speak_until(&self, t: Duration) {
-        self.until.fetch_max(t.as_nanos() as u64, Ordering::Relaxed);
-    }
-
-    /// Whether a voice speaks at `t`.
-    fn speaking_at(&self, t: Duration) -> bool {
-        (t.as_nanos() as u64) < self.until.load(Ordering::Relaxed)
-    }
-}
-
 /// A track's side of a [`VoiceKey`]: it speaks into it or ducks under it,
 /// as `Shared::speaks` says (live).
 struct Voice {
     key: Arc<VoiceKey>,
     detector: VoiceDetector,
     ducker: Box<Ducker>,
-    /// Was a voice at the last block.
+    /// Was a voice at the last block (counted in `key`'s voices).
     speaks: bool,
+    /// The lookahead's delay line, interleaved, while `ahead`: the
+    /// processed audio waits [`LOOKAHEAD_FRAMES`] in it.
+    delay: Box<[f32]>,
+    pos: usize,
+    ahead: bool,
 }
 
 impl Voice {
@@ -165,6 +155,17 @@ impl Voice {
             detector: VoiceDetector::new(ch),
             ducker: Box::new(Ducker::new(ch)),
             speaks: false,
+            delay: vec![0.0; LOOKAHEAD_FRAMES * ch].into(),
+            pos: 0,
+            ahead: false,
+        }
+    }
+}
+
+impl Drop for Voice {
+    fn drop(&mut self) {
+        if self.speaks {
+            self.key.remove_voice();
         }
     }
 }
@@ -607,6 +608,15 @@ fn apply_gain(samples: &mut [f32], from: f32, to: f32) {
     }
 }
 
+/// Appends processed `samples` to `ready`, less the first `skip` frames
+/// (the processing's delay still to remove).
+fn emit(ready: &mut Vec<f32>, skip: &mut usize, samples: &[f32]) {
+    let ch = usize::from(CHANNELS);
+    let n = (*skip).min(samples.len() / ch);
+    *skip -= n;
+    ready.extend_from_slice(&samples[n * ch..]);
+}
+
 /// Feeds samples to the encoder 20 ms at a time and tracks the peak.
 struct Encoder<F> {
     encoder: encoder::Audio,
@@ -629,10 +639,10 @@ struct Encoder<F> {
     process: Option<Process>,
     /// Voice ducking, see [`Options::voice`].
     voice: Option<Voice>,
-    /// Now, for the voice ducking: `monotonic_now` but in tests. A ducking
-    /// track whose thread stalls then catches up ducks its older audio by
-    /// what the voice does now: the duck shifts by the stall.
-    clock: fn() -> Duration,
+    /// Frames taken from `pending` (the input's timeline position), and
+    /// the anchor in frames: a [`VoiceKey`]'s timeline frames are their sum.
+    fed: u64,
+    origin: u64,
     mix: Option<MixInput>,
     /// Gets each block as encoded, with its pts (a live stream's audio).
     tap: Option<Tap>,
@@ -652,8 +662,9 @@ impl<F: FnMut(EncodedPacket)> Encoder<F> {
             frame,
             pending: Vec::new(),
             block: Vec::with_capacity(FRAME * usize::from(CHANNELS)),
-            // Room for a block and a delay change, so it rarely grows.
-            ready: Vec::with_capacity(4 * FRAME * usize::from(CHANNELS)),
+            // Room for a block and a delay change (the lookahead's line
+            // let out at once), so it rarely grows.
+            ready: Vec::with_capacity((4 * FRAME + LOOKAHEAD_FRAMES) * usize::from(CHANNELS)),
             delay: 0,
             skip: 0,
             sent: 0,
@@ -662,7 +673,8 @@ impl<F: FnMut(EncodedPacket)> Encoder<F> {
             shared,
             process: None,
             voice: None,
-            clock: monotonic_now,
+            fed: 0,
+            origin: duration_to_frames(anchor) as u64,
             mix: None,
             tap: None,
             opus: true,
@@ -684,15 +696,15 @@ impl<F: FnMut(EncodedPacket)> Encoder<F> {
             self.block.clear();
             self.block.extend(self.pending.drain(..len));
             self.detect();
+            self.fed += FRAME as u64;
             // The DSP seam: a no-op unless a processor was given.
             let delay = match &mut self.process {
                 Some(process) => process(&mut self.block),
                 None => 0,
             };
-            self.set_delay(delay);
-            let skip = self.skip.min(FRAME);
-            self.skip -= skip;
-            self.ready.extend_from_slice(&self.block[skip * ch..]);
+            let ahead = self.lookahead();
+            self.set_delay(delay + ahead);
+            emit(&mut self.ready, &mut self.skip, &self.block);
             while self.ready.len() >= len {
                 self.block.clear();
                 self.block.extend(self.ready.drain(..len));
@@ -709,19 +721,68 @@ impl<F: FnMut(EncodedPacket)> Encoder<F> {
         if speaks && !v.speaks {
             // A voice from now: it starts listening afresh.
             v.detector.reset();
+            v.key.add_voice();
+        } else if !speaks && v.speaks {
+            v.key.remove_voice();
         }
         v.speaks = speaks;
-        if !speaks || self.shared.muted.load(Ordering::Relaxed) {
+        if !speaks {
             v.detector.pause();
             return;
         }
-        if let Some(end) = v.detector.process(&self.block) {
-            // The voiced window ended that long before the block's end: about now.
-            let frames = self.block.len() / usize::from(CHANNELS);
-            let ended = (self.clock)().saturating_sub(frames_to_duration(frames - end));
-            v.key
-                .speak_until(ended + frames_to_duration(VOICE_HOLD_FRAMES));
+        // The raw block sits at its timeline position: the capture delay
+        // was taken off when it was placed, the filters come after.
+        let at = self.origin + self.fed;
+        if self.shared.muted.load(Ordering::Relaxed) {
+            v.detector.pause();
+        } else {
+            let key = &v.key;
+            v.detector.process_windows(&self.block, |end, voiced| {
+                if voiced {
+                    key.voiced(at + end as u64);
+                }
+            });
         }
+        // Muted, it tells it does not speak.
+        v.key.heard(at + FRAME as u64);
+    }
+
+    /// The lookahead of a track that ducks: delays the processed block in
+    /// `self.block` by [`LOOKAHEAD_FRAMES`] while the track ducks under a
+    /// voice, and returns that delay (0 otherwise). Turned on, the line
+    /// starts silent and `set_delay` drops that silence; turned off, what
+    /// it held comes out before the block. Either way the output goes on
+    /// sample for sample: no gap, no jump.
+    fn lookahead(&mut self) -> usize {
+        let Some(v) = &mut self.voice else { return 0 };
+        let set = self.shared.ducking();
+        let ducks =
+            !v.speaks && v.key.has_voice() && (set.duck_db > 0.0 || set.music_lufs.is_some());
+        if ducks != v.ahead {
+            v.ahead = ducks;
+            if ducks {
+                v.delay.fill(0.0);
+                v.pos = 0;
+            } else {
+                let (newest, oldest) = v.delay.split_at(v.pos);
+                emit(&mut self.ready, &mut self.skip, oldest);
+                emit(&mut self.ready, &mut self.skip, newest);
+                // Out already: not to be filled in by `set_delay`.
+                self.delay -= LOOKAHEAD_FRAMES;
+            }
+        }
+        if !v.ahead {
+            return 0;
+        }
+        // The block (shorter than the line) swaps places with its oldest
+        // samples, wrapping around.
+        let (n, len) = (self.block.len(), v.delay.len());
+        let first = n.min(len - v.pos);
+        let (a, b) = self.block.split_at_mut(first);
+        a.swap_with_slice(&mut v.delay[v.pos..v.pos + first]);
+        b.swap_with_slice(&mut v.delay[..n - first]);
+        v.pos = (v.pos + n) % len;
+        LOOKAHEAD_FRAMES
     }
 
     /// Starts over at frame `at` of the timeline (a mix that was idle):
@@ -731,6 +792,7 @@ impl<F: FnMut(EncodedPacket)> Encoder<F> {
         self.ready.clear();
         self.skip = self.delay;
         self.sent = at as i64;
+        self.fed = at;
     }
 
     /// Follows a change of the processing's delay. Output frame `n` must be
@@ -760,7 +822,10 @@ impl<F: FnMut(EncodedPacket)> Encoder<F> {
             let (settings, speaking) = if speaks {
                 (DuckSettings::default(), false)
             } else {
-                (self.shared.ducking(), v.key.speaking_at((self.clock)()))
+                let ahead = if v.ahead { LOOKAHEAD_FRAMES } else { 0 };
+                let at = self.origin + self.sent as u64;
+                let speaking = v.key.has_voice() && v.key.ducks(at, FRAME, ahead);
+                (self.shared.ducking(), speaking)
             };
             v.ducker.process(&mut self.block, settings, speaking);
             let db = v.ducker.ducking_db();
@@ -1734,19 +1799,6 @@ mod tests {
         2.0 * (re * re + im * im).sqrt() / (block.len() / 2) as f32
     }
 
-    thread_local! {
-        /// The voice ducking's clock in these tests.
-        static NOW: std::cell::Cell<Duration> = const { std::cell::Cell::new(Duration::ZERO) };
-    }
-
-    fn fake_now() -> Duration {
-        NOW.with(std::cell::Cell::get)
-    }
-
-    fn set_now(t: Duration) {
-        NOW.with(|n| n.set(t));
-    }
-
     /// A track on `key` at `anchor` that speaks, or ducks as `ducking` says.
     fn voice_track(
         key: &Arc<VoiceKey>,
@@ -1758,7 +1810,7 @@ mod tests {
         shared.set_ducking(ducking);
         shared.speaks.store(speaks, Ordering::Relaxed);
         let mut enc = Encoder::new(open_encoder().unwrap(), anchor, shared, |_| {});
-        (enc.voice, enc.clock) = (Some(Voice::new(key.clone())), fake_now);
+        enc.voice = Some(Voice::new(key.clone()));
         enc
     }
 
@@ -1819,29 +1871,36 @@ mod tests {
     /// its room.
     const WORDS: std::ops::Range<usize> = 77..267;
 
-    /// The mic speaks (see [`speech_block`]) over a 150 Hz song; block `k`
-    /// of both is processed at 20 ms * (k + 1).
+    /// The mic speaks (see [`speech_block`]) over a 150 Hz song: the song's
+    /// blocks `0..lead` come first, then mic block `k` with song block
+    /// `k + lead`, one after the other.
     fn run_voice<A: FnMut(EncodedPacket), B: FnMut(EncodedPacket)>(
         mic: &mut Encoder<A>,
         music: &mut Encoder<B>,
+        lead: usize,
         mut each: impl FnMut(usize, &Shared),
     ) {
-        for k in 0..WORDS.end + 65 {
-            set_now(Duration::from_secs(100) + Duration::from_millis(20 * (k as u64 + 1)));
-            mic.push(&speech_block(k));
+        for k in 0..lead {
             music.push(&sine_block(150.0, 0.25, k));
+        }
+        for k in 0..WORDS.end + 65 {
+            mic.push(&speech_block(k));
+            music.push(&sine_block(150.0, 0.25, k + lead));
             each(k, &music.shared);
         }
     }
 
-    /// Checks the song's level per block against the voice of `run_voice`.
+    /// Checks the song's level per block against the voice of `run_voice`,
+    /// both on one timeline (`levels[k]` at the mic's block `k`).
     fn check_duck(levels: &[f32]) {
         let db = |k: usize| 20.0 * (levels[k] / 0.25).log10();
         assert!(db(49).abs() < 0.1, "{}", db(49));
-        assert!(db(WORDS.start).abs() < 0.1, "{}", db(WORDS.start));
-        // Down by the depth within 100 ms of the first word, and held
-        // through the gaps between words, then the 300 ms hold.
-        for k in WORDS.start + 5..WORDS.end + 12 {
+        // The lookahead starts it less than 160 ms before the first word.
+        let before = WORDS.start - 8;
+        assert!(db(before).abs() < 0.1, "{}", db(before));
+        // Down by the depth at the first word, and held through the gaps
+        // between words, then the 300 ms hold.
+        for k in WORDS.start..WORDS.end + 12 {
             assert!((db(k) + 12.0).abs() < 0.3, "block {k}: {} dB", db(k));
         }
         // Back after the 600 ms release.
@@ -1865,14 +1924,15 @@ mod tests {
         // 150 Hz measured there.
         music.mix = Some(mix.input());
         let mut during = 0.0;
-        run_voice(&mut mic, &mut music, |k, shared| {
+        run_voice(&mut mic, &mut music, 0, |k, shared| {
             if k == 150 {
                 during = f32::from_bits(shared.ducking.load(Ordering::Relaxed));
             }
         });
         let got: Vec<_> = rx.try_iter().collect();
-        // The limiter's lookahead holds the last one back.
-        assert!(got.len() >= WORDS.end + 64, "{}", got.len());
+        // The ducking's lookahead holds 6 back, the limiter's one.
+        let held = LOOKAHEAD_FRAMES / FRAME + 1;
+        assert!(got.len() >= WORDS.end + 65 - held, "{}", got.len());
         assert_eq!(got[60].0, anchor + Duration::from_millis(1_200));
         check_duck(&got.iter().map(|g| g.1).collect::<Vec<_>>());
         // The duck shows for a meter, and goes.
@@ -1881,22 +1941,88 @@ mod tests {
         assert_eq!(after, 0.0);
     }
 
-    #[test]
-    fn a_track_ahead_on_the_timeline_ducks_in_time() {
-        // Playback heard 500 ms after it is processed (a Bluetooth headset):
-        // its pts run 500 ms ahead of the mic's, more than the hold.
-        let key = Arc::new(VoiceKey::default());
-        let anchor = Duration::from_secs(5);
-        let mut mic = voice_track(&key, anchor, true, DuckSettings::default());
-        let ahead = anchor + Duration::from_millis(500);
-        let mut music = voice_track(&key, ahead, false, DUCK_12);
+    /// The song's level per block as `music` taps it.
+    fn tap_levels<F: FnMut(EncodedPacket)>(
+        music: &mut Encoder<F>,
+    ) -> Arc<std::sync::Mutex<Vec<f32>>> {
         let levels = Arc::new(std::sync::Mutex::new(Vec::new()));
         let l = levels.clone();
         music.tap = Some(Box::new(move |_, b: &[f32]| {
             l.lock().unwrap().push(tone(b, 150.0));
         }));
-        run_voice(&mut mic, &mut music, |_, _| {});
-        check_duck(&levels.lock().unwrap());
+        levels
+    }
+
+    #[test]
+    fn a_track_ahead_on_the_timeline_ducks_in_time() {
+        // The song's track started 500 ms before the mic's (its anchor),
+        // more than the hold: they meet on the timeline, not on block counts.
+        let key = Arc::new(VoiceKey::default());
+        let anchor = Duration::from_secs(5);
+        let mut mic = voice_track(&key, anchor, true, DuckSettings::default());
+        let early = anchor - Duration::from_millis(500);
+        let mut music = voice_track(&key, early, false, DUCK_12);
+        let levels = tap_levels(&mut music);
+        run_voice(&mut mic, &mut music, 25, |_, _| {});
+        check_duck(&levels.lock().unwrap()[25..]);
+    }
+
+    #[test]
+    fn a_track_ahead_in_real_time_still_ducks() {
+        // Playback heard 500 ms after it is processed (a Bluetooth headset):
+        // the song's block at a timeline frame comes 500 ms before the
+        // mic's. The voice is not known there yet: the song ducks as the
+        // voice speaks now, late by those 500 ms less the lookahead.
+        let key = Arc::new(VoiceKey::default());
+        let anchor = Duration::from_secs(5);
+        let mut mic = voice_track(&key, anchor, true, DuckSettings::default());
+        let early = anchor - Duration::from_millis(500);
+        let mut music = voice_track(&key, early, false, DUCK_12);
+        let levels = tap_levels(&mut music);
+        // Song block `k + 25` (on the mic's block `k`) comes with mic
+        // block `k - 25`.
+        run_voice(&mut mic, &mut music, 50, |_, _| {});
+        let levels = levels.lock().unwrap();
+        let db = |k: usize| 20.0 * (levels[k + 25] / 0.25).log10();
+        let late = (500 * 48 - LOOKAHEAD_FRAMES) / FRAME;
+        let before = WORDS.start + late - 8;
+        assert!(db(before).abs() < 0.1, "{}", db(before));
+        for k in WORDS.start + late + 5..WORDS.end + late + 12 {
+            assert!((db(k) + 12.0).abs() < 0.3, "block {k}: {} dB", db(k));
+        }
+        let end = WORDS.end + late + 50;
+        assert!(db(end).abs() < 0.1, "{}", db(end));
+    }
+
+    #[test]
+    fn ducking_on_and_off_keeps_the_audio_continuous_and_in_place() {
+        // Turned on, the lookahead delays the track; turned off, it lets
+        // its line out: the output is the input sample for sample, on the
+        // same timeline frames, with no gap and no jump.
+        let key = Arc::new(VoiceKey::default());
+        key.add_voice();
+        let mut track = voice_track(&key, Duration::ZERO, false, DuckSettings::default());
+        let out = Arc::new(std::sync::Mutex::new(Vec::<f32>::new()));
+        let o = out.clone();
+        track.tap = Some(Box::new(move |_, b: &[f32]| {
+            o.lock().unwrap().extend_from_slice(b);
+        }));
+        let mut k = 0;
+        for (blocks, ducks) in [(10, false), (3, true), (2, false), (20, true), (10, false)] {
+            let set = if ducks {
+                DUCK_12
+            } else {
+                DuckSettings::default()
+            };
+            track.shared.set_ducking(set);
+            for _ in 0..blocks {
+                track.push(&sine_block(441.0, 0.25, k));
+                k += 1;
+            }
+        }
+        assert_eq!(track.delay, 0);
+        let input: Vec<f32> = (0..k).flat_map(|k| sine_block(441.0, 0.25, k)).collect();
+        assert_eq!(*out.lock().unwrap(), input);
     }
 
     #[test]
@@ -1908,8 +2034,12 @@ mod tests {
         track.tap = Some(Box::new(move |_, b: &[f32]| {
             o.lock().unwrap().extend(b.iter().step_by(2));
         }));
-        set_now(Duration::from_secs(1));
-        key.speak_until(Duration::from_secs(10));
+        // Another voice speaks for 10 s.
+        key.add_voice();
+        for end in (480..480_000).step_by(480) {
+            key.voiced(end);
+        }
+        key.heard(480_000);
         track.push(&vec![0.25; FRAME * 2 * 10]);
         track.shared.speaks.store(true, Ordering::Relaxed);
         track.push(&vec![0.25; FRAME * 2 * 80]);
@@ -1919,13 +2049,14 @@ mod tests {
             .map(|w| (w[1] - w[0]).abs())
             .fold(0.0, f32::max);
         assert!(step < 1e-3, "{step}");
-        assert!((out[FRAME * 9] - 0.25 * db_to_gain(-12.0)).abs() < 1e-3);
+        // Out before it became a voice: the lookahead held the rest back.
+        assert!((out[FRAME * 3] - 0.25 * db_to_gain(-12.0)).abs() < 1e-3);
         assert_eq!(*out.last().unwrap(), 0.25);
         assert_eq!(track.shared.ducking.load(Ordering::Relaxed), 0);
     }
 
-    /// Pushes blocks `blocks` of `signal` into `mic`, the clock at each
-    /// block's end; whether the key said speaking after any of them.
+    /// Pushes blocks `blocks` of `signal` into `mic` (anchored at zero);
+    /// whether the key said speaking in any of them.
     fn spoke<F: FnMut(EncodedPacket)>(
         mic: &mut Encoder<F>,
         key: &VoiceKey,
@@ -1934,10 +2065,8 @@ mod tests {
     ) -> bool {
         let mut spoke = false;
         for k in blocks {
-            let now = Duration::from_millis(20 * (k as u64 + 1));
-            set_now(now);
             mic.push(&signal(k));
-            spoke |= key.speaking_at(now);
+            spoke |= key.speaking((k * FRAME) as u64, ((k + 1) * FRAME) as u64);
         }
         spoke
     }
@@ -1954,9 +2083,18 @@ mod tests {
         assert!(!spoke(&mut mic, &key, 150..200, speech_block));
         mic.shared.speaks.store(true, Ordering::Relaxed);
         assert!(spoke(&mut mic, &key, 200..250, speech_block));
-        // Voiced up to about now (5 s), held 300 ms.
-        assert!(key.speaking_at(Duration::from_millis(5_250)));
-        assert!(!key.speaking_at(Duration::from_millis(5_400)));
+        // Voiced in its last block, on the timeline.
+        assert!(key.speaking(249 * FRAME as u64, 250 * FRAME as u64));
+        // Only voices count: one that stops speaking is not one any more.
+        assert!(key.has_voice());
+        mic.shared.speaks.store(false, Ordering::Relaxed);
+        mic.push(&speech_block(250));
+        assert!(!key.has_voice());
+        mic.shared.speaks.store(true, Ordering::Relaxed);
+        mic.push(&speech_block(251));
+        assert!(key.has_voice());
+        drop(mic);
+        assert!(!key.has_voice());
     }
 
     #[test]
