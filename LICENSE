@@ -1,0 +1,41 @@
+Vesper License
+
+Copyright (c) 2026 Paul Carouge. All rights reserved.
+
+Vesper is free to use, but it is not open source: only the copyright
+holder may change it.
+
+1. Use. Anyone may download Vesper, build it from this source, install
+   it and run it, free of charge and for any purpose, commercial uses
+   included (monetized live streams, recordings made for clients...).
+   What you record or stream with Vesper is yours.
+
+2. Redistribution. You may redistribute unmodified copies of Vesper,
+   as source or as a build of the unmodified source (for example a
+   distribution package or a mirror), free of charge, provided this
+   license and the copyright notice above are kept with every copy.
+   Packaging files needed to build and install it (such as a package
+   recipe) are allowed, as long as Vesper's own files are unchanged.
+
+3. Not permitted without the copyright holder's written permission:
+   a. modifying Vesper's source code, or distributing a modified
+      version of Vesper or any work based on it;
+   b. selling Vesper or charging for a copy of it;
+   c. sublicensing it, or removing or altering this license or the
+      copyright notice.
+
+4. Contributions. Issues, suggestions and patches you send to the
+   copyright holder may be used by the copyright holder for any purpose
+   and under any terms, without obligation to you.
+
+5. Third-party components. The libraries Vesper uses keep their own
+   licenses (among them Slint, under the Slint Royalty-free Desktop,
+   Mobile, and Web Applications License 2.0, and FFmpeg). This license
+   covers only Vesper's own code.
+
+6. No warranty. Vesper is provided "as is", without warranty of any
+   kind. In no event shall the copyright holder be liable for any
+   claim, damages or other liability arising from its use.
+
+7. Termination. Any use outside these terms ends the permissions this
+   license grants.
