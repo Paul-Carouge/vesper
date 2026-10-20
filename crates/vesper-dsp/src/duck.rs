@@ -9,9 +9,9 @@
 //! catches up with a song change) and tames their peaks (a gentle
 //! compressor). The duck is spectral: the voice band (300 Hz to 4 kHz)
 //! goes down more than the lows and highs, so the music keeps its body
-//! while it leaves the voice room, and the track is untouched (bit for bit)
-//! while the voice is silent. Its hold and release follow the phrase: a
-//! lone word lets the track back fast, the end of a long phrase gently.
+//! while it leaves the voice room, and it leaves the track untouched (bit
+//! for bit) while the voice is silent. Its hold and release follow the
+//! phrase: a lone word lets the track back fast, a long phrase gently.
 //!
 //! The detector and the ducker meet through a [`VoiceKey`] (other threads):
 //! the voice marks its voiced 10 ms windows on the shared timeline, and a
@@ -57,9 +57,9 @@ const KEPT_DB: f32 = -3.0;
 /// voice; a spectral check (flatness, or harmonicity) would catch them.
 const ZCR_MAX: f32 = 0.35;
 /// Within 300 ms (`HOLD_WINDOWS`) after voice, a window this far over the
-/// floor is voiced
-/// whatever RNNoise says: the unvoiced start of the next word (a fricative,
-/// a plosive) keeps the phrase going instead of letting the duck up.
+/// floor is voiced whatever RNNoise says: the unvoiced start of the next
+/// word (a fricative, a plosive) keeps the phrase going instead of letting
+/// the duck up.
 const BRIDGE_DB: f32 = 12.0;
 const HOLD_WINDOWS: u8 = 30;
 /// Windows under this (RMS dBFS) are digital silence (a stalled source
@@ -297,13 +297,16 @@ const MIN_RATE_DEPTH: f32 = 6.0;
 /// Hold (over the key's [`VOICE_HOLD_FRAMES`]) and release by how long the
 /// phrase lasted (from the duck's start to the voice's last word, gaps
 /// within the hold included): a lone word (up to `SHORT_SPAN_MS`, about a
-/// 300 ms word with the key's hold and the lookahead) is let go after
-/// 150 ms and back in 250 ms; the hold grows to 400 ms by `HOLD_SPAN_MS`
-/// (a phrase's next pause is longer than a word's), the release to 900 ms
-/// by `LONG_SPAN_MS` (the end of a long phrase).
+/// 300 ms word with the key's hold and the lookahead) is held
+/// `HOLD_MIN_MS` more (with the key's 150 ms and the lookahead, a 440 ms
+/// hesitation before the next word does not let the track up) and back in
+/// 250 ms; the hold grows to `HOLD_EXTRA_MS` more by `HOLD_SPAN_MS` (a
+/// phrase's next pause is longer than a word's), the release to 900 ms by
+/// `LONG_SPAN_MS` (the end of a long phrase).
 const SHORT_SPAN_MS: f32 = 700.0;
 const HOLD_SPAN_MS: f32 = 1_200.0;
 const LONG_SPAN_MS: f32 = 2_500.0;
+const HOLD_MIN_MS: f32 = 220.0;
 const HOLD_EXTRA_MS: f32 = 250.0;
 const RELEASE_SHORT_MS: f32 = 250.0;
 const RELEASE_LONG_MS: f32 = 900.0;
@@ -323,8 +326,9 @@ const BAND_Q: f64 = 0.15;
 const BAND_MAX_DB: f32 = 12.0;
 /// The share of the track's loudness the bell takes (its K-weighted power
 /// in the voice band, so to speak) is measured through the bell at this
-/// cut, and smoothed over about `SHARE_BLOCKS` blocks (1 s). Until
-/// measured (a fixed duck does not measure), a typical song's.
+/// cut whenever a duck is set (not only when the loudness is), and
+/// smoothed over about `SHARE_BLOCKS` blocks (1 s); a typical song's until
+/// the first block is measured.
 const SHARE_REF_DB: f32 = 12.0;
 const SHARE_BLOCKS: f32 = 10.0;
 const SHARE_DEFAULT: f32 = 0.6;
@@ -892,10 +896,14 @@ pub struct Ducker {
     bell_live: bool,
     kw: KWeight,
     /// K-weighted power of the current 100 ms block (summed over the
-    /// channels), the same through the reference bell, and its frames.
+    /// channels), and its frames.
     power: f64,
-    cut_power: f64,
     frames: usize,
+    /// The same for the voice band's share (measured whenever a duck is
+    /// set), and through the reference bell.
+    share_power: f64,
+    cut_power: f64,
+    share_frames: usize,
     /// The band-pass state of the reference bell (`SHARE_REF_DB`), per
     /// channel.
     share_z: Vec<State>,
@@ -968,8 +976,10 @@ impl Ducker {
             bell_live: false,
             kw: KWeight::new(ch),
             power: 0.0,
-            cut_power: 0.0,
             frames: 0,
+            share_power: 0.0,
+            cut_power: 0.0,
+            share_frames: 0,
             share_z: vec![State::default(); ch],
             share: SHARE_DEFAULT,
             phrase: None,
@@ -1044,7 +1054,8 @@ impl Ducker {
             (Some(p), false) => {
                 p.quiet += frames;
                 let span = ms(p.span);
-                if ms(p.quiet) <= HOLD_EXTRA_MS * frac(span, HOLD_SPAN_MS) {
+                let hold = HOLD_MIN_MS + (HOLD_EXTRA_MS - HOLD_MIN_MS) * frac(span, HOLD_SPAN_MS);
+                if ms(p.quiet) <= hold {
                     return true;
                 }
                 let f = frac(span, LONG_SPAN_MS);
@@ -1073,9 +1084,9 @@ impl Ducker {
         let measuring = plan.measuring();
         if measuring && !self.measuring {
             // A new measurement: the old one may be of other music.
-            (self.power, self.cut_power, self.frames, self.count) = (0.0, 0.0, 0, 0);
+            // The voice band's share is kept: it is the track's latest.
+            (self.power, self.frames, self.count) = (0.0, 0, 0);
             (self.momentary, self.short, self.long) = (None, None, None);
-            self.share = SHARE_DEFAULT;
             self.ahead_len = 0;
         }
         if plan.target.is_some() && !self.music {
@@ -1084,6 +1095,15 @@ impl Ducker {
         }
         (self.measuring, self.music) = (measuring, plan.target.is_some());
         if !measuring {
+            if plan.fixed > 0.0 {
+                // A fixed duck: the voice band's share only, so its
+                // loudness drops by its depth from the voice's first word.
+                let ch = self.ch;
+                buf.chunks(CHUNK * ch)
+                    .for_each(|c| _ = self.measure_share(c));
+                self.kw.flush();
+                self.share_z.iter_mut().for_each(State::flush);
+            }
             return;
         }
         let ch = self.ch;
@@ -1271,6 +1291,9 @@ impl Ducker {
             }
             let rate = self.depth.max(MIN_RATE_DEPTH) * 1e3 * per_chunk;
             let duck_target = if speaking { -self.depth } else { 0.0 };
+            // While the voice speaks, the last phrase's release speed also
+            // sets how fast the duck follows a shallower depth (an adaptive
+            // one coming up): never faster than a release.
             let release = rate / self.release_ms;
             self.duck = slew(self.duck, duck_target, rate / ATTACK_MS, release);
             let (broad, bell) = self.split();
@@ -1381,26 +1404,38 @@ impl Ducker {
         (1..=n).map(move |i| self.blocks[(self.next + BLOCKS - i) % BLOCKS])
     }
 
+    /// Adds `chunk` to the voice band's share (see `SHARE_REF_DB`), and
+    /// returns its K-weighted energy.
+    fn measure_share(&mut self, chunk: &[f32]) -> f64 {
+        let (energy, cut) = self.kw.energy_cut(chunk, &self.bell_c, &mut self.share_z);
+        self.share_power += energy;
+        self.cut_power += cut;
+        self.share_frames += chunk.len() / self.ch;
+        if self.share_frames >= BLOCK {
+            let power = (self.share_power / self.share_frames as f64) as f32;
+            if power > lufs_power(GATE_LUFS) {
+                // What the reference bell takes, as a share of the power.
+                let took = 1.0 - (self.cut_power / self.share_power) as f32;
+                let share = (took / (1.0 - db_to_lin(-SHARE_REF_DB).powi(2))).clamp(0.0, 1.0);
+                self.share += (share - self.share) / SHARE_BLOCKS;
+            }
+            (self.share_power, self.cut_power, self.share_frames) = (0.0, 0.0, 0);
+        }
+        energy
+    }
+
     /// Adds `chunk` to the loudness measurement, and returns its K-weighted
     /// energy; at the end of each 100 ms block, updates the loudness and,
     /// in music mode (to `target` LUFS), the leveler's target.
     fn measure(&mut self, chunk: &[f32], target: Option<f32>) -> f64 {
-        let (energy, cut) = self.kw.energy_cut(chunk, &self.bell_c, &mut self.share_z);
+        let energy = self.measure_share(chunk);
         self.power += energy;
-        self.cut_power += cut;
         self.frames += chunk.len() / self.ch;
         if self.frames < BLOCK {
             return energy;
         }
         let gate = lufs_power(GATE_LUFS);
         let power = (self.power / self.frames as f64) as f32;
-        if power > gate {
-            // What the reference bell takes, as a share of the power.
-            let took = 1.0 - (self.cut_power / self.power) as f32;
-            let share = (took / (1.0 - db_to_lin(-SHARE_REF_DB).powi(2))).clamp(0.0, 1.0);
-            self.share += (share - self.share) / SHARE_BLOCKS;
-        }
-        self.cut_power = 0.0;
         self.blocks[self.next] = power;
         self.next = (self.next + 1) % BLOCKS;
         self.count = (self.count + 1).min(BLOCKS);
@@ -1637,10 +1672,10 @@ mod tests {
         assert!((db(1_025) + 6.0).abs() < 0.3, "{}", db(1_025));
         assert!((db(1_051) + 12.0).abs() < 0.05, "{}", db(1_051));
         assert!((db(1_900) + 12.0).abs() < 0.05);
-        // A 1 s phrase: held 140 ms (7 blocks), back over 358 ms.
-        assert!((db(2_135) + 12.0).abs() < 0.05, "{}", db(2_135));
-        assert!((db(2_320) + 6.0).abs() < 0.3, "{}", db(2_320));
-        assert!(db(2_500).abs() < 0.05, "{}", db(2_500));
+        // A 1 s phrase: held 220 ms (11 blocks), back over 358 ms.
+        assert!((db(2_215) + 12.0).abs() < 0.05, "{}", db(2_215));
+        assert!((db(2_400) + 6.0).abs() < 0.3, "{}", db(2_400));
+        assert!(db(2_580).abs() < 0.05, "{}", db(2_580));
         // No zipper: the gain moves by a tiny step per sample.
         let step = buf
             .chunks(CH)
@@ -1665,10 +1700,11 @@ mod tests {
             };
             (after(&|x| x > -11.95), after(&|x| x > -0.05))
         };
-        // A lone word (300 ms): no hold past the key's, back in 250 ms.
+        // A lone word (300 ms): held 220 ms past the key's (11 blocks),
+        // back in 250 ms.
         let (hold, back) = release(300);
-        assert!(hold <= 2.0, "{hold}");
-        assert!((back - 250.0).abs() <= 10.0, "{back}");
+        assert!((hold - 220.0).abs() <= 2.0, "{hold}");
+        assert!((back - hold - 250.0).abs() <= 10.0, "{back}");
         // A long phrase (3 s): held 240 ms more (12 blocks), back in 900.
         let (hold, back) = release(3_000);
         assert!((hold - 240.0).abs() <= 5.0, "{hold}");

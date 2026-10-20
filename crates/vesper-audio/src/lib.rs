@@ -1936,12 +1936,6 @@ mod tests {
         music_under_lu: 0.0,
     };
 
-    /// What [`DUCK_12`] does to the 150 Hz song and to a constant: the duck
-    /// is spectral (its loudness drops 12 dB, the voice band more, the lows
-    /// less, a constant only by the broadband part).
-    const DUCKED_150HZ_DB: f32 = -10.87;
-    const DUCKED_DC_DB: f32 = -8.41;
-
     /// Block `k` of a `freq` sine (whole periods in 20 ms), stereo.
     fn sine_block(freq: f32, amp: f32, k: usize) -> Vec<f32> {
         (k * FRAME..(k + 1) * FRAME)
@@ -2024,11 +2018,7 @@ mod tests {
         // Down by the depth at the first word, and held through the gaps
         // between words, then the hold (400 ms after a long phrase).
         for k in WORDS.start..WORDS.end + 12 {
-            assert!(
-                (db(k) - DUCKED_150HZ_DB).abs() < 0.3,
-                "block {k}: {} dB",
-                db(k)
-            );
+            assert!((db(k) + 12.0).abs() < 0.3, "block {k}: {} dB", db(k));
         }
         // Back after the release (900 ms after a long phrase).
         let end = WORDS.end + 70;
@@ -2172,11 +2162,7 @@ mod tests {
         let before = WORDS.start + late - 8;
         assert!(db(before).abs() < 0.1, "{}", db(before));
         for k in WORDS.start + late + 5..WORDS.end + late + 12 {
-            assert!(
-                (db(k) - DUCKED_150HZ_DB).abs() < 0.3,
-                "block {k}: {} dB",
-                db(k)
-            );
+            assert!((db(k) + 12.0).abs() < 0.3, "block {k}: {} dB", db(k));
         }
         let end = WORDS.end + late + 70;
         assert!(db(end).abs() < 0.1, "{}", db(end));
@@ -2263,7 +2249,10 @@ mod tests {
             .fold(0.0, f32::max);
         assert!(step < 1e-3, "{step}");
         // Out before it became a voice: the lookahead held the rest back.
-        assert!((out[FRAME * 3] - 0.25 * db_to_gain(DUCKED_DC_DB)).abs() < 1e-3);
+        // Ducked: the spectral duck lowers a constant by its broadband part
+        // only, 12 dB once it measured that nothing is in the voice band.
+        let ducked = 0.25 * db_to_gain(-12.0) - 1e-3..0.25 * db_to_gain(-8.0);
+        assert!(ducked.contains(&out[FRAME * 3]), "{}", out[FRAME * 3]);
         assert_eq!(*out.last().unwrap(), 0.25);
         assert_eq!(track.shared.ducking.load(Ordering::Relaxed), 0);
     }
