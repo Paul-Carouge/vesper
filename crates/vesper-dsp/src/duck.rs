@@ -158,7 +158,9 @@ impl VoiceKey {
             match self.slots.compare_exchange_weak(
                 taken,
                 taken | 1 << slot,
-                Ordering::Relaxed,
+                // Pairs with the Release that freed it: its old voice's
+                // clearing is seen before this one tells.
+                Ordering::Acquire,
                 Ordering::Relaxed,
             ) {
                 Ok(_) => return Some(slot),
@@ -173,7 +175,7 @@ impl VoiceKey {
         self.voices.fetch_sub(1, Ordering::Relaxed);
         if let Some(slot) = slot {
             self.loudness[slot].store(0, Ordering::Relaxed);
-            self.slots.fetch_and(!(1 << slot), Ordering::Relaxed);
+            self.slots.fetch_and(!(1 << slot), Ordering::Release);
         }
     }
 
@@ -351,6 +353,10 @@ const UNDO_BLOCKS: usize = 20;
 const BACK_BLOCKS: usize = 2;
 const BACK_LU: f32 = 3.0;
 const LEVEL_RESTORE: f32 = 30.0;
+/// A louder song within `AGAIN_LU` of a burst undone in the last 5 s is
+/// that music coming back (a song with stops), not another burst.
+const AGAIN_BLOCKS: usize = 50;
+const AGAIN_LU: f32 = 3.0;
 /// Most the leveler lowers and raises, dB.
 const LEVEL_MIN_DB: f32 = -30.0;
 const LEVEL_MAX_DB: f32 = 15.0;
@@ -806,13 +812,14 @@ struct Piece {
     lufs: f32,
 }
 
-/// A louder song in doubt: the blocks counted before it, blocks since, and
-/// the loudness before it (LUFS).
+/// A louder song in doubt: the blocks counted before it, blocks since,
+/// the loudness before it and its own (LUFS).
 #[derive(Debug, Clone, Copy)]
 struct Undo {
     count: usize,
     since: usize,
     before: f32,
+    loud: f32,
 }
 
 /// Ducking and background music of a non-voice track (see the module docs).
@@ -854,6 +861,8 @@ pub struct Ducker {
     catch_up: Option<usize>,
     /// A louder song that may have been a burst, until confirmed.
     undo: Option<Undo>,
+    /// The last burst undone: its loudness (LUFS) and blocks since.
+    undone: Option<(f32, usize)>,
     /// The leveler rises this fast (dB/s) until it is there: a quieter
     /// song started, or a burst was not a song.
     rise: Option<f32>,
@@ -897,6 +906,7 @@ impl Ducker {
             pos: 0,
             catch_up: None,
             undo: None,
+            undone: None,
             rise: None,
             level_target: 0.0,
             level: 0.0,
@@ -1181,6 +1191,9 @@ impl Ducker {
     /// measurement before it comes back (still in the ring), and the
     /// leveler goes back up at [`LEVEL_RESTORE`].
     fn confirm_louder(&mut self, gate: f32) {
+        if let Some((_, age)) = &mut self.undone {
+            *age += 1;
+        }
         let Some(u) = &mut self.undo else { return };
         u.since += 1;
         let u = *u;
@@ -1196,7 +1209,7 @@ impl Ducker {
             }
             self.count = (u.count + LOUD_BLOCKS + u.since).min(BLOCKS);
             (self.catch_up, self.rise) = (None, Some(LEVEL_RESTORE));
-            self.undo = None;
+            (self.undo, self.undone) = (None, Some((u.loud, 0)));
         } else if u.since >= UNDO_BLOCKS {
             self.undo = None;
         }
@@ -1241,12 +1254,23 @@ impl Ducker {
                     .all(|p| p > lufs_power(before + SONG_UP_LU))
             {
                 // A louder song: measured alone, caught up with at once;
-                // a burst (a shot, a shout) is undone if it ends soon.
-                self.undo.get_or_insert(Undo {
-                    count: self.count.saturating_sub(LOUD_BLOCKS),
-                    since: 0,
-                    before,
-                });
+                // a burst (a shot, a shout) is undone if it ends soon,
+                // unless one as loud was just undone: a song with stops
+                // (it would roll back at every stop, never learnt).
+                let loud = gated(self.last(LOUD_BLOCKS), gate, false).unwrap_or(before);
+                let again = self
+                    .undone
+                    .is_some_and(|(l, age)| age < AGAIN_BLOCKS && (loud - l).abs() <= AGAIN_LU);
+                if again {
+                    (self.undo, self.undone) = (None, None);
+                } else {
+                    self.undo.get_or_insert(Undo {
+                        count: self.count.saturating_sub(LOUD_BLOCKS),
+                        since: 0,
+                        before,
+                        loud,
+                    });
+                }
                 self.count = LOUD_BLOCKS;
                 (self.catch_up, self.rise) = (Some(CATCH_UP_BLOCKS), None);
             } else if self.count >= SHORT_BLOCKS

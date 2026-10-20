@@ -1075,6 +1075,10 @@ fn ducking_report() {
                 "Burst: {ms} ms, 14 LU over a steady bed: leveler back within 1 dB {back:.0} ms after it ends."
             );
         }
+        let (moves, over) = stop_time();
+        println!(
+            "Stop-time song (10 dB louder, 250 ms stops every 1.5 s): over its last 10 s the leveler moves {moves:.1} dB, {over:.0} ms over target + 3 LU."
+        );
         for ms in [2_000, 3_000, 6_000] {
             let (top, over) = pause_menu(ms);
             println!(
@@ -1486,6 +1490,28 @@ fn bursts(len_ms: usize, over: f32, period_ms: usize) -> (f32, f32) {
     (hi - lo, (off * 20) as f32)
 }
 
+/// A -26 LUFS song for 10 s, then one 10 dB louder that stops for 250 ms
+/// every 1.5 s, 30 s, music mode at -26: how far the leveler's gain moves
+/// over its last 10 s (dB), and how long the music is over target + 3 LU
+/// there (ms).
+fn stop_time() -> (f32, f32) {
+    let mut x = song(10.0, -26.0, false, 21);
+    let mut b = song(20.0, -16.0, false, 22);
+    for (i, s) in b.iter_mut().enumerate() {
+        if i % (1_500 * MS) >= 1_250 * MS {
+            *s = 0.0;
+        }
+    }
+    x.extend(b);
+    let sim = simulate(&vec![0.0; x.len()], false, Some(&x), music(-26.0));
+    let l = &sim.level[1_000..];
+    let (lo, hi) = l
+        .iter()
+        .fold((f32::MAX, f32::MIN), |(a, b), &v| (a.min(v), b.max(v)));
+    let (_, over) = overshoot(&sim.out, 20_000 * MS, -26.0);
+    (hi - lo, over)
+}
+
 /// A loud song (-10 LUFS) paused 20 dB lower for `pause_ms` at 10 s
 /// (a game's pause menu), then loud again, music mode at -26: how far and
 /// how long (ms) it goes over target + 3 LU once back.
@@ -1567,4 +1593,8 @@ fn hits_and_bursts_do_not_move_the_leveler() {
     // A 400 ms burst: before, the bed stayed about 14 dB down for 7 s.
     let (_, back) = bursts(400, 14.0, 0);
     assert!(back <= 1_500.0, "back after {back} ms");
+    // A song with stops is learnt, not rolled back at every stop.
+    let (moves, over) = stop_time();
+    assert!(moves <= 1.5, "moves {moves} dB");
+    assert!(over <= 100.0, "{over} ms over target + 3 LU");
 }
