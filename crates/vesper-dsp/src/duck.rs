@@ -15,31 +15,55 @@
 //! Nothing allocates, locks or makes a syscall after construction.
 
 use crate::biquad::{CHUNK, Coefs, State};
+use nnnoiseless::DenoiseState;
+
 use crate::{FS, Glide, coef, db_to_lin, lin_to_db};
 
-/// Voice detection window: 10 ms.
-const WINDOW: usize = 480;
-/// Voice starts this far above the noise floor (RMS, dB)...
-const OPEN_DB: f32 = 10.0;
-/// ...and goes on while above this (hysteresis).
-const CLOSE_DB: f32 = 6.0;
-/// The thresholds never go under these (RMS dBFS): a gated or noise
-/// suppressed microphone is digital silence between words.
-const MIN_OPEN_DB: f32 = -50.0;
-const MIN_CLOSE_DB: f32 = -54.0;
-/// Windows in a row above the threshold before voice starts: a click is
-/// not a word.
-const OPEN_WINDOWS: u8 = 2;
-/// Range of the tracked noise floor, dB. It starts at the top and falls to
-/// the real floor within ~100 ms.
-const FLOOR_MIN: f32 = -90.0;
+/// Voice detection window: 10 ms, an RNNoise frame.
+const WINDOW: usize = DenoiseState::FRAME_SIZE;
+/// RNNoise works on 16-bit sample values.
+const SCALE: f32 = 32_768.0;
+/// A window is voiced when RNNoise's voice probability is over `P_VOICE`
+/// and its level `MARGIN_DB` over the noise floor. RNNoise alone is not
+/// enough: on steady noise its probability drifts up to 0.9 and more
+/// within seconds, and a noise burst then reads as voice.
+const P_VOICE: f32 = 0.9;
+const MARGIN_DB: f32 = 6.0;
+/// ...and RNNoise keeps it: its output (the window before, RNNoise runs a
+/// window late) is at most this far under that window's input. Speech
+/// comes out nearly whole (about -1 dB at 9 dB SNR); the bench's coughs
+/// (noise low-passed at 3 kHz) 4 to 10 dB down even when the probability
+/// says voice. Not every band-limited burst is: see `ZCR_MAX`.
+const KEPT_DB: f32 = -3.0;
+/// ...and it is not broadband noise: its zero-crossing rate (crossings per
+/// sample) is under this. Voiced speech reads 0.0 to 0.3, white noise
+/// about 0.5. After a few seconds of broadband bursts (static, hiss),
+/// RNNoise gives them a high probability and keeps them whole.
+/// shortcut: band-limited noise bursts (low-passed at 4 kHz, and low
+/// rumble such as mic bumps or wind) have a low rate and can still read as
+/// voice; a spectral check (flatness, or harmonicity) would catch them.
+const ZCR_MAX: f32 = 0.35;
+/// Within the hold after voice, a window this far over the floor is voiced
+/// whatever RNNoise says: the unvoiced start of the next word (a fricative,
+/// a plosive) keeps the phrase going instead of letting the duck up.
+const BRIDGE_DB: f32 = 12.0;
+const HOLD_WINDOWS: u8 = (VOICE_HOLD_FRAMES / WINDOW) as u8;
+/// Windows under this (RMS dBFS) are digital silence (a stalled source
+/// filled in, a gate): they end any phrase but leave the floor and
+/// RNNoise's state as they were.
+const SILENCE_DB: f32 = -80.0;
+/// Voice starts when 2 of the last 3 windows are voiced: a click is not
+/// a word.
+const VOTES: u8 = 0b111;
+const OPEN_VOTES: u32 = 2;
+/// Noise floor: the quietest window of the last `SPANS` spans of
+/// `SPAN` windows (minimum statistics over 2 s), followed down at once
+/// and up at 10 dB/s at most, speaking or not: a steady new noise (a fan)
+/// is the floor about 2 s after it appears plus 1 s per 10 dB.
+const SPAN: usize = 25;
+const SPANS: usize = 8;
+const FLOOR_RISE: f32 = 0.1;
 const FLOOR_MAX: f32 = -25.0;
-/// Rise of the floor per window: 3 dB/s while quiet, 1 dB/s during voice,
-/// so a steady new noise (a fan) stops counting as voice within seconds.
-const RISE_QUIET: f32 = 0.03;
-const RISE_VOICE: f32 = 0.01;
-/// Share of the gap the floor falls per window when the level is under it.
-const FALL: f32 = 0.3;
 
 /// How long the voice counts as speaking after its last voiced window
 /// (300 ms): the gaps between words do not pump the ducked tracks.
@@ -97,30 +121,88 @@ fn sum_sq(x: &[f32]) -> f32 {
     acc.iter().sum::<f32>() + rest.iter().map(|s| s * s).sum::<f32>()
 }
 
-/// Tells when a voice track speaks: RMS over 10 ms windows against a noise
-/// floor tracked on the fly, with hysteresis.
+/// Tells when a voice track speaks, from its raw input (before its filters,
+/// volume and mute): RNNoise's voice probability per 10 ms window (its own
+/// state, not the track's noise suppression), backed by the window's level
+/// over a noise floor tracked by minimum statistics. Digital silence, and
+/// a muted microphone (not calling it, then [`VoiceDetector::pause`]), end
+/// any phrase and keep the floor and RNNoise's state.
 pub struct VoiceDetector {
     ch: usize,
+    vad: Box<DenoiseState<'static>>,
+    /// The current window, mixed to mono, and its denoised output (unused).
+    input: Box<[f32; WINDOW]>,
+    output: Box<[f32; WINDOW]>,
     /// Sum of squares of the current window, and its frames.
     sum: f32,
     frames: usize,
     floor: f32,
-    /// Windows in a row above the start threshold.
-    above: u8,
+    /// Quietest window of each span (`FLOOR_MAX` when none yet), the
+    /// current span and its windows.
+    mins: [f32; SPANS],
+    span: usize,
+    in_span: usize,
+    /// Last windows voiced, one bit each (newest lowest).
+    votes: u8,
     speaking: bool,
+    /// Windows since the last one spoken, up to `HOLD_WINDOWS`.
+    quiet: u8,
+    /// Level of the last window RNNoise heard, dBFS.
+    last: f32,
 }
 
 impl VoiceDetector {
+    /// Allocates, and sets up RNNoise's tables and the calling thread's FFT
+    /// caches (see [`VoiceDetector::warm_up`]).
     pub fn new(ch: usize) -> Self {
         assert!(ch > 0, "no channel");
-        Self {
+        let mut d = Self {
             ch,
+            vad: DenoiseState::new(),
+            input: Box::new([0.0; WINDOW]),
+            output: Box::new([0.0; WINDOW]),
             sum: 0.0,
             frames: 0,
             floor: FLOOR_MAX,
-            above: 0,
+            mins: [FLOOR_MAX; SPANS],
+            span: 0,
+            in_span: 0,
+            votes: 0,
             speaking: false,
-        }
+            quiet: HOLD_WINDOWS,
+            last: SILENCE_DB,
+        };
+        d.warm_up();
+        d
+    }
+
+    /// Prepares the calling thread: RNNoise's FFT keeps per-thread caches it
+    /// allocates on a thread's first frame. Call it on the thread that will
+    /// run [`VoiceDetector::process`]. Silence leaves RNNoise nearly as new.
+    pub fn warm_up(&mut self) {
+        self.vad.process_frame(&mut self.output[..], &[0.0; WINDOW]);
+    }
+
+    /// Listens afresh (a track that just became a voice): forgets the floor
+    /// and the votes. RNNoise's state is kept: it would allocate, and it
+    /// follows the input within a few windows anyway.
+    pub fn reset(&mut self) {
+        (self.sum, self.frames) = (0.0, 0);
+        self.floor = FLOOR_MAX;
+        self.mins = [FLOOR_MAX; SPANS];
+        (self.span, self.in_span) = (0, 0);
+        (self.votes, self.speaking, self.quiet) = (0, false, HOLD_WINDOWS);
+    }
+
+    /// Ends any phrase (digital silence, or not listening: a muted mic);
+    /// the floor and RNNoise's state stay as they were.
+    pub fn pause(&mut self) {
+        (self.votes, self.speaking, self.quiet) = (0, false, HOLD_WINDOWS);
+    }
+
+    /// The noise floor it tracks, dBFS RMS.
+    pub fn floor_db(&self) -> f32 {
+        self.floor
     }
 
     /// Feeds `buf` (interleaved, whole frames). Returns where (frames from
@@ -128,10 +210,16 @@ impl VoiceDetector {
     pub fn process(&mut self, buf: &[f32]) -> Option<usize> {
         let mut last = None;
         let mut at = 0;
-        let frames = buf.len() / self.ch;
+        let ch = self.ch;
+        let frames = buf.len() / ch;
         while at < frames {
             let take = (WINDOW - self.frames).min(frames - at);
-            self.sum += sum_sq(&buf[at * self.ch..(at + take) * self.ch]);
+            let part = &buf[at * ch..(at + take) * ch];
+            self.sum += sum_sq(part);
+            let mono = &mut self.input[self.frames..self.frames + take];
+            for (m, f) in mono.iter_mut().zip(part.chunks_exact(ch)) {
+                *m = f.iter().sum::<f32>() * (SCALE / ch as f32);
+            }
             (self.frames, at) = (self.frames + take, at + take);
             if self.frames == WINDOW && self.window() {
                 last = Some(at);
@@ -145,24 +233,48 @@ impl VoiceDetector {
         let mean = self.sum / (WINDOW * self.ch) as f32;
         (self.sum, self.frames) = (0.0, 0);
         let level = 10.0 * mean.max(1e-12).log10();
-        if self.speaking {
-            self.speaking = level > (self.floor + CLOSE_DB).max(MIN_CLOSE_DB);
-            if !self.speaking {
-                self.above = 0;
-            }
-        } else {
-            let start = (self.floor + OPEN_DB).max(MIN_OPEN_DB);
-            self.above = if level > start { self.above + 1 } else { 0 };
-            self.speaking = self.above >= OPEN_WINDOWS;
+        if level < SILENCE_DB {
+            self.pause();
+            return false;
         }
-        self.floor = if level < self.floor {
-            self.floor + (level - self.floor) * FALL
-        } else if self.speaking {
-            self.floor + RISE_VOICE
+        let p = self
+            .vad
+            .process_frame(&mut self.output[..], &self.input[..]);
+        // Both on the mono mix RNNoise hears: a stereo mic is not biased.
+        let db = |x: &[f32]| {
+            10.0 * (sum_sq(x) / (WINDOW as f32 * SCALE * SCALE))
+                .max(1e-12)
+                .log10()
+        };
+        let kept = db(&self.output[..]) - self.last;
+        self.last = db(&self.input[..]);
+        let over = level - self.floor;
+        let crossings = self
+            .input
+            .windows(2)
+            .filter(|w| (w[0] < 0.0) != (w[1] < 0.0));
+        let zcr = crossings.count() as f32 / WINDOW as f32;
+        let strict = p > P_VOICE && over > MARGIN_DB && kept > KEPT_DB && zcr < ZCR_MAX;
+        let voiced = strict || (self.quiet < HOLD_WINDOWS && over > BRIDGE_DB);
+        self.votes = (self.votes << 1 | u8::from(voiced)) & VOTES;
+        self.speaking = self.votes.count_ones() >= OPEN_VOTES || (self.speaking && voiced);
+        // Only RNNoise's voice restarts the bridge: a bridged window does
+        // not, or a noise right after speech would hold the voice on.
+        self.quiet = if self.speaking && strict {
+            0
         } else {
-            self.floor + RISE_QUIET
+            (self.quiet + 1).min(HOLD_WINDOWS)
+        };
+        // Minimum statistics: the floor never learns from silence (above),
+        // and a steady new noise lifts it at a bounded rate.
+        self.mins[self.span] = self.mins[self.span].min(level);
+        let min = self.mins.iter().copied().fold(FLOOR_MAX, f32::min);
+        self.floor = (self.floor + FLOOR_RISE).min(min);
+        self.in_span += 1;
+        if self.in_span == SPAN {
+            self.span = (self.span + 1) % SPANS;
+            (self.mins[self.span], self.in_span) = (FLOOR_MAX, 0);
         }
-        .clamp(FLOOR_MIN, FLOOR_MAX);
         self.speaking
     }
 }
@@ -471,20 +583,82 @@ mod tests {
     }
 
     #[test]
-    fn bursts_over_the_floor_are_voice() {
-        // 400 ms words every 600 ms, 25 dB over a -55 dB floor.
-        let voiced = detect(&speech(6_000, 400, 600, -30.0, -55.0));
-        // Each word is found within its first 40 ms, the gaps are not voice.
-        for word in 1..10 {
-            let start = word * 600 / 20;
-            assert!(voiced[start..start + 2].contains(&true), "word {word}");
-            assert!(!voiced[start + 22], "gap after word {word}");
+    fn digital_silence_leaves_the_detector_as_it_was() {
+        // A muted or stalled microphone filled with zeros: the floor is not
+        // dragged down, so the room is not voice when it comes back.
+        let mut d = VoiceDetector::new(CH);
+        let room = speech(3_000, 0, 1_000, -20.0, -45.0);
+        room.chunks(BLK * CH).for_each(|b| _ = d.process(b));
+        let (floor, mins) = (d.floor, d.mins);
+        assert!((-48.0..-44.0).contains(&floor), "{floor}");
+        for _ in 0..150 {
+            assert_eq!(d.process(&[0.0; BLK * CH]), None);
         }
-        // A quiet word, 12 dB over the floor, still counts; 6 dB does not.
-        let quiet = detect(&speech(3_000, 400, 600, -43.0, -55.0));
-        assert!(quiet[30..].iter().filter(|v| **v).count() > 30);
-        let faint = detect(&speech(3_000, 400, 600, -49.0, -55.0));
-        assert!(faint[10..].iter().all(|v| !v));
+        assert_eq!((d.floor, d.mins), (floor, mins));
+        assert!(room.chunks(BLK * CH).all(|b| d.process(b).is_none()));
+    }
+
+    #[test]
+    fn the_floor_follows_a_new_noise_at_a_bounded_rate() {
+        // -70 dB room, then a -30 dB noise from 3 s.
+        let mut x = speech(3_000, 0, 1_000, -20.0, -70.0);
+        x.extend(speech(9_000, 0, 1_000, -20.0, -30.0));
+        let mut d = VoiceDetector::new(CH);
+        let floors: Vec<f32> = x
+            .chunks(BLK * CH)
+            .map(|b| {
+                d.process(b);
+                d.floor
+            })
+            .collect();
+        // The 2 s minimum holds it, then it rises 10 dB/s at most.
+        assert!(floors[150 + 80] < -69.0, "{}", floors[230]);
+        for w in floors[150..].windows(2) {
+            assert!(w[1] - w[0] <= 2.0 * FLOOR_RISE + 1e-4, "{w:?}");
+        }
+        assert!(floors[150 + 300] > -33.0, "{}", floors[450]);
+    }
+
+    #[test]
+    fn reset_forgets_the_floor() {
+        let mut d = VoiceDetector::new(CH);
+        speech(1_000, 0, 1_000, -20.0, -60.0)
+            .chunks(BLK * CH)
+            .for_each(|b| _ = d.process(b));
+        assert!(d.floor < -55.0);
+        d.reset();
+        assert_eq!(d.floor, FLOOR_MAX);
+    }
+
+    #[test]
+    fn noise_bursts_are_not_voice() {
+        // 400 ms of white noise every 600 ms, 25 dB over a -55 dB floor,
+        // the same on both channels (an upmixed mono mic): loud, but not a
+        // voice (RNNoise alone takes them after a few seconds).
+        let mono: Vec<f32> = speech(6_000, 400, 600, -30.0, -55.0)
+            .chunks(CH)
+            .flat_map(|f| [f[0]; CH])
+            .collect();
+        let voiced = detect(&mono);
+        let s: String = voiced.iter().map(|v| if *v { '1' } else { '.' }).collect();
+        assert!(voiced.iter().all(|v| !v), "{s}");
+    }
+
+    #[test]
+    fn digital_silence_ends_the_phrase() {
+        // A phrase in progress over a -55 dB room (the bridge armed), 200 ms
+        // of digital zeros, then a noise 13 dB over the floor: the bridge
+        // must not take the noise for voice.
+        let mut d = VoiceDetector::new(CH);
+        let room = speech(3_000, 0, 1_000, -20.0, -55.0);
+        room.chunks(BLK * CH).for_each(|b| _ = d.process(b));
+        (d.speaking, d.quiet) = (true, 0);
+        for _ in 0..10 {
+            d.process(&[0.0; BLK * CH]);
+        }
+        let noise = speech(1_000, 0, 1_000, -20.0, -42.0);
+        assert!(noise.chunks(BLK * CH).all(|b| d.process(b).is_none()));
+        assert!(d.floor < -54.0, "{}", d.floor);
     }
 
     #[test]

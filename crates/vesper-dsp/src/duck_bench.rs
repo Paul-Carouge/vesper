@@ -2,17 +2,18 @@
 //! as `vesper-audio` wires them, and the metrics that matter to a listener.
 //!
 //! The voice track and the ducked track run 20 ms blocks side by side. As in
-//! `vesper-audio`'s `encode_block`, the voice key holds "speaking until"
-//! (end of the last voiced window plus [`VOICE_HOLD_FRAMES`]) and a ducked
-//! block asks it at its own end; here both are on one sample clock, the
-//! voice's block first (the best case of the app's two threads).
+//! `vesper-audio`'s `Encoder::push`, the detector hears the voice's raw
+//! block (before its chain), and the voice key holds "speaking until" (end
+//! of the last voiced window plus [`VOICE_HOLD_FRAMES`]); a ducked block
+//! asks it at its own end. Here both are on one sample clock, the voice's
+//! block first (the best case of the app's two threads).
 //!
 //! The duck's timing is read off a probe: a [`Ducker`] (duck only, the same
 //! depth) on a constant 1.0, so its output is its gain, sample by sample.
 //!
 //! Full table: `cargo test --release -p vesper-dsp -- --ignored --nocapture
-//! ducking_report`. The other tests are quick checks of what the current
-//! behaviour already does well, so it does not regress.
+//! ducking_report`. The other tests pin what the detector and the ducker
+//! do well (with a margin), so it does not regress.
 
 use super::*;
 use crate::biquad::{Coefs, State};
@@ -194,14 +195,26 @@ fn clip(name: &str, db: f32, lead_ms: usize, tail_ms: usize) -> Speech {
         .iter()
         .map(|b| f32::from(i16::from_le_bytes(*b)) / 32_768.0)
         .collect();
-    // shortcut: linear 16 to 48 kHz upsampling (images above 8 kHz, ~-30 dB):
-    // fine for energy detection and loudness; a proper resampler if a
-    // spectral detector is benched on these.
+    // 16 to 48 kHz: polyphase windowed sinc (Blackman, 21 taps per phase,
+    // cut at 7.6 kHz), so RNNoise does not hear images above 8 kHz.
+    const TAPS: usize = 21;
+    let h = |t: f32| {
+        // t in input samples from the output frame, |t| < TAPS / 2.
+        let w = 0.42
+            + 0.5 * (std::f32::consts::PI * t / (TAPS as f32 / 2.0)).cos()
+            + 0.08 * (std::f32::consts::TAU * t / (TAPS as f32 / 2.0)).cos();
+        let fc = 7_600.0 / 16_000.0;
+        let a = std::f32::consts::TAU * fc * t;
+        2.0 * fc * w * if t == 0.0 { 1.0 } else { a.sin() / a }
+    };
     let mut x = vec![0.0; lead_ms * MS];
-    for w in x16.windows(2) {
-        for k in 0..3 {
-            x.push(w[0] + (w[1] - w[0]) * k as f32 / 3.0);
-        }
+    for i in 0..x16.len() * 3 {
+        let pos = i as f32 / 3.0;
+        let c = i / 3;
+        let lo = (c + 1).saturating_sub(TAPS / 2);
+        let hi = (c + TAPS / 2 + 1).min(x16.len());
+        let taps = x16[lo..hi].iter().zip(lo..);
+        x.push(taps.map(|(v, j)| v * h(pos - j as f32)).sum());
     }
     x.resize(x.len() + tail_ms * MS, 0.0);
     let win = 10 * MS;
@@ -338,12 +351,14 @@ fn simulate(mic: &[f32], chain: bool, music: Option<&[f32]>, settings: DuckSetti
         for (i, f) in v.as_chunks_mut::<CH>().0.iter_mut().enumerate() {
             f.fill(mic[at + i]);
         }
-        if let Some(c) = &mut chain {
-            c.process(&mut v);
-        }
+        // As `Encoder::push`: the detector hears the raw input, then the
+        // chain runs (it does not change what the detector hears).
         let end = at + BLK;
         if let Some(last) = det.process(&v) {
             until = until.max(at + last + VOICE_HOLD_FRAMES);
+        }
+        if let Some(c) = &mut chain {
+            c.process(&mut v);
         }
         let speaking = end < until;
         sim.speaking.push(speaking);
@@ -991,18 +1006,20 @@ fn ducking_report() {
     println!("| Ducker, background music | {bg:.0} |");
 }
 
-// Quick checks of what works today, so later changes do not regress it.
+// Quick checks, so later changes do not regress.
 
 #[test]
 fn a_spoken_phrase_ducks_fast_and_holds_through_its_gaps() {
     let s = speech_with_floor(synth_speech(5_000, &phrase_words(), 130.0, -26.0, 1), -65.0);
     let sim = simulate(&s.x, false, None, duck_only(12.0));
     let t = timing(&sim, s.onset(), s.offset(), 12.0);
-    assert!(t.to_3db.is_ok_and(|v| v <= 60.0), "{:?}", t.to_3db);
-    assert!(t.to_full.is_ok_and(|v| v <= 100.0), "{:?}", t.to_full);
+    // RNNoise needs the voiced part: each synthetic word opens with a 40 ms
+    // unvoiced onset, so 92 / 128 ms here (real speech: 42 ms, below).
+    assert!(t.to_3db.is_ok_and(|v| v <= 120.0), "{:?}", t.to_3db);
+    assert!(t.to_full.is_ok_and(|v| v <= 160.0), "{:?}", t.to_full);
     assert!(t.back_full.is_ok_and(|v| v <= 1_200.0), "{:?}", t.back_full);
     let (rise, _) = pumping(&sim, s.onset(), s.offset(), 12.0);
-    // 0.0 today; a gap that lets the duck up would show as tenths of a dB.
+    // 0.0; a gap that lets the duck up would show as tenths of a dB.
     assert!(rise < 0.25, "pumps {rise} dB between words");
 }
 
@@ -1033,4 +1050,84 @@ fn a_loud_song_is_leveled_within_a_second() {
     assert!(over <= 600.0, "{over} ms over target + 3 LU, peak {top}");
     let out = loudness(&sim.out[3 * 48_000..], &[]);
     assert!((out + 26.0).abs() < 2.0, "{out} LUFS");
+}
+
+#[test]
+fn noises_alone_do_not_duck() {
+    // Before the RNNoise detector: 28 to 100 % of the time ducked.
+    let cases: [(&str, Vec<f32>, usize); 9] = [
+        ("keyboard -30", keyboard(10, -30.0, 1), 0),
+        ("keyboard -15", keyboard(10, -15.0, 2), 0),
+        ("breaths -45", breaths(10, -45.0), 0),
+        ("breaths -35", breaths(10, -35.0), 0),
+        ("cough -20", coughs(12, -20.0), 0),
+        ("fan -45", appearing(12, 3_000, Some(-70.0), -45.0), 3_000),
+        ("fan -30", appearing(12, 3_000, Some(-70.0), -30.0), 3_000),
+        ("unmute -48", appearing(12, 3_000, None, -48.0), 3_000),
+        ("unmute -40", appearing(12, 3_000, None, -40.0), 3_000),
+    ];
+    // One thread each: RNNoise is slow in a debug build.
+    std::thread::scope(|s| {
+        for (name, mic, from) in cases {
+            s.spawn(move || {
+                let sim = simulate(&mic, false, None, duck_only(12.0));
+                let (pct, _, _) = false_ducks(&sim, from * MS);
+                assert!(pct <= 2.0, "{name}: ducked {pct} % of the time");
+            });
+        }
+    });
+}
+
+#[test]
+fn music_bleeding_into_the_mic_ducks_less() {
+    // Before: 23.5 % at -50, 44.1 % from -40 on. Now 0 and 13 to 27 %.
+    for (db, most) in [(-50.0, 5.0), (-40.0, 35.0), (-20.0, 35.0)] {
+        let sim = simulate(&bleed(20, db), false, None, duck_only(12.0));
+        let (pct, _, _) = false_ducks(&sim, 0);
+        assert!(pct <= most, "bleed at {db}: ducked {pct} % of the time");
+    }
+}
+
+#[test]
+fn soft_or_noisy_speech_is_ducked_throughout() {
+    // Very soft, and at 9 dB SNR (before: 56 %, the duck came up 12 dB
+    // mid-phrase).
+    for (db, floor) in [(-48.0, -65.0), (-36.0, -45.0)] {
+        let s = speech_with_floor(clip("1272-128104-0001", db, 1_000, 2_000), floor);
+        let sim = simulate(&s.x, false, None, duck_only(12.0));
+        let r = recall(&sim, &s);
+        assert!(r >= 93.0, "{db} over {floor}: {r} %");
+        let (rise, _) = pumping(&sim, s.onset(), s.offset(), 12.0);
+        assert!(rise < 1.0, "{db} over {floor}: comes up {rise} dB");
+    }
+}
+
+#[test]
+fn the_voice_chain_does_not_lift_room_noise_into_voice() {
+    // The detector hears the raw input: the chain's makeup gain does not
+    // turn a -45 dB room into voice (before: 22 % of the time ducked).
+    let sim = simulate(
+        &room(10 * 1_000 * MS, -45.0, 51),
+        true,
+        None,
+        duck_only(12.0),
+    );
+    let (pct, _, _) = false_ducks(&sim, 0);
+    assert!(pct <= 1.0, "{pct} %");
+}
+
+#[test]
+fn noise_right_after_speech_does_not_hold_the_voice() {
+    // Speech, then a steady noise from 50 ms after its last word: the
+    // hold's bridge must not keep the voice on through the noise.
+    for db in [-50.0, -30.0] {
+        let mut s = speech_with_floor(clip("1272-128104-0001", -26.0, 1_000, 4_000), -65.0);
+        let at = s.offset() + 50 * MS;
+        let n = s.x.len() - at;
+        add(&mut s.x, &room(n, db, 61), at);
+        let sim = simulate(&s.x, false, None, duck_only(12.0));
+        let last = sim.speaking.iter().rposition(|&v| v).unwrap();
+        let held = ms((last + 1) * BLK).max(0.0) - ms(s.offset());
+        assert!(held < 600.0, "noise at {db}: voice held {held} ms");
+    }
 }
