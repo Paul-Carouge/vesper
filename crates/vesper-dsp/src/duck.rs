@@ -31,13 +31,17 @@ const P_VOICE: f32 = 0.9;
 const MARGIN_DB: f32 = 6.0;
 /// ...and RNNoise keeps it: its output (the window before, RNNoise runs a
 /// window late) is at most this far under that window's input. Speech
-/// comes out nearly whole (about -1 dB at 9 dB SNR), a band-limited cough
-/// or noise burst 4 to 10 dB down even when the probability says voice.
+/// comes out nearly whole (about -1 dB at 9 dB SNR); the bench's coughs
+/// (noise low-passed at 3 kHz) 4 to 10 dB down even when the probability
+/// says voice. Not every band-limited burst is: see `ZCR_MAX`.
 const KEPT_DB: f32 = -3.0;
-/// ...and it is not full-band noise: its zero-crossing rate (crossings per
+/// ...and it is not broadband noise: its zero-crossing rate (crossings per
 /// sample) is under this. Voiced speech reads 0.0 to 0.3, white noise
-/// about 0.5. After a few seconds of white noise bursts (a mic bump, wind,
-/// static), RNNoise gives them a high probability and keeps them whole.
+/// about 0.5. After a few seconds of broadband bursts (static, hiss),
+/// RNNoise gives them a high probability and keeps them whole.
+/// shortcut: band-limited noise bursts (low-passed at 4 kHz, and low
+/// rumble such as mic bumps or wind) have a low rate and can still read as
+/// voice; a spectral check (flatness, or harmonicity) would catch them.
 const ZCR_MAX: f32 = 0.35;
 /// Within the hold after voice, a window this far over the floor is voiced
 /// whatever RNNoise says: the unvoiced start of the next word (a fricative,
@@ -45,7 +49,8 @@ const ZCR_MAX: f32 = 0.35;
 const BRIDGE_DB: f32 = 12.0;
 const HOLD_WINDOWS: u8 = (VOICE_HOLD_FRAMES / WINDOW) as u8;
 /// Windows under this (RMS dBFS) are digital silence (a stalled source
-/// filled in, a gate): they leave the detector as it was.
+/// filled in, a gate): they end any phrase but leave the floor and
+/// RNNoise's state as they were.
 const SILENCE_DB: f32 = -80.0;
 /// Voice starts when 2 of the last 3 windows are voiced: a click is not
 /// a word.
@@ -119,8 +124,9 @@ fn sum_sq(x: &[f32]) -> f32 {
 /// Tells when a voice track speaks, from its raw input (before its filters,
 /// volume and mute): RNNoise's voice probability per 10 ms window (its own
 /// state, not the track's noise suppression), backed by the window's level
-/// over a noise floor tracked by minimum statistics. Not calling it (a
-/// muted microphone) and digital silence leave its state as it was.
+/// over a noise floor tracked by minimum statistics. Digital silence, and
+/// a muted microphone (not calling it, then [`VoiceDetector::pause`]), end
+/// any phrase and keep the floor and RNNoise's state.
 pub struct VoiceDetector {
     ch: usize,
     vad: Box<DenoiseState<'static>>,
@@ -636,6 +642,23 @@ mod tests {
         let voiced = detect(&mono);
         let s: String = voiced.iter().map(|v| if *v { '1' } else { '.' }).collect();
         assert!(voiced.iter().all(|v| !v), "{s}");
+    }
+
+    #[test]
+    fn digital_silence_ends_the_phrase() {
+        // A phrase in progress over a -55 dB room (the bridge armed), 200 ms
+        // of digital zeros, then a noise 13 dB over the floor: the bridge
+        // must not take the noise for voice.
+        let mut d = VoiceDetector::new(CH);
+        let room = speech(3_000, 0, 1_000, -20.0, -55.0);
+        room.chunks(BLK * CH).for_each(|b| _ = d.process(b));
+        (d.speaking, d.quiet) = (true, 0);
+        for _ in 0..10 {
+            d.process(&[0.0; BLK * CH]);
+        }
+        let noise = speech(1_000, 0, 1_000, -20.0, -42.0);
+        assert!(noise.chunks(BLK * CH).all(|b| d.process(b).is_none()));
+        assert!(d.floor < -54.0, "{}", d.floor);
     }
 
     #[test]
