@@ -34,7 +34,10 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
-pub use duck::{DuckSettings, Ducker, MUSIC_DUCK_DB, VOICE_HOLD_FRAMES, VoiceDetector};
+pub use duck::{
+    DuckSettings, Ducker, LOOKAHEAD_FRAMES, MUSIC_DUCK_DB, VOICE_HOLD_FRAMES, VoiceDetector,
+    VoiceKey,
+};
 pub use live::{LiveChain, LiveControl, live};
 pub use spec::{FilterSpec, MAX_PARAMS, ParseError};
 

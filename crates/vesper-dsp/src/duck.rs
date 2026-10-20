@@ -7,12 +7,15 @@
 //! dips the voice presence band (a broad bell around 2 kHz), so speech stays
 //! clear over them.
 //!
-//! The detector and the ducker meet through the caller (another thread, a
-//! few ms apart): they only exchange "the voice speaks until then", which
-//! a gain envelope tolerates. Every gain of the ducker (leveler, compressor,
+//! The detector and the ducker meet through a [`VoiceKey`] (other threads):
+//! the voice marks its voiced 10 ms windows on the shared timeline, and a
+//! ducked track, its audio held back by [`LOOKAHEAD_FRAMES`], asks about
+//! its block and the lookahead after it. Every gain of the ducker (leveler, compressor,
 //! duck) is summed in dB once per [`CHUNK`] frames, and the linear gain is
 //! interpolated across the chunk: no zipper noise, one `exp` per chunk.
 //! Nothing allocates, locks or makes a syscall after construction.
+
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use crate::biquad::{CHUNK, Coefs, State};
 use nnnoiseless::DenoiseState;
@@ -68,6 +71,136 @@ const FLOOR_MAX: f32 = -25.0;
 /// How long the voice counts as speaking after its last voiced window
 /// (300 ms): the gaps between words do not pump the ducked tracks.
 pub const VOICE_HOLD_FRAMES: usize = 14_400;
+
+/// How far ahead of its audio a ducked track reads the voice, frames
+/// (120 ms; a multiple of the tracks' 20 ms block). Its audio waits that
+/// long (a processing latency, taken off its timeline like a plugin's), so
+/// the duck is down by the first syllable although the detector needs
+/// some voiced sound before it opens (about 30 ms, plus the 50 ms attack).
+/// 80 ms would do with the voice told in time; the rest covers a mic that
+/// tells 40 ms after a playback track got the same instant (capture and
+/// playback delays). See `ducking_report`'s lookahead table.
+pub const LOOKAHEAD_FRAMES: usize = 5_760;
+
+/// Windows per word of a [`VoiceKey`]; its top 32 bits tag the word. The
+/// timeline counts from boot: a 32-bit tag of 320 ms words wraps after 43
+/// years, so any two tags compare (wrapping, as `i32`) the right way.
+const KEY_BITS: u64 = 32;
+/// The low 32 bits: a word's window bits, or a word index's tag.
+const LOW32: u64 = u32::MAX as u64;
+/// Words of a [`VoiceKey`]: 32 of 320 ms, 10 s of history (the hold, the
+/// lookahead and a voice seconds late fit well within).
+const KEY_WORDS: usize = 32;
+
+/// When the voices speak, on the timeline the tracks share: a timeline
+/// frame is a track's anchor in frames plus its sample position, so tracks
+/// with the same anchor agree on it sample for sample. Voice tracks mark
+/// their voiced 10 ms windows and how far they have told; ducked tracks ask
+/// about any span. Lock-free, wait-free for readers, no allocation:
+/// several voices merge (a window is voiced if any voice says so).
+#[derive(Debug, Default)]
+pub struct VoiceKey {
+    /// One bit per window: word `k` holds windows `32k..32k + 32` in its
+    /// low bits and `k` (32 bits) on top. A word tagged otherwise holds
+    /// older windows, none of them asked about any more.
+    words: [AtomicU64; KEY_WORDS],
+    /// Timeline frame up to which a voice has told (the furthest one).
+    heard: AtomicU64,
+    /// Voice tracks listening.
+    voices: AtomicU32,
+}
+
+impl VoiceKey {
+    /// A voice track starts listening.
+    pub fn add_voice(&self) {
+        self.voices.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A voice track stops listening (one that called [`Self::add_voice`]).
+    pub fn remove_voice(&self) {
+        self.voices.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    /// Whether a voice track listens: tracks only duck under one then.
+    pub fn has_voice(&self) -> bool {
+        self.voices.load(Ordering::Relaxed) > 0
+    }
+
+    /// The detector's window ending at timeline frame `end` is voiced.
+    /// Kept in the window holding its middle: exact when the track's
+    /// anchor is a whole number of windows, 5 ms off at worst.
+    pub fn voiced(&self, end: u64) {
+        let w = end.saturating_sub(WINDOW as u64 / 2) / WINDOW as u64;
+        let k = w / KEY_BITS;
+        let (tag, bit) = (k & LOW32, 1 << (w % KEY_BITS));
+        let word = &self.words[k as usize % KEY_WORDS];
+        let mut cur = word.load(Ordering::Relaxed);
+        loop {
+            let old = cur >> KEY_BITS;
+            // A word with no bit set was never written (every write sets
+            // one): any tag takes it, whatever its starting tag 0 says.
+            let new = if old == tag {
+                cur | bit
+            } else if cur & LOW32 == 0 || tag.wrapping_sub(old) as u32 as i32 > 0 {
+                tag << KEY_BITS | bit
+            } else {
+                // Older than the history: no one asks about it.
+                return;
+            };
+            if new == cur {
+                return;
+            }
+            match word.compare_exchange_weak(cur, new, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => return,
+                Err(now) => cur = now,
+            }
+        }
+    }
+
+    /// A voice has told everything up to timeline frame `to`.
+    pub fn heard(&self, to: u64) {
+        self.heard.fetch_max(to, Ordering::Release);
+    }
+
+    /// Whether a voice speaks in timeline frames `from..to`, as far as the
+    /// voices have told: past that nothing is known, so nothing is voiced.
+    pub fn speaking(&self, from: u64, to: u64) -> bool {
+        let to = to.min(self.heard.load(Ordering::Acquire));
+        if to <= from {
+            return false;
+        }
+        let w = WINDOW as u64;
+        let last = (to - 1) / w;
+        // Only the history: a word wider than it would be read twice.
+        let first =
+            (from / w).max((last / KEY_BITS).saturating_sub(KEY_WORDS as u64 - 1) * KEY_BITS);
+        (first / KEY_BITS..=last / KEY_BITS).any(|k| {
+            let cur = self.words[k as usize % KEY_WORDS].load(Ordering::Relaxed);
+            if cur >> KEY_BITS != k & LOW32 {
+                return false;
+            }
+            let base = k * KEY_BITS;
+            let (lo, hi) = (first.max(base) - base, last.min(base + KEY_BITS - 1) - base);
+            cur & (u64::MAX >> (63 - hi)) & (u64::MAX << lo) != 0
+        })
+    }
+
+    /// Whether a track ducks its block of `frames` at timeline frame `at`,
+    /// reading the voice `lookahead` frames past it: a voice spoke within
+    /// [`VOICE_HOLD_FRAMES`] before the block's end, or speaks up to
+    /// `lookahead` after it. Where the voices have not told that far, only
+    /// what they told counts; a track ahead of them in real time (its
+    /// output delay, a Bluetooth headset) past the block's end ducks as
+    /// they speak at their last word, with its hold: the duck comes as late
+    /// as they are, less the lookahead. A voice that stalls goes on telling
+    /// (its silence fill).
+    pub fn ducks(&self, at: u64, frames: usize, lookahead: usize) -> bool {
+        let heard = self.heard.load(Ordering::Acquire);
+        let end = at + frames as u64;
+        let from = end.min(heard).saturating_sub(VOICE_HOLD_FRAMES as u64);
+        self.speaking(from, end + lookahead as u64)
+    }
+}
 
 /// Time for a duck to reach its depth, and to come back from it, ms (for a
 /// depth of at least [`MIN_RATE_DEPTH`]; less deep ducks are faster).
@@ -209,6 +342,18 @@ impl VoiceDetector {
     /// its start) the last window found voiced in it ends, if any.
     pub fn process(&mut self, buf: &[f32]) -> Option<usize> {
         let mut last = None;
+        self.process_windows(buf, |end, voiced| {
+            if voiced {
+                last = Some(end);
+            }
+        });
+        last
+    }
+
+    /// Feeds `buf` (interleaved, whole frames); `on_window` gets each
+    /// window that ends in it: where it ends (frames from `buf`'s start),
+    /// and whether the voice speaks there.
+    pub fn process_windows(&mut self, buf: &[f32], mut on_window: impl FnMut(usize, bool)) {
         let mut at = 0;
         let ch = self.ch;
         let frames = buf.len() / ch;
@@ -221,11 +366,11 @@ impl VoiceDetector {
                 *m = f.iter().sum::<f32>() * (SCALE / ch as f32);
             }
             (self.frames, at) = (self.frames + take, at + take);
-            if self.frames == WINDOW && self.window() {
-                last = Some(at);
+            if self.frames == WINDOW {
+                let voiced = self.window();
+                on_window(at, voiced);
             }
         }
-        last
     }
 
     /// Ends a window: whether it is voiced.
@@ -883,6 +1028,111 @@ mod tests {
         for z in d.dip_z.iter().chain(d.kw_z.iter().flatten()) {
             let (a, b) = z.raw();
             assert!(!tiny(a) && !tiny(b));
+        }
+    }
+
+    /// A key with windows 100..110 voiced (frames 48 000..52 800).
+    fn key_with_a_word() -> VoiceKey {
+        let key = VoiceKey::default();
+        for w in 100..110 {
+            key.voiced((w + 1) * WINDOW as u64);
+        }
+        key
+    }
+
+    #[test]
+    fn the_key_tells_voiced_windows_on_the_timeline() {
+        let key = key_with_a_word();
+        assert!(!key.speaking(48_000, 48_001), "not told yet");
+        key.heard(60_000);
+        assert!(key.speaking(48_000, 48_001));
+        assert!(key.speaking(52_799, 52_800));
+        assert!(!key.speaking(52_800, 60_000));
+        assert!(!key.speaking(0, 48_000));
+        // A second voice: windows merge.
+        key.voiced(56_160);
+        assert!(key.speaking(55_680, 56_160));
+        assert!(key.speaking(0, 60_000));
+    }
+
+    #[test]
+    fn a_ducked_block_reads_the_hold_before_and_the_lookahead_after() {
+        let key = key_with_a_word();
+        key.heard(200_000);
+        let ducks = |end: u64| key.ducks(end - 960, 960, LOOKAHEAD_FRAMES);
+        let look = LOOKAHEAD_FRAMES as u64;
+        assert!(!ducks(48_000 - look));
+        assert!(ducks(48_000 - look + 1));
+        let hold = VOICE_HOLD_FRAMES as u64;
+        assert!(ducks(52_800 + hold - 1));
+        assert!(!ducks(52_800 + hold));
+        // Without the lookahead: from the word's first frame.
+        assert!(!key.ducks(48_000 - 960, 960, 0));
+        assert!(key.ducks(48_000 - 959, 960, 0));
+    }
+
+    #[test]
+    fn ahead_of_the_voices_their_last_word_holds() {
+        let key = key_with_a_word();
+        key.heard(52_800);
+        // Far ahead: as the voice speaks at its last word.
+        assert!(key.ducks(100_000, 960, LOOKAHEAD_FRAMES));
+        // Its hold runs out as it tells more silence.
+        key.heard(52_800 + VOICE_HOLD_FRAMES as u64);
+        assert!(!key.ducks(100_000, 960, LOOKAHEAD_FRAMES));
+    }
+
+    #[test]
+    fn the_key_forgets_words_older_than_its_history() {
+        let key = key_with_a_word();
+        // The same word slot, 15.36 s later.
+        let later = (KEY_WORDS as u64 * KEY_BITS + 100) * WINDOW as u64;
+        key.heard(later + 10 * WINDOW as u64);
+        assert!(
+            !key.speaking(later, later + 480),
+            "an old word is not read as new"
+        );
+        key.voiced(later + WINDOW as u64);
+        assert!(key.speaking(later, later + 480));
+        assert!(!key.speaking(48_000, 52_800), "forgotten");
+        // A voice too late for the history changes nothing.
+        key.voiced(48_480);
+        assert!(!key.speaking(48_000, 48_480));
+        assert!(key.speaking(later, later + 480));
+    }
+
+    #[test]
+    fn the_key_works_at_any_uptime() {
+        // Timeline frames count from boot: 5 h up, and word counts around
+        // where 16- and 32-bit tags would flip sign.
+        let w = WINDOW as u64;
+        let five_hours = 5 * 3_600 * 48_000 / (w * KEY_BITS);
+        for words in [
+            five_hours,
+            (1 << 15) - 1,
+            1 << 15,
+            (1 << 15) + 7,
+            (1 << 16) + 3,
+            (1 << 31) - 1,
+            1 << 31,
+            (1 << 31) + 5,
+        ] {
+            let key = VoiceKey::default();
+            let base = words * KEY_BITS * w;
+            for i in 100..110 {
+                key.voiced(base + (i + 1) * w);
+            }
+            key.heard(base + 200 * w);
+            assert!(key.speaking(base + 100 * w, base + 101 * w), "{words}");
+            assert!(!key.speaking(base + 110 * w, base + 200 * w), "{words}");
+            assert!(key.ducks(base + 100 * w, 960, LOOKAHEAD_FRAMES), "{words}");
+            // The same slot, idle for 1000 turns of the ring, then written.
+            let later = base + (KEY_WORDS as u64 * KEY_BITS * 1_000 + 100) * w;
+            key.heard(later + 10 * w);
+            assert!(!key.speaking(later, later + w), "{words}: stale word");
+            key.voiced(later + w);
+            assert!(key.speaking(later, later + w), "{words}");
+            assert!(!key.speaking(later + w, later + 10 * w), "{words}");
         }
     }
 
