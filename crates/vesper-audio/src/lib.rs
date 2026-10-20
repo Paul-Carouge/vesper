@@ -151,8 +151,10 @@ struct Voice {
     /// Its loudness as recorded, told into `key`.
     meter: VoiceMeter,
     ducker: Box<Ducker>,
-    /// Was a voice at the last block (counted in `key`'s voices).
+    /// Was a voice at the last block (counted in `key`'s voices), and its
+    /// slot there to tell its loudness in.
     speaks: bool,
+    slot: Option<usize>,
     /// The lookahead's delay line, interleaved, while `ahead`: the
     /// processed audio waits [`LOOKAHEAD_FRAMES`] in it.
     delay: Box<[f32]>,
@@ -170,6 +172,7 @@ impl Voice {
             meter: VoiceMeter::new(ch),
             ducker: Box::new(Ducker::new(ch)),
             speaks: false,
+            slot: None,
             delay: vec![0.0; LOOKAHEAD_FRAMES * ch].into(),
             pos: 0,
             ahead: false,
@@ -180,7 +183,7 @@ impl Voice {
 impl Drop for Voice {
     fn drop(&mut self) {
         if self.speaks {
-            self.key.remove_voice();
+            self.key.remove_voice(self.slot);
         }
     }
 }
@@ -738,9 +741,12 @@ impl<F: FnMut(EncodedPacket)> Encoder<F> {
             {
                 // Measured as it comes in: the leveler and the duck see a
                 // louder song or section before they play it.
+                // The block after the filters sits their delay earlier on
+                // the timeline: where `encode_block` will process it.
+                let at = (self.origin + self.fed).saturating_sub((FRAME + delay) as u64);
                 let voice = v.key.loudness();
                 v.ducker
-                    .look_ahead(&self.block, self.shared.ducking(), voice);
+                    .look_ahead(&self.block, at, self.shared.ducking(), voice);
             }
             let ahead = self.lookahead();
             self.set_delay(delay + ahead);
@@ -762,9 +768,9 @@ impl<F: FnMut(EncodedPacket)> Encoder<F> {
             // A voice from now: it starts listening afresh.
             v.detector.reset();
             v.meter.reset();
-            v.key.add_voice();
+            v.slot = v.key.add_voice();
         } else if !speaks && v.speaks {
-            v.key.remove_voice();
+            v.key.remove_voice(v.slot.take());
         }
         v.speaks = speaks;
         if !speaks {
@@ -872,8 +878,10 @@ impl<F: FnMut(EncodedPacket)> Encoder<F> {
                 let speaking = v.key.has_voice() && v.key.ducks(at, FRAME, ahead);
                 (self.shared.ducking(), speaking)
             };
+            let at = self.origin + self.sent as u64;
+            let voice = v.key.loudness();
             v.ducker
-                .process(&mut self.block, settings, speaking, v.key.loudness());
+                .process_at(&mut self.block, at, settings, speaking, voice);
             let db = v.ducker.ducking_db();
             self.shared.ducking.store(db.to_bits(), Ordering::Relaxed);
         }
@@ -884,8 +892,11 @@ impl<F: FnMut(EncodedPacket)> Encoder<F> {
         };
         apply_gain(&mut self.block, self.gain, gain);
         self.gain = gain;
+        // The voice as `detect` last saw it (counted in the key, its slot
+        // held), not a fresh read of the switch.
         if let Some(v) = &mut self.voice
-            && speaks
+            && v.speaks
+            && let Some(slot) = v.slot
         {
             // The voice as recorded: after its filters (their delay taken
             // off, so its windows are where the detector marked them) and
@@ -894,7 +905,7 @@ impl<F: FnMut(EncodedPacket)> Encoder<F> {
             let own = &v.own;
             let voiced = |a: usize, b: usize| own.speaking(at + a as u64, at + b as u64);
             if let Some(lufs) = v.meter.process(&self.block, voiced) {
-                v.key.set_loudness(lufs);
+                v.key.set_loudness(slot, lufs);
             }
         }
         self.meter();
@@ -1982,6 +1993,42 @@ mod tests {
     }
 
     #[test]
+    fn background_music_holds_a_louder_song_down_from_its_first_sample() {
+        // A 200 Hz tone at -26 LUFS (the target), music mode turned on at
+        // 1 s (the lookahead with it), then 20 dB louder from block 150:
+        // measured ahead on the same timeline frames, it is held at the
+        // target + 6 from its first block, and not before.
+        let key = Arc::new(VoiceKey::default());
+        let mut track = voice_track(&key, Duration::ZERO, false, DuckSettings::default());
+        let out = Arc::new(std::sync::Mutex::new(Vec::<f32>::new()));
+        let o = out.clone();
+        track.tap = Some(Box::new(move |_, b: &[f32]| {
+            o.lock().unwrap().extend(b.iter().step_by(2));
+        }));
+        let amp = |k: usize| if k >= 150 { 0.5 } else { 0.05 };
+        for k in 0..200 {
+            if k == 50 {
+                track
+                    .shared
+                    .set_ducking(DuckSettings::at_levels(None, Some(1)));
+            }
+            track.push(&sine_block(200.0, amp(k), k));
+        }
+        let out = out.lock().unwrap();
+        let peak = |k: usize| {
+            out[k * FRAME..(k + 1) * FRAME]
+                .iter()
+                .fold(0f32, |m, s| m.max(s.abs()))
+        };
+        for k in 100..147 {
+            assert!(peak(k) > 0.045, "block {k}: {}", peak(k));
+        }
+        for k in 150..(out.len() / FRAME) {
+            assert!(peak(k) < 0.13, "block {k}: {}", peak(k));
+        }
+    }
+
+    #[test]
     fn the_voice_tells_its_loudness_as_recorded() {
         // The same speech at volume 1 and 0.5: 6 dB apart, as recorded.
         let loudness = |gain: f32| {
@@ -1991,7 +2038,11 @@ mod tests {
             for k in 0..WORDS.end + 10 {
                 mic.push(&speech_block(k));
             }
-            key.loudness().expect("measured")
+            let lufs = key.loudness().expect("measured").loudest;
+            // A voice track that goes takes its loudness with it.
+            drop(mic);
+            assert_eq!(key.loudness(), None);
+            lufs
         };
         let (full, half) = (loudness(1.0), loudness(0.5));
         assert!((-40.0..-15.0).contains(&full), "{full}");
@@ -2119,7 +2170,7 @@ mod tests {
     fn a_ducking_track_ends_with_its_input_whether_its_voice_stays_or_not() {
         for voice_left in [false, true] {
             let key = Arc::new(VoiceKey::default());
-            key.add_voice();
+            let slot = key.add_voice();
             let mut track = voice_track(&key, Duration::ZERO, false, DUCK_12);
             let out = Arc::new(std::sync::Mutex::new(Vec::<f32>::new()));
             let o = out.clone();
@@ -2130,7 +2181,7 @@ mod tests {
             track.push(&input);
             if voice_left {
                 // Its voice is gone: the lookahead lets its line out.
-                key.remove_voice();
+                key.remove_voice(slot);
             }
             track.finish();
             // 1 s in, 1 s out: nothing lost, no silence added.

@@ -37,7 +37,7 @@ use std::time::Instant;
 
 pub use duck::{
     DuckSettings, Ducker, LOOKAHEAD_FRAMES, MUSIC_DUCK_DB, VOICE_HOLD_FRAMES, VoiceDetector,
-    VoiceKey, VoiceMeter,
+    VoiceKey, VoiceMeter, Voices,
 };
 pub use live::{LiveChain, LiveControl, live};
 pub use spec::{FilterSpec, MAX_PARAMS, ParseError};

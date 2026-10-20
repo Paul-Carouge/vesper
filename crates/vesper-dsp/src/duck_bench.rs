@@ -393,7 +393,7 @@ fn simulate_with(
             let at = at as u64;
             if let Some(lufs) = meter.process(&v, |a, b| key.speaking(at + a as u64, at + b as u64))
             {
-                key.set_loudness(lufs);
+                key.set_loudness(0, lufs);
             }
         }
         // As `Encoder::push`: the ducked track measures its input as it
@@ -403,7 +403,7 @@ fn simulate_with(
             for (i, f) in m.as_chunks_mut::<CH>().0.iter_mut().enumerate() {
                 f.fill(music.map_or(0.0, |x| x[at + i]));
             }
-            duck.look_ahead(&m, settings, key.loudness());
+            duck.look_ahead(&m, at as u64, settings, key.loudness());
         }
         // The ducked track's block, its audio held back by the lookahead.
         let Some(at) = step
@@ -422,7 +422,7 @@ fn simulate_with(
         for (i, f) in m.as_chunks_mut::<CH>().0.iter_mut().enumerate() {
             f.fill(music.map_or(0.0, |x| x[at + i]));
         }
-        duck.process(&mut m, settings, speaking, key.loudness());
+        duck.process_at(&mut m, at as u64, settings, speaking, key.loudness());
         sim.out.extend(m.as_chunks::<CH>().0.iter().map(|f| f[0]));
         sim.level.push(duck.leveled());
         sim.comp.push(duck.comp);
@@ -1064,6 +1064,23 @@ fn ducking_report() {
         println!(
             "\nArranged song (quiet intro, fade-in, bridge 10 LU lower): leveler gain swings {swing:.1} dB from 12 s; momentary peak {top:.1} LU over target after the intro."
         );
+        let (perc, _) = bursts(20, 14.0, 500);
+        let (perc20, _) = bursts(20, 20.0, 500);
+        println!(
+            "\nPercussive: 20 ms hits over a steady bed every 500 ms: leveler gain moves {perc:.2} dB (14 LU over), {perc20:.2} dB (20 LU over)."
+        );
+        for ms in [400, 800] {
+            let (_, back) = bursts(ms, 14.0, 0);
+            println!(
+                "Burst: {ms} ms, 14 LU over a steady bed: leveler back within 1 dB {back:.0} ms after it ends."
+            );
+        }
+        for ms in [2_000, 3_000, 6_000] {
+            let (top, over) = pause_menu(ms);
+            println!(
+                "Pause menu: loud song 20 dB lower for {ms} ms: once back, {top:.1} LU over target at most, {over:.0} ms over target + 3 LU."
+            );
+        }
         let duck = chorus_under_duck(DuckSettings::at_levels(Some(1), None));
         let bg = chorus_under_duck(DuckSettings::at_levels(None, Some(1)));
         println!(
@@ -1194,10 +1211,10 @@ fn ducking_report() {
     // With the voice measured: the duck measures the track all along.
     let duck_m = DuckSettings::at_levels(Some(1), None);
     let mut d = Ducker::new(CH);
-    let adaptive = time(&mut |b, i| d.process(b, duck_m, i % 100 < 50, Some(-20.0)));
+    let adaptive = time(&mut |b, i| d.process(b, duck_m, i % 100 < 50, Some(Voices::one(-20.0))));
     let music_m = DuckSettings::at_levels(None, Some(1));
     let mut d = Ducker::new(CH);
-    let bg_rel = time(&mut |b, i| d.process(b, music_m, i % 100 < 50, Some(-20.0)));
+    let bg_rel = time(&mut |b, i| d.process(b, music_m, i % 100 < 50, Some(Voices::one(-20.0))));
     let mut m = VoiceMeter::new(CH);
     let meter = time(&mut |b, _| {
         std::hint::black_box(m.process(b, |a, _| a % 960 == 0));
@@ -1434,6 +1451,52 @@ fn chorus_under_duck(settings: DuckSettings) -> f32 {
         / 2.0
 }
 
+/// A steady bed (the steady song at -26 LUFS, music mode at -26) with
+/// noise bursts `len_ms` long, `over` LU louder than the bed, every
+/// `period_ms` from 1 s, or once at 10 s (`period_ms` 0); 20 s. Returns
+/// how far the leveler's gain (its guard included) moves from 10 s (the hits measured), dB,
+/// and how long after the last burst it stays more than 1 dB off where it
+/// was before the first, ms.
+fn bursts(len_ms: usize, over: f32, period_ms: usize) -> (f32, f32) {
+    let mut x = song(20.0, -26.0, false, 19);
+    let len = len_ms * MS;
+    let mut hit = noise(len, 1.0, 23);
+    let g = db_to_lin(-26.0 + over - loudness(&hit, &[]));
+    hit.iter_mut().for_each(|s| *s *= g);
+    let starts: Vec<usize> = if period_ms == 0 {
+        vec![10_000 * MS]
+    } else {
+        (1_000..19_000).step_by(period_ms).map(|t| t * MS).collect()
+    };
+    for &a in &starts {
+        add(&mut x, &hit, a);
+    }
+    let sim = simulate(&vec![0.0; x.len()], false, Some(&x), music(-26.0));
+    let first = starts[0] / BLK;
+    let before = sim.level[first - 50..first].iter().sum::<f32>() / 50.0;
+    let l = &sim.level[500..];
+    let (lo, hi) = l
+        .iter()
+        .fold((f32::MAX, f32::MIN), |(a, b), &v| (a.min(v), b.max(v)));
+    let end = (starts.last().unwrap() + len) / BLK;
+    let off = sim.level[end..]
+        .iter()
+        .rposition(|v| (v - before).abs() > 1.0)
+        .map_or(0, |i| i + 1);
+    (hi - lo, (off * 20) as f32)
+}
+
+/// A loud song (-10 LUFS) paused 20 dB lower for `pause_ms` at 10 s
+/// (a game's pause menu), then loud again, music mode at -26: how far and
+/// how long (ms) it goes over target + 3 LU once back.
+fn pause_menu(pause_ms: usize) -> (f32, f32) {
+    let mut x = song(25.0, -10.0, false, 20);
+    let (a, b) = (10_000 * MS, (10_000 + pause_ms) * MS);
+    x[a..b].iter_mut().for_each(|s| *s *= 0.1);
+    let sim = simulate(&vec![0.0; x.len()], false, Some(&x), music(-26.0));
+    overshoot(&sim.out, b, -26.0)
+}
+
 /// Song `a` then song `b` (LUFS), 15 s each, in music mode at -26 LUFS:
 /// the leveler's convergence after the change (ms, final gain), and how
 /// far and how long (ms) the music goes over target + 3 LU after it.
@@ -1491,4 +1554,17 @@ fn a_louder_section_is_ducked_as_it_starts() {
             });
         }
     });
+}
+
+#[test]
+fn hits_and_bursts_do_not_move_the_leveler() {
+    // A 20 ms hit 14 LU over the bed, every 500 ms: before, the guard dipped
+    // 3.3 dB per hit.
+    for over in [14.0, 20.0] {
+        let (moves, _) = bursts(20, over, 500);
+        assert!(moves < 0.5, "{over} LU over: moves {moves} dB");
+    }
+    // A 400 ms burst: before, the bed stayed about 14 dB down for 7 s.
+    let (_, back) = bursts(400, 14.0, 0);
+    assert!(back <= 1_500.0, "back after {back} ms");
 }

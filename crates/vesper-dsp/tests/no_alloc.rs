@@ -4,7 +4,7 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
-use vesper_dsp::{Chain, DuckSettings, Ducker, FilterSpec, VoiceDetector, VoiceMeter};
+use vesper_dsp::{Chain, DuckSettings, Ducker, FilterSpec, VoiceDetector, VoiceMeter, Voices};
 
 thread_local! {
     static COUNTING: Cell<bool> = const { Cell::new(false) };
@@ -137,9 +137,13 @@ fn voice_meter_and_ducker_do_not_allocate() {
         COUNTING.set(true);
         let mut voice = None;
         for (i, b) in buf.chunks_mut(960 * 2).enumerate() {
-            voice = meter.process(b, |a, _| a % 960 == 0).or(voice);
-            duck.look_ahead(b, set, voice);
-            duck.process(b, set, i % 50 < 30, voice);
+            voice = meter
+                .process(b, |a, _| a % 960 == 0)
+                .map(Voices::one)
+                .or(voice);
+            let at = (i * 960) as u64;
+            duck.look_ahead(b, at, set, voice);
+            duck.process_at(b, at, set, i % 50 < 30, voice);
         }
         meter.reset();
         COUNTING.set(false);
