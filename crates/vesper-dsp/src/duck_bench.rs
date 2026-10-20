@@ -16,6 +16,7 @@
 
 use super::*;
 use crate::biquad::{Coefs, State};
+use crate::test_util::{noise, rms_db};
 use crate::{Chain, FilterSpec};
 
 const CH: usize = 2;
@@ -38,11 +39,6 @@ impl Rng {
 
 fn ms(frames: usize) -> f32 {
     frames as f32 / MS as f32
-}
-
-fn rms_db(x: &[f32]) -> f32 {
-    let p = x.iter().map(|s| f64::from(*s).powi(2)).sum::<f64>() / x.len().max(1) as f64;
-    10.0 * p.max(1e-30).log10() as f32
 }
 
 /// Scales `x` so its RMS over `active` frames (all if empty) is `db` dBFS.
@@ -81,14 +77,9 @@ fn bandpass(x: &mut [f32], hz: f32, q: f64) {
         .for_each(|s| *s = z.run(&c, f64::from(*s)) as f32);
 }
 
-fn white(n: usize, seed: u32) -> Vec<f32> {
-    let mut r = Rng(seed);
-    (0..n).map(|_| r.next()).collect()
-}
-
 /// Steady room noise (white, gently low-passed) at RMS `db`.
 fn room(n: usize, db: f32, seed: u32) -> Vec<f32> {
-    let mut x = white(n, seed);
+    let mut x = noise(n, 1.0, seed);
     lowpass(&mut x, 4_000.0);
     set_rms(&mut x, &[], db);
     x
@@ -96,7 +87,7 @@ fn room(n: usize, db: f32, seed: u32) -> Vec<f32> {
 
 /// A fan: low rumble with a 100 Hz hum, RMS `db`.
 fn fan(n: usize, db: f32, seed: u32) -> Vec<f32> {
-    let mut x = white(n, seed);
+    let mut x = noise(n, 1.0, seed);
     lowpass(&mut x, 600.0);
     for (i, s) in x.iter_mut().enumerate() {
         *s += 0.3 * (std::f32::consts::TAU * 100.0 * i as f32 / FS).sin();
@@ -125,7 +116,7 @@ fn synth_speech(len_ms: usize, words: &[(usize, usize)], f0: f32, db: f32, seed:
         let len = b - a;
         // Unvoiced onset (a fricative / plosive), 40 ms, then voicing.
         let fric = 40 * MS;
-        let mut f = white(fric, seed ^ ((w as u32 + 1) * 977));
+        let mut f = noise(fric, 1.0, seed ^ ((w as u32 + 1) * 977));
         bandpass(&mut f, 4_500.0, 1.0);
         for (i, s) in f.iter_mut().enumerate() {
             *s *= 0.25 * (std::f32::consts::PI * i as f32 / fric as f32).sin();
@@ -372,18 +363,24 @@ fn simulate(mic: &[f32], chain: bool, music: Option<&[f32]>, settings: DuckSetti
 }
 
 /// Duck timing of one phrase, ms: onset to -3 dB, to full depth; offset
-/// to back over -3 dB, to over -0.5 dB. None: never reached.
+/// to back over -3 dB, to over -0.5 dB. Err: "n/a" when already there at
+/// the onset / offset (ducked early, released early), or "never".
 struct Timing {
-    to_3db: Option<f32>,
-    to_full: Option<f32>,
-    back_3db: Option<f32>,
-    back_full: Option<f32>,
+    to_3db: Result<f32, &'static str>,
+    to_full: Result<f32, &'static str>,
+    back_3db: Result<f32, &'static str>,
+    back_full: Result<f32, &'static str>,
 }
 
 fn timing(sim: &Sim, onset: usize, offset: usize, depth: f32) -> Timing {
     let g = &sim.gain;
-    let after = |from: usize, f: &dyn Fn(f32) -> bool| {
-        g[from.min(g.len())..].iter().position(|&x| f(x)).map(ms)
+    let after = |from: usize, f: &dyn Fn(f32) -> bool| match g[from.min(g.len())..]
+        .iter()
+        .position(|&x| f(x))
+    {
+        Some(0) => Err("n/a"),
+        Some(i) => Ok(ms(i)),
+        None => Err("never"),
     };
     Timing {
         to_3db: after(onset, &|x| x <= -3.0),
@@ -393,12 +390,12 @@ fn timing(sim: &Sim, onset: usize, offset: usize, depth: f32) -> Timing {
     }
 }
 
-/// Pumping within a phrase: from full depth after the onset to the
+/// Pumping within a phrase: from the depth reached after the onset to the
 /// offset, how far the duck comes back up (dB) and its gain's standard
 /// deviation (dB).
 fn pumping(sim: &Sim, onset: usize, offset: usize, depth: f32) -> (f32, f32) {
     let g = &sim.gain;
-    let Some(full) = g[onset..offset].iter().position(|&x| x <= -(depth - 0.5)) else {
+    let Some(full) = g[onset..offset].iter().position(|&x| x <= -depth + 0.01) else {
         return (depth, 0.0);
     };
     let s = &g[onset + full..offset];
@@ -485,8 +482,8 @@ fn speech_with_floor(s: Speech, floor_db: f32) -> Speech {
     }
 }
 
-fn opt(x: Option<f32>) -> String {
-    x.map_or("never".into(), |v| format!("{v:.0}"))
+fn opt(x: Result<f32, &str>) -> String {
+    x.map_or_else(String::from, |v| format!("{v:.0}"))
 }
 
 /// One row of the timing table.
@@ -542,7 +539,7 @@ fn keyboard(secs: usize, db: f32, seed: u32) -> Vec<f32> {
 fn breaths(secs: usize, db: f32) -> Vec<f32> {
     let n = secs * 1_000 * MS;
     let mut x = room(n, -60.0, 5);
-    let mut b = white(500 * MS, 6);
+    let mut b = noise(500 * MS, 1.0, 6);
     bandpass(&mut b, 1_200.0, 0.7);
     let l = b.len();
     for (i, s) in b.iter_mut().enumerate() {
@@ -559,7 +556,7 @@ fn breaths(secs: usize, db: f32) -> Vec<f32> {
 fn coughs(secs: usize, db: f32) -> Vec<f32> {
     let n = secs * 1_000 * MS;
     let mut x = room(n, -60.0, 7);
-    let mut c = white(120 * MS, 8);
+    let mut c = noise(120 * MS, 1.0, 8);
     lowpass(&mut c, 3_000.0);
     let l = c.len();
     for (i, s) in c.iter_mut().enumerate() {
@@ -624,10 +621,15 @@ fn talk(db: f32, total_ms: usize) -> Speech {
     Speech { x, active }
 }
 
-/// Blocks until the leveler is within 1 dB of where it ends, from `from`,
-/// in ms; and its final gain.
+/// Time until the leveler is within 1 dB of where it ends (its mean over
+/// the last 2 s), from block `from`, in ms; and that final gain. `level`
+/// and `from` are in 20 ms blocks.
 fn convergence(level: &[f32], from: usize) -> (f32, f32) {
     let end = level.len();
+    assert!(
+        end >= 100 && from < end,
+        "convergence needs a run of 2 s or more past block {from}, got {end} blocks"
+    );
     let last = level[end - 100..].iter().sum::<f32>() / 100.0;
     let settled = level[from..]
         .iter()
@@ -996,15 +998,12 @@ fn a_spoken_phrase_ducks_fast_and_holds_through_its_gaps() {
     let s = speech_with_floor(synth_speech(5_000, &phrase_words(), 130.0, -26.0, 1), -65.0);
     let sim = simulate(&s.x, false, None, duck_only(12.0));
     let t = timing(&sim, s.onset(), s.offset(), 12.0);
-    assert!(t.to_3db.is_some_and(|v| v <= 60.0), "{:?}", t.to_3db);
-    assert!(t.to_full.is_some_and(|v| v <= 100.0), "{:?}", t.to_full);
-    assert!(
-        t.back_full.is_some_and(|v| v <= 1_200.0),
-        "{:?}",
-        t.back_full
-    );
+    assert!(t.to_3db.is_ok_and(|v| v <= 60.0), "{:?}", t.to_3db);
+    assert!(t.to_full.is_ok_and(|v| v <= 100.0), "{:?}", t.to_full);
+    assert!(t.back_full.is_ok_and(|v| v <= 1_200.0), "{:?}", t.back_full);
     let (rise, _) = pumping(&sim, s.onset(), s.offset(), 12.0);
-    assert!(rise < 0.5, "pumps {rise} dB between words");
+    // 0.0 today; a gap that lets the duck up would show as tenths of a dB.
+    assert!(rise < 0.25, "pumps {rise} dB between words");
 }
 
 #[test]
@@ -1013,7 +1012,7 @@ fn real_speech_is_ducked_throughout() {
     let sim = simulate(&s.x, false, None, duck_only(12.0));
     assert!(recall(&sim, &s) >= 95.0, "{}", recall(&sim, &s));
     let t = timing(&sim, s.onset(), s.offset(), 12.0);
-    assert!(t.to_3db.is_some_and(|v| v <= 60.0), "{:?}", t.to_3db);
+    assert!(t.to_3db.is_ok_and(|v| v <= 60.0), "{:?}", t.to_3db);
 }
 
 #[test]
