@@ -1484,7 +1484,7 @@ mod tests {
         // Filled every 20 ms up to 25 ms ago (a fill and the tolerance): the
         // mix and a live stream do not wait for it. Packets lag by that, a
         // block and the encoder.
-        // Waiting for it would lag `STALL`: the bound has room for a loaded CI runner.
+        // Waiting for it would lag at least `STALL`: the bound has room for a loaded CI runner.
         let lag = stalled_lag(false, FRAME);
         let margin = TOLERANCE + STALL_FILL;
         assert!(lag >= margin && lag < STALL, "{lag:?}");
@@ -1495,7 +1495,7 @@ mod tests {
         // An input's buffers are stamped in the past: it stays `STALL` back.
         let lag = stalled_lag(true, FRAME);
         assert!(lag >= STALL, "{lag:?}");
-        assert!(lag < STALL + Duration::from_millis(150), "{lag:?}");
+        assert!(lag < 2 * STALL, "{lag:?}");
     }
 
     /// Decodes Opus packets back to channel 0's samples.
