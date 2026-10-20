@@ -86,7 +86,8 @@ pub const LOOKAHEAD_FRAMES: usize = 5_760;
 /// timeline counts from boot: a 32-bit tag of 320 ms words wraps after 43
 /// years, so any two tags compare (wrapping, as `i32`) the right way.
 const KEY_BITS: u64 = 32;
-const TAG_MASK: u64 = u32::MAX as u64;
+/// The low 32 bits: a word's window bits, or a word index's tag.
+const LOW32: u64 = u32::MAX as u64;
 /// Words of a [`VoiceKey`]: 32 of 320 ms, 10 s of history (the hold, the
 /// lookahead and a voice seconds late fit well within).
 const KEY_WORDS: usize = 32;
@@ -131,7 +132,7 @@ impl VoiceKey {
     pub fn voiced(&self, end: u64) {
         let w = end.saturating_sub(WINDOW as u64 / 2) / WINDOW as u64;
         let k = w / KEY_BITS;
-        let (tag, bit) = (k & TAG_MASK, 1 << (w % KEY_BITS));
+        let (tag, bit) = (k & LOW32, 1 << (w % KEY_BITS));
         let word = &self.words[k as usize % KEY_WORDS];
         let mut cur = word.load(Ordering::Relaxed);
         loop {
@@ -140,7 +141,7 @@ impl VoiceKey {
             // one): any tag takes it, whatever its starting tag 0 says.
             let new = if old == tag {
                 cur | bit
-            } else if cur & TAG_MASK == 0 || tag.wrapping_sub(old) as u32 as i32 > 0 {
+            } else if cur & LOW32 == 0 || tag.wrapping_sub(old) as u32 as i32 > 0 {
                 tag << KEY_BITS | bit
             } else {
                 // Older than the history: no one asks about it.
@@ -175,7 +176,7 @@ impl VoiceKey {
             (from / w).max((last / KEY_BITS).saturating_sub(KEY_WORDS as u64 - 1) * KEY_BITS);
         (first / KEY_BITS..=last / KEY_BITS).any(|k| {
             let cur = self.words[k as usize % KEY_WORDS].load(Ordering::Relaxed);
-            if cur >> KEY_BITS != k & TAG_MASK {
+            if cur >> KEY_BITS != k & LOW32 {
                 return false;
             }
             let base = k * KEY_BITS;

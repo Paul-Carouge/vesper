@@ -920,8 +920,12 @@ impl<F: FnMut(EncodedPacket)> Encoder<F> {
         let end = self.fed as i64 + self.pending_frames() as i64;
         let zeros = vec![0.0; len];
         self.push(&zeros[..(len - self.pending.len() % len) % len]);
-        while self.sent + ((self.ready.len() / ch) as i64) < end {
+        // Bounded: a chain whose latency keeps growing must not spin here.
+        let mut turns = 0;
+        while self.sent + ((self.ready.len() / ch) as i64) < end && turns <= self.delay / FRAME + 2
+        {
             self.push(&zeros);
+            turns += 1;
         }
         if !self.ready.is_empty() {
             self.ready.resize(len, 0.0);
