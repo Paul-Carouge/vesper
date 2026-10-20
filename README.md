@@ -166,8 +166,8 @@ Not planned: plugin APIs for the video pipeline itself.
 
 ## License
 
-Free to use for anyone, commercial uses included, and to redistribute unmodified; changing the code is reserved to its author. See [LICENSE](LICENSE).
+Free to use for anyone, commercial uses included, and to redistribute as unmodified source; changing the code is reserved to its author. See [LICENSE](LICENSE).
 
 The interface is built with Slint, used under its royalty-free license:
 
-[![Made with Slint](https://raw.githubusercontent.com/slint-ui/slint/master/logo/MadeWithSlint-logo-light.svg)](https://slint.dev)
+[![Made with Slint](docs/images/made-with-slint.png)](https://slint.dev)
