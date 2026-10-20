@@ -889,7 +889,7 @@ fn null(out: &[f32], inp: &[f32]) -> String {
 
 /// Duck 12 dB, a phrase from 1 to 2.5 s: null against the input with the
 /// voice silent and from 6 s (well after the release); 2nd and 3rd
-/// harmonics of a 1 kHz sine at full depth (dBc); the worst spur at 1 kHz
+/// harmonics of a 1 kHz sine at full depth, settled (dBc); the worst spur at 1 kHz
 /// +/- 1.5 kHz (the chunk rate) through the attack and the release (dBc).
 fn transparency() -> (String, String, (f32, f32), f32) {
     let x = song(8.0, -20.0, true, 31);
@@ -898,11 +898,16 @@ fn transparency() -> (String, String, (f32, f32), f32) {
     let voice = synth_speech(8_000, &[(1_000, 1_500)], 130.0, -26.0, 4);
     let sim = simulate(&voice.x, false, Some(&x), duck_only(12.0));
     let after = null(&sim.out[6_000 * MS..], &x[6_000 * MS..]);
+    // The sine's phase in f64: in f32 it drifts (a floor near -114 dBc).
     let sine: Vec<f32> = (0..x.len())
-        .map(|i| 0.1 * (std::f32::consts::TAU * 1_000.0 * i as f32 / FS).sin())
+        .map(|i| (0.1 * (std::f64::consts::TAU * 1_000.0 * i as f64 / 48_000.0).sin()) as f32)
         .collect();
     let sim = simulate(&voice.x, false, Some(&sine), duck_only(12.0));
-    let full = &sim.out[1_800 * MS..2_400 * MS];
+    // Harmonics once the duck and the band share settled: a phrase from
+    // 1 to 7.5 s, measured from 4 to 7 s.
+    let long = synth_speech(8_000, &[(1_000, 6_500)], 130.0, -26.0, 4);
+    let held = simulate(&long.x, false, Some(&sine), duck_only(12.0));
+    let full = &held.out[4_000 * MS..7_000 * MS];
     let f0 = tone_at(full, 1_000.0).0;
     let thd = (tone_at(full, 2_000.0).0 - f0, tone_at(full, 3_000.0).0 - f0);
     let zip = [(800, 1_400), (2_400, 4_400)]
@@ -1577,7 +1582,7 @@ fn ducking_report() {
         println!("| voice silent: output minus input, peak (dB re input peak) | {idle} |");
         println!("| 2 s after a phrase's release: output minus input, peak (dB) | {after} |");
         println!(
-            "| 1 kHz at full duck: 2nd / 3rd harmonic (dBc) | {:.0} / {:.0} |",
+            "| 1 kHz at full duck, settled: 2nd / 3rd harmonic (dBc) | {:.0} / {:.0} |",
             thd.0, thd.1
         );
         println!(
@@ -2114,8 +2119,8 @@ fn the_spectral_duck_is_transparent_and_clean() {
     let (idle, after, thd, zip) = transparency();
     assert!(idle.starts_with("exact"), "idle: {idle}");
     assert!(after.starts_with("exact"), "after: {after}");
-    // -98 / -111 and -93 dBc.
-    assert!(thd.0 < -90.0 && thd.1 < -90.0, "{thd:?}");
+    // Settled: see the report.
+    assert!(thd.0 < -100.0 && thd.1 < -100.0, "{thd:?}");
     assert!(zip < -80.0, "spur {zip} dBc");
 }
 

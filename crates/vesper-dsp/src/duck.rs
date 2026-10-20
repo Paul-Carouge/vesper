@@ -332,6 +332,8 @@ const BAND_MAX_DB: f32 = 12.0;
 const SHARE_REF_DB: f32 = 12.0;
 const SHARE_BLOCKS: f32 = 10.0;
 const SHARE_DEFAULT: f32 = 0.6;
+/// The split follows the share over about 100 ms (per chunk).
+const SHARE_GLIDE: f32 = CHUNK as f32 / BLOCK as f32;
 
 /// Most an adaptive duck lowers, dB.
 const MAX_DEPTH_DB: f32 = 36.0;
@@ -907,8 +909,11 @@ pub struct Ducker {
     /// The band-pass state of the reference bell (`SHARE_REF_DB`), per
     /// channel.
     share_z: Vec<State>,
-    /// Share of the track's K-weighted power in the voice band (0 to 1).
+    /// Share of the track's K-weighted power in the voice band (0 to 1),
+    /// per block, and gliding per chunk (what the split reads: a new block's
+    /// share does not step the broadband gain).
     share: f32,
+    share_now: f32,
     /// The phrase the voice speaks, while the duck is down for it.
     phrase: Option<Phrase>,
     /// Release time of the last phrase, ms.
@@ -982,6 +987,7 @@ impl Ducker {
             share_frames: 0,
             share_z: vec![State::default(); ch],
             share: SHARE_DEFAULT,
+            share_now: SHARE_DEFAULT,
             phrase: None,
             release_ms: RELEASE_LONG_MS,
             #[cfg(test)]
@@ -1018,8 +1024,13 @@ impl Ducker {
     }
 
     /// The whole gain now (leveler, compressor and duck), dB. For a meter.
+    /// The duck counts as the loudness it takes (its bell and broadband
+    /// gain together), not the broadband gain alone.
     pub fn gain_db(&self) -> f32 {
-        20.0 * self.gain.log10()
+        if self.idle() {
+            return 0.0;
+        }
+        self.leveled() + self.comp + self.duck
     }
 
     /// The leveler's gain now, dB (its cap included).
@@ -1194,7 +1205,7 @@ impl Ducker {
         let plan = Plan::new(settings, voice);
         let measuring = plan.measuring();
         if !measuring && !(speaking && plan.fixed > 0.0) && self.idle() {
-            self.measuring = false;
+            (self.measuring, self.share_now) = (false, self.share);
             return;
         }
         let target = plan.target;
@@ -1296,6 +1307,13 @@ impl Ducker {
             // one coming up): never faster than a release.
             let release = rate / self.release_ms;
             self.duck = slew(self.duck, duck_target, rate / ATTACK_MS, release);
+            // Not ducking, the split changes nothing: it takes the share
+            // at once (the glide only smooths a duck in progress).
+            self.share_now = if self.duck == 0.0 {
+                self.share
+            } else {
+                self.share_now + (self.share - self.share_now) * SHARE_GLIDE
+            };
             let (broad, bell) = self.split();
             self.bell_chunk(chunk, bell);
             let to = db_to_lin(level + self.comp + broad);
@@ -1346,7 +1364,8 @@ impl Ducker {
             return (0.0, 0.0);
         }
         let band = d.min(BAND_MAX_DB);
-        let left = 1.0 - self.share + self.share * db_to_lin(-band).powi(2);
+        let p = self.share_now;
+        let left = 1.0 - p + p * db_to_lin(-band).powi(2);
         // `left` >= 10^(-band/10) >= 10^(-d/10): never a boost.
         (-(d + 10.0 * left.log10()).max(0.0), -band)
     }
@@ -1709,6 +1728,24 @@ mod tests {
         let (hold, back) = release(3_000);
         assert!((hold - 240.0).abs() <= 5.0, "{hold}");
         assert!((back - hold - 900.0).abs() <= 10.0, "{back}");
+    }
+
+    #[test]
+    fn the_gain_counts_the_bell() {
+        // A fixed 12 dB duck on broadband noise: the meter shows the 12 dB
+        // the loudness drops, though the broadband gain is less.
+        let mut buf = noise(4 * 48_000 * CH, 0.3, 12);
+        let mut d = Ducker::new(CH);
+        for (i, b) in buf.chunks_mut(BLK * CH).enumerate() {
+            d.process(b, duck_only(12.0), i >= 50, None);
+        }
+        assert!((d.gain_db() + 12.0).abs() < 0.01, "{}", d.gain_db());
+        assert!(lin_to_db(d.gain) > -11.5, "broadband {}", lin_to_db(d.gain));
+        // And what the output lost, K-weighted, is that.
+        let input = noise(4 * 48_000 * CH, 0.3, 12);
+        let tail = 3 * 48_000 * CH..;
+        let lost = loudness(&buf[tail.clone()]) - loudness(&input[tail]);
+        assert!((lost - d.gain_db()).abs() < 0.5, "lost {lost} dB");
     }
 
     #[test]
