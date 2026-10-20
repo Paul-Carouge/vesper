@@ -33,11 +33,12 @@ const MARGIN_DB: f32 = 6.0;
 /// window late) is at most this far under that window's input. Speech
 /// comes out nearly whole (about -1 dB at 9 dB SNR), a band-limited cough
 /// or noise burst 4 to 10 dB down even when the probability says voice.
-/// shortcut: full-band white noise bursts, after a few seconds of them,
-/// get both a high probability and about -1 dB kept: they read as voice
-/// (the bench's band-limited coughs, breaths and clicks do not). A
-/// spectral flatness test would catch them if real mics show this.
 const KEPT_DB: f32 = -3.0;
+/// ...and it is not full-band noise: its zero-crossing rate (crossings per
+/// sample) is under this. Voiced speech reads 0.0 to 0.3, white noise
+/// about 0.5. After a few seconds of white noise bursts (a mic bump, wind,
+/// static), RNNoise gives them a high probability and keeps them whole.
+const ZCR_MAX: f32 = 0.35;
 /// Within the hold after voice, a window this far over the floor is voiced
 /// whatever RNNoise says: the unvoiced start of the next word (a fricative,
 /// a plosive) keeps the phrase going instead of letting the duck up.
@@ -242,7 +243,12 @@ impl VoiceDetector {
         let kept = db(&self.output[..]) - self.last;
         self.last = db(&self.input[..]);
         let over = level - self.floor;
-        let strict = p > P_VOICE && over > MARGIN_DB && kept > KEPT_DB;
+        let crossings = self
+            .input
+            .windows(2)
+            .filter(|w| (w[0] < 0.0) != (w[1] < 0.0));
+        let zcr = crossings.count() as f32 / WINDOW as f32;
+        let strict = p > P_VOICE && over > MARGIN_DB && kept > KEPT_DB && zcr < ZCR_MAX;
         let voiced = strict || (self.quiet < HOLD_WINDOWS && over > BRIDGE_DB);
         self.votes = (self.votes << 1 | u8::from(voiced)) & VOTES;
         self.speaking = self.votes.count_ones() >= OPEN_VOTES || (self.speaking && voiced);
@@ -616,6 +622,20 @@ mod tests {
         assert!(d.floor < -55.0);
         d.reset();
         assert_eq!(d.floor, FLOOR_MAX);
+    }
+
+    #[test]
+    fn noise_bursts_are_not_voice() {
+        // 400 ms of white noise every 600 ms, 25 dB over a -55 dB floor,
+        // the same on both channels (an upmixed mono mic): loud, but not a
+        // voice (RNNoise alone takes them after a few seconds).
+        let mono: Vec<f32> = speech(6_000, 400, 600, -30.0, -55.0)
+            .chunks(CH)
+            .flat_map(|f| [f[0]; CH])
+            .collect();
+        let voiced = detect(&mono);
+        let s: String = voiced.iter().map(|v| if *v { '1' } else { '.' }).collect();
+        assert!(voiced.iter().all(|v| !v), "{s}");
     }
 
     #[test]
