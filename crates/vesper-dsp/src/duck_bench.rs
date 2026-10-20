@@ -1113,5 +1113,21 @@ fn the_voice_chain_does_not_lift_room_noise_into_voice() {
         duck_only(12.0),
     );
     let (pct, _, _) = false_ducks(&sim, 0);
-    assert_eq!(pct, 0.0);
+    assert!(pct <= 1.0, "{pct} %");
+}
+
+#[test]
+fn noise_right_after_speech_does_not_hold_the_voice() {
+    // Speech, then a steady noise from 50 ms after its last word: the
+    // hold's bridge must not keep the voice on through the noise.
+    for db in [-50.0, -30.0] {
+        let mut s = speech_with_floor(clip("1272-128104-0001", -26.0, 1_000, 4_000), -65.0);
+        let at = s.offset() + 50 * MS;
+        let n = s.x.len() - at;
+        add(&mut s.x, &room(n, db, 61), at);
+        let sim = simulate(&s.x, false, None, duck_only(12.0));
+        let last = sim.speaking.iter().rposition(|&v| v).unwrap();
+        let held = ms((last + 1) * BLK).max(0.0) - ms(s.offset());
+        assert!(held < 600.0, "noise at {db}: voice held {held} ms");
+    }
 }

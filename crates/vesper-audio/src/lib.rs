@@ -712,6 +712,7 @@ impl<F: FnMut(EncodedPacket)> Encoder<F> {
         }
         v.speaks = speaks;
         if !speaks || self.shared.muted.load(Ordering::Relaxed) {
+            v.detector.pause();
             return;
         }
         if let Some(end) = v.detector.process(&self.block) {
@@ -1794,6 +1795,9 @@ mod tests {
                 .map(|b| f32::from(i16::from_le_bytes(*b)) / 32_768.0)
                 .collect();
             let mut out = vec![0.0; 50 * FRAME];
+            // shortcut: linear upsampling (images above 8 kHz, about -30 dB);
+            // on the bench this clip's detection was the same as with a
+            // windowed sinc. Use the bench's sinc if a test here gets close.
             for w in x.windows(2) {
                 out.extend((0..3).map(|i| w[0] + (w[1] - w[0]) * i as f32 / 3.0));
             }
