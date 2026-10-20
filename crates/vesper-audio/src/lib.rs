@@ -22,8 +22,10 @@
 //! does not click.
 //!
 //! Voice ducking: tracks started with the same [`VoiceKey`] talk through it.
-//! A voice track ([`Options::speaks`]) tells it when it speaks, as heard
-//! (after its filters, volume and mute); every other track ducks under it as
+//! A voice track ([`Options::speaks`]) tells it when it speaks, from its raw
+//! input (before its filters and volume, so neither moves the detector's
+//! thresholds; a muted voice does not listen at all, its detector keeps its
+//! state for the unmute); every other track ducks under it as
 //! its [`DuckSettings`] say, before its volume, so the duck is in the
 //! track's own file and in the mix alike. They meet lock-free on the time
 //! their blocks are processed, not on their pts: a playback track's pts run
@@ -681,6 +683,7 @@ impl<F: FnMut(EncodedPacket)> Encoder<F> {
         while self.pending.len() >= len {
             self.block.clear();
             self.block.extend(self.pending.drain(..len));
+            self.detect();
             // The DSP seam: a no-op unless a processor was given.
             let delay = match &mut self.process {
                 Some(process) => process(&mut self.block),
@@ -695,6 +698,28 @@ impl<F: FnMut(EncodedPacket)> Encoder<F> {
                 self.block.extend(self.ready.drain(..len));
                 self.encode_block();
             }
+        }
+    }
+
+    /// Voice detection on the raw block in `self.block`, before the filters
+    /// and volume. Muted, it does not listen: a mute is not silence to learn.
+    fn detect(&mut self) {
+        let speaks = self.shared.speaks.load(Ordering::Relaxed);
+        let Some(v) = &mut self.voice else { return };
+        if speaks && !v.speaks {
+            // A voice from now: it starts listening afresh.
+            v.detector.reset();
+        }
+        v.speaks = speaks;
+        if !speaks || self.shared.muted.load(Ordering::Relaxed) {
+            return;
+        }
+        if let Some(end) = v.detector.process(&self.block) {
+            // The voiced window ended that long before the block's end: about now.
+            let frames = self.block.len() / usize::from(CHANNELS);
+            let ended = (self.clock)().saturating_sub(frames_to_duration(frames - end));
+            v.key
+                .speak_until(ended + frames_to_duration(VOICE_HOLD_FRAMES));
         }
     }
 
@@ -729,11 +754,6 @@ impl<F: FnMut(EncodedPacket)> Encoder<F> {
         let at = self.anchor + frames_to_duration(self.sent as usize);
         let speaks = self.shared.speaks.load(Ordering::Relaxed);
         if let Some(v) = &mut self.voice {
-            if speaks && !v.speaks {
-                // A voice from now: it starts listening afresh.
-                v.detector = VoiceDetector::new(usize::from(CHANNELS));
-            }
-            v.speaks = speaks;
             // A voice lets a duck it was in come back up smoothly (a no-op
             // once idle): a jump would click.
             let (settings, speaking) = if speaks {
@@ -753,16 +773,6 @@ impl<F: FnMut(EncodedPacket)> Encoder<F> {
         apply_gain(&mut self.block, self.gain, gain);
         self.gain = gain;
         self.meter();
-        // As heard: a muted microphone does not duck anything.
-        if let Some(v) = self.voice.as_mut().filter(|_| speaks)
-            && let Some(end) = v.detector.process(&self.block)
-        {
-            // The voiced window ended that long before the block's end: about now.
-            let frames = self.block.len() / usize::from(CHANNELS);
-            let ended = (self.clock)().saturating_sub(frames_to_duration(frames - end));
-            v.key
-                .speak_until(ended + frames_to_duration(VOICE_HOLD_FRAMES));
-        }
         if let Some(mix) = &self.mix {
             mix.push(&self.block, self.sent as u64);
         }
@@ -955,6 +965,9 @@ impl Slew {
 }
 
 fn encode_loop(mut enc: Encoder<impl FnMut(EncodedPacket)>, mut rx: ring::Reader, input: bool) {
+    if let Some(v) = &mut enc.voice {
+        v.detector.warm_up();
+    }
     let mut timeline = Timeline::new(enc.anchor);
     let mut slew = Slew::default();
     let mut out = Vec::new();
@@ -1763,17 +1776,55 @@ mod tests {
             .collect()
     }
 
-    /// The mic speaks (a 1 kHz tone) in blocks 50..100 (1 s to 2 s) over a
-    /// 150 Hz song; block `k` of both is processed at 20 ms * (k + 1).
+    /// A LibriSpeech utterance (vesper-dsp's test data, 4.8 s) at 48 kHz
+    /// (linear upsampling) over a -65 dB hiss: block `k` of it, stereo, the
+    /// clip starting at block 50 (1 s).
+    fn speech_block(k: usize) -> Vec<f32> {
+        static SPEECH: std::sync::OnceLock<Vec<f32>> = std::sync::OnceLock::new();
+        let speech = SPEECH.get_or_init(|| {
+            let path = concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../vesper-dsp/testdata/speech/1272-128104-0001.s16"
+            );
+            let raw = std::fs::read(path).unwrap();
+            let x: Vec<f32> = raw
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|b| f32::from(i16::from_le_bytes(*b)) / 32_768.0)
+                .collect();
+            let mut out = vec![0.0; 50 * FRAME];
+            for w in x.windows(2) {
+                out.extend((0..3).map(|i| w[0] + (w[1] - w[0]) * i as f32 / 3.0));
+            }
+            out
+        });
+        (k * FRAME..(k + 1) * FRAME)
+            .flat_map(|i| [speech.get(i).copied().unwrap_or(0.0) + hiss(i as u32); 2])
+            .collect()
+    }
+
+    /// Deterministic white noise at about -65 dBFS RMS.
+    fn hiss(i: u32) -> f32 {
+        let x = i.wrapping_mul(2_654_435_761) ^ 0x9e37_79b9;
+        let x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        ((x >> 8) as f32 / (1 << 24) as f32 - 0.5) * 2e-3
+    }
+
+    /// Blocks of [`speech_block`] with words: the clip opens with 0.5 s of
+    /// its room.
+    const WORDS: std::ops::Range<usize> = 77..267;
+
+    /// The mic speaks (see [`speech_block`]) over a 150 Hz song; block `k`
+    /// of both is processed at 20 ms * (k + 1).
     fn run_voice<A: FnMut(EncodedPacket), B: FnMut(EncodedPacket)>(
         mic: &mut Encoder<A>,
         music: &mut Encoder<B>,
         mut each: impl FnMut(usize, &Shared),
     ) {
-        for k in 0..175 {
+        for k in 0..WORDS.end + 65 {
             set_now(Duration::from_secs(100) + Duration::from_millis(20 * (k as u64 + 1)));
-            let amp = if (50..100).contains(&k) { 0.3 } else { 0.0 };
-            mic.push(&sine_block(1_000.0, amp, k));
+            mic.push(&speech_block(k));
             music.push(&sine_block(150.0, 0.25, k));
             each(k, &music.shared);
         }
@@ -1783,13 +1834,15 @@ mod tests {
     fn check_duck(levels: &[f32]) {
         let db = |k: usize| 20.0 * (levels[k] / 0.25).log10();
         assert!(db(49).abs() < 0.1, "{}", db(49));
-        // Down by the depth within the 50 ms attack (from the 20 ms the
-        // detector needs), the whole word and its 300 ms hold.
-        for k in [54, 75, 99, 113] {
+        assert!(db(WORDS.start).abs() < 0.1, "{}", db(WORDS.start));
+        // Down by the depth within 100 ms of the first word, and held
+        // through the gaps between words, then the 300 ms hold.
+        for k in WORDS.start + 5..WORDS.end + 12 {
             assert!((db(k) + 12.0).abs() < 0.3, "block {k}: {} dB", db(k));
         }
         // Back after the 600 ms release.
-        assert!(db(146).abs() < 0.1, "{}", db(146));
+        let end = WORDS.end + 50;
+        assert!(db(end).abs() < 0.1, "{}", db(end));
     }
 
     #[test]
@@ -1804,16 +1857,18 @@ mod tests {
         let key = Arc::new(VoiceKey::default());
         let mut mic = voice_track(&key, anchor, true, DuckSettings::default());
         let mut music = voice_track(&key, anchor, false, DUCK_12);
-        (mic.mix, music.mix) = (Some(mix.input()), Some(mix.input()));
+        // The mic stays out of the mix: its speech would blur the song's
+        // 150 Hz measured there.
+        music.mix = Some(mix.input());
         let mut during = 0.0;
         run_voice(&mut mic, &mut music, |k, shared| {
-            if k == 75 {
+            if k == 150 {
                 during = f32::from_bits(shared.ducking.load(Ordering::Relaxed));
             }
         });
         let got: Vec<_> = rx.try_iter().collect();
         // The limiter's lookahead holds the last one back.
-        assert!(got.len() >= 174, "{}", got.len());
+        assert!(got.len() >= WORDS.end + 64, "{}", got.len());
         assert_eq!(got[60].0, anchor + Duration::from_millis(1_200));
         check_duck(&got.iter().map(|g| g.1).collect::<Vec<_>>());
         // The duck shows for a meter, and goes.
@@ -1865,23 +1920,77 @@ mod tests {
         assert_eq!(track.shared.ducking.load(Ordering::Relaxed), 0);
     }
 
+    /// Pushes blocks `blocks` of `signal` into `mic`, the clock at each
+    /// block's end; whether the key said speaking after any of them.
+    fn spoke<F: FnMut(EncodedPacket)>(
+        mic: &mut Encoder<F>,
+        key: &VoiceKey,
+        blocks: std::ops::Range<usize>,
+        signal: impl Fn(usize) -> Vec<f32>,
+    ) -> bool {
+        let mut spoke = false;
+        for k in blocks {
+            let now = Duration::from_millis(20 * (k as u64 + 1));
+            set_now(now);
+            mic.push(&signal(k));
+            spoke |= key.speaking_at(now);
+        }
+        spoke
+    }
+
     #[test]
     fn a_muted_or_ducking_track_does_not_speak() {
         let key = Arc::new(VoiceKey::default());
         let mut mic = voice_track(&key, Duration::ZERO, true, DuckSettings::default());
-        set_now(Duration::from_secs(1));
         mic.shared.muted.store(true, Ordering::Relaxed);
-        mic.push(&vec![0.3; FRAME * 2 * 20]);
-        assert!(!key.speaking_at(Duration::from_secs(1)));
+        assert!(!spoke(&mut mic, &key, 0..150, speech_block));
         // Not a voice (an input device playing music): it ducks instead.
         mic.shared.muted.store(false, Ordering::Relaxed);
         mic.shared.speaks.store(false, Ordering::Relaxed);
-        mic.push(&vec![0.3; FRAME * 2 * 20]);
-        assert!(!key.speaking_at(Duration::from_secs(1)));
+        assert!(!spoke(&mut mic, &key, 150..200, speech_block));
         mic.shared.speaks.store(true, Ordering::Relaxed);
-        mic.push(&vec![0.3; FRAME * 2 * 20]);
-        // Voiced up to now, held 300 ms.
-        assert!(key.speaking_at(Duration::from_millis(1_250)));
-        assert!(!key.speaking_at(Duration::from_millis(1_350)));
+        assert!(spoke(&mut mic, &key, 200..250, speech_block));
+        // Voiced up to about now (5 s), held 300 ms.
+        assert!(key.speaking_at(Duration::from_millis(5_250)));
+        assert!(!key.speaking_at(Duration::from_millis(5_400)));
+    }
+
+    #[test]
+    fn the_detector_hears_the_raw_input() {
+        // Before the filters and the volume: a chain that silences the
+        // track, at the lowest volume, still lets the voice speak.
+        let key = Arc::new(VoiceKey::default());
+        let mut mic = voice_track(&key, Duration::ZERO, true, DuckSettings::default());
+        mic.process = Some(Box::new(|b: &mut [f32]| {
+            b.fill(0.0);
+            0
+        }));
+        let silent = db_to_gain(MIN_DB);
+        mic.shared.gain.store(silent.to_bits(), Ordering::Relaxed);
+        mic.gain = silent;
+        assert!(spoke(&mut mic, &key, 0..100, speech_block));
+    }
+
+    #[test]
+    fn muting_freezes_the_detector() {
+        // A -65 dB room, then muted for 3 s while a loud steady noise
+        // plays: the detector does not hear it, so its floor stays put and
+        // the speech after the unmute is voice from its first words.
+        let key = Arc::new(VoiceKey::default());
+        let mut mic = voice_track(&key, Duration::ZERO, true, DuckSettings::default());
+        assert!(!spoke(&mut mic, &key, 0..50, speech_block));
+        let floor = mic.voice.as_ref().unwrap().detector.floor_db();
+        assert!(floor < -60.0, "{floor}");
+        mic.shared.muted.store(true, Ordering::Relaxed);
+        let loud = |k: usize| -> Vec<f32> {
+            (k * FRAME..(k + 1) * FRAME)
+                .flat_map(|i| [300.0 * hiss(i as u32); 2])
+                .collect()
+        };
+        assert!(!spoke(&mut mic, &key, 50..200, loud));
+        assert_eq!(mic.voice.as_ref().unwrap().detector.floor_db(), floor);
+        mic.shared.muted.store(false, Ordering::Relaxed);
+        // The clip again: its first word in block 277.
+        assert!(spoke(&mut mic, &key, 200..285, |k| speech_block(k - 200)));
     }
 }

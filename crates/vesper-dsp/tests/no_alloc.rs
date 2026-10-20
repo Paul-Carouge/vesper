@@ -4,7 +4,7 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
-use vesper_dsp::{Chain, FilterSpec};
+use vesper_dsp::{Chain, FilterSpec, VoiceDetector};
 
 thread_local! {
     static COUNTING: Cell<bool> = const { Cell::new(false) };
@@ -95,4 +95,31 @@ fn process_does_not_allocate() {
     .join()
     .unwrap();
     assert_eq!(calls, 0, "allocator calls in process()");
+}
+
+#[test]
+fn voice_detector_does_not_allocate() {
+    let mut seed = 5u32;
+    let input: Vec<f32> = (0..48_000 * 2)
+        .map(|i| {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let noise = (seed >> 8) as f32 / (1 << 24) as f32 - 0.5;
+            0.3 * (i as f32 * 0.02).sin() * (i as f32 * 1e-4).sin() + 0.01 * noise
+        })
+        .collect();
+    let mut det = VoiceDetector::new(2);
+    let calls = std::thread::spawn(move || {
+        det.warm_up();
+        COUNTING.set(true);
+        for b in input.chunks(2 * 481) {
+            std::hint::black_box(det.process(b));
+        }
+        det.process(&[0.0; 960 * 2]);
+        det.reset();
+        COUNTING.set(false);
+        CALLS.get()
+    })
+    .join()
+    .unwrap();
+    assert_eq!(calls, 0, "allocator calls in VoiceDetector");
 }
