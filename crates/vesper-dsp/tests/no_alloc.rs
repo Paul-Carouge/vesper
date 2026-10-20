@@ -131,6 +131,7 @@ fn voice_meter_and_ducker_do_not_allocate() {
         .collect();
     let mut meter = VoiceMeter::new(2);
     let mut duck = Ducker::new(2);
+    let mut fixed = Ducker::new(2);
     let set = DuckSettings::at_levels(Some(1), Some(1));
     let calls = std::thread::spawn(move || {
         let mut buf = input.clone();
@@ -144,6 +145,10 @@ fn voice_meter_and_ducker_do_not_allocate() {
             let at = (i * 960) as u64;
             duck.look_ahead(b, at, set, voice);
             duck.process_at(b, at, set, i % 50 < 30, voice);
+            // A fixed spectral duck (not measuring), lone words and
+            // phrases: its bell, hold and release.
+            let speaking = i % 100 < 15 || (i % 100 >= 40 && i % 100 < 80);
+            fixed.process(b, DuckSettings::at_levels(Some(2), None), speaking, None);
         }
         meter.reset();
         COUNTING.set(false);

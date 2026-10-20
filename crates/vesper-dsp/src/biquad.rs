@@ -39,12 +39,25 @@ impl Coefs {
         })
     }
 
+    #[cfg(test)]
+    pub fn lowpass(freq: f32, q: f64) -> Self {
+        Self::new(freq, q, |cos, _| {
+            [(1.0 - cos) / 2.0, 1.0 - cos, (1.0 - cos) / 2.0]
+        })
+    }
+
+    #[cfg(test)]
+    pub fn allpass(freq: f32, q: f64) -> Self {
+        Self::new(freq, q, |cos, alpha| [1.0 - alpha, -2.0 * cos, 1.0 + alpha])
+    }
+
     /// Band-pass with a 0 dB peak: `x - bandpass(x)` is the matching notch.
     pub fn bandpass(freq: f32, q: f64) -> Self {
         Self::new(freq, q, |_, alpha| [alpha, 0.0, -alpha])
     }
 
     /// Peaking EQ (bell) of `db` at `freq`.
+    #[cfg(test)]
     pub fn peaking(freq: f32, q: f64, db: f32) -> Self {
         let a = 10f64.powf(f64::from(db) / 40.0);
         let w0 = std::f64::consts::TAU * f64::from(freq) / f64::from(FS);

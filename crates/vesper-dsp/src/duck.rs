@@ -6,9 +6,12 @@
 //! deep as it takes to leave them a set gap under the voice, once its
 //! loudness is known), and in background music mode also levels them under
 //! the voice (a slow loudness leveler that keeps a song's dynamics and
-//! catches up with a song change), tames their peaks (a gentle compressor)
-//! and dips the voice presence band (a broad bell around 2 kHz), so speech
-//! stays clear over them.
+//! catches up with a song change) and tames their peaks (a gentle
+//! compressor). The duck is spectral: the voice band (300 Hz to 4 kHz)
+//! goes down more than the lows and highs, so the music keeps its body
+//! while it leaves the voice room, and it leaves the track untouched (bit
+//! for bit) while the voice is silent. Its hold and release follow the
+//! phrase: a lone word lets the track back fast, a long phrase gently.
 //!
 //! The detector and the ducker meet through a [`VoiceKey`] (other threads):
 //! the voice marks its voiced 10 ms windows on the shared timeline, and a
@@ -27,7 +30,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use crate::biquad::{CHUNK, Coefs, State};
 use nnnoiseless::DenoiseState;
 
-use crate::{FS, Glide, coef, db_to_lin, lin_to_db};
+use crate::{FS, coef, db_to_lin, lin_to_db};
 
 /// Voice detection window: 10 ms, an RNNoise frame.
 const WINDOW: usize = DenoiseState::FRAME_SIZE;
@@ -53,11 +56,12 @@ const KEPT_DB: f32 = -3.0;
 /// rumble such as mic bumps or wind) have a low rate and can still read as
 /// voice; a spectral check (flatness, or harmonicity) would catch them.
 const ZCR_MAX: f32 = 0.35;
-/// Within the hold after voice, a window this far over the floor is voiced
-/// whatever RNNoise says: the unvoiced start of the next word (a fricative,
-/// a plosive) keeps the phrase going instead of letting the duck up.
+/// Within 300 ms (`HOLD_WINDOWS`) after voice, a window this far over the
+/// floor is voiced whatever RNNoise says: the unvoiced start of the next
+/// word (a fricative, a plosive) keeps the phrase going instead of letting
+/// the duck up.
 const BRIDGE_DB: f32 = 12.0;
-const HOLD_WINDOWS: u8 = (VOICE_HOLD_FRAMES / WINDOW) as u8;
+const HOLD_WINDOWS: u8 = 30;
 /// Windows under this (RMS dBFS) are digital silence (a stalled source
 /// filled in, a gate): they end any phrase but leave the floor and
 /// RNNoise's state as they were.
@@ -76,8 +80,10 @@ const FLOOR_RISE: f32 = 0.1;
 const FLOOR_MAX: f32 = -25.0;
 
 /// How long the voice counts as speaking after its last voiced window
-/// (300 ms): the gaps between words do not pump the ducked tracks.
-pub const VOICE_HOLD_FRAMES: usize = 14_400;
+/// (150 ms), on the key; with the lookahead, gaps between words up to
+/// about 270 ms do not let a ducked track up. The [`Ducker`] holds longer
+/// as a phrase goes on (see `HOLD_EXTRA_MS`).
+pub const VOICE_HOLD_FRAMES: usize = 7_200;
 
 /// How far ahead of its audio a ducked track reads the voice, frames
 /// (120 ms; a multiple of the tracks' 20 ms block). Its audio waits that
@@ -284,20 +290,50 @@ impl VoiceKey {
     }
 }
 
-/// Time for a duck to reach its depth, and to come back from it, ms (for a
-/// depth of at least [`MIN_RATE_DEPTH`]; less deep ducks are faster).
+/// Time for a duck to reach its depth, ms (for a depth of at least
+/// [`MIN_RATE_DEPTH`]; less deep ducks are faster).
 const ATTACK_MS: f32 = 50.0;
-const RELEASE_MS: f32 = 600.0;
 const MIN_RATE_DEPTH: f32 = 6.0;
+/// Hold (over the key's [`VOICE_HOLD_FRAMES`]) and release by how long the
+/// phrase lasted (from the duck's start to the voice's last word, gaps
+/// within the hold included): a lone word (up to `SHORT_SPAN_MS`, about a
+/// 300 ms word with the key's hold and the lookahead) is held
+/// `HOLD_MIN_MS` more (with the key's 150 ms and the lookahead, a 440 ms
+/// hesitation before the next word does not let the track up) and back in
+/// 250 ms; the hold grows to `HOLD_EXTRA_MS` more by `HOLD_SPAN_MS` (a
+/// phrase's next pause is longer than a word's), the release to 900 ms by
+/// `LONG_SPAN_MS` (the end of a long phrase).
+const SHORT_SPAN_MS: f32 = 700.0;
+const HOLD_SPAN_MS: f32 = 1_200.0;
+const LONG_SPAN_MS: f32 = 2_500.0;
+const HOLD_MIN_MS: f32 = 220.0;
+const HOLD_EXTRA_MS: f32 = 250.0;
+const RELEASE_SHORT_MS: f32 = 250.0;
+const RELEASE_LONG_MS: f32 = 900.0;
 /// Duck depth of background music when ducking is not set on its own.
 pub const MUSIC_DUCK_DB: f32 = 6.0;
 
-/// Presence dip of background music.
-const DIP_HZ: f32 = 2_000.0;
-/// About two octaves (1 to 4 kHz).
-const DIP_Q: f64 = 0.7;
-const DIP_DB: f32 = -4.0;
-const DIP_GLIDE_MS: f32 = 100.0;
+/// Spectral duck: a bell over the voice band, `x + (g - 1) bp(x)` with
+/// `bp` a fixed band-pass (0 dB peak) at 1.1 kHz, so `g`, its gain at the
+/// centre, moves sample by sample with no coefficient change (no zipper),
+/// and at `g = 1` it is the identity. It cuts as deep as the duck (half of
+/// that at about 300 Hz and 4 kHz), `BAND_MAX_DB` at most; the whole track
+/// goes down by less, so its loudness still drops by the depth (the gap to
+/// the voice holds). A bell, not a band split: no crossover's all-pass
+/// phase at 0 dB, one biquad (see `ducking_report`).
+const BAND_HZ: f32 = 1_100.0;
+const BAND_Q: f64 = 0.15;
+const BAND_MAX_DB: f32 = 12.0;
+/// The share of the track's loudness the bell takes (its K-weighted power
+/// in the voice band, so to speak) is measured through the bell at this
+/// cut whenever a duck is set (not only when the loudness is), and
+/// smoothed over about `SHARE_BLOCKS` blocks (1 s); a typical song's until
+/// the first block is measured.
+const SHARE_REF_DB: f32 = 12.0;
+const SHARE_BLOCKS: f32 = 10.0;
+const SHARE_DEFAULT: f32 = 0.6;
+/// The split follows the share over about 100 ms (per chunk).
+const SHARE_GLIDE: f32 = CHUNK as f32 / BLOCK as f32;
 
 /// Most an adaptive duck lowers, dB.
 const MAX_DEPTH_DB: f32 = 36.0;
@@ -454,6 +490,25 @@ impl KWeight {
             }
         }
         e
+    }
+
+    /// [`Self::energy`], and that of `buf` through the voice band's bell at
+    /// `SHARE_REF_DB` as well (after the K-weighting; `bp` its band-pass,
+    /// `z` its state per channel).
+    fn energy_cut(&mut self, buf: &[f32], bp: &Coefs, z: &mut [State]) -> (f64, f64) {
+        let [c0, c1] = self.c;
+        let k = f64::from(db_to_lin(-SHARE_REF_DB) - 1.0);
+        let (mut e, mut ec) = (0.0, 0.0);
+        for frame in buf.chunks_exact(self.z.len()) {
+            for ((&s, kz), zc) in frame.iter().zip(&mut self.z).zip(&mut *z) {
+                let x = kz[0].run(&c0, f64::from(s));
+                let y = kz[1].run(&c1, x);
+                let yc = y + k * zc.run(bp, y);
+                e += y * y;
+                ec += yc * yc;
+            }
+        }
+        (e, ec)
     }
 
     /// Keeps the filters away from denormals (after silence).
@@ -822,18 +877,53 @@ struct Undo {
     loud: f32,
 }
 
+/// A phrase in frames: from the duck's start to the voice's last block,
+/// and since that block.
+#[derive(Debug, Clone, Copy)]
+struct Phrase {
+    span: usize,
+    quiet: usize,
+}
+
 /// Ducking and background music of a non-voice track (see the module docs).
 pub struct Ducker {
     ch: usize,
-    /// Presence dip gain, dB: 0 when off.
-    dip: Glide,
-    dip_c: Coefs,
-    dip_z: Vec<State>,
+    /// The voice band's bell: its cut now (dB, <= 0; 0: not run), its
+    /// `g - 1`, its band-pass and its state per channel.
+    bell: f32,
+    bell_k: f32,
+    bell_c: Coefs,
+    bell_z: Vec<State>,
+    /// The bell ran since its state was last cleared.
+    bell_live: bool,
     kw: KWeight,
     /// K-weighted power of the current 100 ms block (summed over the
     /// channels), and its frames.
     power: f64,
     frames: usize,
+    /// The same for the voice band's share (measured whenever a duck is
+    /// set), and through the reference bell.
+    share_power: f64,
+    cut_power: f64,
+    share_frames: usize,
+    /// The band-pass state of the reference bell (`SHARE_REF_DB`), per
+    /// channel.
+    share_z: Vec<State>,
+    /// Share of the track's K-weighted power in the voice band (0 to 1),
+    /// per block, and gliding per chunk (what the split reads: a new block's
+    /// share does not step the broadband gain).
+    share: f32,
+    share_now: f32,
+    /// A block of the share was measured.
+    share_known: bool,
+    /// The phrase the voice speaks, while the duck is down for it.
+    phrase: Option<Phrase>,
+    /// Release time of the last phrase, ms.
+    release_ms: f32,
+    /// Tests: a broadband duck only (the bench's probe reads the duck's
+    /// loudness envelope off a constant).
+    #[cfg(test)]
+    broadband: bool,
     /// Mean power of the last [`BLOCKS`] blocks, the next one, and how
     /// many of them the leveler reads (since it started over).
     blocks: [f32; BLOCKS],
@@ -886,12 +976,25 @@ impl Ducker {
         assert!(ch > 0, "no channel");
         Self {
             ch,
-            dip: Glide::new(0.0, DIP_GLIDE_MS, CHUNK),
-            dip_c: Coefs::peaking(DIP_HZ, DIP_Q, 0.0),
-            dip_z: vec![State::default(); ch],
+            bell: 0.0,
+            bell_k: 0.0,
+            bell_c: Coefs::bandpass(BAND_HZ, BAND_Q),
+            bell_z: vec![State::default(); ch],
+            bell_live: false,
             kw: KWeight::new(ch),
             power: 0.0,
             frames: 0,
+            share_power: 0.0,
+            cut_power: 0.0,
+            share_frames: 0,
+            share_z: vec![State::default(); ch],
+            share: SHARE_DEFAULT,
+            share_now: SHARE_DEFAULT,
+            share_known: false,
+            phrase: None,
+            release_ms: RELEASE_LONG_MS,
+            #[cfg(test)]
+            broadband: false,
             blocks: [0.0; BLOCKS],
             next: 0,
             count: 0,
@@ -924,8 +1027,13 @@ impl Ducker {
     }
 
     /// The whole gain now (leveler, compressor and duck), dB. For a meter.
+    /// The duck counts as the loudness it takes (its bell and broadband
+    /// gain together), not the broadband gain alone.
     pub fn gain_db(&self) -> f32 {
-        20.0 * self.gain.log10()
+        if self.idle() {
+            return 0.0;
+        }
+        self.leveled() + self.comp + self.duck
     }
 
     /// The leveler's gain now, dB (its cap included).
@@ -933,14 +1041,44 @@ impl Ducker {
         self.level.min(self.cap)
     }
 
-    /// Nothing to do: every gain at 0 dB, no dip.
+    /// Nothing to do: every gain at 0 dB, no bell.
     fn idle(&self) -> bool {
         self.gain == 1.0
             && self.leveled() == 0.0
             && self.comp == 0.0
             && self.duck == 0.0
-            && self.dip.settled()
-            && self.dip.cur == 0.0
+            && self.bell == 0.0
+            && self.phrase.is_none()
+    }
+
+    /// Whether the duck stays down for the voice in a block of `frames`
+    /// it `speaking` or not: the phrase's hold (see `HOLD_EXTRA_MS`) runs
+    /// past the key's; once it is over, the release is set by the phrase.
+    fn hold(&mut self, speaking: bool, frames: usize) -> bool {
+        let ms = |f: usize| f as f32 * 1e3 / FS;
+        let frac = |span: f32, long: f32| {
+            ((span - SHORT_SPAN_MS) / (long - SHORT_SPAN_MS)).clamp(0.0, 1.0)
+        };
+        match (&mut self.phrase, speaking) {
+            (p, true) => {
+                let p = p.get_or_insert(Phrase { span: 0, quiet: 0 });
+                (p.span, p.quiet) = (p.span + p.quiet + frames, 0);
+                true
+            }
+            (Some(p), false) => {
+                p.quiet += frames;
+                let span = ms(p.span);
+                let hold = HOLD_MIN_MS + (HOLD_EXTRA_MS - HOLD_MIN_MS) * frac(span, HOLD_SPAN_MS);
+                if ms(p.quiet) <= hold {
+                    return true;
+                }
+                let f = frac(span, LONG_SPAN_MS);
+                self.release_ms = RELEASE_SHORT_MS + f * (RELEASE_LONG_MS - RELEASE_SHORT_MS);
+                self.phrase = None;
+                false
+            }
+            (None, false) => false,
+        }
     }
 
     /// Measures `buf` (interleaved, whole frames), at frame `at` of the
@@ -960,6 +1098,7 @@ impl Ducker {
         let measuring = plan.measuring();
         if measuring && !self.measuring {
             // A new measurement: the old one may be of other music.
+            // The voice band's share is kept: it is the track's latest.
             (self.power, self.frames, self.count) = (0.0, 0, 0);
             (self.momentary, self.short, self.long) = (None, None, None);
             self.ahead_len = 0;
@@ -970,6 +1109,15 @@ impl Ducker {
         }
         (self.measuring, self.music) = (measuring, plan.target.is_some());
         if !measuring {
+            if plan.fixed > 0.0 {
+                // A fixed duck: the voice band's share only, so its
+                // loudness drops by its depth from the voice's first word.
+                let ch = self.ch;
+                buf.chunks(CHUNK * ch)
+                    .for_each(|c| _ = self.measure_share(c));
+                self.kw.flush();
+                self.share_z.iter_mut().for_each(State::flush);
+            }
             return;
         }
         let ch = self.ch;
@@ -978,6 +1126,7 @@ impl Ducker {
             .map(|chunk| self.measure(chunk, plan.target))
             .sum();
         self.kw.flush();
+        self.share_z.iter_mut().for_each(State::flush);
         let frames = buf.len() / ch;
         let lufs = -0.691 + 10.0 * ((energy / frames.max(1) as f64) as f32).log10();
         if self.ahead_len > 0 {
@@ -1059,7 +1208,7 @@ impl Ducker {
         let plan = Plan::new(settings, voice);
         let measuring = plan.measuring();
         if !measuring && !(speaking && plan.fixed > 0.0) && self.idle() {
-            self.measuring = false;
+            (self.measuring, self.share_now) = (false, self.share);
             return;
         }
         let target = plan.target;
@@ -1068,6 +1217,7 @@ impl Ducker {
             (self.undo, self.rise) = (None, None);
         }
         let ch = self.ch;
+        let speaking = self.hold(speaking && plan.fixed > 0.0, buf.len() / ch);
         let loudest = if measuring {
             self.guard_loudness(at, buf.len() / ch)
         } else {
@@ -1076,28 +1226,17 @@ impl Ducker {
         // Music mode: what is coming is held under the target plus
         // `GUARD_LU` (a much louder song, before the leveler catches up).
         let cap = target.map_or(LEVEL_MAX_DB, |t| (t + GUARD_LU - loudest).min(LEVEL_MAX_DB));
-        self.dip.target = if target.is_some() { DIP_DB } else { 0.0 };
         let per_chunk = CHUNK as f32 / FS;
         let (comp_attack, comp_release) = (
             coef(COMP_ATTACK_MS / CHUNK as f32),
             coef(COMP_RELEASE_MS / CHUNK as f32),
         );
         for chunk in buf.chunks_mut(CHUNK * ch) {
-            if !self.dip.settled() {
-                self.dip_c = Coefs::peaking(DIP_HZ, DIP_Q, self.dip.step());
-            }
             let peak = if measuring {
                 chunk.iter().fold(0f32, |m, s| m.max(s.abs()))
             } else {
                 0.0
             };
-            if self.dip.cur != 0.0 {
-                for frame in chunk.chunks_exact_mut(ch) {
-                    for (s, z) in frame.iter_mut().zip(&mut self.dip_z) {
-                        *s = z.run(&self.dip_c, f64::from(*s)) as f32;
-                    }
-                }
-            }
             // Out of music mode the leveler goes back fast.
             let up = match target {
                 None => LEVEL_DOWN,
@@ -1166,11 +1305,72 @@ impl Ducker {
             }
             let rate = self.depth.max(MIN_RATE_DEPTH) * 1e3 * per_chunk;
             let duck_target = if speaking { -self.depth } else { 0.0 };
-            self.duck = slew(self.duck, duck_target, rate / ATTACK_MS, rate / RELEASE_MS);
-            let to = db_to_lin(level + self.comp + self.duck);
+            // While the voice speaks, the last phrase's release speed also
+            // sets how fast the duck follows a shallower depth (an adaptive
+            // one coming up): never faster than a release.
+            let release = rate / self.release_ms;
+            self.duck = slew(self.duck, duck_target, rate / ATTACK_MS, release);
+            // Not ducking, the split changes nothing: it takes the share
+            // at once (the glide only smooths a duck in progress).
+            self.share_now = if self.duck == 0.0 {
+                self.share
+            } else {
+                self.share_now + (self.share - self.share_now) * SHARE_GLIDE
+            };
+            let (broad, bell) = self.split();
+            self.bell_chunk(chunk, bell);
+            let to = db_to_lin(level + self.comp + broad);
             self.ramp(chunk, to);
         }
-        self.dip_z.iter_mut().for_each(State::flush);
+        if self.bell_k == 0.0 && self.bell_live {
+            // Back to the identity: bypassed from now, bit-exact (the
+            // band-pass starts over from rest, its output then weighs 0).
+            self.bell_z.fill(State::default());
+            self.bell_live = false;
+        }
+        self.bell_z.iter_mut().for_each(State::flush);
+    }
+
+    /// Runs the bell on `chunk`, its cut gliding from the last chunk's to
+    /// `db` across it (its `g` interpolated per frame).
+    fn bell_chunk(&mut self, chunk: &mut [f32], db: f32) {
+        let k0 = self.bell_k;
+        if db != self.bell {
+            (self.bell, self.bell_k) = (db, db_to_lin(db) - 1.0);
+        }
+        if k0 == 0.0 && self.bell_k == 0.0 {
+            return;
+        }
+        self.bell_live = true;
+        let ch = self.ch;
+        let step = (self.bell_k - k0) / (chunk.len() / ch) as f32;
+        for (i, frame) in chunk.chunks_exact_mut(ch).enumerate() {
+            let k = f64::from(k0 + step * (i + 1) as f32);
+            for (s, z) in frame.iter_mut().zip(&mut self.bell_z) {
+                let x = f64::from(*s);
+                *s = (x + k * z.run(&self.bell_c, x)) as f32;
+            }
+        }
+    }
+
+    /// The duck now (`duck`, its loudness) as a broadband gain and the voice
+    /// band's bell, dB (<= 0): the bell cuts as deep as the duck
+    /// ([`BAND_MAX_DB`] at most), and the broadband gain takes the rest of
+    /// the loudness the bell does not (by the voice band's share of it).
+    fn split(&self) -> (f32, f32) {
+        let d = -self.duck;
+        #[cfg(test)]
+        if self.broadband {
+            return (self.duck, 0.0);
+        }
+        if d <= 0.0 {
+            return (0.0, 0.0);
+        }
+        let band = d.min(BAND_MAX_DB);
+        let p = self.share_now;
+        let left = 1.0 - p + p * db_to_lin(-band).powi(2);
+        // `left` >= 10^(-band/10) >= 10^(-d/10): never a boost.
+        (-(d + 10.0 * left.log10()).max(0.0), -band)
     }
 
     /// Ramps the gain of `chunk` from the last chunk's to `to`.
@@ -1226,24 +1426,52 @@ impl Ducker {
         (1..=n).map(move |i| self.blocks[(self.next + BLOCKS - i) % BLOCKS])
     }
 
+    /// Adds `chunk` to the voice band's share (see `SHARE_REF_DB`), and
+    /// returns its K-weighted energy.
+    fn measure_share(&mut self, chunk: &[f32]) -> f64 {
+        let (energy, cut) = self.kw.energy_cut(chunk, &self.bell_c, &mut self.share_z);
+        self.share_power += energy;
+        self.cut_power += cut;
+        self.share_frames += chunk.len() / self.ch;
+        if self.share_frames >= BLOCK {
+            let power = (self.share_power / self.share_frames as f64) as f32;
+            if power > lufs_power(GATE_LUFS) {
+                // What the reference bell takes, as a share of the power.
+                let took = 1.0 - (self.cut_power / self.share_power) as f32;
+                let share = (took / (1.0 - db_to_lin(-SHARE_REF_DB).powi(2))).clamp(0.0, 1.0);
+                // The first block measured is taken whole: within the
+                // lookahead of the first word, not the default's.
+                self.share = if self.share_known {
+                    self.share + (share - self.share) / SHARE_BLOCKS
+                } else {
+                    share
+                };
+                self.share_known = true;
+            }
+            (self.share_power, self.cut_power, self.share_frames) = (0.0, 0.0, 0);
+        }
+        energy
+    }
+
     /// Adds `chunk` to the loudness measurement, and returns its K-weighted
     /// energy; at the end of each 100 ms block, updates the loudness and,
     /// in music mode (to `target` LUFS), the leveler's target.
     fn measure(&mut self, chunk: &[f32], target: Option<f32>) -> f64 {
-        let energy = self.kw.energy(chunk);
+        let energy = self.measure_share(chunk);
         self.power += energy;
         self.frames += chunk.len() / self.ch;
         if self.frames < BLOCK {
             return energy;
         }
-        self.blocks[self.next] = (self.power / self.frames as f64) as f32;
+        let gate = lufs_power(GATE_LUFS);
+        let power = (self.power / self.frames as f64) as f32;
+        self.blocks[self.next] = power;
         self.next = (self.next + 1) % BLOCKS;
         self.count = (self.count + 1).min(BLOCKS);
         (self.power, self.frames) = (0.0, 0);
         if let Some(n) = &mut self.catch_up {
             *n += 1;
         }
-        let gate = lufs_power(GATE_LUFS);
         self.momentary = gated(self.last(MOMENTARY_BLOCKS), gate, false);
         self.short = gated(self.last(SHORT_BLOCKS), gate, false);
         if target.is_some() {
@@ -1444,6 +1672,18 @@ mod tests {
         d
     }
 
+    /// [`duck`] on a constant 1.0, broadband: the output is the duck's
+    /// loudness envelope.
+    fn probe(secs: usize, depth: f32, speaking: impl Fn(usize) -> bool) -> Vec<f32> {
+        let mut buf = vec![1.0; secs * 48_000 * CH];
+        let mut d = Ducker::new(CH);
+        d.broadband = true;
+        for (i, b) in buf.chunks_mut(BLK * CH).enumerate() {
+            d.process(b, duck_only(depth), speaking(i), None);
+        }
+        buf
+    }
+
     fn duck_only(db: f32) -> DuckSettings {
         DuckSettings {
             duck_db: db,
@@ -1454,17 +1694,17 @@ mod tests {
     #[test]
     fn duck_reaches_its_depth_in_the_attack_time_and_comes_back() {
         // Constant 1.0: the output is the gain. Voice from 1 s to 2 s.
-        let mut buf = vec![1.0; 4 * 48_000 * CH];
-        duck(&mut buf, duck_only(12.0), |b| (50..100).contains(&b));
+        let buf = probe(4, 12.0, |b| (50..100).contains(&b));
         let db = |ms: usize| lin_to_db(buf[ms * 48 * CH]);
         assert_eq!(db(990), 0.0);
         // Halfway down after half the attack, all the way after it.
         assert!((db(1_025) + 6.0).abs() < 0.3, "{}", db(1_025));
         assert!((db(1_051) + 12.0).abs() < 0.05, "{}", db(1_051));
         assert!((db(1_900) + 12.0).abs() < 0.05);
-        // Back over the release.
-        assert!((db(2_300) + 6.0).abs() < 0.3, "{}", db(2_300));
-        assert!(db(2_601).abs() < 0.05, "{}", db(2_601));
+        // A 1 s phrase: held 220 ms (11 blocks), back over 358 ms.
+        assert!((db(2_215) + 12.0).abs() < 0.05, "{}", db(2_215));
+        assert!((db(2_400) + 6.0).abs() < 0.3, "{}", db(2_400));
+        assert!(db(2_580).abs() < 0.05, "{}", db(2_580));
         // No zipper: the gain moves by a tiny step per sample.
         let step = buf
             .chunks(CH)
@@ -1474,6 +1714,48 @@ mod tests {
             .map(|w| (w[1] - w[0]).abs())
             .fold(0.0, f32::max);
         assert!(step < 2e-3, "{step}");
+    }
+
+    #[test]
+    fn the_release_follows_the_phrase() {
+        // Where the duck leaves its depth and is back (ms), after a voice
+        // speaking from 1 s for `ms`.
+        let release = |ms: usize| {
+            let buf = probe(6, 12.0, |b| (50..50 + ms / 20).contains(&b));
+            let g: Vec<f32> = buf.chunks(CH).map(|f| lin_to_db(f[0])).collect();
+            let end = 1_000 + ms;
+            let after = |f: &dyn Fn(f32) -> bool| {
+                g[end * 48..].iter().position(|&x| f(x)).unwrap() as f32 / 48.0
+            };
+            (after(&|x| x > -11.95), after(&|x| x > -0.05))
+        };
+        // A lone word (300 ms): held 220 ms past the key's (11 blocks),
+        // back in 250 ms.
+        let (hold, back) = release(300);
+        assert!((hold - 220.0).abs() <= 2.0, "{hold}");
+        assert!((back - hold - 250.0).abs() <= 10.0, "{back}");
+        // A long phrase (3 s): held 240 ms more (12 blocks), back in 900.
+        let (hold, back) = release(3_000);
+        assert!((hold - 240.0).abs() <= 5.0, "{hold}");
+        assert!((back - hold - 900.0).abs() <= 10.0, "{back}");
+    }
+
+    #[test]
+    fn the_gain_counts_the_bell() {
+        // A fixed 12 dB duck on broadband noise: the meter shows the 12 dB
+        // the loudness drops, though the broadband gain is less.
+        let mut buf = noise(4 * 48_000 * CH, 0.3, 12);
+        let mut d = Ducker::new(CH);
+        for (i, b) in buf.chunks_mut(BLK * CH).enumerate() {
+            d.process(b, duck_only(12.0), i >= 50, None);
+        }
+        assert!((d.gain_db() + 12.0).abs() < 0.01, "{}", d.gain_db());
+        assert!(lin_to_db(d.gain) > -11.5, "broadband {}", lin_to_db(d.gain));
+        // And what the output lost, K-weighted, is that.
+        let input = noise(4 * 48_000 * CH, 0.3, 12);
+        let tail = 3 * 48_000 * CH..;
+        let lost = loudness(&buf[tail.clone()]) - loudness(&input[tail]);
+        assert!((lost - d.gain_db()).abs() < 0.5, "lost {lost} dB");
     }
 
     #[test]
@@ -1611,38 +1893,51 @@ mod tests {
         assert!(after < before - 1.5, "{before} dB to {after} dB");
     }
 
-    /// Steady-state gain of the presence dip at `freq`, dB.
-    fn dip_response(freq: f32) -> f32 {
+    /// Steady-state gain of the voice band's bell at `db` at `freq`, dB.
+    fn bell_response(db: f32, freq: f32) -> f32 {
         let input = sine(freq, 0.5, 48_000, 1);
-        let c = Coefs::peaking(DIP_HZ, DIP_Q, DIP_DB);
+        let c = Coefs::bandpass(BAND_HZ, BAND_Q);
+        let k = f64::from(db_to_lin(db) - 1.0);
         let mut z = State::default();
         let out: Vec<f32> = input
             .iter()
-            .map(|&s| z.run(&c, f64::from(s)) as f32)
+            .map(|&s| (f64::from(s) + k * z.run(&c, f64::from(s))) as f32)
             .collect();
         rms_db(&out[24_000..]) - rms_db(&input[24_000..])
     }
 
     #[test]
-    fn presence_dip_is_a_broad_bell_around_2khz() {
-        let at = dip_response;
-        assert!((at(2_000.0) - DIP_DB).abs() < 0.1, "{}", at(2_000.0));
-        // About half the depth an octave away, nothing far away.
-        assert!(at(1_000.0) < -1.5 && at(4_000.0) < -1.5);
-        assert!(at(100.0).abs() < 0.1, "{}", at(100.0));
-        assert!(at(16_000.0).abs() < 0.3, "{}", at(16_000.0));
+    fn the_bell_covers_the_voice_band() {
+        let at = |f| bell_response(-12.0, f);
+        assert!((at(BAND_HZ) + 12.0).abs() < 0.1, "{}", at(BAND_HZ));
+        // Half the cut at 300 Hz and 4 kHz, little far out.
+        for f in [300.0, 4_000.0] {
+            assert!((at(f) + 6.0).abs() < 1.0, "{f}: {}", at(f));
+        }
+        assert!(at(50.0) > -1.5, "{}", at(50.0));
+        assert!(at(16_000.0) > -2.5, "{}", at(16_000.0));
+        // At 0 dB, the identity.
+        assert!(bell_response(0.0, 1_000.0).abs() < 1e-4);
     }
 
     #[test]
-    fn music_mode_glides_the_dip_in() {
+    fn the_bell_runs_only_while_ducking() {
+        // Music mode, the voice silent: no bell, the samples untouched by
+        // it; speaking: the bell cuts as deep as the duck; after: gone.
         let mut d = Ducker::new(CH);
         let mut buf = vec![0.0; BLK * CH];
-        d.process(&mut buf, music(-26.0), false, None);
-        assert!(d.dip.cur < 0.0 && d.dip.cur > DIP_DB);
+        for _ in 0..100 {
+            d.process(&mut buf, music(-26.0), false, None);
+            assert!(!d.bell_live && d.bell == 0.0);
+        }
+        for _ in 0..50 {
+            d.process(&mut buf, music(-26.0), true, None);
+        }
+        assert_eq!(d.bell, -MUSIC_DUCK_DB);
         for _ in 0..100 {
             d.process(&mut buf, music(-26.0), false, None);
         }
-        assert_eq!(d.dip.cur, DIP_DB);
+        assert!(!d.bell_live && d.bell == 0.0);
     }
 
     #[test]
@@ -1831,7 +2126,7 @@ mod tests {
         let d = duck(&mut buf, music(-26.0), |b| b % 7 < 3);
         assert!(buf.iter().all(|s| s.is_finite()));
         let tiny = |x: f64| x != 0.0 && x.abs() < 1e-30;
-        for z in d.dip_z.iter().chain(d.kw.z.iter().flatten()) {
+        for z in d.bell_z.iter().chain(d.kw.z.iter().flatten()) {
             let (a, b) = z.raw();
             assert!(!tiny(a) && !tiny(b));
         }

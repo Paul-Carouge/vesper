@@ -348,6 +348,8 @@ fn simulate_with(
     let mut chain = chain.then(|| Chain::new(&FilterSpec::voice_chain(), CH).0);
     let mut det = VoiceDetector::new(CH);
     let mut probe = Ducker::new(CH);
+    // The duck's loudness envelope (its spectral split aside).
+    probe.broadband = true;
     let mut duck = Ducker::new(CH);
     let probe_set = duck_only(depth);
     let mut meter = VoiceMeter::new(CH);
@@ -729,23 +731,11 @@ fn long_talk(db: f32) -> Speech {
 /// measured by then.
 fn gap_by_mic(voice: &Speech, song: &[f32], settings: DuckSettings) -> (f32, f32, f32, f32) {
     let sim = simulate(&voice.x, false, Some(&song[..voice.x.len()]), settings);
-    let ranges: Vec<_> = voice
-        .active
-        .iter()
-        .copied()
-        .filter(|&(a, _)| a > 10_000 * MS)
-        .collect();
-    let v = loudness(&voice.x, &ranges);
     // The music where the voice speaks and the duck is down (60 ms into
     // the voice's run): how deep it goes, not its attack and release (other
     // matters).
-    let down =
-        |k: usize| k >= 3 && k < sim.speaking.len() && sim.speaking[k - 3..=k].iter().all(|&s| s);
-    let ducked: Vec<_> = ranges
-        .iter()
-        .flat_map(|&(a, b)| (a / BLK..b.div_ceil(BLK)).map(|k| (k * BLK, (k + 1) * BLK)))
-        .filter(|&(a, _)| down(a / BLK))
-        .collect();
+    let (ranges, ducked) = ducked_ranges(&sim, voice);
+    let v = loudness(&voice.x, &ranges);
     let m = loudness(&sim.out, &ducked);
     let (lo, hi) = ducked
         .iter()
@@ -785,17 +775,442 @@ fn overshoot(x: &[f32], from: usize, target: f32) -> (f32, f32) {
     (top - target, (over * 100) as f32)
 }
 
-/// Level of `hz` in mono `x` (Goertzel), dB.
-fn tone_db(x: &[f32], hz: f32) -> f32 {
-    let w = std::f64::consts::TAU * f64::from(hz) / f64::from(FS);
-    let c = 2.0 * w.cos();
-    let (mut s1, mut s2) = (0.0f64, 0.0f64);
-    for &v in x {
-        let s0 = f64::from(v) + c * s1 - s2;
-        (s2, s1) = (s1, s0);
+/// Mono `x` through the cascade `cs`, from rest.
+fn filtered(x: &[f32], cs: &[Coefs]) -> Vec<f32> {
+    let mut z = vec![State::default(); cs.len()];
+    x.iter()
+        .map(|&s| {
+            let mut v = f64::from(s);
+            for (c, z) in cs.iter().zip(&mut z) {
+                v = z.run(c, v);
+            }
+            v as f32
+        })
+        .collect()
+}
+
+const BUTTERWORTH: f64 = std::f64::consts::FRAC_1_SQRT_2;
+
+/// The voice band of mono `x`: 300 Hz to 4 kHz, 24 dB/octave each side.
+fn voice_band(x: &[f32]) -> Vec<f32> {
+    let (hp, lp) = (
+        Coefs::highpass(300.0, BUTTERWORTH),
+        Coefs::lowpass(4_000.0, BUTTERWORTH),
+    );
+    filtered(x, &[hp, hp, lp, lp])
+}
+
+/// Under 150 Hz, 24 dB/octave.
+fn lows(x: &[f32]) -> Vec<f32> {
+    let lp = Coefs::lowpass(150.0, BUTTERWORTH);
+    filtered(x, &[lp, lp])
+}
+
+/// Over 6 kHz, 24 dB/octave.
+fn highs(x: &[f32]) -> Vec<f32> {
+    let hp = Coefs::highpass(6_000.0, BUTTERWORTH);
+    filtered(x, &[hp, hp])
+}
+
+/// Mean power of mono `x` over `ranges`, dB.
+fn power_db(x: &[f32], ranges: &[(usize, usize)]) -> f32 {
+    let (p, n) = ranges.iter().fold((0.0f64, 0usize), |(p, n), &(a, b)| {
+        let s = &x[a.min(x.len())..b.min(x.len())];
+        (
+            p + s.iter().map(|v| f64::from(*v).powi(2)).sum::<f64>(),
+            n + s.len(),
+        )
+    });
+    10.0 * (p / n.max(1) as f64).max(1e-30).log10() as f32
+}
+
+/// Level (dB) and phase (rad) of `hz` in mono `x`, Hann-windowed (its
+/// leakage far from `hz` is far under any artefact measured here).
+fn tone_at(x: &[f32], hz: f32) -> (f32, f64) {
+    let tau = std::f64::consts::TAU;
+    let w = tau * f64::from(hz) / f64::from(FS);
+    let n = x.len() as f64;
+    let (mut re, mut im) = (0.0f64, 0.0f64);
+    for (i, &v) in x.iter().enumerate() {
+        let i = i as f64;
+        let h = 0.5 - 0.5 * (tau * i / n).cos();
+        let a = w * i;
+        re += h * f64::from(v) * a.cos();
+        im -= h * f64::from(v) * a.sin();
     }
-    let p = s1 * s1 + s2 * s2 - c * s1 * s2;
-    10.0 * (p.max(1e-30)).log10() as f32
+    (
+        10.0 * (re * re + im * im).max(1e-300).log10() as f32,
+        im.atan2(re),
+    )
+}
+
+/// The tones of [`tone_gains`].
+const TONES: [f32; 5] = [80.0, 300.0, 1_100.0, 3_000.0, 10_000.0];
+
+/// Five equal tones (-37 dBFS RMS each) under `set`: each tone's gain
+/// (dB, the leveler's and compressor's gains taken out) while the voice is
+/// silent (1.5 to 4.5 s) and while it speaks (one phrase from 5 s to
+/// 9.5 s, measured from 6.5 to 9 s).
+fn tone_gains(set: DuckSettings) -> ([f32; 5], [f32; 5]) {
+    let x: Vec<f32> = (0..10 * 48_000)
+        .map(|i| {
+            let t = i as f32 / FS;
+            TONES
+                .iter()
+                .map(|f| 0.02 * (std::f32::consts::TAU * f * t).sin())
+                .sum()
+        })
+        .collect();
+    let voice = synth_speech(10_000, &[(5_000, 4_500)], 130.0, -26.0, 2);
+    let sim = simulate(&voice.x, false, Some(&x), set);
+    let gains = |a: usize, b: usize| {
+        let (fa, fb) = (a * MS, b * MS);
+        let blocks = fa / BLK..fb / BLK;
+        let n = blocks.len() as f32;
+        let lc = blocks.map(|k| sim.level[k] + sim.comp[k]).sum::<f32>() / n;
+        TONES.map(|f| tone_at(&sim.out[fa..fb], f).0 - tone_at(&x[fa..fb], f).0 - lc)
+    };
+    (gains(1_500, 4_500), gains(6_500, 9_000))
+}
+
+/// Peak of `out - inp` against `inp`'s peak, dB, or "exact".
+fn null(out: &[f32], inp: &[f32]) -> String {
+    let d = out
+        .iter()
+        .zip(inp)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0, f32::max);
+    if d == 0.0 {
+        return "exact (bit-identical)".into();
+    }
+    let peak = inp.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+    format!("{:.0}", lin_to_db(d) - lin_to_db(peak))
+}
+
+/// Duck 12 dB, a phrase from 1 to 2.5 s: null against the input with the
+/// voice silent and from 6 s (well after the release); 2nd and 3rd
+/// harmonics of a 1 kHz sine at full depth, settled (dBc); the worst spur at 1 kHz
+/// +/- 1.5 kHz (the chunk rate) through the attack and the release (dBc).
+fn transparency() -> (String, String, (f32, f32), f32) {
+    let x = song(8.0, -20.0, true, 31);
+    let sim = simulate(&vec![0.0; x.len()], false, Some(&x), duck_only(12.0));
+    let idle = null(&sim.out, &x);
+    let voice = synth_speech(8_000, &[(1_000, 1_500)], 130.0, -26.0, 4);
+    let sim = simulate(&voice.x, false, Some(&x), duck_only(12.0));
+    let after = null(&sim.out[6_000 * MS..], &x[6_000 * MS..]);
+    // The sine's phase in f64: in f32 it drifts (a floor near -114 dBc).
+    let sine: Vec<f32> = (0..x.len())
+        .map(|i| (0.1 * (std::f64::consts::TAU * 1_000.0 * i as f64 / 48_000.0).sin()) as f32)
+        .collect();
+    let sim = simulate(&voice.x, false, Some(&sine), duck_only(12.0));
+    // Harmonics once the duck and the band share settled: a phrase from
+    // 1 to 7.5 s, measured from 4 to 7 s.
+    let long = synth_speech(8_000, &[(1_000, 6_500)], 130.0, -26.0, 4);
+    let held = simulate(&long.x, false, Some(&sine), duck_only(12.0));
+    let full = &held.out[4_000 * MS..7_000 * MS];
+    let f0 = tone_at(full, 1_000.0).0;
+    let thd = (tone_at(full, 2_000.0).0 - f0, tone_at(full, 3_000.0).0 - f0);
+    let zip = [(800, 1_400), (2_400, 4_400)]
+        .iter()
+        .map(|&(a, b)| {
+            let w = &sim.out[a * MS..b * MS];
+            let c = tone_at(w, 1_000.0).0;
+            tone_at(w, 2_500.0).0.max(tone_at(w, 500.0).0) - c
+        })
+        .fold(f32::MIN, f32::max);
+    (idle, after, thd, zip)
+}
+
+/// Ways to cut the voice band.
+#[derive(Clone, Copy)]
+enum Design {
+    /// `x + (g - 1) bp(x)`, `g` per frame (the ducker's).
+    Bell,
+    /// An RBJ peaking bell, its coefficients per chunk (the old dip's).
+    Peaking,
+    /// A 3-band Linkwitz-Riley (4th order) split at 300 Hz and 4 kHz, the
+    /// low band all-passed at 4 kHz to sum flat, the mid band's gain per
+    /// frame.
+    Split,
+}
+
+impl Design {
+    fn name(self) -> &'static str {
+        match self {
+            Design::Bell => "bell, x + (g - 1) bp(x), gain per frame (chosen)",
+            Design::Peaking => "RBJ peaking bell, coefficients per 32-frame chunk",
+            Design::Split => "LR4 3-band split 300 Hz / 4 kHz, mid gain per frame",
+        }
+    }
+}
+
+/// A [`Design`] on mono audio.
+struct Voiceband {
+    d: Design,
+    c: Vec<Coefs>,
+    z: Vec<State>,
+    /// The cut (dB) at the end of the last chunk.
+    db: f32,
+}
+
+impl Voiceband {
+    fn new(d: Design, db: f32) -> Self {
+        let c = match d {
+            Design::Bell => vec![Coefs::bandpass(1_100.0, 0.15)],
+            Design::Peaking => vec![Coefs::peaking(1_100.0, 0.3, db)],
+            Design::Split => {
+                let (lo, hi) = (
+                    Coefs::lowpass(300.0, BUTTERWORTH),
+                    Coefs::highpass(300.0, BUTTERWORTH),
+                );
+                let (lo4, hi4) = (
+                    Coefs::lowpass(4_000.0, BUTTERWORTH),
+                    Coefs::highpass(4_000.0, BUTTERWORTH),
+                );
+                let ap = Coefs::allpass(4_000.0, BUTTERWORTH);
+                vec![lo, lo, hi, hi, lo4, lo4, hi4, hi4, ap]
+            }
+        };
+        Self {
+            d,
+            z: vec![State::default(); c.len()],
+            c,
+            db,
+        }
+    }
+
+    /// Runs `x` (one chunk), the cut gliding to `db` across it.
+    fn chunk(&mut self, x: &mut [f32], db: f32) {
+        let n = x.len() as f32;
+        let (g0, g1) = (db_to_lin(self.db), db_to_lin(db));
+        let (c, z) = (&self.c, &mut self.z);
+        match self.d {
+            Design::Bell => {
+                for (i, s) in x.iter_mut().enumerate() {
+                    let k = f64::from(g0 + (g1 - g0) * (i + 1) as f32 / n - 1.0);
+                    let v = f64::from(*s);
+                    *s = (v + k * z[0].run(&c[0], v)) as f32;
+                }
+            }
+            Design::Peaking => {
+                if db != self.db {
+                    self.c[0] = Coefs::peaking(1_100.0, 0.3, db);
+                }
+                for s in x.iter_mut() {
+                    *s = self.z[0].run(&self.c[0], f64::from(*s)) as f32;
+                }
+            }
+            Design::Split => {
+                for (i, s) in x.iter_mut().enumerate() {
+                    let g = f64::from(g0 + (g1 - g0) * (i + 1) as f32 / n);
+                    let v = f64::from(*s);
+                    let lo = z[0].run(&c[0], v);
+                    let lo = z[1].run(&c[1], lo);
+                    let lo = z[8].run(&c[8], lo);
+                    let hi = z[2].run(&c[2], v);
+                    let hi = z[3].run(&c[3], hi);
+                    let mid = z[4].run(&c[4], hi);
+                    let mid = z[5].run(&c[5], mid);
+                    let top = z[6].run(&c[6], hi);
+                    let top = z[7].run(&c[7], top);
+                    *s = (lo + g * mid + top) as f32;
+                }
+            }
+        }
+        self.db = db;
+    }
+
+    /// Mono `x` through `d` at a steady cut of `db`.
+    fn steady(d: Design, db: f32, x: &[f32]) -> Vec<f32> {
+        let mut v = Self::new(d, db);
+        let mut y = x.to_vec();
+        y.chunks_mut(32).for_each(|c| v.chunk(c, db));
+        y
+    }
+}
+
+struct DesignRow {
+    null: String,
+    delay0: f32,
+    delay12: f32,
+    phase12: f32,
+    zipper: f32,
+    cpu: f64,
+}
+
+fn design_row(d: Design) -> DesignRow {
+    let x = noise(48_000, 0.3, 77);
+    let y = Voiceband::steady(d, 0.0, &x);
+    let r = y
+        .iter()
+        .zip(&x)
+        .map(|(a, b)| f64::from(a - b).powi(2))
+        .sum::<f64>();
+    let null = if r == 0.0 {
+        "exact (bit-identical)".to_string()
+    } else {
+        let p = x.iter().map(|v| f64::from(*v).powi(2)).sum::<f64>();
+        format!("{:.0}", 10.0 * (r / p).log10())
+    };
+    let phase = |db: f32, f: f32| {
+        let x: Vec<f32> = (0..48_000)
+            .map(|i| 0.1 * (std::f32::consts::TAU * f * i as f32 / FS).sin())
+            .collect();
+        let y = Voiceband::steady(d, db, &x);
+        let a = tone_at(&x[24_000..], f).1;
+        let b = tone_at(&y[24_000..], f).1;
+        let tau = std::f64::consts::TAU;
+        (b - a + tau * 1.5).rem_euclid(tau) - tau / 2.0
+    };
+    let freqs = [
+        50.0, 100.0, 200.0, 300.0, 500.0, 1_000.0, 2_000.0, 4_000.0, 8_000.0, 16_000.0,
+    ];
+    let delay = |db: f32| {
+        freqs
+            .iter()
+            .map(|&f| {
+                let dp = phase(db, f * 1.02) - phase(db, f);
+                (dp / (std::f64::consts::TAU * 0.02 * f64::from(f))).abs() as f32 * 1e3
+            })
+            .fold(0.0, f32::max)
+    };
+    let phase12 = freqs
+        .iter()
+        .map(|&f| phase(-12.0, f).abs().to_degrees() as f32)
+        .fold(0.0, f32::max);
+    // A 1 kHz sine, the cut gliding in at 0.5 s (12 dB in 50 ms) and out
+    // at 1.2 s (in 250 ms), per chunk as the ducker does.
+    let sine: Vec<f32> = (0..2 * 48_000)
+        .map(|i| 0.1 * (std::f32::consts::TAU * 1_000.0 * i as f32 / FS).sin())
+        .collect();
+    let mut y = sine.clone();
+    let mut v = Voiceband::new(d, 0.0);
+    let mut db = 0.0f32;
+    for (i, c) in y.chunks_mut(32).enumerate() {
+        let t = (i * 32) as f32 / FS;
+        let target = if (0.5..1.2).contains(&t) { -12.0 } else { 0.0 };
+        db = slew(
+            db,
+            target,
+            12.0 * 32.0 / 48.0 / 50.0,
+            12.0 * 32.0 / 48.0 / 250.0,
+        );
+        v.chunk(c, db);
+    }
+    let w = &y[19_200..76_800];
+    let carrier = tone_at(w, 1_000.0).0;
+    let zipper = tone_at(w, 2_500.0).0.max(tone_at(w, 500.0).0) - carrier;
+    // CPU: 30 s of noise at a steady -12 dB cut, 20 ms stereo blocks (as
+    // 1920 mono samples).
+    let x = noise(30 * 48_000 * CH, 0.3, 78);
+    let mut v = Voiceband::new(d, -12.0);
+    let mut buf = x.clone();
+    let t = std::time::Instant::now();
+    for b in buf.chunks_mut(BLK * CH) {
+        b.chunks_mut(32 * CH).for_each(|c| v.chunk(c, -12.0));
+    }
+    std::hint::black_box(&buf);
+    let cpu = t.elapsed().as_nanos() as f64 / (x.len() / (BLK * CH)) as f64;
+    DesignRow {
+        null,
+        delay0: delay(0.0),
+        delay12: delay(-12.0),
+        phase12,
+        zipper,
+        cpu,
+    }
+}
+
+/// Frame ranges.
+type Ranges = Vec<(usize, usize)>;
+
+/// `voice`'s active parts from 10 s in, and their blocks where the duck
+/// is down (60 ms into the voice's run), as frame ranges.
+fn ducked_ranges(sim: &Sim, voice: &Speech) -> (Ranges, Ranges) {
+    let ranges: Vec<_> = voice
+        .active
+        .iter()
+        .copied()
+        .filter(|&(a, _)| a > 10_000 * MS)
+        .collect();
+    let down =
+        |k: usize| k >= 3 && k < sim.speaking.len() && sim.speaking[k - 3..=k].iter().all(|&s| s);
+    let ducked = ranges
+        .iter()
+        .flat_map(|&(a, b)| (a / BLK..b.div_ceil(BLK)).map(|k| (k * BLK, (k + 1) * BLK)))
+        .filter(|&(a, _)| down(a / BLK))
+        .collect();
+    (ranges, ducked)
+}
+
+struct Bands {
+    gap: f32,
+    snr: f32,
+    lows: f32,
+    mids: f32,
+    highs: f32,
+}
+
+/// `voice` over `song` with `settings`, where the duck is down: the LU gap,
+/// the voice-band SNR of the voice against the music (dB), and the music's
+/// gain in its lows, voice band and highs (dB, the leveler's and the
+/// compressor's gains taken out).
+fn bands_under_voice(voice: &Speech, song: &[f32], settings: DuckSettings) -> Bands {
+    let song = &song[..voice.x.len()];
+    let sim = simulate(&voice.x, false, Some(song), settings);
+    let (ranges, ducked) = ducked_ranges(&sim, voice);
+    let gap = loudness(&voice.x, &ranges) - loudness(&sim.out, &ducked);
+    let n = ducked.len() as f32;
+    let lc = ducked
+        .iter()
+        .map(|&(a, _)| sim.level[a / BLK] + sim.comp[a / BLK])
+        .sum::<f32>()
+        / n;
+    let gain = |f: fn(&[f32]) -> Vec<f32>| {
+        power_db(&f(&sim.out), &ducked) - power_db(&f(song), &ducked) - lc
+    };
+    Bands {
+        gap,
+        snr: power_db(&voice_band(&voice.x), &ducked) - power_db(&voice_band(&sim.out), &ducked),
+        lows: gain(lows),
+        mids: gain(voice_band),
+        highs: gain(highs),
+    }
+}
+
+/// Speech of several shapes, for the release.
+fn phrase_types() -> Vec<(&'static str, Speech)> {
+    let synth = |words: &[(usize, usize)]| {
+        speech_with_floor(synth_speech(6_000, words, 130.0, -26.0, 1), -65.0)
+    };
+    vec![
+        ("lone word", synth(&[(1_000, 300)])),
+        (
+            "two words, 120 ms apart",
+            synth(&[(1_000, 300), (1_420, 350)]),
+        ),
+        ("synthetic phrase, 5 words", synth(&phrase_words())),
+        (
+            "clip 1272-128104-0001",
+            speech_with_floor(clip("1272-128104-0001", -26.0, 1_000, 3_000), -65.0),
+        ),
+        (
+            "clip 1272-135031-0004",
+            speech_with_floor(clip("1272-135031-0004", -26.0, 1_000, 3_000), -65.0),
+        ),
+        (
+            "word, 350 ms pause, word",
+            synth(&[(1_000, 300), (1_650, 350)]),
+        ),
+        (
+            "word, 400 ms pause, word",
+            synth(&[(1_000, 300), (1_700, 350)]),
+        ),
+        (
+            "word, 440 ms pause, word",
+            synth(&[(1_000, 300), (1_740, 350)]),
+        ),
+    ]
 }
 
 /// The whole table: `cargo test --release -p vesper-dsp -- --ignored
@@ -1143,36 +1558,91 @@ fn ducking_report() {
         }
     }
 
-    println!("\n### Presence dip (music mode)\n");
+    println!("\n### Spectral duck: tone gains (dB, leveler and compressor taken out)\n");
+    println!(
+        "Five equal tones; the voice silent from 1.5 to 4.5 s, speaking (one 4.5 s phrase) from 6.5 to 9 s.\n"
+    );
+    println!("| Mode | voice | 80 Hz | 300 Hz | 1.1 kHz | 3 kHz | 10 kHz |");
+    println!("|---|---|---|---|---|---|---|");
+    for (name, set) in [
+        ("duck 12 dB (fixed)", duck_only(12.0)),
+        ("music -26, duck 6 dB", music(-26.0)),
+    ] {
+        let (silent, talking) = tone_gains(set);
+        for (voice, g) in [("silent", silent), ("speaking", talking)] {
+            let cells: Vec<String> = g.iter().map(|v| format!("{v:.1}")).collect();
+            println!("| {name} | {voice} | {} |", cells.join(" | "));
+        }
+    }
+
+    println!("\n### Transparency and artefacts (duck 12 dB)\n");
     {
-        // 200 Hz and 2 kHz tones, equal level; the dip is their difference.
-        let n = 6 * 48_000;
-        let x: Vec<f32> = (0..n)
-            .map(|i| {
-                let t = i as f32 / FS;
-                0.05 * ((std::f32::consts::TAU * 200.0 * t).sin()
-                    + (std::f32::consts::TAU * 2_000.0 * t).sin())
-            })
-            .collect();
-        let quiet = vec![0.0; n];
-        let mut talking = vec![0.0; n];
-        add(
-            &mut talking,
-            &synth_speech(6_000, &[(500, 5_000)], 130.0, -26.0, 2).x,
-            0,
+        let (idle, after, thd, zip) = transparency();
+        println!("| Measure | value |\n|---|---|");
+        println!("| voice silent: output minus input, peak (dB re input peak) | {idle} |");
+        println!("| 2 s after a phrase's release: output minus input, peak (dB) | {after} |");
+        println!(
+            "| 1 kHz at full duck, settled: 2nd / 3rd harmonic (dBc) | {:.0} / {:.0} |",
+            thd.0, thd.1
         );
-        for (name, mic) in [("voice silent", &quiet), ("voice speaking", &talking)] {
-            let sim = simulate(mic, false, Some(&x), music(-26.0));
-            let tail = &sim.out[4 * 48_000..];
-            let src = &x[4 * 48_000..];
-            let rel = |hz| tone_db(tail, hz) - tone_db(src, hz);
+        println!(
+            "| 1 kHz through the attack and release: spur at 1 kHz +/- 1.5 kHz (the chunk rate), dBc | {:.0} |",
+            zip
+        );
+    }
+
+    println!("\n### Voice band: design choice (bell vs. Linkwitz-Riley split)\n");
+    {
+        println!(
+            "| Design | null vs input at 0 dB (dB) | group delay at 0 dB, worst 50 Hz-16 kHz (ms) | at -12 dB band cut (ms) | phase at -12 dB, worst (deg) | spur on a 1 kHz cut in/out (dBc) | CPU per 20 ms stereo block (ns) |"
+        );
+        println!("|---|---|---|---|---|---|---|");
+        for d in [Design::Bell, Design::Peaking, Design::Split] {
+            let r = design_row(d);
             println!(
-                "- {name}: 2 kHz {:.1} dB vs 200 Hz {:.1} dB: dip {:.1} dB",
-                rel(2_000.0),
-                rel(200.0),
-                rel(2_000.0) - rel(200.0)
+                "| {} | {} | {:.2} | {:.2} | {:.0} | {:.0} | {:.0} |",
+                d.name(),
+                r.null,
+                r.delay0,
+                r.delay12,
+                r.phase12,
+                r.zipper,
+                r.cpu
             );
         }
+    }
+
+    println!(
+        "\n### Voice over the track: intelligibility proxy and the music's body (Medium, voice -26 dBFS, from 10 s, while ducked)\n"
+    );
+    println!(
+        "| Mode | gap (LU, K-weighted) | voice-band SNR, voice vs music (dB) | music lows < 150 Hz (dB vs input) | music voice band (dB vs input) | music highs > 6 kHz (dB vs input) |"
+    );
+    println!("|---|---|---|---|---|---|");
+    for (mode, song_lufs) in [("duck", -14.0), ("music", -10.0)] {
+        let s = song(30.0, song_lufs, false, 15);
+        let r = bands_under_voice(&long_talk(-26.0), &s, level_settings(mode == "music", 1));
+        println!(
+            "| {mode} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} |",
+            r.gap, r.snr, r.lows, r.mids, r.highs
+        );
+    }
+
+    println!("\n### Release by phrase type (duck 12 dB; ms from the voice's offset)\n");
+    println!(
+        "| Phrase | length (ms) | offset to -3 dB | offset to -0.5 dB | rise in phrase (dB) |"
+    );
+    println!("|---|---|---|---|---|");
+    for (name, s) in phrase_types() {
+        let sim = simulate(&s.x, false, None, duck_only(12.0));
+        let t = timing(&sim, s.onset(), s.offset(), 12.0);
+        let (rise, _) = pumping(&sim, s.onset(), s.offset(), 12.0);
+        println!(
+            "| {name} | {:.0} | {} | {} | {rise:.2} |",
+            ms(s.offset() - s.onset()),
+            opt(t.back_3db),
+            opt(t.back_full)
+        );
     }
 
     println!("\n### CPU per 20 ms stereo block (ns; meaningful in --release)\n");
@@ -1240,7 +1710,12 @@ fn a_spoken_phrase_ducks_fast_and_holds_through_its_gaps() {
     // without it; real speech: below).
     assert!(t.to_3db.is_ok_and(|v| v <= 0.0), "{:?}", t.to_3db);
     assert!(t.to_full.is_ok_and(|v| v <= 20.0), "{:?}", t.to_full);
-    assert!(t.back_full.is_ok_and(|v| v <= 1_200.0), "{:?}", t.back_full);
+    // A long phrase is let go gently: 400 ms hold, 900 ms release (1262).
+    assert!(
+        t.back_full.is_ok_and(|v| (1_100.0..=1_400.0).contains(&v)),
+        "{:?}",
+        t.back_full
+    );
     let (rise, _) = pumping(&sim, s.onset(), s.offset(), 12.0);
     // 0.0; a gap that lets the duck up would show as tenths of a dB.
     assert!(rise < 0.25, "pumps {rise} dB between words");
@@ -1253,10 +1728,11 @@ fn real_speech_is_ducked_throughout() {
     assert!(recall(&sim, &s) >= 95.0, "{}", recall(&sim, &s));
     let t = timing(&sim, s.onset(), s.offset(), 12.0);
     // Down at full depth before the first syllable (-78 / -42 ms; 42 / 78
-    // without the lookahead), released as before (795 ms).
+    // without the lookahead), released gently, a long phrase (1162 ms;
+    // 795 before the release followed the phrase).
     assert!(t.to_3db.is_ok_and(|v| v <= -40.0), "{:?}", t.to_3db);
     assert!(t.to_full.is_ok_and(|v| v <= 0.0), "{:?}", t.to_full);
-    assert!(t.back_full.is_ok_and(|v| v <= 850.0), "{:?}", t.back_full);
+    assert!(t.back_full.is_ok_and(|v| v <= 1_300.0), "{:?}", t.back_full);
     let (rise, _) = pumping(&sim, s.onset(), s.offset(), 12.0);
     assert!(rise < 0.25, "pumps {rise} dB");
 }
@@ -1597,4 +2073,97 @@ fn hits_and_bursts_do_not_move_the_leveler() {
     let (moves, over) = stop_time();
     assert!(moves <= 1.5, "moves {moves} dB");
     assert!(over <= 100.0, "{over} ms over target + 3 LU");
+}
+
+#[test]
+fn the_release_follows_the_phrase_type() {
+    // Before, every phrase came back 885 to 895 ms after its end. Now a
+    // lone word in 400 ms, two words in 646, a long phrase in 1262; no
+    // pumping between words either way.
+    let types = phrase_types();
+    std::thread::scope(|sc| {
+        for (name, s, most, least) in [
+            (types[0].0, &types[0].1, 700.0, 0.0),
+            (types[1].0, &types[1].1, 800.0, 0.0),
+            (types[2].0, &types[2].1, 1_400.0, 1_100.0),
+        ] {
+            sc.spawn(move || {
+                let sim = simulate(&s.x, false, None, duck_only(12.0));
+                let t = timing(&sim, s.onset(), s.offset(), 12.0);
+                let back = t.back_full.unwrap();
+                assert!((least..=most).contains(&back), "{name}: back in {back} ms");
+                let (rise, _) = pumping(&sim, s.onset(), s.offset(), 12.0);
+                assert!(rise < 0.25, "{name}: pumps {rise} dB");
+            });
+        }
+    });
+}
+
+#[test]
+fn the_duck_cuts_the_voice_band_more_and_nothing_while_silent() {
+    // Before: 12 dB at every tone; music mode dipped 2.2 to 2.9 dB at 1 to
+    // 3 kHz all along. Now the lows and highs go down 9.3 / 9.8 dB, the
+    // voice band 14 to 20 dB, and nothing moves while the voice is silent.
+    let (silent, talking) = tone_gains(duck_only(12.0));
+    assert!(silent.iter().all(|g| g.abs() < 0.05), "{silent:?}");
+    let [lo, _, mid, _, hi] = talking;
+    assert!(lo > -10.5 && hi > -11.0, "{talking:?}");
+    assert!(mid < -18.0, "{talking:?}");
+    let (silent, talking) = tone_gains(music(-26.0));
+    assert!(silent.iter().all(|g| g.abs() < 0.1), "music: {silent:?}");
+    assert!(talking[2] < talking[0] - 3.0, "music: {talking:?}");
+}
+
+#[test]
+fn the_spectral_duck_is_transparent_and_clean() {
+    let (idle, after, thd, zip) = transparency();
+    assert!(idle.starts_with("exact"), "idle: {idle}");
+    assert!(after.starts_with("exact"), "after: {after}");
+    // Settled: see the report.
+    assert!(thd.0 < -100.0 && thd.1 < -100.0, "{thd:?}");
+    assert!(zip < -80.0, "spur {zip} dBc");
+}
+
+#[test]
+fn the_voice_band_gets_more_room_under_the_same_gap() {
+    // Medium, voice -26 dBFS: voice-band SNR 16.3 -> 20.2 dB (duck) and
+    // 18.6 -> 20.7 (music), the lows 1.9 and 1.4 dB fuller than before,
+    // the gap where it was (11.5, 13.6 LU).
+    std::thread::scope(|sc| {
+        for (music_mode, song_lufs, gap, snr) in
+            [(false, -14.0, 12.0, 19.0), (true, -10.0, 14.0, 19.7)]
+        {
+            sc.spawn(move || {
+                let x = song(26.0, song_lufs, false, 15);
+                let r = bands_under_voice(&long_talk(-26.0), &x, level_settings(music_mode, 1));
+                assert!(
+                    (r.gap - gap).abs() <= 1.5,
+                    "music {music_mode}: gap {}",
+                    r.gap
+                );
+                assert!(r.snr >= snr, "music {music_mode}: SNR {}", r.snr);
+                assert!(
+                    r.lows > r.mids + 2.5,
+                    "music {music_mode}: lows {} mids {}",
+                    r.lows,
+                    r.mids
+                );
+            });
+        }
+    });
+}
+
+#[test]
+fn a_hesitation_after_the_first_word_does_not_lift_the_track() {
+    // A 300 ms word, a 350 to 440 ms pause, another word: the hold of a
+    // lone word covers it (without its floor: +3.8 / +5.8 / +7.7 dB).
+    std::thread::scope(|sc| {
+        for (name, s) in phrase_types().into_iter().skip(5) {
+            sc.spawn(move || {
+                let sim = simulate(&s.x, false, None, duck_only(12.0));
+                let (rise, _) = pumping(&sim, s.onset(), s.offset(), 12.0);
+                assert!(rise < 1.0, "{name}: lifts {rise} dB");
+            });
+        }
+    });
 }
