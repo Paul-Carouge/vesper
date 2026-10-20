@@ -41,7 +41,10 @@
 //! its voiced windows) and tells it through the key: a duck then goes as
 //! deep as it takes for the track to sit its gap under the voice, and
 //! background music is leveled relative to the voice (see
-//! [`DuckSettings`]).
+//! [`DuckSettings`]). A ducked track measures its loudness as its input
+//! comes in, before the lookahead, so its leveler and duck meet a louder
+//! song or section before playing it; background music looks ahead even
+//! with no voice.
 
 mod aac;
 mod exclusions;
@@ -730,6 +733,15 @@ impl<F: FnMut(EncodedPacket)> Encoder<F> {
                 Some(process) => process(&mut self.block),
                 None => 0,
             };
+            if let Some(v) = &mut self.voice
+                && !v.speaks
+            {
+                // Measured as it comes in: the leveler and the duck see a
+                // louder song or section before they play it.
+                let voice = v.key.loudness();
+                v.ducker
+                    .look_ahead(&self.block, self.shared.ducking(), voice);
+            }
             let ahead = self.lookahead();
             self.set_delay(delay + ahead);
             emit(&mut self.ready, &mut self.skip, &self.block);
@@ -780,15 +792,17 @@ impl<F: FnMut(EncodedPacket)> Encoder<F> {
 
     /// The lookahead of a track that ducks: delays the processed block in
     /// `self.block` by [`LOOKAHEAD_FRAMES`] while the track ducks under a
-    /// voice, and returns that delay (0 otherwise). Turned on, the line
-    /// starts silent and `set_delay` drops that silence; turned off, what
-    /// it held comes out before the block. Either way the output goes on
-    /// sample for sample: no gap, no jump.
+    /// voice or plays as background music, and returns that delay (0
+    /// otherwise). Turned on, the line starts silent and `set_delay` drops
+    /// that silence; turned off, what it held comes out before the block.
+    /// Either way the output goes on sample for sample: no gap, no jump.
     fn lookahead(&mut self) -> usize {
         let Some(v) = &mut self.voice else { return 0 };
         let set = self.shared.ducking();
+        // Background music always looks ahead: its leveler holds a much
+        // louder song down from its first sample.
         let ducks =
-            !v.speaks && v.key.has_voice() && (set.duck_db > 0.0 || set.music_lufs.is_some());
+            !v.speaks && (set.music_lufs.is_some() || (v.key.has_voice() && set.duck_db > 0.0));
         if ducks != v.ahead && !self.ending {
             v.ahead = ducks;
             if ducks {

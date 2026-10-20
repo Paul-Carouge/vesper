@@ -316,6 +316,8 @@ struct Sim {
     out: Vec<f32>,
     level: Vec<f32>,
     comp: Vec<f32>,
+    /// The duck's gain per block, dB.
+    duck: Vec<f32>,
 }
 
 /// Runs the voice `mic` (mono, through the voice chain first if `chain`)
@@ -356,6 +358,7 @@ fn simulate_with(
         out: Vec::with_capacity(blocks * BLK),
         level: Vec::with_capacity(blocks),
         comp: Vec::with_capacity(blocks),
+        duck: Vec::with_capacity(blocks),
     };
     let (mut v, mut m, mut p) = (
         vec![0.0; BLK * CH],
@@ -393,6 +396,15 @@ fn simulate_with(
                 key.set_loudness(lufs);
             }
         }
+        // As `Encoder::push`: the ducked track measures its input as it
+        // comes in, before the lookahead holds it back.
+        if step < blocks {
+            let at = step * BLK;
+            for (i, f) in m.as_chunks_mut::<CH>().0.iter_mut().enumerate() {
+                f.fill(music.map_or(0.0, |x| x[at + i]));
+            }
+            duck.look_ahead(&m, settings, key.loudness());
+        }
         // The ducked track's block, its audio held back by the lookahead.
         let Some(at) = step
             .checked_sub(look)
@@ -412,8 +424,9 @@ fn simulate_with(
         }
         duck.process(&mut m, settings, speaking, key.loudness());
         sim.out.extend(m.as_chunks::<CH>().0.iter().map(|f| f[0]));
-        sim.level.push(duck.level);
+        sim.level.push(duck.leveled());
         sim.comp.push(duck.comp);
+        sim.duck.push(duck.duck);
     }
     sim
 }
@@ -711,9 +724,10 @@ fn long_talk(db: f32) -> Speech {
 }
 
 /// `voice` speaks over `song` with `settings`. Returns (voice LUFS, track
-/// LUFS during the voice, LU gap), from 10 s in: the voice's loudness and
-/// the leveler are measured by then.
-fn gap_by_mic(voice: &Speech, song: &[f32], settings: DuckSettings) -> (f32, f32, f32) {
+/// LUFS during the voice, LU gap, how far the duck's gain moves there in
+/// dB: pumping), from 10 s in: the voice's loudness and the leveler are
+/// measured by then.
+fn gap_by_mic(voice: &Speech, song: &[f32], settings: DuckSettings) -> (f32, f32, f32, f32) {
     let sim = simulate(&voice.x, false, Some(&song[..voice.x.len()]), settings);
     let ranges: Vec<_> = voice
         .active
@@ -733,7 +747,11 @@ fn gap_by_mic(voice: &Speech, song: &[f32], settings: DuckSettings) -> (f32, f32
         .filter(|&(a, _)| down(a / BLK))
         .collect();
     let m = loudness(&sim.out, &ducked);
-    (v, m, v - m)
+    let (lo, hi) = ducked
+        .iter()
+        .map(|&(a, _)| sim.duck[a / BLK])
+        .fold((f32::MAX, f32::MIN), |(lo, hi), d| (lo.min(d), hi.max(d)));
+    (v, m, v - m, hi - lo)
 }
 
 /// Time until the leveler is within 1 dB of where it ends (its mean over
@@ -1042,6 +1060,15 @@ fn ducking_report() {
             sec_in(20) - sec_in(16),
             sec(20) - sec(16),
         );
+        let (swing, top) = arranged_swing();
+        println!(
+            "\nArranged song (quiet intro, fade-in, bridge 10 LU lower): leveler gain swings {swing:.1} dB from 12 s; momentary peak {top:.1} LU over target after the intro."
+        );
+        let duck = chorus_under_duck(DuckSettings::at_levels(Some(1), None));
+        let bg = chorus_under_duck(DuckSettings::at_levels(None, Some(1)));
+        println!(
+            "\nChorus while the voice speaks: music in its first second (from 200 ms) over settled: duck Medium {duck:.1} LU, music Normal {bg:.1} LU."
+        );
     }
 
     println!(
@@ -1069,26 +1096,28 @@ fn ducking_report() {
         "\n### Voice over the track: LU gap by mic level (while the voice speaks, from 10 s in)\n"
     );
     println!(
-        "| Mode, level | song in (LUFS) | gap at -20 dBFS | gap at -26 dBFS | gap at -32 dBFS | spread (LU) |"
+        "| Mode, level | song in (LUFS) | gap at -20 dBFS | gap at -26 dBFS | gap at -32 dBFS | spread (LU) | duck moves (dB, -26 dBFS) |"
     );
-    println!("|---|---|---|---|---|---|");
+    println!("|---|---|---|---|---|---|---|");
     for (mode, song_lufs) in [("duck", -14.0), ("music", -10.0)] {
         for (name, level) in [("Low", 0), ("Medium", 1), ("High", 2)] {
             let set = level_settings(mode == "music", level);
             let s = song(30.0, song_lufs, false, 15);
-            let gaps: Vec<f32> = [-20.0, -26.0, -32.0]
+            let runs: Vec<_> = [-20.0, -26.0, -32.0]
                 .iter()
-                .map(|&vdb| gap_by_mic(&long_talk(vdb), &s, set).2)
+                .map(|&vdb| gap_by_mic(&long_talk(vdb), &s, set))
                 .collect();
+            let gaps: Vec<f32> = runs.iter().map(|r| r.2).collect();
             let (lo, hi) = gaps
                 .iter()
                 .fold((f32::MAX, f32::MIN), |(a, b), &v| (a.min(v), b.max(v)));
             println!(
-                "| {mode}, {name} | {song_lufs:.0} | {:.1} | {:.1} | {:.1} | {:.1} |",
+                "| {mode}, {name} | {song_lufs:.0} | {:.1} | {:.1} | {:.1} | {:.1} | {:.2} |",
                 gaps[0],
                 gaps[1],
                 gaps[2],
-                hi - lo
+                hi - lo,
+                runs[1].3
             );
         }
     }
@@ -1344,7 +1373,7 @@ fn the_voice_over_music_gap_does_not_depend_on_the_mic_level() {
         for (music_mode, song_lufs, vdb, want) in cases {
             s.spawn(move || {
                 let x = song(26.0, song_lufs, false, 15);
-                let (_, _, gap) = gap_by_mic(&long_talk(vdb), &x, level_settings(music_mode, 1));
+                let (_, _, gap, _) = gap_by_mic(&long_talk(vdb), &x, level_settings(music_mode, 1));
                 assert!(
                     (gap - want).abs() <= 1.5,
                     "music {music_mode}, voice {vdb} dBFS: gap {gap} LU, want {want}"
@@ -1352,6 +1381,57 @@ fn the_voice_over_music_gap_does_not_depend_on_the_mic_level() {
             });
         }
     });
+}
+
+/// A song as played: a quiet intro (-12 dB, 6 s), a 4 s fade-in, 12 s
+/// full, a bridge 10 LU lower (6 s), 12 s full again; -14 LUFS when full.
+fn arranged_song() -> Vec<f32> {
+    let mut x = song(40.0, -14.0, false, 17);
+    for (i, s) in x.iter_mut().enumerate() {
+        let t = i as f32 / FS;
+        let db = match t {
+            t if t < 6.0 => -12.0,
+            t if t < 10.0 => -12.0 + 3.0 * (t - 6.0),
+            t if (22.0..28.0).contains(&t) => -10.0,
+            _ => 0.0,
+        };
+        *s *= db_to_lin(db);
+    }
+    x
+}
+
+/// [`arranged_song`] in music mode at -26 LUFS, no voice: how far the
+/// leveler's gain swings once the song is in (from 12 s), and how far
+/// the music goes over the target after the intro (momentary, LU).
+fn arranged_swing() -> (f32, f32) {
+    let x = arranged_song();
+    let sim = simulate(&vec![0.0; x.len()], false, Some(&x), music(-26.0));
+    let l = &sim.level[600..];
+    let (lo, hi) = l
+        .iter()
+        .fold((f32::MAX, f32::MIN), |(a, b), &v| (a.min(v), b.max(v)));
+    let (top, _) = overshoot(&sim.out, 6_000 * MS, -26.0);
+    (hi - lo, top)
+}
+
+/// A voice talking all along (300 ms words, 100 ms apart, -26 dBFS) over
+/// a verse/chorus song (-14 LUFS, chorus 8 dB louder, from 4 s every
+/// 8 s) with `settings`: how much louder the music is in the chorus's
+/// first second (from 200 ms) than once settled (2 to 4 s in), LU, over
+/// the choruses at 12 and 20 s. 0: ducked as deep at once.
+fn chorus_under_duck(settings: DuckSettings) -> f32 {
+    let words: Vec<_> = (0..74).map(|i| (300 + i * 400, 300)).collect();
+    let voice = synth_speech(30_000, &words, 130.0, -26.0, 7);
+    let x = song(30.0, -14.0, true, 18);
+    let sim = simulate(&voice.x, false, Some(&x), settings);
+    let at = |s: usize, a: usize, b: usize| {
+        loudness(&sim.out, &[((s * 1_000 + a) * MS, (s * 1_000 + b) * MS)])
+    };
+    [12, 20]
+        .iter()
+        .map(|&s| at(s, 200, 1_000) - at(s, 2_000, 4_000))
+        .sum::<f32>()
+        / 2.0
 }
 
 /// Song `a` then song `b` (LUFS), 15 s each, in music mode at -26 LUFS:
@@ -1368,9 +1448,12 @@ fn song_change(a: f32, b: f32) -> (f32, f32, f32, f32) {
 
 #[test]
 fn a_song_change_is_leveled_in_both_directions() {
-    // Before: 1.9 s over target + 3 LU, and 11.8 s to converge 9 LU under.
+    // Before: 1.9 s over target + 3 LU (peak 14.9 LU), and 11.8 s to
+    // converge 9 LU under. Now 100 ms, peak 3.6 LU: the guard holds the
+    // louder song down from its first sample.
     let (_, _, top, over) = song_change(-40.0, -8.0);
-    assert!(over <= 600.0, "{over} ms over target + 3 LU, peak {top}");
+    assert!(over <= 200.0, "{over} ms over target + 3 LU, peak {top}");
+    assert!(top <= 6.0, "peak {top} LU over target");
     let (conv, gain, _, _) = song_change(-8.0, -40.0);
     assert!(conv <= 9_000.0, "{conv} ms to converge");
     assert!(gain >= 11.0, "raised {gain} dB only");
@@ -1386,4 +1469,26 @@ fn the_leveler_keeps_a_songs_dynamics() {
         .iter()
         .fold((f32::MAX, f32::MIN), |(a, b), &v| (a.min(v), b.max(v)));
     assert!(hi - lo <= 3.0, "swings {} dB", hi - lo);
+}
+
+#[test]
+fn an_arranged_song_does_not_pump() {
+    // Quiet intro, fade-in, a bridge 10 LU lower: 1.5 dB, 4.7 LU.
+    let (swing, top) = arranged_swing();
+    assert!(swing <= 3.0, "swings {swing} dB");
+    assert!(top <= 7.0, "peak {top} LU over target");
+}
+
+#[test]
+fn a_louder_section_is_ducked_as_it_starts() {
+    // Before (depth from the 3 s loudness): the chorus's first second was
+    // 3.9 (duck) and 6.3 LU (music) louder than settled; now 0.4 and 0.9.
+    std::thread::scope(|s| {
+        for (duck, music) in [(Some(1), None), (None, Some(1))] {
+            s.spawn(move || {
+                let under = chorus_under_duck(DuckSettings::at_levels(duck, music));
+                assert!(under <= 2.0, "{duck:?} {music:?}: {under} LU");
+            });
+        }
+    });
 }

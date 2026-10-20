@@ -138,6 +138,7 @@ fn voice_meter_and_ducker_do_not_allocate() {
         let mut voice = None;
         for (i, b) in buf.chunks_mut(960 * 2).enumerate() {
             voice = meter.process(b, |a, _| a % 960 == 0).or(voice);
+            duck.look_ahead(b, set, voice);
             duck.process(b, set, i % 50 < 30, voice);
         }
         meter.reset();
