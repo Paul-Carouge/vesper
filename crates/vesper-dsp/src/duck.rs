@@ -750,3 +750,7 @@ mod tests {
         });
     }
 }
+
+#[cfg(test)]
+#[path = "duck_bench.rs"]
+mod bench;
