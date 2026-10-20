@@ -643,6 +643,9 @@ struct Encoder<F> {
     /// the anchor in frames: a [`VoiceKey`]'s timeline frames are their sum.
     fed: u64,
     origin: u64,
+    /// In `finish`: the lookahead stays as it is, so its line drains
+    /// through the padding instead of coming out with an extra block.
+    ending: bool,
     mix: Option<MixInput>,
     /// Gets each block as encoded, with its pts (a live stream's audio).
     tap: Option<Tap>,
@@ -675,6 +678,7 @@ impl<F: FnMut(EncodedPacket)> Encoder<F> {
             voice: None,
             fed: 0,
             origin: duration_to_frames(anchor) as u64,
+            ending: false,
             mix: None,
             tap: None,
             opus: true,
@@ -758,7 +762,7 @@ impl<F: FnMut(EncodedPacket)> Encoder<F> {
         let set = self.shared.ducking();
         let ducks =
             !v.speaks && v.key.has_voice() && (set.duck_db > 0.0 || set.music_lufs.is_some());
-        if ducks != v.ahead {
+        if ducks != v.ahead && !self.ending {
             v.ahead = ducks;
             if ducks {
                 v.delay.fill(0.0);
@@ -907,10 +911,18 @@ impl<F: FnMut(EncodedPacket)> Encoder<F> {
 
     fn finish(mut self) {
         // Pad the last partial frame and flush the processing's delay so no
-        // captured audio is lost.
-        let len = FRAME * usize::from(CHANNELS);
-        let tail = self.pending.len() + self.delay * usize::from(CHANNELS);
-        self.push(&vec![0.0; tail.next_multiple_of(len) - self.pending.len()]);
+        // captured audio is lost, and no silence added: zeros go in until
+        // the output reaches the input's end (the delay read again per
+        // block), the lookahead held as it is.
+        self.ending = true;
+        let ch = usize::from(CHANNELS);
+        let len = FRAME * ch;
+        let end = self.fed as i64 + self.pending_frames() as i64;
+        let zeros = vec![0.0; len];
+        self.push(&zeros[..(len - self.pending.len() % len) % len]);
+        while self.sent + ((self.ready.len() / ch) as i64) < end {
+            self.push(&zeros);
+        }
         if !self.ready.is_empty() {
             self.ready.resize(len, 0.0);
             self.block.clear();
@@ -2023,6 +2035,31 @@ mod tests {
         assert_eq!(track.delay, 0);
         let input: Vec<f32> = (0..k).flat_map(|k| sine_block(441.0, 0.25, k)).collect();
         assert_eq!(*out.lock().unwrap(), input);
+    }
+
+    #[test]
+    fn a_ducking_track_ends_with_its_input_whether_its_voice_stays_or_not() {
+        for voice_left in [false, true] {
+            let key = Arc::new(VoiceKey::default());
+            key.add_voice();
+            let mut track = voice_track(&key, Duration::ZERO, false, DUCK_12);
+            let out = Arc::new(std::sync::Mutex::new(Vec::<f32>::new()));
+            let o = out.clone();
+            track.tap = Some(Box::new(move |_, b: &[f32]| {
+                o.lock().unwrap().extend_from_slice(b);
+            }));
+            let input: Vec<f32> = (0..50).flat_map(|k| sine_block(441.0, 0.25, k)).collect();
+            track.push(&input);
+            if voice_left {
+                // Its voice is gone: the lookahead lets its line out.
+                key.remove_voice();
+            }
+            track.finish();
+            // 1 s in, 1 s out: nothing lost, no silence added.
+            let out = out.lock().unwrap();
+            assert_eq!(out.len(), input.len(), "voice left: {voice_left}");
+            assert!(*out == input, "voice left: {voice_left}");
+        }
     }
 
     #[test]

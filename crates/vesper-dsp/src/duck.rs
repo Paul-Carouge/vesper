@@ -82,9 +82,13 @@ pub const VOICE_HOLD_FRAMES: usize = 14_400;
 /// playback delays). See `ducking_report`'s lookahead table.
 pub const LOOKAHEAD_FRAMES: usize = 5_760;
 
-/// Windows per word of a [`VoiceKey`]; its top 16 bits tag the word.
-const KEY_BITS: u64 = 48;
-/// Words of a [`VoiceKey`]: 32 of 480 ms, 15 s of history.
+/// Windows per word of a [`VoiceKey`]; its top 32 bits tag the word. The
+/// timeline counts from boot: a 32-bit tag of 320 ms words wraps after 43
+/// years, so any two tags compare (wrapping, as `i32`) the right way.
+const KEY_BITS: u64 = 32;
+const TAG_MASK: u64 = u32::MAX as u64;
+/// Words of a [`VoiceKey`]: 32 of 320 ms, 10 s of history (the hold, the
+/// lookahead and a voice seconds late fit well within).
 const KEY_WORDS: usize = 32;
 
 /// When the voices speak, on the timeline the tracks share: a timeline
@@ -95,8 +99,8 @@ const KEY_WORDS: usize = 32;
 /// several voices merge (a window is voiced if any voice says so).
 #[derive(Debug, Default)]
 pub struct VoiceKey {
-    /// One bit per window: word `k` holds windows `48k..48k + 48` in its
-    /// low bits and `k` (16 bits) on top. A word tagged otherwise holds
+    /// One bit per window: word `k` holds windows `32k..32k + 32` in its
+    /// low bits and `k` (32 bits) on top. A word tagged otherwise holds
     /// older windows, none of them asked about any more.
     words: [AtomicU64; KEY_WORDS],
     /// Timeline frame up to which a voice has told (the furthest one).
@@ -127,14 +131,16 @@ impl VoiceKey {
     pub fn voiced(&self, end: u64) {
         let w = end.saturating_sub(WINDOW as u64 / 2) / WINDOW as u64;
         let k = w / KEY_BITS;
-        let (tag, bit) = (k & 0xFFFF, 1 << (w % KEY_BITS));
+        let (tag, bit) = (k & TAG_MASK, 1 << (w % KEY_BITS));
         let word = &self.words[k as usize % KEY_WORDS];
         let mut cur = word.load(Ordering::Relaxed);
         loop {
             let old = cur >> KEY_BITS;
+            // A word with no bit set was never written (every write sets
+            // one): any tag takes it, whatever its starting tag 0 says.
             let new = if old == tag {
                 cur | bit
-            } else if tag.wrapping_sub(old) as u16 as i16 > 0 {
+            } else if cur & TAG_MASK == 0 || tag.wrapping_sub(old) as u32 as i32 > 0 {
                 tag << KEY_BITS | bit
             } else {
                 // Older than the history: no one asks about it.
@@ -169,7 +175,7 @@ impl VoiceKey {
             (from / w).max((last / KEY_BITS).saturating_sub(KEY_WORDS as u64 - 1) * KEY_BITS);
         (first / KEY_BITS..=last / KEY_BITS).any(|k| {
             let cur = self.words[k as usize % KEY_WORDS].load(Ordering::Relaxed);
-            if cur >> KEY_BITS != k & 0xFFFF {
+            if cur >> KEY_BITS != k & TAG_MASK {
                 return false;
             }
             let base = k * KEY_BITS;
@@ -1092,6 +1098,41 @@ mod tests {
         key.voiced(48_480);
         assert!(!key.speaking(48_000, 48_480));
         assert!(key.speaking(later, later + 480));
+    }
+
+    #[test]
+    fn the_key_works_at_any_uptime() {
+        // Timeline frames count from boot: 5 h up, and word counts around
+        // where 16- and 32-bit tags would flip sign.
+        let w = WINDOW as u64;
+        let five_hours = 5 * 3_600 * 48_000 / (w * KEY_BITS);
+        for words in [
+            five_hours,
+            (1 << 15) - 1,
+            1 << 15,
+            (1 << 15) + 7,
+            (1 << 16) + 3,
+            (1 << 31) - 1,
+            1 << 31,
+            (1 << 31) + 5,
+        ] {
+            let key = VoiceKey::default();
+            let base = words * KEY_BITS * w;
+            for i in 100..110 {
+                key.voiced(base + (i + 1) * w);
+            }
+            key.heard(base + 200 * w);
+            assert!(key.speaking(base + 100 * w, base + 101 * w), "{words}");
+            assert!(!key.speaking(base + 110 * w, base + 200 * w), "{words}");
+            assert!(key.ducks(base + 100 * w, 960, LOOKAHEAD_FRAMES), "{words}");
+            // The same slot, idle for 1000 turns of the ring, then written.
+            let later = base + (KEY_WORDS as u64 * KEY_BITS * 1_000 + 100) * w;
+            key.heard(later + 10 * w);
+            assert!(!key.speaking(later, later + w), "{words}: stale word");
+            key.voiced(later + w);
+            assert!(key.speaking(later, later + w), "{words}");
+            assert!(!key.speaking(later + w, later + 10 * w), "{words}");
+        }
     }
 
     /// CPU per track: `cargo test --release -p vesper-dsp -- --ignored
