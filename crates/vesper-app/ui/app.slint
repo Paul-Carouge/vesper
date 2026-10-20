@@ -21,6 +21,10 @@ export struct FilterKind { kind: string, title: string }
 /// `source-label` names it ("Desktop audio", "Headset", "Firefox") and
 /// `device` is the device it records, if named ("Speakers (USB DAC)").
 export struct AudioTrack { name: string, source: string, source-label: string, device: string, kind: TrackKind, enabled: bool, muted: bool, volume-db: float, filters: [FilterRow], voice: bool, duck: bool, duck-level: int, music: bool, music-level: int, leave-desktop: bool, without: string }
+/// What ducking does to a track now: its voice speaks (a voice track,
+/// never while muted), the duck lowers it, and the whole gain of the duck,
+/// leveler and compressor in whole dB.
+export struct TrackDuck { speaking: bool, lowered: bool, db: int }
 /// A source a picker offers. `section` heads the first of a group; `added`:
 /// a track records it; `detail` is shown after the label ("Default",
 /// "Disconnected").
@@ -192,6 +196,11 @@ global TrackText {
         db <= -60 ? @tr("Silent") : (db > 0 ? "+" : "") + "\{Math.round(db * 2) / 2} dB"
     }
 
+    // A gain in whole dB, with its sign ("−9 dB", "+4 dB").
+    public pure function gain(db: int) -> string {
+        (db > 0 ? "+" : db < 0 ? "−" : "") + "\{Math.abs(db)} dB"
+    }
+
     public pure function icon(kind: TrackKind, muted: bool) -> string {
         kind == TrackKind.microphone || kind == TrackKind.input
             ? (muted ? Icons.mic-off : Icons.mic)
@@ -223,13 +232,17 @@ component AudioRow inherits HorizontalLayout {
     in property <bool> interactive: true;
     /// Its settings are shown below it.
     in property <bool> open;
-    /// Lowered under the voice right now.
-    in property <bool> ducked;
+    /// What ducking does to it right now.
+    in property <TrackDuck> duck;
     callback toggle-mute;
     callback toggle-open;
     callback clear-clip;
 
     property <bool> silent: root.track.muted || !root.track.enabled;
+    property <bool> speaking: root.track.enabled && !root.track.muted && root.track.voice && root.duck.speaking;
+    property <bool> lowered: root.track.enabled && !root.track.muted && root.duck.lowered;
+    // Background music shows its level while no voice lowers it.
+    property <bool> leveled: root.track.enabled && !root.track.muted && root.track.music && !root.duck.lowered && root.duck.db != 0;
 
     spacing: Theme.space-md;
     alignment: stretch;
@@ -259,7 +272,9 @@ component AudioRow inherits HorizontalLayout {
         Text {
             text: !root.track.enabled ? @tr("Not recorded")
                 : root.track.muted ? @tr("Muted")
-                : root.ducked ? @tr("Lowered")
+                : root.speaking ? @tr("Voice detected")
+                : root.lowered ? @tr("Lowered {}", TrackText.gain(root.duck.db))
+                : root.leveled ? @tr("Music {}", TrackText.gain(root.duck.db))
                 : root.track.volume-db != 0 ? TrackText.volume(root.track.volume-db)
                 : root.track.without == "" ? TrackText.source(root.track)
                 : root.track.device == "" ? @tr("Without {}", root.track.without)
@@ -267,8 +282,11 @@ component AudioRow inherits HorizontalLayout {
             font-size: Theme.font-caption;
             font-weight: root.track.muted && root.track.enabled ? 600 : 400;
             color: root.track.muted && root.track.enabled ? Theme.rec
-                : root.ducked && root.track.enabled ? Theme.accent : Theme.text-muted;
+                : root.speaking || root.lowered ? Theme.accent : Theme.text-muted;
             overflow: elide;
+            accessible-label: root.lowered ? @tr("Lowered by {} dB under the voice", -root.duck.db)
+                : root.leveled ? @tr("Background music at {} dB", root.duck.db)
+                : self.text;
         }
     }
 
@@ -981,8 +999,8 @@ export component AppWindow inherits Window {
     in property <[AudioTrack]> tracks;
     /// Level meter of each track.
     in property <[TrackMeter]> track-meters;
-    /// Per track: lowered under the voice right now.
-    in property <[bool]> track-ducked;
+    /// Per track: what ducking does to it right now.
+    in property <[TrackDuck]> track-ducked;
     /// What "Add track" and a track's Source offer, kept current while
     /// `watching-sources`.
     in property <[SourceOption]> source-options;
@@ -2145,7 +2163,7 @@ export component AppWindow inherits Window {
                                 track: track;
                                 meter: root.track-meters[i];
                                 open: root.open-track == i;
-                                ducked: root.track-ducked[i];
+                                duck: root.track-ducked[i];
                                 toggle-mute => {
                                     root.track-mute-toggled(i);
                                 }

@@ -4,7 +4,8 @@
 # replay buffer then really encodes), WARM (12), WIN (20), SHIM, TRAY (0: no
 # tray at all), MIX (true), MUTED (false), DEMO (VESPER_DEMO intents, e.g.
 # settings,desktop-devices to open the device list: NodeWatch runs), CHURN (1:
-# short-lived audio streams come and go on the graph).
+# short-lived audio streams come and go on the graph), MUSIC (a level, e.g.
+# medium: the Dev2 track is background music).
 . "${LABROOT:?not in the lab, use go or r2}/lib.sh" || exit 1
 . $LABROOT/audio_up.sh
 audio_up
@@ -13,6 +14,7 @@ WIN=${WIN:-20}
 mkdir -p $L/cfg/vesper
 printf 'replay=%s\nreplay_seconds=60\ngame_source=true\ntracks=\ntrack=true|%s|0|desktop|Desktop\ntrack=true|%s|0|output:labsink2|Dev2\naudio_mix=%s\n' \
   ${REPLAY:-false} ${MUTED:-false} ${MUTED:-false} ${MIX:-true} > $L/cfg/vesper/settings
+[ -n "${MUSIC:-}" ] && sed -i "/|Dev2\$/a music=true|$MUSIC" $L/cfg/vesper/settings
 if [ "${TRAY:-1}" = 1 ]; then
   python3 -I $LABROOT/r2_fake_tray.py ${HIDE_AT:-} > $L/log/tray.log 2>&1 &
   sleep 1

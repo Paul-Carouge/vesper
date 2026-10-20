@@ -47,8 +47,8 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use vesper_audio::{
-    Aac, AudioCapture, CHANNELS, DuckSettings, Exclusions, Mix, Options, Peaks, SAMPLE_RATE,
-    Source, TrackState, VoiceKey,
+    Aac, AudioCapture, CHANNELS, DuckSettings, DuckState, Exclusions, Mix, Options, Peaks,
+    SAMPLE_RATE, Source, TrackState, VoiceKey,
 };
 use vesper_capture::Capture;
 use vesper_compose::{Compositor, Draw, Source as DrawSource};
@@ -590,14 +590,17 @@ impl Pipeline {
         }
     }
 
-    /// How much the duck lowers track `index` now, dB; 0 when it does not run.
-    pub fn ducking_db(&self, index: usize) -> f32 {
+    /// What the duck does to track `index` now, and whether its voice spoke
+    /// since the last call; all 0 when it does not run.
+    pub fn take_duck_state(&self, index: usize) -> DuckState {
         let audio = lock(&self.audio);
         audio
             .running
             .iter()
             .find(|(i, _)| *i == index)
-            .map_or(0.0, |(_, capture)| capture.ducking_db())
+            .map_or(DuckState::default(), |(_, capture)| {
+                capture.take_duck_state()
+            })
     }
 
     /// Sets the filters of track `index`, live: parameters glide, a new

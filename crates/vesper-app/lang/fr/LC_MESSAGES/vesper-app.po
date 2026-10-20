@@ -633,8 +633,20 @@ msgstr "{} · sauf {}"
 msgid "Lower {} when I speak"
 msgstr "Baisser {} quand je parle"
 
-msgid "Lowered"
-msgstr "Baissée"
+msgid "Voice detected"
+msgstr "Voix détectée"
+
+msgid "Lowered {}"
+msgstr "Baissée {}"
+
+msgid "Music {}"
+msgstr "Musique {}"
+
+msgid "Lowered by {} dB under the voice"
+msgstr "Baissée de {} dB sous la voix"
+
+msgid "Background music at {} dB"
+msgstr "Musique de fond à {} dB"
 
 msgid "Makeup"
 msgstr "Compensation"

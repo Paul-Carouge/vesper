@@ -55,3 +55,6 @@ SHOT_LANG=en shot ducking-en-dark dark screen-look,ducking-look,scroll-end
 SHOT_LANG=fr shot ducking-fr-light light screen-look,ducking-look,scroll-end
 SHOT_LANG=fr SIZE=360x700 shot ducking-fr-narrow-dark dark screen-look,ducking-look,scroll-end
 SHOT_LANG=en SIZE=360x700 shot ducking-en-narrow-light light screen-look,ducking-look,scroll-end
+# Background music at its level, no voice speaking.
+SHOT_LANG=en shot music-en-light light screen-look,ducking-look,music-look,scroll-end
+SHOT_LANG=fr SIZE=360x700 shot music-fr-narrow-dark dark screen-look,ducking-look,music-look,scroll-end
