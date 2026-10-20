@@ -914,6 +914,8 @@ pub struct Ducker {
     /// share does not step the broadband gain).
     share: f32,
     share_now: f32,
+    /// A block of the share was measured.
+    share_known: bool,
     /// The phrase the voice speaks, while the duck is down for it.
     phrase: Option<Phrase>,
     /// Release time of the last phrase, ms.
@@ -988,6 +990,7 @@ impl Ducker {
             share_z: vec![State::default(); ch],
             share: SHARE_DEFAULT,
             share_now: SHARE_DEFAULT,
+            share_known: false,
             phrase: None,
             release_ms: RELEASE_LONG_MS,
             #[cfg(test)]
@@ -1436,7 +1439,14 @@ impl Ducker {
                 // What the reference bell takes, as a share of the power.
                 let took = 1.0 - (self.cut_power / self.share_power) as f32;
                 let share = (took / (1.0 - db_to_lin(-SHARE_REF_DB).powi(2))).clamp(0.0, 1.0);
-                self.share += (share - self.share) / SHARE_BLOCKS;
+                // The first block measured is taken whole: within the
+                // lookahead of the first word, not the default's.
+                self.share = if self.share_known {
+                    self.share + (share - self.share) / SHARE_BLOCKS
+                } else {
+                    share
+                };
+                self.share_known = true;
             }
             (self.share_power, self.cut_power, self.share_frames) = (0.0, 0.0, 0);
         }

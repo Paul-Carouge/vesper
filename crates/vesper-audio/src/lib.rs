@@ -773,8 +773,13 @@ impl<F: FnMut(EncodedPacket)> Encoder<F> {
                 // the timeline: where `encode_block` will process it.
                 let at = (self.origin + self.fed).saturating_sub((FRAME + delay) as u64);
                 let voice = v.key.loudness();
-                v.ducker
-                    .look_ahead(&self.block, at, self.shared.ducking(), voice);
+                let mut settings = self.shared.ducking();
+                if !v.key.has_voice() {
+                    // No voice to duck under: a duck alone measures nothing
+                    // (its band share is kept for when one comes).
+                    settings.duck_db = 0.0;
+                }
+                v.ducker.look_ahead(&self.block, at, settings, voice);
             }
             let ahead = self.lookahead();
             self.set_delay(delay + ahead);
@@ -2249,10 +2254,11 @@ mod tests {
             .fold(0.0, f32::max);
         assert!(step < 1e-3, "{step}");
         // Out before it became a voice: the lookahead held the rest back.
-        // Ducked: the spectral duck lowers a constant by its broadband part
-        // only, 12 dB once it measured that nothing is in the voice band.
-        let ducked = 0.25 * db_to_gain(-12.0) - 1e-3..0.25 * db_to_gain(-8.0);
-        assert!(ducked.contains(&out[FRAME * 3]), "{}", out[FRAME * 3]);
+        // Ducked by the broadband part of the 12 dB duck: K-weighting
+        // removes a constant, so its voice-band share is that of its onset
+        // alone (the first block measured, within the lookahead), 9.33 dB.
+        let db = 20.0 * (out[FRAME * 3] / 0.25).log10();
+        assert!((db + 9.33).abs() < 0.1, "{db}");
         assert_eq!(*out.last().unwrap(), 0.25);
         assert_eq!(track.shared.ducking.load(Ordering::Relaxed), 0);
     }
