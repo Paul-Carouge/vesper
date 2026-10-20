@@ -163,3 +163,11 @@ Not planned: plugin APIs for the video pipeline itself.
 - Wayland delivers frames on damage only: constant framerate needs frame duplication or timestamp handling.
 - DMA-BUF modifier negotiation between PipeWire and VAAPI.
 - Hybrid GPUs: pick the right render node explicitly.
+
+## License
+
+Free to use for anyone, commercial uses included, and to redistribute as unmodified source; changing the code is reserved to its author. See [LICENSE](LICENSE).
+
+The interface is built with Slint, used under its royalty-free license:
+
+[![Made with Slint](docs/images/made-with-slint.png)](https://slint.dev)

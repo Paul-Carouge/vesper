@@ -10,8 +10,7 @@ pkgrel=1
 pkgdesc='Fast, bloat-free screen recorder with replay buffer and Vulkan/OpenGL game capture'
 arch=('x86_64')
 url='https://github.com/Paul-Carouge/vesper'
-# No license file in the repository yet.
-license=('custom')
+license=('LicenseRef-Vesper')
 # Linked: ffmpeg, libva, pipewire, fontconfig. Loaded at runtime by the UI:
 # libEGL/libGL (libglvnd), libwayland-*, libxkbcommon. mesa: VAAPI driver.
 depends=(
@@ -115,4 +114,5 @@ package() {
   install -dm755 "$pkgdir/usr/share/icons"
   cp -r --no-preserve=ownership crates/vesper-app/data/icons/hicolor "$pkgdir/usr/share/icons/"
   install -Dm644 README.md -t "$pkgdir/usr/share/doc/$pkgname/"
+  install -Dm644 LICENSE -t "$pkgdir/usr/share/licenses/$pkgname/"
 }
