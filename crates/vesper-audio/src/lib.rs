@@ -268,6 +268,18 @@ pub struct Peaks {
     pub fresh: bool,
 }
 
+/// What ducking does to a track now, for its caption. See
+/// [`AudioCapture::take_duck_state`].
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub struct DuckState {
+    /// How much the duck lowers the track, dB (>= 0).
+    pub lowered_db: f32,
+    /// The whole gain of the duck, leveler and compressor, dB.
+    pub gain_db: f32,
+    /// A voice track heard a voice since the last take (never while muted).
+    pub voiced: bool,
+}
+
 impl Peaks {
     /// Silence, as a block would report it: what a track that does not run
     /// shows (`Default` is "no block came", which keeps the last peaks).
@@ -317,6 +329,10 @@ struct Shared {
     music_under_lu: AtomicU32,
     /// `f32` bits of the duck's current reduction, dB.
     ducking: AtomicU32,
+    /// `f32` bits of the ducker's whole gain now, dB.
+    duck_gain: AtomicU32,
+    /// A voice was detected since [`AudioCapture::take_duck_state`].
+    voiced: AtomicBool,
     /// A voice: it speaks into the [`VoiceKey`] instead of ducking.
     speaks: AtomicBool,
 }
@@ -362,6 +378,8 @@ impl Default for Shared {
             gap_lu: AtomicU32::new(0),
             music_under_lu: AtomicU32::new(0),
             ducking: AtomicU32::new(0),
+            duck_gain: AtomicU32::new(0),
+            voiced: AtomicBool::new(false),
             speaks: AtomicBool::new(false),
         }
     }
@@ -376,6 +394,15 @@ impl Shared {
             clipped: self.clipped.swap(false, Ordering::Relaxed),
             stereo: self.stereo.load(Ordering::Relaxed),
             fresh: self.fresh.swap(false, Ordering::Relaxed),
+        }
+    }
+
+    fn take_duck_state(&self) -> DuckState {
+        let db = |a: &AtomicU32| f32::from_bits(a.load(Ordering::Relaxed));
+        DuckState {
+            lowered_db: db(&self.ducking),
+            gain_db: db(&self.duck_gain),
+            voiced: self.voiced.swap(false, Ordering::Relaxed),
         }
     }
 
@@ -485,9 +512,10 @@ impl AudioCapture {
         self.shared.speaks.store(speaks, Ordering::Relaxed);
     }
 
-    /// How much the duck lowers the track now, dB (>= 0).
-    pub fn ducking_db(&self) -> f32 {
-        f32::from_bits(self.shared.ducking.load(Ordering::Relaxed))
+    /// What the duck does now, and whether the voice spoke since the last
+    /// call. Cheap: a few atomics.
+    pub fn take_duck_state(&self) -> DuckState {
+        self.shared.take_duck_state()
     }
 
     /// `OpusHead` for the container's codec private data.
@@ -783,11 +811,12 @@ impl<F: FnMut(EncodedPacket)> Encoder<F> {
         if self.shared.muted.load(Ordering::Relaxed) {
             v.detector.pause();
         } else {
-            let (key, own) = (&v.key, &v.own);
+            let (key, own, shared) = (&v.key, &v.own, &self.shared);
             v.detector.process_windows(&self.block, |end, voiced| {
                 if voiced {
                     key.voiced(at + end as u64);
                     own.voiced(at + end as u64);
+                    shared.voiced.store(true, Ordering::Relaxed);
                 }
             });
         }
@@ -884,6 +913,10 @@ impl<F: FnMut(EncodedPacket)> Encoder<F> {
                 .process_at(&mut self.block, at, settings, speaking, voice);
             let db = v.ducker.ducking_db();
             self.shared.ducking.store(db.to_bits(), Ordering::Relaxed);
+            let gain = v.ducker.gain_db();
+            self.shared
+                .duck_gain
+                .store(gain.to_bits(), Ordering::Relaxed);
         }
         let gain = if self.shared.muted.load(Ordering::Relaxed) {
             0.0
@@ -2235,6 +2268,45 @@ mod tests {
             spoke |= key.speaking((k * FRAME) as u64, ((k + 1) * FRAME) as u64);
         }
         spoke
+    }
+
+    #[test]
+    fn the_duck_state_tells_the_voice_and_the_ducked_gain() {
+        let key = Arc::new(VoiceKey::default());
+        let mut mic = voice_track(&key, Duration::ZERO, true, DuckSettings::default());
+        let mic_shared = mic.shared.clone();
+        let mut music = voice_track(&key, Duration::ZERO, false, DUCK_12);
+        let (mut voiced, mut lowered, mut gain) = (Vec::new(), 0f32, 0f32);
+        run_voice(&mut mic, &mut music, 0, |k, shared| {
+            let state = shared.take_duck_state();
+            (lowered, gain) = (lowered.max(state.lowered_db), gain.min(state.gain_db));
+            assert!(!state.voiced, "a ducked track has no voice");
+            if mic_shared.take_duck_state().voiced {
+                voiced.push(k);
+            }
+        });
+        // The duck's 12 dB, and the whole gain with them (no leveler).
+        assert!((lowered - 12.0).abs() < 0.1, "{lowered}");
+        assert!((gain + 12.0).abs() < 0.1, "{gain}");
+        // The voice is told during its words only (the last window ends
+        // in the block after them).
+        assert!(voiced.len() > WORDS.len() / 2, "{}", voiced.len());
+        let words = WORDS.start..=WORDS.end;
+        assert!(voiced.iter().all(|k| words.contains(k)), "{voiced:?}");
+        // Back up after the voice.
+        let state = music.shared.take_duck_state();
+        assert_eq!((state.lowered_db, state.gain_db), (0.0, 0.0));
+    }
+
+    #[test]
+    fn a_muted_voice_is_not_told() {
+        let key = Arc::new(VoiceKey::default());
+        let mut mic = voice_track(&key, Duration::ZERO, true, DuckSettings::default());
+        mic.shared.muted.store(true, Ordering::Relaxed);
+        for k in 0..WORDS.end {
+            mic.push(&speech_block(k));
+            assert!(!mic.shared.take_duck_state().voiced, "block {k}");
+        }
     }
 
     #[test]

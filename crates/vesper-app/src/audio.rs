@@ -14,11 +14,12 @@ use std::time::{Duration, Instant};
 use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
 use vesper_audio::{MAX_DB, MIN_DB, Node, NodeWatch, Peaks, Source};
 
-use crate::meter::MeterState;
+use crate::meter::{DuckCaption, MeterState};
 use crate::prefs::{self, Device, Prefs};
 use crate::recorder::{Ducking, Level, MAX_TRACKS, Pipeline, Track};
 use crate::{
-    AppWindow, AudioTrack, DeviceChoice, METER_TICK, Shared, SourceOption, TrackKind, TrackMeter,
+    AppWindow, AudioTrack, DeviceChoice, METER_TICK, Shared, SourceOption, TrackDuck, TrackKind,
+    TrackMeter,
 };
 
 /// Devices and applications, from a [`NodeWatch`] that runs while the UI
@@ -37,9 +38,6 @@ thread_local! {
     // no pipeline's audio runs.
     static RUNNING_EXCEPT: RefCell<Option<Vec<String>>> = RefCell::default();
 }
-
-/// A track lowered by more than this (dB) shows it is.
-const DUCKED_DB: f32 = 1.0;
 
 /// Volume changes are saved once the slider rests this long.
 const SAVE_DELAY: Duration = Duration::from_millis(400);
@@ -787,8 +785,9 @@ pub fn start_meters(ui: &AppWindow, rec: &Shared) -> Rc<slint::Timer> {
     let meters: Rc<RefCell<Vec<MeterState>>> = Rc::default();
     let shown = Rc::new(VecModel::<TrackMeter>::default());
     ui.set_track_meters(shown.clone().into());
-    let ducked = Rc::new(VecModel::default());
+    let ducked = Rc::new(VecModel::<TrackDuck>::default());
     ui.set_track_ducked(ducked.clone().into());
+    let mut captions: Vec<DuckCaption> = Vec::new();
     let reductions = Rc::new(VecModel::default());
     ui.set_filter_reductions(reductions.clone().into());
     // Peaks gathered while the window was away are stale: the first tick
@@ -818,7 +817,8 @@ pub fn start_meters(ui: &AppWindow, rec: &Shared) -> Rc<slint::Timer> {
                 .map(|(kind, _)| MeterState::new(stereo_source(*kind)))
                 .collect();
             model.set_vec(meters.iter().map(MeterState::shown).collect::<Vec<_>>());
-            ducked.set_vec(vec![false; meters.len()]);
+            captions = vec![DuckCaption::default(); meters.len()];
+            ducked.set_vec(vec![TrackDuck::default(); meters.len()]);
         }
         // The real time since the last tick (timers slip under load), at
         // most a few ticks: the first one after a stop is not a long silence.
@@ -841,14 +841,22 @@ pub fn start_meters(ui: &AppWindow, rec: &Shared) -> Rc<slint::Timer> {
             if model.row_data(i).as_ref() != Some(&now) {
                 model.set_row_data(i, now);
             }
-            let lowered = rec.as_ref().is_some_and(|r| r.ducking_db(i) > DUCKED_DB);
-            if ducked.row_data(i) != Some(lowered) {
-                ducked.set_row_data(i, lowered);
+            let duck = rec
+                .as_ref()
+                .map_or_else(Default::default, |r| r.take_duck_state(i));
+            if stale {
+                captions[i].reset(duck);
+            } else {
+                captions[i].feed(duck, dt);
+            }
+            let now = captions[i].shown();
+            if ducked.row_data(i).as_ref() != Some(&now) {
+                ducked.set_row_data(i, now);
             }
         }
         let rested = meters.iter().all(MeterState::rested)
             && reductions.iter().all(|r| r == 0.0)
-            && ducked.iter().all(|d| !d);
+            && captions.iter().all(DuckCaption::rested);
         quiet = if rested { quiet + 1 } else { 0 };
         let on_screen = crate::scene_ui::shown_on_screen(&ui);
         if quiet >= REST_TICKS || !on_screen {

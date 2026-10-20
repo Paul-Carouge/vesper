@@ -923,6 +923,11 @@ impl Ducker {
         0.0 - self.duck
     }
 
+    /// The whole gain now (leveler, compressor and duck), dB. For a meter.
+    pub fn gain_db(&self) -> f32 {
+        20.0 * self.gain.log10()
+    }
+
     /// The leveler's gain now, dB (its cap included).
     fn leveled(&self) -> f32 {
         self.level.min(self.cap)

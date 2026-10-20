@@ -9,9 +9,9 @@
 
 use std::time::Duration;
 
-use vesper_audio::Peaks;
+use vesper_audio::{DuckState, Peaks};
 
-use crate::TrackMeter;
+use crate::{TrackDuck, TrackMeter};
 
 /// Lowest level shown: quieter is silence, the meter rests.
 pub const FLOOR_DB: f32 = -60.0;
@@ -178,6 +178,85 @@ impl MeterState {
             hold_right: quantize(position(right.hold)),
             clip: self.clip,
             stereo: self.stereo,
+        }
+    }
+}
+
+/// A track lowered by more than this (dB) says so.
+const LOWERED_DB: f32 = 1.0;
+/// The caption's dB follow the gain with this time constant: the
+/// compressor's quick moves and the duck's ramps do not flicker it.
+const GAIN_SMOOTH: Duration = Duration::from_millis(300);
+/// The dB shown change once the gain is this far from them, so a gain
+/// sitting between two whole dB does not flap.
+const GAIN_STEP_DB: f32 = 1.0;
+/// "Voice detected" stays this long after the last voiced window: it does
+/// not blink between words.
+const VOICE_HOLD: Duration = Duration::from_millis(600);
+
+/// A track's ducking caption: a voice that speaks, the duck that lowers a
+/// track, and the whole gain of the duck, leveler and compressor in whole
+/// dB, fed at the meters' tick.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub struct DuckCaption {
+    /// The gain, dB, smoothed, and where it goes.
+    gain: f32,
+    target: f32,
+    /// What is shown of it, whole dB.
+    db: i32,
+    lowered: bool,
+    /// Time left showing the voice.
+    voice: Duration,
+}
+
+impl DuckCaption {
+    /// Feeds the state taken over the last `dt`.
+    pub fn feed(&mut self, state: DuckState, dt: Duration) {
+        self.voice = if state.voiced {
+            VOICE_HOLD
+        } else {
+            self.voice.saturating_sub(dt)
+        };
+        self.lowered = state.lowered_db > LOWERED_DB;
+        // Lowered, the drop shown is at least the duck's: a quiet song the
+        // leveler raised more than the duck lowers it is still lowered.
+        self.target = if self.lowered {
+            state.gain_db.min(-state.lowered_db)
+        } else {
+            state.gain_db
+        };
+        let k = (dt.as_secs_f32() / GAIN_SMOOTH.as_secs_f32()).min(1.0);
+        self.gain += (self.target - self.gain) * k;
+        // Moving, the dB follow the gain by steps; settled, they round it
+        // (a gain at x.5 keeps the dB it had).
+        let off = (self.gain - self.db as f32).abs();
+        let settled = (self.gain - self.target).abs() < 0.05;
+        if off >= GAIN_STEP_DB || (settled && off > 0.6) {
+            self.db = self.gain.round() as i32;
+        }
+    }
+
+    /// Back to the state as it is, without the past (the window was away).
+    pub fn reset(&mut self, state: DuckState) {
+        *self = Self::default();
+        self.feed(state, GAIN_SMOOTH);
+    }
+
+    /// Nothing to tick for: no voice shown, not lowered, the gain settled.
+    pub fn rested(&self) -> bool {
+        self.voice.is_zero() && !self.lowered && (self.gain - self.target).abs() < 0.1
+    }
+
+    pub fn shown(&self) -> TrackDuck {
+        TrackDuck {
+            speaking: !self.voice.is_zero(),
+            lowered: self.lowered,
+            // Lowered says by how much, at least a dB.
+            db: if self.lowered {
+                self.db.min(-1)
+            } else {
+                self.db
+            },
         }
     }
 }
@@ -359,5 +438,104 @@ mod tests {
         a.feed(peaks(0.5, 0.5), TICK);
         b.feed(peaks(0.5005, 0.5005), TICK);
         assert_eq!(a.shown(), b.shown());
+    }
+
+    fn duck(lowered_db: f32, gain_db: f32, voiced: bool) -> DuckState {
+        DuckState {
+            lowered_db,
+            gain_db,
+            voiced,
+        }
+    }
+
+    #[test]
+    fn the_voice_shows_through_pauses_between_words() {
+        let mut c = DuckCaption::default();
+        c.feed(duck(0.0, 0.0, true), TICK);
+        assert!(c.shown().speaking);
+        // A 300 ms pause between words: still speaking.
+        for _ in 0..9 {
+            c.feed(duck(0.0, 0.0, false), TICK);
+        }
+        assert!(c.shown().speaking && !c.rested());
+        c.feed(duck(0.0, 0.0, true), TICK);
+        for _ in 0..18 {
+            c.feed(duck(0.0, 0.0, false), TICK);
+        }
+        assert!(c.shown().speaking);
+        for _ in 0..2 {
+            c.feed(duck(0.0, 0.0, false), TICK);
+        }
+        assert!(!c.shown().speaking && c.rested());
+    }
+
+    #[test]
+    fn the_duck_shows_its_whole_drop_in_whole_db() {
+        let mut c = DuckCaption::default();
+        // Ducked 12 dB under a leveler at -3 dB: -15 dB once settled.
+        for _ in 0..60 {
+            c.feed(duck(12.0, -15.2, false), TICK);
+        }
+        let shown = c.shown();
+        assert!(shown.lowered && !shown.speaking);
+        assert_eq!(shown.db, -15);
+        assert!(!c.rested());
+        // A quiet song raised 8 dB, ducked 6: lowered by the duck at least.
+        for _ in 0..60 {
+            c.feed(duck(6.0, 2.0, false), TICK);
+        }
+        assert_eq!(c.shown().db, -6);
+        // Back up: not lowered, the leveler's +2 dB show, then rest.
+        for _ in 0..60 {
+            c.feed(duck(0.0, 2.0, false), TICK);
+        }
+        assert_eq!(
+            c.shown(),
+            TrackDuck {
+                speaking: false,
+                lowered: false,
+                db: 2
+            }
+        );
+        assert!(c.rested());
+        // Under a dB of duck is not lowered.
+        c.feed(duck(0.9, 2.0, false), TICK);
+        assert!(!c.shown().lowered);
+    }
+
+    #[test]
+    fn a_gain_between_two_db_or_a_quick_peak_does_not_flicker() {
+        let mut c = DuckCaption::default();
+        for _ in 0..60 {
+            c.feed(duck(0.0, -9.5, false), TICK);
+        }
+        let first = c.shown().db;
+        // Wobbling around -9.5 dB, then a compressor peak of 3 dB for 30 ms.
+        let mut seen = vec![first];
+        for i in 0..60 {
+            let g = if i % 2 == 0 { -9.4 } else { -9.6 };
+            c.feed(duck(0.0, g, false), TICK);
+            seen.push(c.shown().db);
+        }
+        c.feed(duck(0.0, -12.5, false), TICK);
+        seen.push(c.shown().db);
+        c.feed(duck(0.0, -9.5, false), TICK);
+        seen.push(c.shown().db);
+        assert!(seen.iter().all(|&db| db == first), "{seen:?}");
+    }
+
+    #[test]
+    fn reset_shows_the_state_at_once() {
+        let mut c = DuckCaption::default();
+        c.feed(duck(0.0, 0.0, true), TICK);
+        c.reset(duck(0.0, -12.0, false));
+        assert_eq!(
+            c.shown(),
+            TrackDuck {
+                speaking: false,
+                lowered: false,
+                db: -12
+            }
+        );
     }
 }

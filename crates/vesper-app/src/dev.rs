@@ -7,7 +7,7 @@
 //!   notification, both for `VESPER_DEMO_FILE`.
 //!   Looks without a capture or a game, for screenshots: `screen-look`,
 //!   `game-look`, `game-window-look`, `consent-look`, `starting-look`, `stopping-look`, `picking-look` (the picker is open), `layer-installed`, `layer-missing`,
-//!   `replay-on`, `replay-off`, `filters-look`, `ducking-look`, `live-look`, `live-dropping-look`,
+//!   `replay-on`, `replay-off`, `filters-look`, `ducking-look`, `music-look`, `live-look`, `live-dropping-look`,
 //!   `live-reconnecting-look`, `live-key-look`; `scroll-end` scrolls the settings
 //!   to the end, `scroll:<px>` that far.
 //!   `track-source` opens the first track's Source list, `desktop-devices` and
@@ -531,7 +531,31 @@ fn look(ui: &AppWindow, step: &str) -> bool {
                 ((-14.0, -14.0), (-9.0, -9.0), false, false),
                 ((-36.0, -37.0), (-30.0, -31.0), true, false),
             ]));
-            let ducked = vec![false, false, true];
+            // The microphone speaks, the music is down 14 dB.
+            let ducked = vec![
+                crate::TrackDuck::default(),
+                crate::TrackDuck {
+                    speaking: true,
+                    ..Default::default()
+                },
+                crate::TrackDuck {
+                    lowered: true,
+                    db: -14,
+                    ..Default::default()
+                },
+            ];
+            ui.set_track_ducked(std::rc::Rc::new(slint::VecModel::from(ducked)).into());
+        }
+        // After `ducking-look`: no one speaks, the music sits at its level.
+        "music-look" => {
+            let ducked = vec![
+                crate::TrackDuck::default(),
+                crate::TrackDuck::default(),
+                crate::TrackDuck {
+                    db: -8,
+                    ..Default::default()
+                },
+            ];
             ui.set_track_ducked(std::rc::Rc::new(slint::VecModel::from(ducked)).into());
         }
         // On air for 12:34 on Twitch, as the stats show it.
