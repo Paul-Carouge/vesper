@@ -1936,6 +1936,12 @@ mod tests {
         music_under_lu: 0.0,
     };
 
+    /// What [`DUCK_12`] does to the 150 Hz song and to a constant: the duck
+    /// is spectral (its loudness drops 12 dB, the voice band more, the lows
+    /// less, a constant only by the broadband part).
+    const DUCKED_150HZ_DB: f32 = -10.87;
+    const DUCKED_DC_DB: f32 = -8.41;
+
     /// Block `k` of a `freq` sine (whole periods in 20 ms), stereo.
     fn sine_block(freq: f32, amp: f32, k: usize) -> Vec<f32> {
         (k * FRAME..(k + 1) * FRAME)
@@ -2000,7 +2006,7 @@ mod tests {
         for k in 0..lead {
             music.push(&sine_block(150.0, 0.25, k));
         }
-        for k in 0..WORDS.end + 65 {
+        for k in 0..WORDS.end + 80 {
             mic.push(&speech_block(k));
             music.push(&sine_block(150.0, 0.25, k + lead));
             each(k, &music.shared);
@@ -2016,12 +2022,16 @@ mod tests {
         let before = WORDS.start - 8;
         assert!(db(before).abs() < 0.1, "{}", db(before));
         // Down by the depth at the first word, and held through the gaps
-        // between words, then the 300 ms hold.
+        // between words, then the hold (400 ms after a long phrase).
         for k in WORDS.start..WORDS.end + 12 {
-            assert!((db(k) + 12.0).abs() < 0.3, "block {k}: {} dB", db(k));
+            assert!(
+                (db(k) - DUCKED_150HZ_DB).abs() < 0.3,
+                "block {k}: {} dB",
+                db(k)
+            );
         }
-        // Back after the 600 ms release.
-        let end = WORDS.end + 50;
+        // Back after the release (900 ms after a long phrase).
+        let end = WORDS.end + 70;
         assert!(db(end).abs() < 0.1, "{}", db(end));
     }
 
@@ -2106,7 +2116,7 @@ mod tests {
         let got: Vec<_> = rx.try_iter().collect();
         // The ducking's lookahead holds 6 back, the limiter's one.
         let held = LOOKAHEAD_FRAMES / FRAME + 1;
-        assert!(got.len() >= WORDS.end + 65 - held, "{}", got.len());
+        assert!(got.len() >= WORDS.end + 80 - held, "{}", got.len());
         assert_eq!(got[60].0, anchor + Duration::from_millis(1_200));
         check_duck(&got.iter().map(|g| g.1).collect::<Vec<_>>());
         // The duck shows for a meter, and goes.
@@ -2162,9 +2172,13 @@ mod tests {
         let before = WORDS.start + late - 8;
         assert!(db(before).abs() < 0.1, "{}", db(before));
         for k in WORDS.start + late + 5..WORDS.end + late + 12 {
-            assert!((db(k) + 12.0).abs() < 0.3, "block {k}: {} dB", db(k));
+            assert!(
+                (db(k) - DUCKED_150HZ_DB).abs() < 0.3,
+                "block {k}: {} dB",
+                db(k)
+            );
         }
-        let end = WORDS.end + late + 50;
+        let end = WORDS.end + late + 70;
         assert!(db(end).abs() < 0.1, "{}", db(end));
     }
 
@@ -2249,7 +2263,7 @@ mod tests {
             .fold(0.0, f32::max);
         assert!(step < 1e-3, "{step}");
         // Out before it became a voice: the lookahead held the rest back.
-        assert!((out[FRAME * 3] - 0.25 * db_to_gain(-12.0)).abs() < 1e-3);
+        assert!((out[FRAME * 3] - 0.25 * db_to_gain(DUCKED_DC_DB)).abs() < 1e-3);
         assert_eq!(*out.last().unwrap(), 0.25);
         assert_eq!(track.shared.ducking.load(Ordering::Relaxed), 0);
     }
